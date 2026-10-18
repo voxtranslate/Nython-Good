@@ -218,7 +218,10 @@ bool is_exc(NythonExecutor& E, const std::string& s, const char* type) {
     try { return E.excTypeMatches(s, type); } catch (...) { return false; }
 }
 
-void report_ignored(NythonExecutor& E, Gen* g, const std::string& s) {
+void report_ignored(NythonExecutor& E, Gen* g, const std::string& s, const Value* obj = nullptr) {
+    // (round 85) the program's sys.unraisablehook, given the generator when
+    // it is still alive (a finalized one is being destroyed: None)
+    if (E.reportUnraisable(s, obj ? *obj : NONE_VALUE)) return;
     std::string d;
     try { d = E.describeException(s); } catch (...) { d = s; }
     std::fprintf(stderr, "Exception ignored in: <generator object %s at %s>\n%s\n", g->name.c_str(),
@@ -388,7 +391,7 @@ void close_owned(NythonExecutor& E, Cursor& cu) {
     Gen* g = cu.g;
     if (g && cu.owns && g->st != St::Done && g->st != St::Running) {
         try { close(E, g); }
-        catch (std::string& s) { report_ignored(E, g, s); }
+        catch (std::string& s) { report_ignored(E, g, s, &cu.hold); }
         catch (...) {}
     }
     cu.k = Cursor::END;
@@ -1445,7 +1448,7 @@ void close_temp(NythonExecutor& E, const Value& v) {
     Gen* g = gen_of(v);
     if (!g || g->st == St::Done || g->st == St::Running) return;
     try { close(E, g); }
-    catch (std::string& s) { report_ignored(E, g, s); }
+    catch (std::string& s) { report_ignored(E, g, s, &v); }
     catch (...) {}
 }
 

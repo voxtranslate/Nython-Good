@@ -14,6 +14,7 @@ fix from masking a new failure.
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -90,6 +91,14 @@ def main(argv):
                          capture_output=True, text=True)
     cur = sweep(binary, timeout, jobs)
     cur[("nython.cbp", "units")] = ("ok" if cbp.returncode == 0 else "fail", cbp.stdout)
+    # round 85: no name CPython's modules have that Nython had may disappear
+    # (tools/api_diff.py --check against tools/api_baseline.json; skipped
+    # without python3, or for a binary of another platform than the baseline's)
+    baseline = os.path.join(REPO, "tools", "api_baseline.json")
+    if shutil.which("python3") and os.path.exists(baseline):
+        api = subprocess.run([shutil.which("python3"), os.path.join(REPO, "tools", "api_diff.py"), "--check", baseline,
+                              "--bin", binary, "-j", str(jobs)], capture_output=True, text=True, errors="replace")
+        cur[("tools/api_baseline.json", "api")] = ("ok" if api.returncode == 0 else "fail", api.stdout + api.stderr)
     bad = sorted(k for k, v in cur.items() if v[0] != "ok")
     print("%d runs, %d not ok" % (len(cur), len(bad)))
     for k in bad:

@@ -406,6 +406,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit113 | 389 | round 84 (part B): unicodedata (every property over a sample, NormalizationTest-14.0.0, ucd_3_2_0, aliases and named sequences), str by the database (full case mapping, final sigma, casefold, title, the is* predicates, Unicode whitespace and line breaks, int/float/complex/Decimal of Unicode digits), PEP 3131 identifiers, re's Unicode classes, the CJK codecs (every one, every error handler, incremental, streams), utf-7, the single-byte code pages, idna's nameprep, email charsets, mbcs/oem/code_page_* on Windows (392 there, run under Wine); generated from python3.11's values (`tools/vm_audit113_spec.py`; the 380 shared checks pass under python3.11) |
 | vm_audit114 | 215 | round 84 (part C): tkinter/ttk/turtle over Nython's own Tk (the Tcl subset, widgets, geometry managers, events and bindings, variables, images, fonts, ttk styles, dialogs, turtle) driven through the scripted-input harness (python3: skipped without tkinter) |
 | vm_audit115 | 611 | round 84 (part D): curses without ncurses - ten programs under a pty on xterm-256color and vt100 compared cell for cell with CPython+ncurses through the VT emulator, terminfo against infocmp, tparm, byte counts (585 under python3.11 with ncurses) |
+| vm_audit118 | 155 | round 85, part E: the rest of posix (statvfs, sysconf/pathconf/confstr, ids, the scheduler, eventfd/memfd/pidfd, splice, copy_file_range, xattrs, posix_spawn, wait3/wait4/waitid, register_at_fork, popen, spawn*, fwalk, a posix module), time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data/send_fds/interfaces/constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt (RFC 7914), locale's catalogs - values asked of the host's python3 (passes under python3) |
 | vm_audit119 | 82 | round 85 (part F): Python's binding rule in a Python-language file - every binding form, UnboundLocalError, closures/nonlocal, class bodies, comprehensions, generators, decorators, exec/eval/compile/ast from the file; Nython-only: a `.ny` file keeps Nython's rule, the def-line opt-in, `-W nython-scope` / `NY_SCOPE_WARN`, `--scope-report` (63 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1693,7 +1694,25 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   of an enclosing local not yet bound falls back to the module's name or a
   NameError); what exec'd code binds in a function is not in a later
   `locals()` there (3.13's PEP 667 behaviour, not 3.12's). See `HANDOFF.md`
-  §0yF.
+  §0y2.
+
+## Round 85, part E: the names CPython's system modules have (see `HANDOFF.md` §0y)
+
+- **`python3 tools/api_diff.py [-m mod] [-v]`** lists, per module of lib/
+  CPython also has (and os/sys/time/gc/math/builtins/posix), the public
+  names CPython 3.11/3.12 have that either engine lacks, by kind, with the
+  coverage (82.5% -> 94.1% of 9676 names this round). `--check
+  tools/api_baseline.json` (a sweep row) fails when a name that was there
+  disappears; **rewrite the baseline** (`--write-baseline`) after adding names.
+- The rest of posixmodule.c is `src/builtins/os_posix.cpp` (`_ny_os_call`
+  ops) and the prelude's "posix" chunk, `src/NyPreludePosix.cpp` (its own
+  unit: editing it rebuilds one file); `lib/posix.ny` re-exports os's own
+  objects; os natives show `__module__` "posix".
+- sys.set_int_max_str_digits is enforced (NyBigInt.hpp `int_digits_check_*`
+  at int(str) and an int's str/repr/format on both engines); the engines'
+  "Exception ignored in" reports go to a program's sys.unraisablehook.
+- subprocess starts children with posix_spawn where that means the same as
+  fork + exec (`NY_SPAWN_FORK=1` forces fork).
 
 ## Transcripts
 

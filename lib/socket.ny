@@ -10,6 +10,16 @@
 # same thing). recv() returns bytes; send()/sendall() take bytes or str
 # (UTF-8). settimeout(t): t seconds per call, then TimeoutError("timed out");
 # none blocks; 0 makes it non-blocking (BlockingIOError).
+#
+# Round 85: sendmsg/recvmsg with ancillary data, send_fds/recv_fds
+# (SCM_RIGHTS), CMSG_LEN/CMSG_SPACE, close/dup/fromfd, gethostbyname_ex,
+# getprotobyname, has_dualstack_ipv6, if_nameindex/if_nametoindex/
+# if_indextoname, sethostname, error/timeout/gaierror/herror, every integer
+# constant CPython has where this platform's headers define it, and the
+# AddressFamily / SocketKind / MsgFlag / AddressInfo enums (made on first
+# use; the constants stay ints). Bluetooth's are the Linux kernel's values
+# (its headers are not installed with the C library). Not here: sendmsg's
+# destination address, CAPI, socket objects' family/type as enum members.
 
 def _consts():
     var d = {}
@@ -358,6 +368,39 @@ class socket:
     def wait_writable(self, timeout=none):
         return _net_wait(self._h, 2, timeout) != 0
 
+    # (round 85) sendmsg / recvmsg with ancillary data (SCM_RIGHTS ...):
+    # the call is made non-blocking and waited for as send/recv are (the
+    # timeout, a parked async task); POSIX only. sendmsg's address (an
+    # unconnected datagram socket's destination) is not supported.
+    def sendmsg(self, buffers, ancdata=(), flags=0, address=none):
+        if address is not none:
+            raise NotImplementedError("sendmsg(): a destination address is not supported here")
+        var data = b"".join([bytes(_bl(b)) if not isinstance(b, str) else b.encode() for b in buffers])
+        var anc = []
+        for item in ancdata:
+            anc.append((item[0], item[1], bytes(_bl(item[2]))))
+        var t = self.gettimeout()
+        while true:
+            try:
+                return _ny_os_call("sendmsg", self.fileno(), data, anc, flags)
+            except BlockingIOError:
+                if t == 0.0:
+                    raise
+                if not self.wait_writable(t):
+                    raise TimeoutError("timed out")
+
+    def recvmsg(self, bufsize, ancbufsize=0, flags=0):
+        var t = self.gettimeout()
+        while true:
+            try:
+                var r = _ny_os_call("recvmsg", self.fileno(), bufsize, ancbufsize, flags)
+                return (r[0], list(r[1]), r[2], none)
+            except BlockingIOError:
+                if t == 0.0:
+                    raise
+                if not self.wait_readable(t):
+                    raise TimeoutError("timed out")
+
     def __enter__(self):
         return self
 
@@ -536,3 +579,140 @@ def getdefaulttimeout():
 
 def setdefaulttimeout(t):
     _net_setdefaulttimeout(t)
+
+# ── round 85: the rest of CPython's socket module ────────────────────────
+# the exception aliases, close/dup/fromfd on descriptors, CMSG_LEN/
+# CMSG_SPACE, send_fds/recv_fds (SCM_RIGHTS over sendmsg/recvmsg),
+# gethostbyname_ex, getprotobyname, has_dualstack_ipv6, the interface
+# index calls, sethostname, every integer constant CPython has where the
+# platform's headers define it (builtins/os_posix.cpp), and the
+# AddressFamily / SocketKind / MsgFlag / AddressInfo enums.
+error = OSError
+timeout = TimeoutError
+gaierror = gaierror
+herror = herror
+SocketType = socket
+if _C.get("AF_BLUETOOTH") is not none or sys_platform() == "linux":
+    BDADDR_ANY = "00:00:00:00:00:00"
+    BDADDR_LOCAL = "00:00:00:FF:FF:FF"
+
+def _sint(v):
+    if isinstance(v, int):
+        return int(v)
+    if hasattr(type(v), "__index__"):
+        return v.__index__()
+    raise TypeError("'" + type(v).__name__ + "' object cannot be interpreted as an integer")
+
+def close(fd):
+    _ny_os_call("close", _sint(fd))
+
+def dup(fd):
+    return _ny_os_call("dup", _sint(fd))
+
+def fromfd(fd, family, type, proto=0):
+    return socket(family, type, proto, dup(fd))
+
+def gethostbyname_ex(hostname):
+    return _ny_os_call("gethostbyname_ex", hostname)
+
+def getprotobyname(protocolname):
+    return _ny_os_call("getprotobyname", protocolname)
+
+def has_dualstack_ipv6():
+    if not has_ipv6 or IPV6_V6ONLY is none:
+        return false
+    try:
+        var s = socket(AF_INET6, SOCK_STREAM)
+        try:
+            s.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)
+            return true
+        finally:
+            s.close()
+    except OSError:
+        return false
+
+def if_nameindex():
+    return list(_ny_os_call("if_nameindex"))
+
+def if_nametoindex(oname):
+    return _ny_os_call("if_nametoindex", oname)
+
+def if_indextoname(index):
+    return _ny_os_call("if_indextoname", _sint(index))
+
+def sethostname(name):
+    _ny_sys_audit("socket.sethostname", name)
+    _ny_os_call("sethostname", name)
+
+def CMSG_LEN(length):
+    return _ny_os_call("CMSG_LEN", _sint(length))
+
+def CMSG_SPACE(length):
+    return _ny_os_call("CMSG_SPACE", _sint(length))
+
+def send_fds(sock, buffers, fds, flags=0, address=none):
+    """send_fds(sock, buffers, fds[, flags[, address]]) -> integer
+
+    Send the list of file descriptors fds over an AF_UNIX socket.
+    """
+    import struct
+    return sock.sendmsg(buffers, [(SOL_SOCKET, SCM_RIGHTS, struct.pack(str(len(fds)) + "i", *fds))], flags, address)
+
+def recv_fds(sock, bufsize, maxfds, flags=0):
+    """recv_fds(sock, bufsize, maxfds[, flags]) -> (data, list of file
+    descriptors, msg_flags, address)
+
+    Receive up to maxfds file descriptors returning the message
+    data and a list containing the descriptors.
+    """
+    import struct
+    var r = sock.recvmsg(bufsize, CMSG_LEN(maxfds * 4), flags)
+    var fds = []
+    for item in r[1]:
+        if item[0] == SOL_SOCKET and item[1] == SCM_RIGHTS:
+            var d = item[2][:len(item[2]) - (len(item[2]) % 4)]
+            fds.extend(struct.unpack(str(len(d) // 4) + "i", d))
+    return (r[0], fds, r[2], r[3])
+
+if sys_platform() != "win32":
+    def _load_more():
+        var g = globals()
+        for pair in _ny_os_call("socket_constants"):
+            if pair[0] not in g:
+                g[pair[0]] = pair[1]
+    _load_more()
+    del _load_more
+
+# the enums (CPython's IntEnum._convert_ / IntFlag._convert_ over the
+# constants): the constants stay ints here (socket.AF_INET == 2 ==
+# AddressFamily.AF_INET); made the first time one is asked for
+_enums = {}
+def _make_enums():
+    if _enums:
+        return _enums
+    import enum
+    var g = globals()
+    def pick(test):
+        var out = []
+        for n in list(g):
+            var v = g[n]
+            if isinstance(v, int) and not isinstance(v, bool) and test(n):
+                out.append((n, v))
+        out.sort(key=lambda kv: (kv[1], kv[0]))
+        return out
+    _enums["AddressFamily"] = enum.IntEnum("AddressFamily",
+        pick(lambda n: n.isupper() and (n.startswith("AF_") or (n.startswith("PF_") and false))), module="socket")
+    _enums["SocketKind"] = enum.IntEnum("SocketKind", pick(lambda n: n.isupper() and n.startswith("SOCK_")), module="socket")
+    _enums["MsgFlag"] = enum.IntFlag("MsgFlag", pick(lambda n: n.isupper() and n.startswith("MSG_")), module="socket")
+    _enums["AddressInfo"] = enum.IntFlag("AddressInfo", pick(lambda n: n.isupper() and n.startswith("AI_")), module="socket")
+    return _enums
+
+def __getattr__(name):
+    if name in ("AddressFamily", "SocketKind", "MsgFlag", "AddressInfo"):
+        return _make_enums()[name]
+    raise AttributeError("module 'socket' has no attribute '" + name + "'")
+
+def __dir__():
+    var names = list(globals())
+    names.extend(["AddressFamily", "SocketKind", "MsgFlag", "AddressInfo"])
+    return sorted(names)

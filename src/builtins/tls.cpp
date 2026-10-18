@@ -127,6 +127,15 @@ struct Api {
     void (*BIO_free)(void*) = nullptr;
     void* (*PEM_read_bio_X509)(void*, void*, void*, void*) = nullptr;
     int (*X509_STORE_add_cert)(void*, void*) = nullptr;
+    // (round 85) ssl.RAND_*: libcrypto's generator
+    int (*RAND_bytes)(unsigned char*, int) = nullptr;
+    int (*RAND_status)() = nullptr;
+    void (*RAND_add)(const void*, int, double) = nullptr;
+    unsigned long (*OpenSSL_version_num)() = nullptr;      // ssl.OPENSSL_VERSION_NUMBER
+    const char* (*X509_get_default_cert_file_env)() = nullptr;   // ssl.get_default_verify_paths
+    const char* (*X509_get_default_cert_file)() = nullptr;
+    const char* (*X509_get_default_cert_dir_env)() = nullptr;
+    const char* (*X509_get_default_cert_dir)() = nullptr;
 };
 
 static void* sym(void* lib, const char* name) {
@@ -249,6 +258,14 @@ static Api& api() {
     bind(a, a.BIO_free, "BIO_free");
     bind(a, a.PEM_read_bio_X509, "PEM_read_bio_X509");
     bind(a, a.X509_STORE_add_cert, "X509_STORE_add_cert");
+    bind(a, a.RAND_bytes, "RAND_bytes", false);     // round 85
+    bind(a, a.RAND_status, "RAND_status", false);
+    bind(a, a.RAND_add, "RAND_add", false);
+    bind(a, a.OpenSSL_version_num, "OpenSSL_version_num", false);
+    bind(a, a.X509_get_default_cert_file_env, "X509_get_default_cert_file_env", false);
+    bind(a, a.X509_get_default_cert_file, "X509_get_default_cert_file", false);
+    bind(a, a.X509_get_default_cert_dir_env, "X509_get_default_cert_dir_env", false);
+    bind(a, a.X509_get_default_cert_dir, "X509_get_default_cert_dir", false);
     a.lib = keep;
     a.ok = a.why.empty();
     return a;
@@ -569,7 +586,7 @@ std::vector<std::string> tls_builtin_names() {
     return {"_tls_available", "_tls_version_text", "_tls_ctx_new", "_tls_ctx_free", "_tls_ctx_set_verify",
             "_tls_ctx_default_paths", "_tls_ctx_load_verify", "_tls_ctx_load_cert_chain", "_tls_ctx_set_alpn",
             "_tls_ctx_set_ciphers", "_tls_ctx_set_versions", "_tls_wrap", "_tls_handshake", "_tls_unwrap",
-            "_tls_info", "_tls_peer_cert"};
+            "_tls_info", "_tls_peer_cert", "_tls_rand"};
 }
 
 Value dispatch_tls(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx) {
@@ -579,6 +596,37 @@ Value dispatch_tls(NythonExecutor& E, const std::string& name, std::vector<Value
                            "password", "protocols", "ciphers", "minimum", "maximum", "sock", "server_side",
                            "server_hostname", "check_hostname", "do_handshake", "binary_form"});
     if (name == "_tls_available") return Value(api().ok);
+    if (name == "_tls_rand") {
+        // (round 85) ssl.RAND_bytes(n) / RAND_status() / RAND_add(data,
+        // entropy) / RAND_pseudo_bytes(n) over libcrypto's RAND_*
+        std::string op = args.empty() ? std::string() : E.getStringValue(args[0]);
+        if (op == "version_num") {   // 0 without OpenSSL
+            Api& b = api();
+            return intValue((int64_t)(b.ok && b.OpenSSL_version_num ? b.OpenSSL_version_num() : 0));
+        }
+        Api& a = need_api();
+        if (op == "paths") {
+            auto s = [&](const char* (*f)()) { const char* r = f ? f() : nullptr; return E.makeStringValue(r ? r : ""); };
+            return E.makeListValue({s(a.X509_get_default_cert_file_env), s(a.X509_get_default_cert_file),
+                                    s(a.X509_get_default_cert_dir_env), s(a.X509_get_default_cert_dir)});
+        }
+        if (op == "status") return Value(a.RAND_status ? a.RAND_status() == 1 : false);
+        if (op == "add") {
+            std::string d = args.size() > 1 ? (E.bytesOf(args[1]) ? E.bytesOf(args[1])->s : E.getStringValue(args[1])) : std::string();
+            double ent = args.size() > 2 ? to_double(args[2]) : 0.0;
+            if (a.RAND_add) a.RAND_add(d.data(), (int)d.size(), ent);
+            return NONE_VALUE;
+        }
+        int64_t n = args.size() > 1 ? nyos::to_int(args[1], 0) : 0;
+        if (n < 0) raise_ssl("ValueError", "num must be positive");
+        if (n > INT32_MAX) raise_ssl("OverflowError", "Python int too large to convert to C int");
+        std::string buf((size_t)n, '\0');
+        if (!a.RAND_bytes) raise_ssl("SSLError", "RAND_bytes is not available");
+        int ok = a.RAND_bytes(n ? (unsigned char*)&buf[0] : (unsigned char*)buf.data(), (int)n);
+        if (op == "pseudo") return E.makeListValue({E.makeBytesValue(buf), Value(ok == 1)}, true);
+        if (ok != 1) raise_ssl("SSLError", "[RAND] " + queue_text(a));
+        return E.makeBytesValue(buf);
+    }
     if (name == "_tls_version_text") {
         Api& a = api();
         if (!a.ok || !a.OpenSSL_version) return E.makeStringValue("");

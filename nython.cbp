@@ -165,6 +165,7 @@
         <Unit filename="src/builtins/ffi.cpp" />
         <Unit filename="src/builtins/nybuffer.cpp" />
         <Unit filename="src/NyPreludeBuffer.cpp" />
+        <Unit filename="src/NyPreludePosix.cpp" />
         <Unit filename="src/builtins/hashing.cpp" />
         <Unit filename="src/builtins/pymath.cpp" />
         <Unit filename="src/builtins/pyjson.cpp" />
@@ -175,6 +176,7 @@
         <Unit filename="src/builtins/os_time.cpp" />
         <Unit filename="src/builtins/os_proc.cpp" />
         <Unit filename="src/builtins/os_fd.cpp" />
+        <Unit filename="src/builtins/os_posix.cpp" />
         <Unit filename="src/builtins/nycodecs.cpp" />
         <Unit filename="src/builtins/nyunicode.cpp" />
         <Unit filename="src/builtins/nycjk.cpp" />

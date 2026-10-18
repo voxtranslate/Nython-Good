@@ -28,6 +28,10 @@ namespace nyrt {
 // chunk "buffer" (builtin_mirror_chunk); the startup prelude below holds the
 // class memoryview and the stubs that load it.
 const char* prelude_buffer_source();
+// (round 85) The rest of Python's posix (nt on Windows) module - what CPython's
+// posixmodule.c has and the "os" chunk below does not - is in
+// src/NyPreludePosix.cpp, loaded by the os chunk as the mirror chunk "posix".
+const char* prelude_posix_source();
 
 inline const char* prelude_source() {
     return R"NYPRELUDE(
@@ -3619,6 +3623,125 @@ def _ny_setswitchinterval(interval):
         raise ValueError("switch interval must be strictly positive")
     _ny_sys_info("switch_interval", v)
 
+# ── sys's remaining members (round 85) ──────────────────────────────────
+def _ny_sys_index(v):
+    if isinstance(v, int):
+        return int(v)
+    if hasattr(type(v), "__index__"):
+        return v.__index__()
+    raise TypeError("'" + type(v).__name__ + "' object cannot be interpreted as an integer")
+
+def _ny_get_int_max_str_digits():
+    # the limit on int <-> decimal str conversions (CPython 3.11, gh-95778):
+    # 4300 digits unless -X int_max_str_digits / PYTHONINTMAXSTRDIGITS said
+    # otherwise; 0 is no limit (both engines check it: NyFormat.hpp)
+    return _ny_sys_info("int_max_str_digits")
+
+def _ny_set_int_max_str_digits(maxdigits):
+    var n = _ny_sys_index(maxdigits)
+    if n != 0 and n < 640:
+        raise ValueError("maxdigits must be 0 or larger than 640")
+    _ny_sys_info("int_max_str_digits", n)
+
+class _NyUnraisableHookArgs(_NyStructSeq):
+    # what sys.unraisablehook is given (CPython's UnraisableHookArgs; not a
+    # sys attribute there either)
+    __module__ = "builtins"
+    _ny_qual = "UnraisableHookArgs"
+    _ny_names = ("exc_type", "exc_value", "exc_traceback", "err_msg", "object")
+    n_sequence_fields = 5
+    n_fields = 5
+    n_unnamed_fields = 0
+_NyUnraisableHookArgs.__name__ = "UnraisableHookArgs"
+_NyUnraisableHookArgs.__qualname__ = "UnraisableHookArgs"
+
+def _ny_unraisablehook(unraisable):
+    # sys.unraisablehook / sys.__unraisablehook__: CPython's default report
+    # on sys.stderr ("Exception ignored in: <obj>", then the traceback)
+    var err = None
+    if _ny_sys_ref[0] is not None:
+        err = getattr(_ny_sys_ref[0], "stderr", None)
+    if err is None:
+        err = _ny_stderr
+    var obj = unraisable.object
+    var msg = unraisable.err_msg
+    var head = ""
+    if obj is not None:
+        var r = None
+        try:
+            r = repr(obj)
+        except BaseException:
+            r = "<object repr() failed>"
+        head = (msg if msg is not None else "Exception ignored in") + ": " + r + "\n"
+    elif msg is not None:
+        head = msg + "\n"
+    var v = unraisable.exc_value
+    var body = ""
+    if isinstance(v, BaseException):
+        if unraisable.exc_traceback is not None and getattr(v, "__traceback__", None) is None:
+            v.__traceback__ = unraisable.exc_traceback
+        body = _ny_format_exc(v, True, [], {})
+    elif unraisable.exc_type is not None:
+        body = unraisable.exc_type.__name__ + ": " + str(v) + "\n"
+    err.write(head + body)
+    try:
+        err.flush()
+    except BaseException:
+        pass
+
+def _ny_unraisable(exc, err_msg, obj):
+    # (round 85) the engines' "Exception ignored in ..." reports (a __del__,
+    # a weakref callback, a generator's finally) go through the program's
+    # sys.unraisablehook once it has set one: True when that was called,
+    # False when the engine prints its own report (the default hook)
+    var s = _ny_sys_ref[0]
+    if s is None:
+        return False
+    var h = getattr(s, "unraisablehook", None)
+    if h is _ny_unraisablehook or h is None:
+        return False
+    try:
+        h(_NyUnraisableHookArgs((type(exc), exc, getattr(exc, "__traceback__", None), err_msg, obj)))
+    except BaseException as e2:
+        _ny_unraisablehook(_NyUnraisableHookArgs((type(e2), e2, getattr(e2, "__traceback__", None),
+                                                  "Exception ignored in sys.unraisablehook", h)))
+    return True
+
+_ny_sys_state = {"dlopenflags": 2, "coro_depth": 0}
+
+def _ny_getdlopenflags():
+    # the flags ctypes and the import system would give dlopen (RTLD_NOW)
+    return _ny_sys_state["dlopenflags"]
+
+def _ny_setdlopenflags(flags):
+    _ny_sys_state["dlopenflags"] = _ny_sys_index(flags)
+
+def _ny_get_coroutine_origin_tracking_depth():
+    return _ny_sys_state["coro_depth"]
+
+def _ny_set_coroutine_origin_tracking_depth(depth):
+    # coroutines made while it is > 0 record where they were made in
+    # cr_origin: ((filename, lineno, function), ...), innermost first
+    var n = _ny_sys_index(depth)
+    if n < 0:
+        raise ValueError("depth must be >= 0")
+    _ny_sys_state["coro_depth"] = n
+
+def _ny_getallocatedblocks():
+    # the objects the engine's memory manager holds now (its collectors'
+    # tracked objects and live strings - CPython counts its allocator's blocks)
+    return _ny_sys_info("allocated_blocks")
+
+class _NySysThreadInfo(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "sys.thread_info"
+    _ny_names = ("name", "lock", "version")
+    n_sequence_fields = 3
+    n_fields = 3
+    n_unnamed_fields = 0
+_NySysThreadInfo.__name__ = "thread_info"
+_NySysThreadInfo.__qualname__ = "thread_info"
+
 def _ny_stdlib_names():
     # sys.stdlib_module_names (round 81): the modules and packages of the
     # standard library directory (lib/), and the ones the engines make
@@ -3688,7 +3811,7 @@ def _ny_sys_extend(sysmod):
     sysmod.hash_info = _NySysHashInfo((64, 2305843009213693951, 314159, 0, 1000003, "fnv", 64, 0, 0))
     sysmod.float_info = _NySysFloatInfo((1.7976931348623157e+308, 1024, 308, 2.2250738585072014e-308,
                                           -1021, -307, 15, 53, 2.220446049250313e-16, 2, 1))
-    sysmod.int_info = _NySysIntInfo((32, 4, 0, 640))
+    sysmod.int_info = _NySysIntInfo((32, 4, 4300, 640))   # (round 85: the limit is enforced)
     sysmod.flags = _NySysFlags(tuple(_ny_sys_info("flags")))
     sysmod.float_repr_style = "short"
     sysmod.maxunicode = 1114111
@@ -3721,6 +3844,22 @@ def _ny_sys_extend(sysmod):
     sysmod.addaudithook = _ny_sys_addaudithook
     sysmod.getswitchinterval = _ny_getswitchinterval
     sysmod.setswitchinterval = _ny_setswitchinterval
+    # round 85
+    sysmod.get_int_max_str_digits = _ny_get_int_max_str_digits
+    sysmod.set_int_max_str_digits = _ny_set_int_max_str_digits
+    sysmod.unraisablehook = _ny_unraisablehook
+    sysmod.__unraisablehook__ = _ny_unraisablehook
+    sysmod.getallocatedblocks = _ny_getallocatedblocks
+    sysmod.get_coroutine_origin_tracking_depth = _ny_get_coroutine_origin_tracking_depth
+    sysmod.set_coroutine_origin_tracking_depth = _ny_set_coroutine_origin_tracking_depth
+    if os_name != "nt":
+        sysmod.getdlopenflags = _ny_getdlopenflags
+        sysmod.setdlopenflags = _ny_setdlopenflags
+        sysmod.abiflags = ""
+        sysmod.thread_info = _NySysThreadInfo(("pthread", "mutex+cond", _ny_sys_info("libc_version")))
+    else:
+        sysmod.thread_info = _NySysThreadInfo(("nt", None, None))
+    sysmod.pycache_prefix = None
     # where the standard library is: <prefix>/lib (no virtual environments)
     var root = _ny_sys_info("prefix")
     sysmod.prefix = root
@@ -5681,6 +5820,11 @@ def _ny_os_member_list():
             def sched_getaffinity(pid):
                 return set(_ny_os_call("sched_getaffinity", _ny_os_fd(pid)))
             m.append(("sched_getaffinity", sched_getaffinity))
+    # (round 85) the rest of posixmodule.c (statvfs, sysconf, xattrs, the
+    # scheduler, posix_spawn, popen, register_at_fork ...): the "posix"
+    # chunk, src/NyPreludePosix.cpp - it appends its members to m
+    _ny_load_chunk("posix")
+    _ny_posix_extend(m)
     return m
 
 _ny_os_members = _ny_os_member_list()
@@ -5689,6 +5833,7 @@ _ny_os_members = _ny_os_member_list()
 // The text of one chunk of builtin_mirrors_source() ("" if there is none).
 inline std::string builtin_mirror_chunk(const std::string& name) {
     if (name == "buffer") return prelude_buffer_source();   // (round 84) its own unit
+    if (name == "posix") return prelude_posix_source();     // (round 85) its own unit
     static const std::string src = builtin_mirrors_source();
     const std::string mark = "#@ " + name + "\n";
     size_t b = src.find(mark);

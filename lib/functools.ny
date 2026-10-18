@@ -38,7 +38,7 @@
 #                                        .dispatch(), .registry, ._clear_cache()
 # singledispatchmethod(func)             the same for methods (first argument
 #                                        after self)
-# WRAPPER_ASSIGNMENTS, WRAPPER_UPDATES
+# WRAPPER_ASSIGNMENTS, WRAPPER_UPDATES, get_cache_token (abc's, round 85)
 #
 # Not here: Python 3.14's Placeholder. A function's attributes cannot be
 # listed by the runtime, so update_wrapper copies the named ones but not
@@ -1207,3 +1207,18 @@ class singledispatchmethod:
         _method.register = self.register
         update_wrapper(_method, self.func)
         return _method
+
+
+# (round 85) functools.get_cache_token is abc's own function, as CPython's
+# `from abc import get_cache_token`; abc is imported when it is first asked
+# for (PEP 562), not with functools
+def __getattr__(name):
+    if name == "get_cache_token":
+        import abc as _abc_mod
+        return _abc_mod.get_cache_token
+    raise AttributeError("module 'functools' has no attribute '" + name + "'")
+
+def __dir__():
+    var names = list(globals())
+    names.append("get_cache_token")
+    return sorted(names)

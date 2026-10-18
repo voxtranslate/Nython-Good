@@ -135,6 +135,10 @@ struct Stats {
 };
 Stats stats();
 long long tracked_objects();
+// (round 85) gc.get_objects(generation): every tracked object of a
+// generation (-1: all three), built ones only (a count above zero, not
+// being destroyed), outside a collection.
+void each_tracked(int gen, void (*fn)(Collectable*, void*), void* arg);
 
 // Strings (untracked, counted for gc_stats()).
 extern long long g_live_strings;

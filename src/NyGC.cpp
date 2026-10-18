@@ -406,6 +406,19 @@ long long tracked_objects() {
     return n;
 }
 
+void each_tracked(int gen, void (*fn)(Collectable*, void*), void* arg) {   // round 85: gc.get_objects
+    if (collecting) return;
+    std::vector<Collectable*> found;   // collected first: fn may allocate (and track) objects
+    for (int g = 0; g < kGenerations; g++) {
+        if (gen >= 0 && g != gen) continue;
+        for (Collectable* c = lists[g].head; c; c = c->gc_next)
+            if (c->gc_rc > 0 && !(c->gc_flags & F_DEALLOC)) found.push_back(c);
+    }
+    for (Collectable* c : found) incref(c);
+    for (Collectable* c : found) fn(c, arg);
+    for (Collectable* c : found) decref(c);
+}
+
 Stats stats() {
     Stats s = st;
     for (int g = 0; g < kGenerations; g++) s.gen_count[g] = lists[g].size;

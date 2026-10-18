@@ -31,6 +31,27 @@ struct PyError {
 };
 [[noreturn]] inline void raise(const char* type, const std::string& msg) { throw PyError(type, msg); }
 
+// (round 85) The limit on int <-> decimal str conversions a program makes
+// (CPython 3.11, gh-95778): sys.get/set_int_max_str_digits, -X
+// int_max_str_digits, PYTHONINTMAXSTRDIGITS; 0 is no limit. int(s) in a base
+// that is not a power of two (parse_int_str) and str/repr/format/%d of an int
+// (format_int, each engine's str) raise ValueError past it, with CPython's
+// messages; the engines' own uses of the text (dict keys, the VM's big ints)
+// are not limited.
+inline int& int_max_str_digits() { static int n = 4300; return n; }
+inline void int_digits_check_in(size_t digits) {
+    int lim = int_max_str_digits();
+    if (lim > 0 && digits > 640 && digits > (size_t)lim)
+        raise("ValueError", "Exceeds the limit (" + std::to_string(lim) + " digits) for integer string conversion: value has "
+              + std::to_string(digits) + " digits; use sys.set_int_max_str_digits() to increase the limit");
+}
+inline void int_digits_check_out(size_t digits) {
+    int lim = int_max_str_digits();
+    if (lim > 0 && digits > 640 && digits > (size_t)lim)
+        raise("ValueError", "Exceeds the limit (" + std::to_string(lim) + " digits) for integer string conversion; "
+              "use sys.set_int_max_str_digits() to increase the limit");
+}
+
 struct BigInt {
     bool neg = false;
     std::vector<uint32_t> mag;

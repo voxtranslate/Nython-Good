@@ -1440,6 +1440,19 @@ int main(int argc, char** argv, char** env) {
                         if (c == 'W' && val.rfind("nython-scope", 0) == 0 && (val.size() == 12 || val[12] == ':'))
                             nython::scope::warn_filter() = val.size() > 13 ? val.substr(13) : std::string("1");
                         else if (c == 'W') nyrt::warn_options().push_back(val);
+                        // (round 85) -X int_max_str_digits=N (CPython 3.11)
+                        if (c == 'X' && val.rfind("int_max_str_digits", 0) == 0) {
+                            std::string n = val.size() > 19 && val[18] == '=' ? val.substr(19) : std::string();
+                            char* end = nullptr;
+                            long v = n.empty() ? -1 : std::strtol(n.c_str(), &end, 10);
+                            if (n.empty() || (end && *end) || v < 0 || (v > 0 && v < 640)) {
+                                std::cerr << "Fatal Python error: config_init_int_max_str_digits: -X int_max_str_digits: "
+                                             "invalid limit; must be >= 640 or 0 for unlimited.\n";
+                                return 1;
+                            }
+                            nyrt::int_max_str_digits() = (int)std::min<long>(v, INT32_MAX);
+                            nyrt::cli_flags().int_max_str_digits = (int)std::min<long>(v, INT32_MAX);
+                        }
                         stop = true;
                     }
                     else if (c == 'i') { inspect = true; nyrt::cli_flags().inspect = nyrt::cli_flags().interactive = 1; }
@@ -1469,6 +1482,19 @@ int main(int argc, char** argv, char** env) {
             break;
         }
         if (const char* ub = getenv("NYTHONUNBUFFERED")) if (*ub) setenv_default_unbuffered();
+        // (round 85) PYTHONINTMAXSTRDIGITS, when -X did not set the limit
+        if (nyrt::cli_flags().int_max_str_digits < 0 && !nyrt::cli_flags().ignore_environment)
+            if (const char* md = getenv("PYTHONINTMAXSTRDIGITS")) if (*md) {
+                char* end = nullptr;
+                long v = std::strtol(md, &end, 10);
+                if ((end && *end) || v < 0 || (v > 0 && v < 640)) {
+                    std::cerr << "Fatal Python error: config_init_int_max_str_digits: PYTHONINTMAXSTRDIGITS: "
+                                 "invalid limit; must be >= 640 or 0 for unlimited.\n";
+                    return 1;
+                }
+                nyrt::int_max_str_digits() = (int)std::min<long>(v, INT32_MAX);
+                nyrt::cli_flags().int_max_str_digits = (int)std::min<long>(v, INT32_MAX);
+            }
 #if NYTHON_WITH_IDE
         if (ide) { launch_ide(get_binary_dir(argv[0])); return 0; }
 #else

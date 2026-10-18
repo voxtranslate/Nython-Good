@@ -186,6 +186,7 @@ inline std::string format_int(const FmtVal& v, Spec s) {
     } else {
         BigInt m = b; m.neg = false;
         digits = m.to_string(base);
+        if (base == 10) int_digits_check_out(digits.size());   // (round 85)
     }
     if (t == 'X') for (auto& c : digits) c = (char)std::toupper((unsigned char)c);
     std::string prefix = sign_str(neg, s.sign);
@@ -293,7 +294,12 @@ inline std::string format_value(const FmtVal& v, const std::string& spec) {
     if (v.custom) return v.custom(spec);
     if (spec.empty()) {
         switch (v.kind) {
-            case FmtVal::INT: return v.is_big ? v.big.to_string() : std::to_string(v.i);
+            case FmtVal::INT: {
+                if (!v.is_big) return std::to_string(v.i);
+                std::string t = v.big.to_string();
+                int_digits_check_out(t.size() - (t[0] == '-' ? 1 : 0));   // (round 85)
+                return t;
+            }
             case FmtVal::FLOAT: return float_repr(v.d);
             default: return v.s;
         }
@@ -591,6 +597,17 @@ inline bool parse_int_str(const std::string& in, int base, BigInt& out) {
         digits += ch;
     }
     if (digits.empty() || prev_us) return false;
+    if ((base & (base - 1)) && digits.size() > 640) {
+        // (round 85) sys.set_int_max_str_digits: the run of valid digits, as
+        // CPython counts them before it looks at what follows
+        size_t nd = 0;
+        for (char ch : digits) {
+            int d = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'z' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'Z' ? ch - 'A' + 10 : 99;
+            if (d >= base) break;
+            nd++;
+        }
+        int_digits_check_in(nd);
+    }
     if (!BigInt::parse(digits, base, out)) return false;
     if (neg) out = -out;
     return true;

@@ -31,8 +31,11 @@
 #else
 #  include <fcntl.h>
 #  include <sys/time.h>
+#  include <sys/stat.h>
 #  include <poll.h>
 #  include <unistd.h>
+#  include <pthread.h>
+#  include <time.h>
 #endif
 
 #include <algorithm>
@@ -142,6 +145,10 @@ struct ThreadRec : Waitable {
     Task* task = nullptr;           // non-null for an async task's thread
     int64_t group = 0;              // task group, if spawned into one
     WQ joiners;                     // threads waiting for this one to finish
+#ifndef _WIN32
+    pthread_t os_thread{};          // (round 85) signal.pthread_kill, time.pthread_getcpuclockid
+    bool has_os_thread = false;
+#endif
 
     void owners(std::vector<ThreadRec*>& out) const override {
         if (!done) out.push_back(const_cast<ThreadRec*>(this));
@@ -336,6 +343,9 @@ static ThreadRec* current(Engine& e) {
         rec->engine = &e;
         rec->estate = e.state_new();
         rec->started = true;
+#ifndef _WIN32
+        rec->os_thread = pthread_self(); rec->has_os_thread = true;   // round 85
+#endif
         rt.threads[rec->id] = rec;
         rt.live.insert(rec.get());
     }
@@ -504,6 +514,9 @@ static int64_t start_thread(Engine& e, Body body, const std::string& name, bool 
 static void launch(std::shared_ptr<ThreadRec> rec, Body body) {
     std::thread th([rec, body]() mutable {
         t_self = rec.get();
+#ifndef _WIN32
+        rec->os_thread = pthread_self(); rec->has_os_thread = true;   // round 85
+#endif
         gil_acquire();
         rec->started = true;
         BoxPtr res; bool failed = false; NyError err;
@@ -3676,6 +3689,12 @@ static void sig_wake_drain() {
     while (::read(g_sig_pipe[0], buf, sizeof buf) > 0) {}
 #endif
 }
+// (round 85) signal.set_wakeup_fd: the program's descriptor that every
+// signal's number is also written to (asyncio's self-pipe), -1 for none;
+// signal.siginterrupt: the signals whose handler restarts system calls
+// (SA_RESTART) instead of interrupting them
+static std::atomic<int> g_wakeup_fd{-1};
+static std::atomic<bool> g_sig_restart[kMaxSig];
 // Async-signal-safe: atomics and write(2) only.
 static void ny_signal_trampoline(int sig) {
     int saved = errno;
@@ -3687,6 +3706,15 @@ static void ny_signal_trampoline(int sig) {
 #else
     if (g_sig_pipe[1] >= 0) { char c = (char)sig; ssize_t r = ::write(g_sig_pipe[1], &c, 1); (void)r; }
 #endif
+    int wfd = g_wakeup_fd.load(std::memory_order_relaxed);   // (round 85)
+    if (wfd >= 0) {
+        unsigned char c = (unsigned char)sig;
+#ifdef _WIN32
+        ::send((SOCKET)wfd, (const char*)&c, 1, 0);
+#else
+        ssize_t r = ::write(wfd, &c, 1); (void)r;
+#endif
+    }
     errno = saved;
 }
 
@@ -3716,8 +3744,9 @@ static void os_set_handler(int sig, bool ours, int kind) {
     sigemptyset(&sa.sa_mask);
     // No SA_RESTART: a blocking read returns EINTR, so input(), recv() and
     // the process waits notice the signal (and retry when its handler
-    // returns), as in Python.
-    sa.sa_flags = 0;
+    // returns), as in Python - unless signal.siginterrupt(sig, False) asked
+    // for it (round 85).
+    sa.sa_flags = sig > 0 && sig < kMaxSig && g_sig_restart[sig].load(std::memory_order_relaxed) ? SA_RESTART : 0;
     sa.sa_handler = ours ? ny_signal_trampoline : kind == 1 ? SIG_IGN : SIG_DFL;
     sigaction(sig, &sa, nullptr);
 #endif
@@ -4228,6 +4257,75 @@ static void register_signal_builtins(std::unordered_map<std::string, Handler>& T
 #else
         const char* d = ::strsignal(sig);
         return d ? Ret::str(d) : Ret::none();
+#endif
+    };
+    // (round 85) signal.set_wakeup_fd(fd, warn_on_full_buffer): the old fd
+    T["_sig_set_wakeup_fd"] = [](Engine&, const Args& a) {
+        int fd = a.size() > 0 && a.is_number(0) ? (int)a.as_int(0) : -1;
+        if (!is_main_thread()) raise("ValueError", "set_wakeup_fd only works in main thread of the main interpreter");
+        if (fd != -1) {
+#ifndef _WIN32
+            struct stat st;
+            if (::fstat(fd, &st) != 0) raise("OSError", "[Errno " + std::to_string(errno) + "] " + std::strerror(errno));
+            int fl = ::fcntl(fd, F_GETFL);
+            if (fl >= 0 && !(fl & O_NONBLOCK)) raise("ValueError", "the fd " + std::to_string(fd) + " must be in non-blocking mode");
+#endif
+        }
+        sig_wake_open();
+        return Ret::integer(g_wakeup_fd.exchange(fd));
+    };
+    // signal.siginterrupt(sig, flag): flag false - its handler restarts
+    // system calls (SA_RESTART); true - they are interrupted (the default)
+    T["_sig_siginterrupt"] = [](Engine&, const Args& a) {
+        int sig = sig_arg(a, 0, "siginterrupt");
+        bool flag = a.size() > 1 && a.truthy(1);
+        g_sig_restart[sig].store(!flag);
+#ifndef _WIN32
+        struct sigaction sa;
+        if (sigaction(sig, nullptr, &sa) == 0) {
+            if (flag) sa.sa_flags &= ~SA_RESTART; else sa.sa_flags |= SA_RESTART;
+            sigaction(sig, &sa, nullptr);
+        }
+#endif
+        return Ret::none();
+    };
+    // signal.pthread_kill(ident, sig) / time.pthread_getcpuclockid(ident):
+    // the runtime's thread record ident -> its pthread
+    T["_sig_pthread"] = [](Engine& e, const Args& a) {
+#ifdef _WIN32
+        (void)e; (void)a;
+        raise("OSError", "[Errno 40] Function not implemented");
+#else
+        std::string op = a.size() > 0 ? a.as_str(0) : std::string();
+        int64_t ident = a.size() > 1 && a.is_number(1) ? a.as_int(1) : 0;
+        current(e);
+        pthread_t th{};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> l(RT().m);
+            auto it = RT().threads.find(ident);
+            if (it != RT().threads.end() && it->second->has_os_thread && !it->second->done) {
+                ThreadRec* r = it->second.get();
+                // an async task's record stands for its loop's thread
+                if (r->task && r->task->loop && r->task->loop->thread) r = r->task->loop->thread;
+                th = r->os_thread; found = r->has_os_thread;
+            }
+        }
+        if (!found) raise("ProcessLookupError", "[Errno 3] No such process");
+        if (op == "kill") {
+            int sig = a.size() > 2 && a.is_number(2) ? (int)a.as_int(2) : 0;
+            int r = ::pthread_kill(th, sig);
+            if (r != 0) raise(r == ESRCH ? "ProcessLookupError" : "OSError", "[Errno " + std::to_string(r) + "] " + std::strerror(r));
+            return Ret::none();
+        }
+#  if defined(__linux__)
+        clockid_t cid;
+        int r = ::pthread_getcpuclockid(th, &cid);
+        if (r != 0) raise("OSError", "[Errno " + std::to_string(r) + "] " + std::strerror(r));
+        return Ret::integer((int64_t)cid);
+#  else
+        raise("OSError", "[Errno 78] Function not implemented");
+#  endif
 #endif
     };
 }

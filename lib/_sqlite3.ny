@@ -367,6 +367,16 @@ def enable_callback_tracebacks(enable, /):
     _callback_tracebacks[0] = bool(enable)
 
 
+# (round 85) 3.11's shared-cache mode for the connections opened from now on
+# (deprecated, removed in 3.12; 3.11's `version` stays 3.12's
+# _deprecated_version, which sqlite3.version warns about)
+def enable_shared_cache(do_enable):
+    # (sqlite3.enable_shared_cache, 3.11's dbapi2 wrapper, is what warns)
+    var rc = _sql_shared_cache(bool(do_enable))
+    if rc != 0:
+        raise OperationalError("Changing the shared_cache flag failed")
+
+
 def _need_adapt(v):
     if _base_type_adapted[0]:
         return True

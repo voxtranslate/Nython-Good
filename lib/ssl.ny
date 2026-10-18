@@ -307,9 +307,277 @@ class SSLSocket:
     def __repr__(self):
         return "<ssl.SSLSocket " + repr(self._sock)[1:]
 
+import collections as _collections
+DefaultVerifyPaths = _collections.namedtuple("DefaultVerifyPaths",
+    "cafile capath openssl_cafile_env openssl_cafile openssl_capath_env openssl_capath")
+
 def get_default_verify_paths():
-    return {"cafile": none, "capath": none}
+    """Return paths to default cafile and capath (round 85: libcrypto's)."""
+    import os
+    var parts = _tls_rand("paths") if HAS_TLS else ["SSL_CERT_FILE", "", "SSL_CERT_DIR", ""]
+    var cafile = os.environ.get(parts[0], parts[1])
+    var capath = os.environ.get(parts[2], parts[3])
+    return DefaultVerifyPaths(cafile if os.path.isfile(cafile) else none,
+                              capath if os.path.isdir(capath) else none,
+                              parts[0], parts[1], parts[2], parts[3])
 
 def match_hostname(cert, hostname):
     # host name matching happens in the handshake (OpenSSL, RFC 6125)
     pass
+
+# ── round 85: the rest of CPython's ssl module-level API ─────────────────
+# RAND_bytes / RAND_status / RAND_add / RAND_pseudo_bytes over libcrypto
+# (builtins/tls.cpp), DER/PEM conversion, cert_time_to_seconds,
+# get_protocol_name, get_server_certificate, 3.11's deprecated wrap_socket,
+# the OpenSSL version number, the
+# OP_* / ALERT_DESCRIPTION_* / SSL_ERROR_* / VERIFY_* / PROTOCOL_* constants
+# (OpenSSL 3's values; Nython loads OpenSSL 1.1.1 or 3 at run time), the
+# HAS_* flags and the Options / VerifyMode / VerifyFlags / SSLErrorNumber /
+# AlertDescription enums. Not here: MemoryBIO, SSLObject and SSLSession (the
+# TLS layer drives OpenSSL on a socket only), NPN, SSLv2/v3.
+from socket import SOCK_STREAM, SOL_SOCKET, SO_TYPE, create_connection, _GLOBAL_DEFAULT_TIMEOUT
+socket_error = OSError
+
+def RAND_bytes(n):
+    """Generate n cryptographically strong pseudo-random bytes."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("'" + type(n).__name__ + "' object cannot be interpreted as an integer")
+    return _tls_rand("bytes", n)
+
+def RAND_pseudo_bytes(n):
+    """Generate n pseudo-random bytes: (bytes, is_cryptographic)."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("'" + type(n).__name__ + "' object cannot be interpreted as an integer")
+    import warnings
+    warnings.warn("ssl.RAND_pseudo_bytes() is deprecated", DeprecationWarning, stacklevel=2)
+    return tuple(_tls_rand("pseudo", n))
+
+def RAND_status():
+    """Returns True if the OpenSSL PRNG has been seeded with enough data."""
+    return _tls_rand("status")
+
+def RAND_add(string, entropy):
+    """Mix string into the OpenSSL PRNG state."""
+    if isinstance(string, str):
+        string = string.encode("utf-8")
+    elif not isinstance(string, (bytes, bytearray)):
+        string = _ny_bytes_like(string)
+    if isinstance(entropy, str) or not isinstance(entropy, (int, float)):
+        raise TypeError("must be real number, not " + type(entropy).__name__)
+    _tls_rand("add", bytes(string), float(entropy))
+
+OPENSSL_VERSION_NUMBER = _tls_rand("version_num")
+def _version_info(n):
+    var status = n & 15
+    n = n >> 4
+    var patch = n & 255
+    n = n >> 8
+    var fix = n & 255
+    n = n >> 8
+    var minor = n & 255
+    n = n >> 8
+    return (n & 255, minor, fix, patch, status)
+OPENSSL_VERSION_INFO = _version_info(OPENSSL_VERSION_NUMBER)
+_OPENSSL_API_VERSION = OPENSSL_VERSION_INFO
+
+PROTOCOL_SSLv23 = PROTOCOL_TLS
+PROTOCOL_TLSv1 = 3
+PROTOCOL_TLSv1_1 = 4
+PROTOCOL_TLSv1_2 = 5
+_PROTOCOL_NAMES = {2: "PROTOCOL_TLS", 3: "PROTOCOL_TLSv1", 4: "PROTOCOL_TLSv1_1", 5: "PROTOCOL_TLSv1_2",
+                   16: "PROTOCOL_TLS_CLIENT", 17: "PROTOCOL_TLS_SERVER"}
+
+def get_protocol_name(protocol_code):
+    return _PROTOCOL_NAMES.get(protocol_code, "<unknown>")
+
+HAS_ECDH = true
+HAS_NEVER_CHECK_COMMON_NAME = true
+HAS_NPN = false
+HAS_SSLv2 = false
+HAS_SSLv3 = false
+HAS_TLSv1 = true
+HAS_TLSv1_1 = true
+CHANNEL_BINDING_TYPES = ["tls-unique"]
+
+OP_ALL = 2147483728
+OP_CIPHER_SERVER_PREFERENCE = 4194304
+OP_ENABLE_KTLS = 8
+OP_ENABLE_MIDDLEBOX_COMPAT = 1048576
+OP_IGNORE_UNEXPECTED_EOF = 128
+OP_LEGACY_SERVER_CONNECT = 4
+OP_NO_COMPRESSION = 131072
+OP_NO_RENEGOTIATION = 1073741824
+OP_NO_SSLv2 = 0
+OP_NO_SSLv3 = 33554432
+OP_NO_TICKET = 16384
+OP_NO_TLSv1 = 67108864
+OP_NO_TLSv1_1 = 268435456
+OP_NO_TLSv1_2 = 134217728
+OP_NO_TLSv1_3 = 536870912
+OP_SINGLE_DH_USE = 0
+OP_SINGLE_ECDH_USE = 0
+
+ALERT_DESCRIPTION_CLOSE_NOTIFY = 0
+ALERT_DESCRIPTION_UNEXPECTED_MESSAGE = 10
+ALERT_DESCRIPTION_BAD_RECORD_MAC = 20
+ALERT_DESCRIPTION_RECORD_OVERFLOW = 22
+ALERT_DESCRIPTION_DECOMPRESSION_FAILURE = 30
+ALERT_DESCRIPTION_HANDSHAKE_FAILURE = 40
+ALERT_DESCRIPTION_BAD_CERTIFICATE = 42
+ALERT_DESCRIPTION_UNSUPPORTED_CERTIFICATE = 43
+ALERT_DESCRIPTION_CERTIFICATE_REVOKED = 44
+ALERT_DESCRIPTION_CERTIFICATE_EXPIRED = 45
+ALERT_DESCRIPTION_CERTIFICATE_UNKNOWN = 46
+ALERT_DESCRIPTION_ILLEGAL_PARAMETER = 47
+ALERT_DESCRIPTION_UNKNOWN_CA = 48
+ALERT_DESCRIPTION_ACCESS_DENIED = 49
+ALERT_DESCRIPTION_DECODE_ERROR = 50
+ALERT_DESCRIPTION_DECRYPT_ERROR = 51
+ALERT_DESCRIPTION_PROTOCOL_VERSION = 70
+ALERT_DESCRIPTION_INSUFFICIENT_SECURITY = 71
+ALERT_DESCRIPTION_INTERNAL_ERROR = 80
+ALERT_DESCRIPTION_USER_CANCELLED = 90
+ALERT_DESCRIPTION_NO_RENEGOTIATION = 100
+ALERT_DESCRIPTION_UNSUPPORTED_EXTENSION = 110
+ALERT_DESCRIPTION_CERTIFICATE_UNOBTAINABLE = 111
+ALERT_DESCRIPTION_UNRECOGNIZED_NAME = 112
+ALERT_DESCRIPTION_BAD_CERTIFICATE_STATUS_RESPONSE = 113
+ALERT_DESCRIPTION_BAD_CERTIFICATE_HASH_VALUE = 114
+ALERT_DESCRIPTION_UNKNOWN_PSK_IDENTITY = 115
+
+SSL_ERROR_SSL = 1
+SSL_ERROR_WANT_READ = 2
+SSL_ERROR_WANT_WRITE = 3
+SSL_ERROR_WANT_X509_LOOKUP = 4
+SSL_ERROR_SYSCALL = 5
+SSL_ERROR_ZERO_RETURN = 6
+SSL_ERROR_WANT_CONNECT = 7
+SSL_ERROR_EOF = 8
+SSL_ERROR_INVALID_ERROR_CODE = 10
+
+VERIFY_DEFAULT = 0
+VERIFY_CRL_CHECK_LEAF = 4
+VERIFY_CRL_CHECK_CHAIN = 12
+VERIFY_X509_STRICT = 32
+VERIFY_ALLOW_PROXY_CERTS = 64
+VERIFY_X509_TRUSTED_FIRST = 32768
+VERIFY_X509_PARTIAL_CHAIN = 524288
+
+PEM_HEADER = "-----BEGIN CERTIFICATE-----"
+PEM_FOOTER = "-----END CERTIFICATE-----"
+
+def DER_cert_to_PEM_cert(der_cert_bytes):
+    """Takes a certificate in binary DER format and returns the
+    PEM version of it as a string."""
+    import base64
+    var f = str(base64.standard_b64encode(der_cert_bytes), "ASCII", "strict")
+    var ss = [PEM_HEADER]
+    var i = 0
+    while i < len(f):
+        ss.append(f[i:i + 64])
+        i += 64
+    ss.append(PEM_FOOTER + "\n")
+    return "\n".join(ss)
+
+def PEM_cert_to_DER_cert(pem_cert_string):
+    """Takes a certificate in ASCII PEM format and returns the
+    DER-encoded version of it as a byte sequence"""
+    import base64
+    if not pem_cert_string.startswith(PEM_HEADER):
+        raise ValueError("Invalid PEM encoding; must start with " + PEM_HEADER)
+    if not pem_cert_string.strip().endswith(PEM_FOOTER):
+        raise ValueError("Invalid PEM encoding; must end with " + PEM_FOOTER)
+    var d = pem_cert_string.strip()[len(PEM_HEADER):-len(PEM_FOOTER)]
+    return base64.decodebytes(d.encode("ASCII", "strict"))
+
+def cert_time_to_seconds(cert_time):
+    """Return the time in seconds since the Epoch, given the timestring
+    representing the "notBefore" or "notAfter" date from a certificate
+    in ``"%b %d %H:%M:%S %Y %Z"`` strptime format (C locale)."""
+    from time import strptime
+    from calendar import timegm
+    var months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    var time_format = " %d %H:%M:%S %Y GMT"
+    var month_number = 0
+    try:
+        month_number = months.index(cert_time[:3].title()) + 1
+    except ValueError:
+        raise ValueError("time data " + repr(cert_time) + " does not match format \"%b" + time_format + "\"")
+    var tt = strptime(cert_time[3:], time_format)
+    return timegm((tt[0], month_number) + tuple(tt[2:6]))
+
+def wrap_socket(sock, keyfile=none, certfile=none, server_side=false, cert_reqs=CERT_NONE, ssl_version=PROTOCOL_TLS,
+                ca_certs=none, do_handshake_on_connect=true, suppress_ragged_eofs=true, ciphers=none):
+    """3.11's module-level wrap_socket (deprecated; removed in 3.12)."""
+    import warnings
+    warnings.warn("ssl.wrap_socket() is deprecated, use SSLContext.wrap_socket()", category=DeprecationWarning, stacklevel=2)
+    if server_side and not certfile:
+        raise ValueError("certfile must be specified for server-side operations")
+    if keyfile and not certfile:
+        raise ValueError("certfile must be specified")
+    var context = SSLContext(ssl_version)
+    context.verify_mode = cert_reqs
+    if ca_certs:
+        context.load_verify_locations(ca_certs)
+    if certfile:
+        context.load_cert_chain(certfile, keyfile)
+    if ciphers:
+        context.set_ciphers(ciphers)
+    return context.wrap_socket(sock, server_side=server_side, do_handshake_on_connect=do_handshake_on_connect,
+                               suppress_ragged_eofs=suppress_ragged_eofs)
+
+def get_server_certificate(addr, ssl_version=PROTOCOL_TLS_CLIENT, ca_certs=none, timeout=_GLOBAL_DEFAULT_TIMEOUT):
+    """Retrieve the certificate from the server at the specified address,
+    and return it as a PEM-encoded string."""
+    var host = addr[0]
+    var port = addr[1]
+    var context = SSLContext(ssl_version)
+    if ca_certs is not none:
+        context.verify_mode = CERT_REQUIRED
+        context.load_verify_locations(ca_certs)
+    else:
+        context.check_hostname = false
+        context.verify_mode = CERT_NONE
+    var sock = create_connection(addr, timeout=timeout)
+    try:
+        var sslsock = context.wrap_socket(sock, server_hostname=host)
+        try:
+            return DER_cert_to_PEM_cert(sslsock.getpeercert(true))
+        finally:
+            sslsock.close()
+    finally:
+        sock.close()
+
+# the enums (CPython's _IntEnum._convert_ / _IntFlag._convert_): the
+# constants stay ints here, the enums are made when first asked for
+_enums = {}
+def _make_enums():
+    if _enums:
+        return _enums
+    import enum
+    var g = globals()
+    def pick(test):
+        var out = []
+        for n in list(g):
+            var v = g[n]
+            if isinstance(v, int) and not isinstance(v, bool) and test(n):
+                out.append((n, v))
+        out.sort(key=lambda kv: (kv[1], kv[0]))
+        return out
+    _enums["Options"] = enum.IntFlag("Options", pick(lambda n: n.startswith("OP_")), module="ssl")
+    _enums["AlertDescription"] = enum.IntEnum("AlertDescription",
+        pick(lambda n: n.startswith("ALERT_DESCRIPTION_")), module="ssl")
+    _enums["SSLErrorNumber"] = enum.IntEnum("SSLErrorNumber", pick(lambda n: n.startswith("SSL_ERROR_")), module="ssl")
+    _enums["VerifyFlags"] = enum.IntFlag("VerifyFlags", pick(lambda n: n.startswith("VERIFY_")), module="ssl")
+    _enums["VerifyMode"] = enum.IntEnum("VerifyMode", pick(lambda n: n.startswith("CERT_")), module="ssl")
+    return _enums
+
+def __getattr__(name):
+    if name in ("Options", "AlertDescription", "SSLErrorNumber", "VerifyFlags", "VerifyMode"):
+        return _make_enums()[name]
+    raise AttributeError("module 'ssl' has no attribute '" + name + "'")
+
+def __dir__():
+    var names = list(globals())
+    names.extend(["Options", "AlertDescription", "SSLErrorNumber", "VerifyFlags", "VerifyMode"])
+    return sorted(names)

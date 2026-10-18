@@ -81,6 +81,12 @@ std::vector<std::pair<std::string, Value>> map_items(const Value& v);
 // descriptors, ids, scandir, pwd/grp, shared memory - `_ny_os_call(op, ...)`
 // with args[0] the op. UNDEFINED_VALUE for an op it does not know.
 Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& args);
+// (round 85) the rest of posixmodule.c (src/builtins/os_posix.cpp): statvfs,
+// sysconf/pathconf/confstr, xattrs, the scheduler, priorities, the uid/gid
+// setters, eventfd/memfd/pidfd, splice/copy_file_range, posix_spawn,
+// wait3/wait4/waitid, clocks (time.clock_*), signal masks and waits,
+// interfaces and ancillary socket data. Same contract as os_call_ext.
+Value os_call_posix(NythonExecutor& E, const std::string& op, std::vector<Value>& args);
 
 std::string cwd();
 std::string normpath(const std::string& p);

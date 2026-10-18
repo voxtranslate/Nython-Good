@@ -375,9 +375,12 @@ void safe_point_slow(VirtualMachine& vm) {
     if (!final_queue().empty()) g_pending.store(true, std::memory_order_relaxed);
 }
 
-void for_each_value(const std::function<void(VMVal&)>& f) {   // round 79
+void for_each_value(const std::function<void(VMVal&)>& f) { for_each_value_in(-1, f); }   // round 79
+
+void for_each_value_in(int which, const std::function<void(VMVal&)>& f) {   // round 85: one generation, or -1
     for (int g = 0; g < 3; g++)
         for (auto& e : gen(g)) {
+            if (which >= 0 && g != which) continue;
             auto keep = e.w.lock();
             if (!keep) continue;
             switch (e.k) {

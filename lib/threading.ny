@@ -289,6 +289,12 @@ class Lock:
     def __repr__(self):
         return "<" + ("locked" if self.locked() else "unlocked") + " _thread.lock object at " + hex(id(self)) + ">"
 
+    def _at_fork_reinit(self):
+        # (round 85) in the child of os.fork (os.register_at_fork): a new,
+        # unlocked lock - the parent's may be held by a thread the child
+        # does not have
+        self._id = pylock_create()
+
     def __del__(self):
         # round 82: the native lock goes with the object (sync_free frees
         # it only when no thread holds or waits for it)
@@ -322,6 +328,9 @@ class RLock(Lock):
 
     def _is_owned(self):
         return mutex_owner(self._id) == thread_id()
+
+    def _at_fork_reinit(self):
+        self._id = rmutex_create()   # (round 85)
 
     def __repr__(self):
         var o = mutex_owner(self._id)
@@ -369,6 +378,11 @@ class Condition:
 
     def notifyAll(self):
         cond_notify_all(self._id)
+
+    def _at_fork_reinit(self):
+        # (round 85) os.register_at_fork's child: its lock and waiters anew
+        self._lock._at_fork_reinit()
+        self._id = cond_create()
 
     def __del__(self):
         _free_native(self)
@@ -419,6 +433,10 @@ class BoundedSemaphore(Semaphore):
 
 class Event:
     def __init__(self):
+        self._id = event_create()
+
+    def _at_fork_reinit(self):
+        # (round 85) os.register_at_fork's child: unset, no waiters
         self._id = event_create()
 
     def is_set(self):

@@ -30,6 +30,10 @@
 # is 1), so getpreferredencoding() is 'utf-8', as CPython's is under -X utf8;
 # getencoding() is the C library's CODESET.
 #
+# gettext, dgettext, dcgettext, textdomain, bindtextdomain and
+# bind_textdomain_codeset (round 85) are the C library's (glibc's libintl),
+# where it has them.
+#
 # Not here: locale.format() (removed in 3.12).
 
 """Locale support module.
@@ -135,6 +139,55 @@ if _sys_platform_posix():
         """Get the current locale encoding."""
         var cs = _sys_nl_langinfo(CODESET)
         return cs if cs else "utf-8"
+
+    # (round 85) the C library's message catalogs, as _locale's: glibc's
+    # libintl (builtins/os_posix.cpp); where the C library has none they
+    # are absent, as in a CPython built without libintl
+    def _intl_arg(v, fn, pos, none_ok):
+        if v is None and none_ok:
+            return None
+        if not isinstance(v, _builtin_str):
+            if pos == 0:
+                raise TypeError(fn + "() argument must be str, not " + type(v).__name__)
+            raise TypeError(fn + "() argument " + repr(pos) + " must be str" + (" or None" if none_ok else "") +
+                            ", not " + type(v).__name__)
+        return v
+
+    def _intl_ok():
+        try:
+            _ny_os_call("intl", "textdomain", None)
+            return True
+        except ValueError:
+            return False
+
+    if _intl_ok():
+        def gettext(msg, /):
+            """gettext(msg) -> string. Return translation of msg."""
+            return _ny_os_call("intl", "gettext", _intl_arg(msg, "gettext", 0, False))
+
+        def dgettext(domain, msg, /):
+            """dgettext(domain, msg) -> string. Return translation of msg in domain."""
+            return _ny_os_call("intl", "dgettext", _intl_arg(domain, "dgettext", 1, True), _intl_arg(msg, "dgettext", 2, False))
+
+        def dcgettext(domain, msg, category, /):
+            """Return translation of msg in domain and category."""
+            return _ny_os_call("intl", "dcgettext", _intl_arg(domain, "dcgettext", 1, True),
+                               _intl_arg(msg, "dcgettext", 2, False), category)
+
+        def textdomain(domain, /):
+            """Set the C library's textdmain to domain, returning the new domain."""
+            return _ny_os_call("intl", "textdomain", _intl_arg(domain, "textdomain", 1, True))
+
+        def bindtextdomain(domain, dir, /):
+            """Bind the C library's domain to dir."""
+            if not isinstance(domain, _builtin_str) or domain == "":
+                raise Error("domain must be a non-empty string")
+            return _ny_os_call("intl", "bindtextdomain", domain, _intl_arg(dir, "bindtextdomain", 2, True))
+
+        def bind_textdomain_codeset(domain, codeset, /):
+            """Bind the C library's domain to codeset."""
+            return _ny_os_call("intl", "bind_textdomain_codeset", _intl_arg(domain, "bind_textdomain_codeset", 1, False),
+                               _intl_arg(codeset, "bind_textdomain_codeset", 2, True))
 else:
     def getencoding():
         """Get the current locale encoding."""

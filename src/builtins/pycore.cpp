@@ -220,7 +220,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             if (b.k != 1 || (base != 0 && (base < 2 || base > 36))) E.pyRaise("ValueError", "int() base must be >= 2 and <= 36, or 0");
             nypy::BigInt out;
             const std::string& s = bo ? bo->s : *(std::string*)v.value.p;
-            if (!nypy::parse_int_str(bo ? s : nypy::uni_to_ascii(s), base, out))   // (round 84: Unicode digits and spaces)
+            if (!E.nyCall([&] { return nypy::parse_int_str(bo ? s : nypy::uni_to_ascii(s), base, out); }))   // (round 84: Unicode digits and spaces; round 85: nyCall, the digit limit raises)
                 E.pyRaise("ValueError", "invalid literal for int() with base " + std::to_string(base) + ": " + (bo ? E.reprOf(v, ctx) : nypy::str_repr(s)));
             return intValue(out);
         }
@@ -240,7 +240,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (E.isStringValue(v) || E.isBytesValue(v)) {
             const std::string& s = *(std::string*)v.value.p;
             nypy::BigInt out;
-            if (!nypy::parse_int_default(E.isStringValue(v) ? nypy::uni_to_ascii(s) : s, out))   // (round 84)
+            if (!E.nyCall([&] { return nypy::parse_int_default(E.isStringValue(v) ? nypy::uni_to_ascii(s) : s, out); }))   // (round 84; round 85: nyCall)
                 E.pyRaise("ValueError", "invalid literal for int() with base 10: " + (E.isStringValue(v) ? nypy::str_repr(s) : E.reprOf(v, ctx)));   // (round 84: a bytes literal shows as bytes)
             return intValue(out);
         }

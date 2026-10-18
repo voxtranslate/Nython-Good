@@ -64,6 +64,7 @@
 #  include <fcntl.h>
 #  include <unistd.h>
 #  include <signal.h>
+#  include <spawn.h>
 extern char** environ;
 #else
 #  include <process.h>
@@ -235,6 +236,72 @@ pid_t start_process(const Cmd& c, const std::string& cwd,
     } else {
         for (auto& a : c.argv) argv.push_back(const_cast<char*>(a.c_str()));
         argv.push_back(nullptr);
+    }
+    // (round 85) posix_spawn where it means the same as the fork + exec
+    // below - what CPython's subprocess does on Linux (_posixsubprocess's
+    // vfork path, "use_vfork"): the child shares the parent's memory until it
+    // runs the program, so the cost no longer grows with the parent's size
+    // (fork copies the page tables of every mapping). Kept on fork: an env=
+    // that sets PATH for a bare program name (execvp searches the child's
+    // PATH, posix_spawnp the parent's), a cwd= without
+    // posix_spawn_file_actions_addchdir_np (glibc < 2.29), NY_SPAWN_FORK=1.
+    {
+        bool path_from_env = c.env_replace;
+        for (auto& o : env) if (o.first == "PATH") path_from_env = true;
+        static const bool force_fork = [] { const char* f = std::getenv("NY_SPAWN_FORK"); return f && *f && std::strcmp(f, "0") != 0; }();
+        bool can_spawn = !force_fork && (c.shell || !path_from_env || c.argv[0].find('/') != std::string::npos);
+#if !(defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29)))
+        if (!cwd.empty()) can_spawn = false;
+#endif
+        if (can_spawn) {
+            posix_spawn_file_actions_t fa;
+            posix_spawnattr_t at;
+            posix_spawn_file_actions_init(&fa);
+            posix_spawnattr_init(&at);
+            if (want_stdin) posix_spawn_file_actions_adddup2(&fa, in_p[0], 0);
+            else if (!inh_in) posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+            if (!inh_out) posix_spawn_file_actions_adddup2(&fa, out_p[1], 1);
+            if (merge) posix_spawn_file_actions_adddup2(&fa, 1, 2);   // merge: stderr where stdout goes
+            else if (!inh_err) posix_spawn_file_actions_adddup2(&fa, err_p[1], 2);
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))
+            if (!cwd.empty()) posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
+#endif
+            sigset_t def;
+            sigemptyset(&def);
+            sigaddset(&def, SIGPIPE);
+            posix_spawnattr_setsigdefault(&at, &def);
+            posix_spawnattr_setpgroup(&at, 0);
+            posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF);
+            pid_t spid = 0;
+            char** ep = envp.empty() ? environ : envp.data();
+            int err = c.shell ? ::posix_spawn(&spid, argv[0], &fa, &at, argv.data(), ep)
+                              : ::posix_spawnp(&spid, argv[0], &fa, &at, argv.data(), ep);
+            posix_spawn_file_actions_destroy(&fa);
+            posix_spawnattr_destroy(&at);
+            ::close(ex_p[0]);
+            ::close(ex_p[1]);
+            if (want_stdin) ::close(in_p[0]);
+            ::close(out_p[1]);
+            ::close(err_p[1]);
+            if (err != 0) {
+                if (want_stdin) ::close(in_p[1]);
+                ::close(out_p[0]);
+                ::close(err_p[0]);
+                char tag = cwd.empty() || err != ENOENT ? 'e' : 'c';
+                if (!cwd.empty() && ::access(cwd.c_str(), F_OK) != 0) tag = 'c';
+                if (tag == 'c') raise_errno(err ? err : ENOENT, cwd);
+                raise_errno(err, c.shell ? sh : c.argv[0]);
+            }
+            in_fd = want_stdin ? in_p[1] : -1;
+            if (in_fd >= 0) set_cloexec_nonblock(in_fd, true);
+            out_fd = out_p[0];
+            err_fd = err_p[0];
+            if (inh_out) { ::close(out_fd); out_fd = -1; }
+            if (inh_err || (merge && inh_out)) { ::close(err_fd); err_fd = -1; }
+            if (out_fd >= 0) set_cloexec_nonblock(out_fd, true);
+            if (err_fd >= 0) set_cloexec_nonblock(err_fd, true);
+            return spid;
+        }
     }
     pid_t pid = ::fork();
     if (pid < 0) raise_errno(errno, "fork");

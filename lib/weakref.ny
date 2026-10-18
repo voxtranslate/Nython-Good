@@ -83,10 +83,28 @@ def _tname(o):
     return type(o).__name__
 
 
+def _report_ignored(exc, obj):
+    # (round 85) an exception a callback raised, reported and ignored as
+    # CPython's PyErr_WriteUnraisable: through sys.unraisablehook (the
+    # default prints "Exception ignored in: <obj>" and the traceback)
+    import sys
+    var hook = getattr(sys, "unraisablehook", None)
+    var args = _NyUnraisableHookArgs((type(exc), exc, getattr(exc, "__traceback__", None), None, obj))
+    try:
+        if hook is None:
+            sys.__unraisablehook__(args)
+        else:
+            hook(args)
+    except BaseException as e2:
+        sys.__unraisablehook__(_NyUnraisableHookArgs((type(e2), e2, getattr(e2, "__traceback__", None),
+                                                      "Exception ignored in sys.unraisablehook", hook)))
+
+
 # ── who refers to what ──────────────────────────────────────────────────────
 # Per referent: one engine reference with a callback (the probe), and engine
 # references to the ref / proxy objects made for it, oldest first. When the
 # referent dies the probe's callback calls theirs, newest first.
+
 class _Referents:
     def __init__(self, serial, ob):
         self.serial = serial
@@ -219,9 +237,7 @@ class ref:
             try:
                 cb(self)
             except Exception as exc:
-                import sys
-                sys.stderr.write("Exception ignored in: " + repr(cb) + "\n" +
-                                 type(exc).__name__ + ": " + str(exc) + "\n")
+                _report_ignored(exc, cb)
 
     @property
     def __callback__(self):
@@ -363,9 +379,7 @@ class ProxyType:
             try:
                 cb(self)
             except Exception as exc:
-                import sys
-                sys.stderr.write("Exception ignored in: " + repr(cb) + "\n" +
-                                 type(exc).__name__ + ": " + str(exc) + "\n")
+                _report_ignored(exc, cb)
 
     def _ny_get(self):
         var o = self._ny_w()
@@ -1321,9 +1335,7 @@ class finalize:
                         # of a new finalizer
                         f()
                     except Exception as exc:
-                        import sys
-                        sys.stderr.write("Exception ignored in: " + repr(f) + "\n" +
-                                         type(exc).__name__ + ": " + str(exc) + "\n")
+                        _report_ignored(exc, f)
         finally:
             # prevent any more finalizers from executing during shutdown
             finalize._shutdown = True

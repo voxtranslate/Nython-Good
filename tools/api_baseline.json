@@ -1,0 +1,1691 @@
+{
+ "comment": "tools/api_diff.py --write-baseline: per module, the CPython names each Nython engine has",
+ "modules": {
+  "_codecs_cn": {
+   "both": "getcodec",
+   "cpython": 1
+  },
+  "_codecs_hk": {
+   "both": "getcodec",
+   "cpython": 1
+  },
+  "_codecs_iso2022": {
+   "both": "getcodec",
+   "cpython": 1
+  },
+  "_codecs_jp": {
+   "both": "getcodec",
+   "cpython": 1
+  },
+  "_codecs_kr": {
+   "both": "getcodec",
+   "cpython": 1
+  },
+  "_codecs_tw": {
+   "both": "getcodec",
+   "cpython": 1
+  },
+  "_collections_abc": {
+   "both": "AsyncGenerator AsyncIterable AsyncIterator Awaitable Buffer ByteString Callable Collection Container Coroutine EllipsisType Generator Hashable ItemsView Iterable Iterator KeysView Mapping MappingView MutableMapping MutableSequence MutableSet Reversible Sequence Set Sized ValuesView",
+   "cpython": 48
+  },
+  "_compression": {
+   "both": "BUFFER_SIZE BaseStream DecompressReader",
+   "cpython": 3
+  },
+  "_curses": {
+   "both": "ALL_MOUSE_EVENTS A_ALTCHARSET A_ATTRIBUTES A_BLINK A_BOLD A_CHARTEXT A_COLOR A_DIM A_HORIZONTAL A_INVIS A_ITALIC A_LEFT A_LOW A_NORMAL A_PROTECT A_REVERSE A_RIGHT A_STANDOUT A_TOP A_UNDERLINE A_VERTICAL BUTTON1_CLICKED BUTTON1_DOUBLE_CLICKED BUTTON1_PRESSED BUTTON1_RELEASED BUTTON1_TRIPLE_CLICKED BUTTON2_CLICKED BUTTON2_DOUBLE_CLICKED BUTTON2_PRESSED BUTTON2_RELEASED BUTTON2_TRIPLE_CLICKED BUTTON3_CLICKED BUTTON3_DOUBLE_CLICKED BUTTON3_PRESSED BUTTON3_RELEASED BUTTON3_TRIPLE_CLICKED BUTTON4_CLICKED BUTTON4_DOUBLE_CLICKED BUTTON4_PRESSED BUTTON4_RELEASED BUTTON4_TRIPLE_CLICKED BUTTON5_CLICKED BUTTON5_DOUBLE_CLICKED BUTTON5_PRESSED BUTTON5_RELEASED BUTTON5_TRIPLE_CLICKED BUTTON_ALT BUTTON_CTRL BUTTON_SHIFT COLOR_BLACK COLOR_BLUE COLOR_CYAN COLOR_GREEN COLOR_MAGENTA COLOR_RED COLOR_WHITE COLOR_YELLOW ERR KEY_A1 KEY_A3 KEY_B2 KEY_BACKSPACE KEY_BEG KEY_BREAK KEY_BTAB KEY_C1 KEY_C3 KEY_CANCEL KEY_CATAB KEY_CLEAR KEY_CLOSE KEY_COMMAND KEY_COPY KEY_CREATE KEY_CTAB KEY_DC KEY_DL KEY_DOWN KEY_EIC KEY_END KEY_ENTER KEY_EOL KEY_EOS KEY_EXIT KEY_F0 KEY_F1 KEY_F10 KEY_F11 KEY_F12 KEY_F13 KEY_F14 KEY_F15 KEY_F16 KEY_F17 KEY_F18 KEY_F19 KEY_F2 KEY_F20 KEY_F21 KEY_F22 KEY_F23 KEY_F24 KEY_F25 KEY_F26 KEY_F27 KEY_F28 KEY_F29 KEY_F3 KEY_F30 KEY_F31 KEY_F32 KEY_F33 KEY_F34 KEY_F35 KEY_F36 KEY_F37 KEY_F38 KEY_F39 KEY_F4 KEY_F40 KEY_F41 KEY_F42 KEY_F43 KEY_F44 KEY_F45 KEY_F46 KEY_F47 KEY_F48 KEY_F49 KEY_F5 KEY_F50 KEY_F51 KEY_F52 KEY_F53 KEY_F54 KEY_F55 KEY_F56 KEY_F57 KEY_F58 KEY_F59 KEY_F6 KEY_F60 KEY_F61 KEY_F62 KEY_F63 KEY_F7 KEY_F8 KEY_F9 KEY_FIND KEY_HELP KEY_HOME KEY_IC KEY_IL KEY_LEFT KEY_LL KEY_MARK KEY_MAX KEY_MESSAGE KEY_MIN KEY_MOUSE KEY_MOVE KEY_NEXT KEY_NPAGE KEY_OPEN KEY_OPTIONS KEY_PPAGE KEY_PREVIOUS KEY_PRINT KEY_REDO KEY_REFERENCE KEY_REFRESH KEY_REPLACE KEY_RESET KEY_RESIZE KEY_RESTART KEY_RESUME KEY_RIGHT KEY_SAVE KEY_SBEG KEY_SCANCEL KEY_SCOMMAND KEY_SCOPY KEY_SCREATE KEY_SDC KEY_SDL KEY_SELECT KEY_SEND KEY_SEOL KEY_SEXIT KEY_SF KEY_SFIND KEY_SHELP KEY_SHOME KEY_SIC KEY_SLEFT KEY_SMESSAGE KEY_SMOVE KEY_SNEXT KEY_SOPTIONS KEY_SPREVIOUS KEY_SPRINT KEY_SR KEY_SREDO KEY_SREPLACE KEY_SRESET KEY_SRIGHT KEY_SRSUME KEY_SSAVE KEY_SSUSPEND KEY_STAB KEY_SUNDO KEY_SUSPEND KEY_UNDO KEY_UP OK REPORT_MOUSE_POSITION baudrate beep can_change_color cbreak color_content color_pair curs_set def_prog_mode def_shell_mode delay_output doupdate echo endwin erasechar error filter flash flushinp get_escdelay get_tabsize getmouse getsyx getwin halfdelay has_colors has_extended_color_support has_ic has_il has_key init_color init_pair initscr intrflush is_term_resized isendwin keyname killchar longname meta mouseinterval mousemask napms ncurses_version newpad newwin nl nocbreak noecho nonl noqiflush noraw pair_content pair_number putp qiflush raw reset_prog_mode reset_shell_mode resetty resize_term resizeterm savetty set_escdelay set_tabsize setsyx setupterm start_color termattrs termname tigetflag tigetnum tigetstr tparm typeahead unctrl unget_wch ungetch ungetmouse update_lines_cols use_default_colors use_env version window",
+   "cpython": 299
+  },
+  "_curses_panel": {
+   "both": "bottom_panel error new_panel panel top_panel update_panels version",
+   "cpython": 7
+  },
+  "_markupbase": {
+   "both": "ParserBase",
+   "cpython": 1
+  },
+  "_multibytecodec": {
+   "both": "MultibyteIncrementalDecoder MultibyteIncrementalEncoder MultibyteStreamReader MultibyteStreamWriter",
+   "cpython": 4
+  },
+  "_sitebuiltins": {
+   "both": "Quitter",
+   "cpython": 1
+  },
+  "_sqlite3": {
+   "both": "Blob Connection Cursor DataError DatabaseError Error IntegrityError InterfaceError InternalError LEGACY_TRANSACTION_CONTROL NotSupportedError OperationalError PARSE_COLNAMES PARSE_DECLTYPES PrepareProtocol ProgrammingError Row SQLITE_ABORT SQLITE_ABORT_ROLLBACK SQLITE_ALTER_TABLE SQLITE_ANALYZE SQLITE_ATTACH SQLITE_AUTH SQLITE_AUTH_USER SQLITE_BUSY SQLITE_BUSY_RECOVERY SQLITE_BUSY_SNAPSHOT SQLITE_BUSY_TIMEOUT SQLITE_CANTOPEN SQLITE_CANTOPEN_CONVPATH SQLITE_CANTOPEN_DIRTYWAL SQLITE_CANTOPEN_FULLPATH SQLITE_CANTOPEN_ISDIR SQLITE_CANTOPEN_NOTEMPDIR SQLITE_CANTOPEN_SYMLINK SQLITE_CONSTRAINT SQLITE_CONSTRAINT_CHECK SQLITE_CONSTRAINT_COMMITHOOK SQLITE_CONSTRAINT_FOREIGNKEY SQLITE_CONSTRAINT_FUNCTION SQLITE_CONSTRAINT_NOTNULL SQLITE_CONSTRAINT_PINNED SQLITE_CONSTRAINT_PRIMARYKEY SQLITE_CONSTRAINT_ROWID SQLITE_CONSTRAINT_TRIGGER SQLITE_CONSTRAINT_UNIQUE SQLITE_CONSTRAINT_VTAB SQLITE_CORRUPT SQLITE_CORRUPT_INDEX SQLITE_CORRUPT_SEQUENCE SQLITE_CORRUPT_VTAB SQLITE_CREATE_INDEX SQLITE_CREATE_TABLE SQLITE_CREATE_TEMP_INDEX SQLITE_CREATE_TEMP_TABLE SQLITE_CREATE_TEMP_TRIGGER SQLITE_CREATE_TEMP_VIEW SQLITE_CREATE_TRIGGER SQLITE_CREATE_VIEW SQLITE_CREATE_VTABLE SQLITE_DBCONFIG_DEFENSIVE SQLITE_DBCONFIG_DQS_DDL SQLITE_DBCONFIG_DQS_DML SQLITE_DBCONFIG_ENABLE_FKEY SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION SQLITE_DBCONFIG_ENABLE_QPSG SQLITE_DBCONFIG_ENABLE_TRIGGER SQLITE_DBCONFIG_ENABLE_VIEW SQLITE_DBCONFIG_LEGACY_ALTER_TABLE SQLITE_DBCONFIG_LEGACY_FILE_FORMAT SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE SQLITE_DBCONFIG_RESET_DATABASE SQLITE_DBCONFIG_TRIGGER_EQP SQLITE_DBCONFIG_TRUSTED_SCHEMA SQLITE_DBCONFIG_WRITABLE_SCHEMA SQLITE_DELETE SQLITE_DENY SQLITE_DETACH SQLITE_DONE SQLITE_DROP_INDEX SQLITE_DROP_TABLE SQLITE_DROP_TEMP_INDEX SQLITE_DROP_TEMP_TABLE SQLITE_DROP_TEMP_TRIGGER SQLITE_DROP_TEMP_VIEW SQLITE_DROP_TRIGGER SQLITE_DROP_VIEW SQLITE_DROP_VTABLE SQLITE_EMPTY SQLITE_ERROR SQLITE_ERROR_MISSING_COLLSEQ SQLITE_ERROR_RETRY SQLITE_ERROR_SNAPSHOT SQLITE_FORMAT SQLITE_FULL SQLITE_FUNCTION SQLITE_IGNORE SQLITE_INSERT SQLITE_INTERNAL SQLITE_INTERRUPT SQLITE_IOERR SQLITE_IOERR_ACCESS SQLITE_IOERR_AUTH SQLITE_IOERR_BEGIN_ATOMIC SQLITE_IOERR_BLOCKED SQLITE_IOERR_CHECKRESERVEDLOCK SQLITE_IOERR_CLOSE SQLITE_IOERR_COMMIT_ATOMIC SQLITE_IOERR_CONVPATH SQLITE_IOERR_CORRUPTFS SQLITE_IOERR_DATA SQLITE_IOERR_DELETE SQLITE_IOERR_DELETE_NOENT SQLITE_IOERR_DIR_CLOSE SQLITE_IOERR_DIR_FSYNC SQLITE_IOERR_FSTAT SQLITE_IOERR_FSYNC SQLITE_IOERR_GETTEMPPATH SQLITE_IOERR_LOCK SQLITE_IOERR_MMAP SQLITE_IOERR_NOMEM SQLITE_IOERR_RDLOCK SQLITE_IOERR_READ SQLITE_IOERR_ROLLBACK_ATOMIC SQLITE_IOERR_SEEK SQLITE_IOERR_SHMLOCK SQLITE_IOERR_SHMMAP SQLITE_IOERR_SHMOPEN SQLITE_IOERR_SHMSIZE SQLITE_IOERR_SHORT_READ SQLITE_IOERR_TRUNCATE SQLITE_IOERR_UNLOCK SQLITE_IOERR_VNODE SQLITE_IOERR_WRITE SQLITE_LIMIT_ATTACHED SQLITE_LIMIT_COLUMN SQLITE_LIMIT_COMPOUND_SELECT SQLITE_LIMIT_EXPR_DEPTH SQLITE_LIMIT_FUNCTION_ARG SQLITE_LIMIT_LENGTH SQLITE_LIMIT_LIKE_PATTERN_LENGTH SQLITE_LIMIT_SQL_LENGTH SQLITE_LIMIT_TRIGGER_DEPTH SQLITE_LIMIT_VARIABLE_NUMBER SQLITE_LIMIT_VDBE_OP SQLITE_LIMIT_WORKER_THREADS SQLITE_LOCKED SQLITE_LOCKED_SHAREDCACHE SQLITE_LOCKED_VTAB SQLITE_MISMATCH SQLITE_MISUSE SQLITE_NOLFS SQLITE_NOMEM SQLITE_NOTADB SQLITE_NOTFOUND SQLITE_NOTICE SQLITE_NOTICE_RECOVER_ROLLBACK SQLITE_NOTICE_RECOVER_WAL SQLITE_OK SQLITE_OK_LOAD_PERMANENTLY SQLITE_OK_SYMLINK SQLITE_PERM SQLITE_PRAGMA SQLITE_PROTOCOL SQLITE_RANGE SQLITE_READ SQLITE_READONLY SQLITE_READONLY_CANTINIT SQLITE_READONLY_CANTLOCK SQLITE_READONLY_DBMOVED SQLITE_READONLY_DIRECTORY SQLITE_READONLY_RECOVERY SQLITE_READONLY_ROLLBACK SQLITE_RECURSIVE SQLITE_REINDEX SQLITE_ROW SQLITE_SAVEPOINT SQLITE_SCHEMA SQLITE_SELECT SQLITE_TOOBIG SQLITE_TRANSACTION SQLITE_UPDATE SQLITE_WARNING SQLITE_WARNING_AUTOINDEX Warning adapt adapters complete_statement connect converters enable_callback_tracebacks enable_shared_cache register_adapter register_converter sqlite_version threadsafety",
+   "cpython": 198
+  },
+  "_thread": {
+   "both": "LockType RLock TIMEOUT_MAX allocate allocate_lock daemon_threads_allowed error exit exit_thread get_ident get_native_id interrupt_main stack_size start_new start_new_thread",
+   "cpython": 15
+  },
+  "abc": {
+   "both": "ABC ABCMeta abstractclassmethod abstractmethod abstractproperty abstractstaticmethod get_cache_token update_abstractmethods",
+   "cpython": 8
+  },
+  "aifc": {
+   "both": "Aifc_read Aifc_write Error open",
+   "cpython": 4
+  },
+  "argparse": {
+   "both": "Action ArgumentDefaultsHelpFormatter ArgumentError ArgumentParser ArgumentTypeError BooleanOptionalAction FileType HelpFormatter MetavarTypeHelpFormatter Namespace ONE_OR_MORE OPTIONAL PARSER REMAINDER RawDescriptionHelpFormatter RawTextHelpFormatter SUPPRESS ZERO_OR_MORE",
+   "cpython": 18
+  },
+  "array": {
+   "both": "ArrayType array typecodes",
+   "cpython": 3
+  },
+  "ast": {
+   "both": "AST Add And AnnAssign Assert Assign AsyncFor AsyncFunctionDef AsyncWith Attribute AugAssign AugLoad AugStore Await BinOp BitAnd BitOr BitXor BoolOp Break Bytes Call ClassDef Compare Constant Continue Del Delete Dict DictComp Div Eq ExceptHandler Expr Expression ExtSlice FloorDiv For FormattedValue FunctionDef FunctionType GeneratorExp Global Gt GtE If IfExp Import ImportFrom In Index Interactive Invert Is IsNot JoinedStr LShift Lambda List ListComp Load Lt LtE MatMult Match MatchAs MatchClass MatchMapping MatchOr MatchSequence MatchSingleton MatchStar MatchValue Mod Module Mult Name NameConstant NamedExpr NodeTransformer NodeVisitor Nonlocal Not NotEq NotIn Num Or Param ParamSpec Pass Pow PyCF_ALLOW_TOP_LEVEL_AWAIT PyCF_ONLY_AST PyCF_TYPE_COMMENTS RShift Raise Return Set SetComp Slice Starred Store Str Sub Subscript Suite Try TryStar Tuple TypeAlias TypeIgnore TypeVar TypeVarTuple UAdd USub UnaryOp While With Yield YieldFrom alias arg arguments boolop cmpop comprehension copy_location dump excepthandler expr expr_context fix_missing_locations get_docstring get_source_segment increment_lineno iter_child_nodes iter_fields keyword literal_eval main match_case mod operator parse pattern slice stmt type_ignore type_param unaryop unparse walk withitem",
+   "cpython": 158
+  },
+  "asyncio": {
+   "both": "ALL_COMPLETED AbstractEventLoop AbstractEventLoopPolicy AbstractServer Barrier BaseEventLoop BaseProtocol BaseTransport BoundedSemaphore BrokenBarrierError BufferedProtocol CancelledError Condition DatagramProtocol DatagramTransport DefaultEventLoopPolicy Event FIRST_COMPLETED FIRST_EXCEPTION Future Handle IncompleteReadError InvalidStateError LifoQueue LimitOverrunError Lock PriorityQueue Protocol Queue QueueEmpty QueueFull ReadTransport Runner SelectorEventLoop Semaphore SendfileNotAvailableError Server StreamReader StreamReaderProtocol StreamWriter SubprocessProtocol SubprocessTransport Task TaskGroup Timeout TimeoutError TimerHandle Transport WriteTransport all_tasks as_completed base_events coroutines create_eager_task_factory create_subprocess_exec create_subprocess_shell create_task current_task eager_task_factory ensure_future events exceptions futures gather get_event_loop get_event_loop_policy get_running_loop iscoroutine iscoroutinefunction isfuture locks new_event_loop open_connection open_unix_connection protocols queues run run_coroutine_threadsafe runners set_event_loop set_event_loop_policy shield sleep start_server start_unix_server streams subprocess taskgroups tasks timeout timeout_at timeouts to_thread transports wait wait_for wrap_future",
+   "cpython": 118
+  },
+  "asyncio.base_events": {
+   "both": "BaseEventLoop Server",
+   "cpython": 3
+  },
+  "asyncio.coroutines": {
+   "both": "iscoroutine iscoroutinefunction",
+   "cpython": 2
+  },
+  "asyncio.events": {
+   "both": "AbstractEventLoop AbstractEventLoopPolicy AbstractServer BaseDefaultEventLoopPolicy Handle TimerHandle get_event_loop get_event_loop_policy get_running_loop new_event_loop set_event_loop set_event_loop_policy",
+   "cpython": 15
+  },
+  "asyncio.exceptions": {
+   "both": "BrokenBarrierError CancelledError IncompleteReadError InvalidStateError LimitOverrunError SendfileNotAvailableError TimeoutError",
+   "cpython": 7
+  },
+  "asyncio.futures": {
+   "both": "Future isfuture wrap_future",
+   "cpython": 4
+  },
+  "asyncio.locks": {
+   "both": "Barrier BoundedSemaphore Condition Event Lock Semaphore",
+   "cpython": 6
+  },
+  "asyncio.protocols": {
+   "both": "BaseProtocol BufferedProtocol DatagramProtocol Protocol SubprocessProtocol",
+   "cpython": 5
+  },
+  "asyncio.queues": {
+   "both": "LifoQueue PriorityQueue Queue QueueEmpty QueueFull",
+   "cpython": 5
+  },
+  "asyncio.runners": {
+   "both": "Runner run",
+   "cpython": 2
+  },
+  "asyncio.streams": {
+   "both": "FlowControlMixin StreamReader StreamReaderProtocol StreamWriter open_connection open_unix_connection start_server start_unix_server",
+   "cpython": 8
+  },
+  "asyncio.subprocess": {
+   "both": "DEVNULL PIPE Process STDOUT SubprocessStreamProtocol create_subprocess_exec create_subprocess_shell",
+   "cpython": 7
+  },
+  "asyncio.taskgroups": {
+   "both": "TaskGroup",
+   "cpython": 1
+  },
+  "asyncio.tasks": {
+   "both": "ALL_COMPLETED FIRST_COMPLETED FIRST_EXCEPTION Task all_tasks as_completed create_eager_task_factory create_task current_task eager_task_factory ensure_future gather run_coroutine_threadsafe shield sleep wait wait_for",
+   "cpython": 17
+  },
+  "asyncio.timeouts": {
+   "both": "Timeout timeout timeout_at",
+   "cpython": 4
+  },
+  "asyncio.transports": {
+   "both": "BaseTransport DatagramTransport ReadTransport SubprocessTransport Transport WriteTransport",
+   "cpython": 6
+  },
+  "atexit": {
+   "both": "register unregister",
+   "cpython": 2
+  },
+  "audioop": {
+   "both": "add adpcm2lin alaw2lin avg avgpp bias byteswap cross error findfactor findfit findmax getsample lin2adpcm lin2alaw lin2lin lin2ulaw max maxpp minmax mul ratecv reverse rms tomono tostereo ulaw2lin",
+   "cpython": 27
+  },
+  "base64": {
+   "both": "b16decode b16encode b32decode b32encode b64decode b64encode decodebytes encodebytes standard_b64decode standard_b64encode urlsafe_b64decode urlsafe_b64encode",
+   "cpython": 25
+  },
+  "bdb": {
+   "both": "Bdb BdbQuit Breakpoint CO_ASYNC_GENERATOR CO_COROUTINE CO_GENERATOR GENERATOR_AND_COROUTINE_FLAGS checkfuncname effective set_trace",
+   "cpython": 14
+  },
+  "binascii": {
+   "both": "Error Incomplete a2b_base64 a2b_hex a2b_qp a2b_uu b2a_base64 b2a_hex b2a_qp b2a_uu crc32 crc_hqx hexlify unhexlify",
+   "cpython": 14
+  },
+  "bisect": {
+   "both": "bisect bisect_left bisect_right insort insort_left insort_right",
+   "cpython": 6
+  },
+  "builtins": {
+   "both": "ArithmeticError AssertionError AttributeError BaseException BaseExceptionGroup BlockingIOError BrokenPipeError BufferError BytesWarning ChildProcessError ConnectionAbortedError ConnectionError ConnectionRefusedError ConnectionResetError DeprecationWarning EOFError Ellipsis EncodingWarning EnvironmentError Exception ExceptionGroup FileExistsError FileNotFoundError FloatingPointError FutureWarning GeneratorExit IOError ImportError ImportWarning IndentationError IndexError InterruptedError IsADirectoryError KeyError KeyboardInterrupt LookupError MemoryError ModuleNotFoundError NameError NotADirectoryError NotImplemented NotImplementedError OSError OverflowError PendingDeprecationWarning PermissionError ProcessLookupError RecursionError ReferenceError ResourceWarning RuntimeError RuntimeWarning StopAsyncIteration StopIteration SyntaxError SyntaxWarning SystemExit TabError TimeoutError TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError UnicodeError UnicodeTranslateError UnicodeWarning UserWarning ValueError Warning ZeroDivisionError abs aiter all anext any ascii bin bool breakpoint bytearray bytes callable chr classmethod compile complex delattr dict dir divmod enumerate eval exec exit filter float format frozenset getattr globals hasattr hash help hex id input int isinstance issubclass iter len list locals map max memoryview min next object oct open ord pow print property quit range repr reversed round set setattr slice sorted staticmethod str sum tuple type vars zip",
+   "cpython": 149,
+   "interp_only": "super"
+  },
+  "bz2": {
+   "both": "BZ2Compressor BZ2Decompressor BZ2File compress decompress open",
+   "cpython": 6
+  },
+  "cProfile": {
+   "both": "Profile label main run runctx",
+   "cpython": 5
+  },
+  "calendar": {
+   "both": "APRIL AUGUST Calendar DECEMBER EPOCH FEBRUARY FRIDAY HTMLCalendar IllegalMonthError IllegalWeekdayError JANUARY JULY JUNE LocaleHTMLCalendar LocaleTextCalendar MARCH MAY MONDAY NOVEMBER OCTOBER SATURDAY SEPTEMBER SUNDAY THURSDAY TUESDAY TextCalendar WEDNESDAY calendar day_abbr day_name error firstweekday format formatstring isleap leapdays mdays month month_abbr month_name monthcalendar monthrange prcal prmonth prweek setfirstweekday timegm week weekday weekheader",
+   "cpython": 57
+  },
+  "cgi": {
+   "both": "FieldStorage MiniFieldStorage closelog dolog initlog log logfile logfp maxlen nolog parse parse_header parse_multipart print_arguments print_directory print_environ print_environ_usage print_exception print_form test valid_boundary",
+   "cpython": 21
+  },
+  "cgitb": {
+   "both": "Hook enable grey handler html html_escape lookup reset scanvars small strong text",
+   "cpython": 12
+  },
+  "chunk": {
+   "both": "Chunk",
+   "cpython": 1
+  },
+  "cmath": {
+   "both": "acos acosh asin asinh atan atanh cos cosh e exp inf infj isclose isfinite isinf isnan log log10 nan nanj phase pi polar rect sin sinh sqrt tan tanh tau",
+   "cpython": 30
+  },
+  "cmd": {
+   "both": "Cmd IDENTCHARS PROMPT",
+   "cpython": 3
+  },
+  "code": {
+   "both": "InteractiveConsole InteractiveInterpreter compile_command interact",
+   "cpython": 4
+  },
+  "codecs": {
+   "both": "BOM BOM32_BE BOM32_LE BOM64_BE BOM64_LE BOM_BE BOM_LE BOM_UTF16 BOM_UTF16_BE BOM_UTF16_LE BOM_UTF32 BOM_UTF32_BE BOM_UTF32_LE BOM_UTF8 BufferedIncrementalDecoder BufferedIncrementalEncoder Codec CodecInfo EncodedFile IncrementalDecoder IncrementalEncoder StreamReader StreamReaderWriter StreamRecoder StreamWriter ascii_decode ascii_encode backslashreplace_errors charmap_build charmap_decode charmap_encode decode encode escape_decode escape_encode getdecoder getencoder getincrementaldecoder getincrementalencoder getreader getwriter ignore_errors iterdecode iterencode latin_1_decode latin_1_encode lookup lookup_error make_encoding_map make_identity_dict namereplace_errors open raw_unicode_escape_decode raw_unicode_escape_encode readbuffer_encode register register_error replace_errors strict_errors unicode_escape_decode unicode_escape_encode unregister utf_16_be_decode utf_16_be_encode utf_16_decode utf_16_encode utf_16_ex_decode utf_16_le_decode utf_16_le_encode utf_32_be_decode utf_32_be_encode utf_32_decode utf_32_encode utf_32_ex_decode utf_32_le_decode utf_32_le_encode utf_7_decode utf_7_encode utf_8_decode utf_8_encode xmlcharrefreplace_errors",
+   "cpython": 81
+  },
+  "codeop": {
+   "both": "CommandCompiler Compile PyCF_ALLOW_INCOMPLETE_INPUT PyCF_DONT_IMPLY_DEDENT compile_command",
+   "cpython": 5
+  },
+  "collections": {
+   "both": "ChainMap Counter OrderedDict UserDict UserList abc defaultdict deque namedtuple",
+   "cpython": 10
+  },
+  "collections.abc": {
+   "both": "AsyncGenerator AsyncIterable AsyncIterator Awaitable Buffer ByteString Callable Collection Container Coroutine Generator Hashable ItemsView Iterable Iterator KeysView Mapping MappingView MutableMapping MutableSequence MutableSet Reversible Sequence Set Sized ValuesView",
+   "cpython": 26
+  },
+  "colorsys": {
+   "both": "ONE_SIXTH ONE_THIRD TWO_THIRD hls_to_rgb hsv_to_rgb rgb_to_hls rgb_to_hsv rgb_to_yiq yiq_to_rgb",
+   "cpython": 9
+  },
+  "compileall": {
+   "both": "compile_dir compile_file compile_path main",
+   "cpython": 4
+  },
+  "concurrent": {
+   "both": "",
+   "cpython": 0
+  },
+  "concurrent.futures": {
+   "both": "ALL_COMPLETED BrokenExecutor CancelledError Executor FIRST_COMPLETED FIRST_EXCEPTION Future ProcessPoolExecutor ThreadPoolExecutor TimeoutError as_completed wait",
+   "cpython": 12
+  },
+  "concurrent.futures._base": {
+   "both": "ALL_COMPLETED BrokenExecutor CANCELLED CANCELLED_AND_NOTIFIED CancelledError DoneAndNotDoneFutures Error Executor FINISHED FIRST_COMPLETED FIRST_EXCEPTION Future InvalidStateError LOGGER PENDING RUNNING TimeoutError as_completed wait",
+   "cpython": 19
+  },
+  "concurrent.futures.process": {
+   "both": "BrokenProcessPool EXTRA_QUEUED_CALLS ProcessPoolExecutor",
+   "cpython": 6
+  },
+  "concurrent.futures.thread": {
+   "both": "BrokenThreadPool ThreadPoolExecutor",
+   "cpython": 2
+  },
+  "configparser": {
+   "both": "BasicInterpolation ConfigParser ConverterMapping DEFAULTSECT DuplicateOptionError DuplicateSectionError Error ExtendedInterpolation Interpolation InterpolationDepthError InterpolationError InterpolationMissingOptionError InterpolationSyntaxError LegacyInterpolation MAX_INTERPOLATION_DEPTH MissingSectionHeaderError NoOptionError NoSectionError ParsingError RawConfigParser SafeConfigParser SectionProxy",
+   "cpython": 22
+  },
+  "contextlib": {
+   "both": "AbstractAsyncContextManager AbstractContextManager AsyncContextDecorator AsyncExitStack ContextDecorator ExitStack aclosing asynccontextmanager chdir closing contextmanager nullcontext redirect_stderr redirect_stdout suppress",
+   "cpython": 16
+  },
+  "contextvars": {
+   "both": "Context ContextVar Token copy_context",
+   "cpython": 4
+  },
+  "copy": {
+   "both": "Error copy deepcopy error",
+   "cpython": 5
+  },
+  "copyreg": {
+   "both": "add_extension clear_extension_cache constructor dispatch_table pickle pickle_complex remove_extension",
+   "cpython": 8
+  },
+  "csv": {
+   "both": "Dialect DictReader DictWriter Error QUOTE_ALL QUOTE_MINIMAL QUOTE_NONE QUOTE_NONNUMERIC QUOTE_NOTNULL QUOTE_STRINGS Sniffer excel excel_tab field_size_limit get_dialect list_dialects reader register_dialect unix_dialect unregister_dialect writer",
+   "cpython": 21
+  },
+  "ctypes": {
+   "both": "ARRAY ArgumentError Array BigEndianStructure BigEndianUnion CDLL CFUNCTYPE DEFAULT_MODE LibraryLoader LittleEndianStructure LittleEndianUnion POINTER PYFUNCTYPE PyDLL RTLD_GLOBAL RTLD_LOCAL SetPointerType Structure Union addressof alignment byref c_bool c_buffer c_byte c_char c_char_p c_double c_float c_int c_int16 c_int32 c_int64 c_int8 c_long c_longdouble c_longlong c_short c_size_t c_ssize_t c_time_t c_ubyte c_uint c_uint16 c_uint32 c_uint64 c_uint8 c_ulong c_ulonglong c_ushort c_void_p c_voidp c_wchar c_wchar_p cast cdll create_string_buffer create_unicode_buffer get_errno memmove memset pointer pydll pythonapi resize set_errno sizeof string_at wstring_at",
+   "cpython": 71
+  },
+  "ctypes.util": {
+   "both": "find_library",
+   "cpython": 2
+  },
+  "ctypes.wintypes": {
+   "both": "ATOM BOOL BOOLEAN BYTE CHAR COLORREF DOUBLE DWORD FILETIME FLOAT HACCEL HANDLE HBITMAP HBRUSH HCOLORSPACE HDC HDESK HDWP HENHMETAFILE HFONT HGDIOBJ HGLOBAL HHOOK HICON HINSTANCE HKEY HKL HLOCAL HMENU HMETAFILE HMODULE HMONITOR HPALETTE HPEN HRGN HRSRC HSTR HTASK HWINSTA HWND INT LANGID LARGE_INTEGER LCID LCTYPE LGRPID LONG LPARAM LPBOOL LPBYTE LPCOLESTR LPCOLORREF LPCSTR LPCVOID LPCWSTR LPDWORD LPFILETIME LPHANDLE LPHKL LPINT LPLONG LPMSG LPOLESTR LPPOINT LPRECT LPRECTL LPSC_HANDLE LPSIZE LPSIZEL LPSTR LPUINT LPVOID LPWIN32_FIND_DATAA LPWIN32_FIND_DATAW LPWORD LPWSTR MAX_PATH MSG OLESTR PBOOL PBOOLEAN PBYTE PCHAR PDWORD PFILETIME PFLOAT PHANDLE PHKEY PINT PLARGE_INTEGER PLCID PLONG PMSG POINT POINTL PPOINT PPOINTL PRECT PRECTL PSHORT PSIZE PSIZEL PSMALL_RECT PUINT PULARGE_INTEGER PULONG PUSHORT PWCHAR PWIN32_FIND_DATAA PWIN32_FIND_DATAW PWORD RECT RECTL RGB SC_HANDLE SERVICE_STATUS_HANDLE SHORT SIZE SIZEL SMALL_RECT UINT ULARGE_INTEGER ULONG USHORT VARIANT_BOOL WCHAR WIN32_FIND_DATAA WIN32_FIND_DATAW WORD WPARAM tagMSG tagPOINT tagRECT tagSIZE",
+   "cpython": 134
+  },
+  "curses": {
+   "both": "ALL_MOUSE_EVENTS A_ALTCHARSET A_ATTRIBUTES A_BLINK A_BOLD A_CHARTEXT A_COLOR A_DIM A_HORIZONTAL A_INVIS A_ITALIC A_LEFT A_LOW A_NORMAL A_PROTECT A_REVERSE A_RIGHT A_STANDOUT A_TOP A_UNDERLINE A_VERTICAL BUTTON1_CLICKED BUTTON1_DOUBLE_CLICKED BUTTON1_PRESSED BUTTON1_RELEASED BUTTON1_TRIPLE_CLICKED BUTTON2_CLICKED BUTTON2_DOUBLE_CLICKED BUTTON2_PRESSED BUTTON2_RELEASED BUTTON2_TRIPLE_CLICKED BUTTON3_CLICKED BUTTON3_DOUBLE_CLICKED BUTTON3_PRESSED BUTTON3_RELEASED BUTTON3_TRIPLE_CLICKED BUTTON4_CLICKED BUTTON4_DOUBLE_CLICKED BUTTON4_PRESSED BUTTON4_RELEASED BUTTON4_TRIPLE_CLICKED BUTTON5_CLICKED BUTTON5_DOUBLE_CLICKED BUTTON5_PRESSED BUTTON5_RELEASED BUTTON5_TRIPLE_CLICKED BUTTON_ALT BUTTON_CTRL BUTTON_SHIFT COLOR_BLACK COLOR_BLUE COLOR_CYAN COLOR_GREEN COLOR_MAGENTA COLOR_RED COLOR_WHITE COLOR_YELLOW ERR KEY_A1 KEY_A3 KEY_B2 KEY_BACKSPACE KEY_BEG KEY_BREAK KEY_BTAB KEY_C1 KEY_C3 KEY_CANCEL KEY_CATAB KEY_CLEAR KEY_CLOSE KEY_COMMAND KEY_COPY KEY_CREATE KEY_CTAB KEY_DC KEY_DL KEY_DOWN KEY_EIC KEY_END KEY_ENTER KEY_EOL KEY_EOS KEY_EXIT KEY_F0 KEY_F1 KEY_F10 KEY_F11 KEY_F12 KEY_F13 KEY_F14 KEY_F15 KEY_F16 KEY_F17 KEY_F18 KEY_F19 KEY_F2 KEY_F20 KEY_F21 KEY_F22 KEY_F23 KEY_F24 KEY_F25 KEY_F26 KEY_F27 KEY_F28 KEY_F29 KEY_F3 KEY_F30 KEY_F31 KEY_F32 KEY_F33 KEY_F34 KEY_F35 KEY_F36 KEY_F37 KEY_F38 KEY_F39 KEY_F4 KEY_F40 KEY_F41 KEY_F42 KEY_F43 KEY_F44 KEY_F45 KEY_F46 KEY_F47 KEY_F48 KEY_F49 KEY_F5 KEY_F50 KEY_F51 KEY_F52 KEY_F53 KEY_F54 KEY_F55 KEY_F56 KEY_F57 KEY_F58 KEY_F59 KEY_F6 KEY_F60 KEY_F61 KEY_F62 KEY_F63 KEY_F7 KEY_F8 KEY_F9 KEY_FIND KEY_HELP KEY_HOME KEY_IC KEY_IL KEY_LEFT KEY_LL KEY_MARK KEY_MAX KEY_MESSAGE KEY_MIN KEY_MOUSE KEY_MOVE KEY_NEXT KEY_NPAGE KEY_OPEN KEY_OPTIONS KEY_PPAGE KEY_PREVIOUS KEY_PRINT KEY_REDO KEY_REFERENCE KEY_REFRESH KEY_REPLACE KEY_RESET KEY_RESIZE KEY_RESTART KEY_RESUME KEY_RIGHT KEY_SAVE KEY_SBEG KEY_SCANCEL KEY_SCOMMAND KEY_SCOPY KEY_SCREATE KEY_SDC KEY_SDL KEY_SELECT KEY_SEND KEY_SEOL KEY_SEXIT KEY_SF KEY_SFIND KEY_SHELP KEY_SHOME KEY_SIC KEY_SLEFT KEY_SMESSAGE KEY_SMOVE KEY_SNEXT KEY_SOPTIONS KEY_SPREVIOUS KEY_SPRINT KEY_SR KEY_SREDO KEY_SREPLACE KEY_SRESET KEY_SRIGHT KEY_SRSUME KEY_SSAVE KEY_SSUSPEND KEY_STAB KEY_SUNDO KEY_SUSPEND KEY_UNDO KEY_UP OK REPORT_MOUSE_POSITION baudrate beep can_change_color cbreak color_content color_pair curs_set def_prog_mode def_shell_mode delay_output doupdate echo endwin erasechar error filter flash flushinp get_escdelay get_tabsize getmouse getsyx getwin halfdelay has_colors has_extended_color_support has_ic has_il has_key init_color init_pair initscr intrflush is_term_resized isendwin keyname killchar longname meta mouseinterval mousemask napms ncurses_version newpad newwin nl nocbreak noecho nonl noqiflush noraw pair_content pair_number putp qiflush raw reset_prog_mode reset_shell_mode resetty resize_term resizeterm savetty set_escdelay set_tabsize setsyx setupterm start_color termattrs termname tigetflag tigetnum tigetstr tparm typeahead unctrl unget_wch ungetch ungetmouse update_lines_cols use_default_colors use_env version window wrapper",
+   "cpython": 300
+  },
+  "curses.ascii": {
+   "both": "ACK BEL BS CAN CR DC1 DC2 DC3 DC4 DEL DLE EM ENQ EOT ESC ETB ETX FF FS GS HT LF NAK NL NUL RS SI SO SOH SP STX SUB SYN TAB US VT alt ascii controlnames ctrl isalnum isalpha isascii isblank iscntrl isctrl isdigit isgraph islower ismeta isprint ispunct isspace isupper isxdigit unctrl",
+   "cpython": 56
+  },
+  "curses.has_key": {
+   "both": "has_key",
+   "cpython": 1
+  },
+  "curses.panel": {
+   "both": "bottom_panel error new_panel panel top_panel update_panels version",
+   "cpython": 7
+  },
+  "curses.textpad": {
+   "both": "Textbox rectangle",
+   "cpython": 2
+  },
+  "dataclasses": {
+   "both": "Field FrozenInstanceError InitVar KW_ONLY MISSING asdict astuple dataclass field fields is_dataclass make_dataclass replace",
+   "cpython": 14
+  },
+  "datetime": {
+   "both": "MAXYEAR MINYEAR UTC date datetime time timedelta timezone tzinfo",
+   "cpython": 10
+  },
+  "dbm": {
+   "both": "error ndbm open whichdb",
+   "cpython": 4
+  },
+  "dbm.dumb": {
+   "both": "error open",
+   "cpython": 2
+  },
+  "dbm.ndbm": {
+   "both": "",
+   "cpython": 3
+  },
+  "decimal": {
+   "both": "BasicContext Clamped Context ConversionSyntax Decimal DecimalException DecimalTuple DefaultContext DivisionByZero DivisionImpossible DivisionUndefined ExtendedContext FloatOperation HAVE_CONTEXTVAR HAVE_THREADS Inexact InvalidContext InvalidOperation MAX_EMAX MAX_PREC MIN_EMIN MIN_ETINY Overflow ROUND_05UP ROUND_CEILING ROUND_DOWN ROUND_FLOOR ROUND_HALF_DOWN ROUND_HALF_EVEN ROUND_HALF_UP ROUND_UP Rounded Subnormal Underflow getcontext localcontext setcontext",
+   "cpython": 37
+  },
+  "difflib": {
+   "both": "Differ HtmlDiff IS_CHARACTER_JUNK IS_LINE_JUNK Match SequenceMatcher context_diff diff_bytes get_close_matches ndiff restore unified_diff",
+   "cpython": 12
+  },
+  "dis": {
+   "both": "Bytecode COMPILER_FLAG_NAMES EXTENDED_ARG HAVE_ARGUMENT Instruction Positions UNKNOWN cmp_op code_info deoptmap dis disassemble disco distb findlabels findlinestarts get_instructions hasarg hascompare hasconst hasfree hasjabs hasjrel haslocal hasname main opmap opname pretty_flags show_code stack_effect",
+   "cpython": 51
+  },
+  "email": {
+   "both": "message_from_binary_file message_from_bytes message_from_file message_from_string",
+   "cpython": 4
+  },
+  "email._encoded_words": {
+   "both": "ascii_letters decode decode_b decode_q digits encode encode_b encode_q len_b len_q",
+   "cpython": 10
+  },
+  "email._header_value_parser": {
+   "both": "ASPECIALS ATOM_ENDS ATTRIBUTE_ENDS AddrSpec Address AddressList AngleAddr Atom Attribute BareQuotedString CFWSList CFWS_LEADER Comment ContentDisposition ContentTransferEncoding ContentType DOT DOT_ATOM_ENDS DisplayName Domain DomainLiteral DotAtom DotAtomText EWWhiteSpaceTerminal EXTENDED_ATTRIBUTE_ENDS EncodedWord Group GroupList Header HeaderLabel InvalidMailbox InvalidMessageID InvalidParameter ListSeparator LocalPart MIMEVersion Mailbox MailboxList MessageID MimeParameters MsgID NLSET NameAddr NoFoldLiteral ObsLocalPart ObsRoute PHRASE_ENDS Parameter ParameterizedHeaderValue Phrase QuotedString RouteComponentMarker SPECIALS SPECIALSNL Section TOKEN_ENDS TSPECIALS Terminal Token TokenList UnstructuredTokenList Value ValueTerminal WSP WhiteSpaceTerminal WhiteSpaceTokenList Word get_addr_spec get_address get_address_list get_angle_addr get_atext get_atom get_attribute get_attrtext get_bare_quoted_string get_cfws get_comment get_display_name get_domain get_domain_literal get_dot_atom get_dot_atom_text get_dtext get_encoded_word get_extended_attribute get_extended_attrtext get_fws get_group get_group_list get_invalid_mailbox get_invalid_parameter get_local_part get_mailbox get_mailbox_list get_msg_id get_name_addr get_no_fold_literal get_obs_local_part get_obs_route get_parameter get_phrase get_qcontent get_qp_ctext get_quoted_string get_section get_token get_ttext get_unstructured get_value get_word hexdigits itemgetter make_parenthesis_pairs parse_content_disposition_header parse_content_transfer_encoding_header parse_content_type_header parse_message_id parse_mime_parameters parse_mime_version quote_string rfc2047_matcher",
+   "cpython": 123
+  },
+  "email._parseaddr": {
+   "both": "AddressList AddrlistClass COMMASPACE EMPTYSTRING SPACE mktime_tz parsedate parsedate_tz quote",
+   "cpython": 9
+  },
+  "email._policybase": {
+   "both": "Compat32 Policy compat32",
+   "cpython": 3
+  },
+  "email.base64mime": {
+   "both": "CRLF EMPTYSTRING MISC_LEN NL body_decode body_encode decode decodestring header_encode header_length",
+   "cpython": 10
+  },
+  "email.charset": {
+   "both": "ALIASES BASE64 CHARSETS CODEC_MAP Charset DEFAULT_CHARSET EMPTYSTRING QP RFC2047_CHROME_LEN SHORTEST UNKNOWN8BIT add_alias add_charset add_codec",
+   "cpython": 14
+  },
+  "email.contentmanager": {
+   "both": "ContentManager get_and_fixup_unknown_message_content get_message_content get_non_text_content get_text_content raw_data_manager set_bytes_content set_message_content set_text_content",
+   "cpython": 9
+  },
+  "email.encoders": {
+   "both": "encode_7or8bit encode_base64 encode_noop encode_quopri",
+   "cpython": 4
+  },
+  "email.errors": {
+   "both": "BoundaryError CharsetError CloseBoundaryNotFoundDefect FirstHeaderLineIsContinuationDefect HeaderDefect HeaderMissingRequiredValue HeaderParseError HeaderWriteError InvalidBase64CharactersDefect InvalidBase64LengthDefect InvalidBase64PaddingDefect InvalidDateDefect InvalidHeaderDefect InvalidMultipartContentTransferEncodingDefect MalformedHeaderDefect MessageDefect MessageError MessageParseError MisplacedEnvelopeHeaderDefect MissingHeaderBodySeparatorDefect MultipartConversionError MultipartInvariantViolationDefect NoBoundaryInMultipartDefect NonASCIILocalPartDefect NonPrintableDefect ObsoleteHeaderDefect StartBoundaryNotFoundDefect UndecodableBytesDefect",
+   "cpython": 28
+  },
+  "email.feedparser": {
+   "both": "BufferedSubFile BytesFeedParser EMPTYSTRING FeedParser NL NeedMoreData",
+   "cpython": 6
+  },
+  "email.generator": {
+   "both": "BytesGenerator DecodedGenerator Generator NL UNDERSCORE",
+   "cpython": 5
+  },
+  "email.header": {
+   "both": "BSPACE EMPTYSTRING FWS Header MAXLINELEN NL SPACE SPACE8 decode_header make_header",
+   "cpython": 10
+  },
+  "email.headerregistry": {
+   "both": "Address AddressHeader BaseHeader ContentDispositionHeader ContentTransferEncodingHeader ContentTypeHeader DateHeader Group HeaderRegistry MIMEVersionHeader MappingProxyType MessageIDHeader ParameterizedMIMEHeader SingleAddressHeader UniqueAddressHeader UniqueDateHeader UniqueSingleAddressHeader UniqueUnstructuredHeader UnstructuredHeader",
+   "cpython": 19
+  },
+  "email.iterators": {
+   "both": "body_line_iterator typed_subpart_iterator walk",
+   "cpython": 3
+  },
+  "email.message": {
+   "both": "EmailMessage MIMEPart Message SEMISPACE",
+   "cpython": 4
+  },
+  "email.mime": {
+   "both": "",
+   "cpython": 0
+  },
+  "email.mime.application": {
+   "both": "MIMEApplication",
+   "cpython": 1
+  },
+  "email.mime.audio": {
+   "both": "MIMEAudio rule",
+   "cpython": 2
+  },
+  "email.mime.base": {
+   "both": "MIMEBase",
+   "cpython": 1
+  },
+  "email.mime.image": {
+   "both": "MIMEImage rule",
+   "cpython": 2
+  },
+  "email.mime.message": {
+   "both": "MIMEMessage",
+   "cpython": 1
+  },
+  "email.mime.multipart": {
+   "both": "MIMEMultipart",
+   "cpython": 1
+  },
+  "email.mime.nonmultipart": {
+   "both": "MIMENonMultipart",
+   "cpython": 1
+  },
+  "email.mime.text": {
+   "both": "MIMEText",
+   "cpython": 1
+  },
+  "email.parser": {
+   "both": "BytesFeedParser BytesHeaderParser BytesParser FeedParser HeaderParser Parser",
+   "cpython": 6
+  },
+  "email.policy": {
+   "both": "Compat32 EmailPolicy HTTP Policy SMTP SMTPUTF8 compat32 default strict",
+   "cpython": 9
+  },
+  "email.quoprimime": {
+   "both": "CRLF EMPTYSTRING NL ascii_letters body_check body_decode body_encode body_length decode decodestring digits header_check header_decode header_encode header_length hexdigits quote unquote",
+   "cpython": 18
+  },
+  "email.utils": {
+   "both": "COMMASPACE CRLF EMPTYSTRING TICK UEMPTYSTRING collapse_rfc2231_value decode_params decode_rfc2231 encode_rfc2231 format_datetime formataddr formatdate getaddresses localtime make_msgid mktime_tz parseaddr parsedate parsedate_to_datetime parsedate_tz supports_strict_parsing unquote",
+   "cpython": 22
+  },
+  "encodings": {
+   "both": "CodecRegistryError aliases normalize_encoding search_function",
+   "cpython": 5
+  },
+  "encodings.aliases": {
+   "both": "aliases",
+   "cpython": 1
+  },
+  "encodings.ascii": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamConverter StreamReader StreamWriter getregentry",
+   "cpython": 7
+  },
+  "encodings.base64_codec": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter base64_decode base64_encode getregentry",
+   "cpython": 8
+  },
+  "encodings.big5": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.big5hkscs": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.bz2_codec": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter bz2_decode bz2_encode getregentry",
+   "cpython": 8
+  },
+  "encodings.charmap": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry",
+   "cpython": 6
+  },
+  "encodings.cp037": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1006": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1026": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1125": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp1140": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1250": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1251": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1252": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1253": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1254": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1255": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1256": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1257": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp1258": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp273": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp424": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp437": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp500": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp720": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp737": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp775": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp850": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp852": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp855": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp856": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp857": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp858": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp860": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp861": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp862": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp863": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp864": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp865": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp866": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp869": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.cp874": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp875": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.cp932": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.cp949": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.cp950": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.euc_jis_2004": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.euc_jisx0213": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.euc_jp": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.euc_kr": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.gb18030": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.gb2312": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.gbk": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.hex_codec": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry hex_decode hex_encode",
+   "cpython": 8
+  },
+  "encodings.hp_roman8": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.hz": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.idna": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry",
+   "cpython": 13
+  },
+  "encodings.iso2022_jp": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso2022_jp_1": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso2022_jp_2": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso2022_jp_2004": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso2022_jp_3": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso2022_jp_ext": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso2022_kr": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.iso8859_1": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_10": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_11": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_13": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_14": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_15": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_16": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_2": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_3": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_4": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_5": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_6": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_7": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_8": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.iso8859_9": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.johab": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.koi8_r": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.koi8_t": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.koi8_u": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.kz1048": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.latin_1": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamConverter StreamReader StreamWriter getregentry",
+   "cpython": 7
+  },
+  "encodings.mac_arabic": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_map decoding_table encoding_map getregentry",
+   "cpython": 9
+  },
+  "encodings.mac_croatian": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_cyrillic": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_farsi": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_greek": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_iceland": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_latin2": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_roman": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_romanian": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.mac_turkish": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.palmos": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.ptcp154": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.punycode": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter T adapt decode_generalized_number digits generate_generalized_integer generate_integers getregentry insertion_sort insertion_unsort punycode_decode punycode_encode segregate selective_find selective_len",
+   "cpython": 19
+  },
+  "encodings.quopri_codec": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry",
+   "cpython": 9
+  },
+  "encodings.raw_unicode_escape": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry",
+   "cpython": 6
+  },
+  "encodings.rot_13": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry rot13 rot13_map",
+   "cpython": 8
+  },
+  "encodings.shift_jis": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.shift_jis_2004": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.shift_jisx0213": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter codec getregentry",
+   "cpython": 7
+  },
+  "encodings.tis_620": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decoding_table encoding_table getregentry",
+   "cpython": 8
+  },
+  "encodings.undefined": {
+   "both": "",
+   "cpython": 6
+  },
+  "encodings.unicode_escape": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry",
+   "cpython": 6
+  },
+  "encodings.utf_16": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_16_be": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_16_le": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_32": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_32_be": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_32_le": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_7": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_8": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.utf_8_sig": {
+   "both": "IncrementalDecoder IncrementalEncoder StreamReader StreamWriter decode encode getregentry",
+   "cpython": 7
+  },
+  "encodings.uu_codec": {
+   "both": "BytesIO Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry uu_decode uu_encode",
+   "cpython": 9
+  },
+  "encodings.zlib_codec": {
+   "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry zlib_decode zlib_encode",
+   "cpython": 8
+  },
+  "enum": {
+   "both": "CONFORM CONTINUOUS EJECT Enum EnumCheck EnumMeta EnumType Flag FlagBoundary IntEnum IntFlag KEEP NAMED_FLAGS ReprEnum STRICT StrEnum UNIQUE auto bin global_enum global_enum_repr global_flag_repr global_str member nonmember property show_flag_values unique verify",
+   "cpython": 32
+  },
+  "errno": {
+   "both": "E2BIG EACCES EADDRINUSE EADDRNOTAVAIL EADV EAFNOSUPPORT EAGAIN EALREADY EBADE EBADF EBADFD EBADMSG EBADR EBADRQC EBADSLT EBFONT EBUSY ECANCELED ECHILD ECHRNG ECOMM ECONNABORTED ECONNREFUSED ECONNRESET EDEADLK EDEADLOCK EDESTADDRREQ EDOM EDOTDOT EDQUOT EEXIST EFAULT EFBIG EHOSTDOWN EHOSTUNREACH EIDRM EILSEQ EINPROGRESS EINTR EINVAL EIO EISCONN EISDIR EISNAM EKEYEXPIRED EKEYREJECTED EKEYREVOKED EL2HLT EL2NSYNC EL3HLT EL3RST ELIBACC ELIBBAD ELIBEXEC ELIBMAX ELIBSCN ELNRNG ELOOP EMEDIUMTYPE EMFILE EMLINK EMSGSIZE EMULTIHOP ENAMETOOLONG ENAVAIL ENETDOWN ENETRESET ENETUNREACH ENFILE ENOANO ENOBUFS ENOCSI ENODATA ENODEV ENOENT ENOEXEC ENOKEY ENOLCK ENOLINK ENOMEDIUM ENOMEM ENOMSG ENONET ENOPKG ENOPROTOOPT ENOSPC ENOSR ENOSTR ENOSYS ENOTBLK ENOTCONN ENOTDIR ENOTEMPTY ENOTNAM ENOTRECOVERABLE ENOTSOCK ENOTSUP ENOTTY ENOTUNIQ ENXIO EOPNOTSUPP EOVERFLOW EOWNERDEAD EPERM EPFNOSUPPORT EPIPE EPROTO EPROTONOSUPPORT EPROTOTYPE ERANGE EREMCHG EREMOTE EREMOTEIO ERESTART ERFKILL EROFS ESHUTDOWN ESOCKTNOSUPPORT ESPIPE ESRCH ESRMNT ESTALE ESTRPIPE ETIME ETIMEDOUT ETOOMANYREFS ETXTBSY EUCLEAN EUNATCH EUSERS EWOULDBLOCK EXDEV EXFULL errorcode",
+   "cpython": 134
+  },
+  "faulthandler": {
+   "both": "cancel_dump_traceback_later disable dump_traceback dump_traceback_later enable is_enabled register unregister",
+   "cpython": 8
+  },
+  "fcntl": {
+   "both": "DN_ACCESS DN_ATTRIB DN_CREATE DN_DELETE DN_MODIFY DN_MULTISHOT DN_RENAME FASYNC FD_CLOEXEC FICLONE FICLONERANGE F_ADD_SEALS F_DUPFD F_DUPFD_CLOEXEC F_EXLCK F_GETFD F_GETFL F_GETLEASE F_GETLK F_GETLK64 F_GETOWN F_GETPIPE_SZ F_GETSIG F_GET_SEALS F_NOTIFY F_OFD_GETLK F_OFD_SETLK F_OFD_SETLKW F_RDLCK F_SEAL_GROW F_SEAL_SEAL F_SEAL_SHRINK F_SEAL_WRITE F_SETFD F_SETFL F_SETLEASE F_SETLK F_SETLK64 F_SETLKW F_SETLKW64 F_SETOWN F_SETPIPE_SZ F_SETSIG F_SHLCK F_UNLCK F_WRLCK LOCK_EX LOCK_MAND LOCK_NB LOCK_READ LOCK_RW LOCK_SH LOCK_UN LOCK_WRITE fcntl flock ioctl lockf",
+   "cpython": 58
+  },
+  "filecmp": {
+   "both": "BUFSIZE DEFAULT_IGNORES clear_cache cmp cmpfiles demo dircmp",
+   "cpython": 7
+  },
+  "fileinput": {
+   "both": "FileInput close filelineno filename fileno hook_compressed hook_encoded input isfirstline isstdin lineno nextfile",
+   "cpython": 12
+  },
+  "fnmatch": {
+   "both": "filter fnmatch fnmatchcase translate",
+   "cpython": 4
+  },
+  "fractions": {
+   "both": "Fraction",
+   "cpython": 1
+  },
+  "ftplib": {
+   "both": "B_CRLF CRLF Error FTP FTP_PORT FTP_TLS MAXLINE MSG_OOB all_errors error_perm error_proto error_reply error_temp ftpcp parse150 parse227 parse229 parse257 print_line test",
+   "cpython": 20
+  },
+  "functools": {
+   "both": "WRAPPER_ASSIGNMENTS WRAPPER_UPDATES cache cached_property cmp_to_key lru_cache partial partialmethod reduce singledispatch singledispatchmethod total_ordering update_wrapper wraps",
+   "cpython": 14
+  },
+  "gc": {
+   "both": "DEBUG_COLLECTABLE DEBUG_LEAK DEBUG_SAVEALL DEBUG_STATS DEBUG_UNCOLLECTABLE callbacks collect disable enable freeze garbage get_count get_debug get_freeze_count get_objects get_referents get_referrers get_stats get_threshold is_finalized is_tracked isenabled set_debug set_threshold unfreeze",
+   "cpython": 25
+  },
+  "genericpath": {
+   "both": "ALLOW_MISSING commonprefix exists getatime getctime getmtime getsize isdir isfile samefile sameopenfile samestat",
+   "cpython": 13
+  },
+  "getopt": {
+   "both": "GetoptError do_longs do_shorts error getopt gnu_getopt long_has_args short_has_arg",
+   "cpython": 8
+  },
+  "getpass": {
+   "both": "GetPassWarning fallback_getpass getpass getuser unix_getpass win_getpass",
+   "cpython": 6
+  },
+  "gettext": {
+   "both": "Catalog GNUTranslations NullTranslations bindtextdomain c2py dgettext dngettext dnpgettext dpgettext find gettext install ngettext npgettext pgettext textdomain translation",
+   "cpython": 17
+  },
+  "glob": {
+   "both": "escape glob glob0 glob1 has_magic iglob",
+   "cpython": 6
+  },
+  "graphlib": {
+   "both": "CycleError TopologicalSorter",
+   "cpython": 2
+  },
+  "grp": {
+   "both": "getgrall getgrgid getgrnam struct_group",
+   "cpython": 4
+  },
+  "gzip": {
+   "both": "BadGzipFile FCOMMENT FEXTRA FHCRC FNAME FTEXT GzipFile READ READ_BUFFER_SIZE WRITE compress decompress open",
+   "cpython": 15
+  },
+  "hashlib": {
+   "both": "algorithms_available algorithms_guaranteed blake2b blake2s file_digest md5 new pbkdf2_hmac scrypt sha1 sha224 sha256 sha384 sha3_224 sha3_256 sha3_384 sha3_512 sha512 shake_128 shake_256",
+   "cpython": 20
+  },
+  "heapq": {
+   "both": "heapify heappop heappush heappushpop heapreplace merge nlargest nsmallest",
+   "cpython": 8
+  },
+  "hmac": {
+   "both": "HMAC compare_digest digest new",
+   "cpython": 7
+  },
+  "html": {
+   "both": "entities escape unescape",
+   "cpython": 3
+  },
+  "html.entities": {
+   "both": "codepoint2name entitydefs html5 name2codepoint",
+   "cpython": 4
+  },
+  "html.parser": {
+   "both": "HTMLParser",
+   "cpython": 1
+  },
+  "http": {
+   "both": "HTTPMethod HTTPStatus",
+   "cpython": 2
+  },
+  "http.client": {
+   "both": "BadStatusLine CannotSendHeader CannotSendRequest HTTPConnection HTTPException HTTPMessage HTTPResponse HTTPSConnection HTTPS_PORT HTTP_PORT ImproperConnectionState IncompleteRead InvalidURL LineTooLong NotConnected RemoteDisconnected ResponseNotReady UnknownProtocol UnknownTransferEncoding parse_headers responses",
+   "cpython": 85
+  },
+  "http.cookiejar": {
+   "both": "Cookie CookieJar DefaultCookiePolicy LoadError domain_match",
+   "cpython": 46
+  },
+  "http.server": {
+   "both": "BaseHTTPRequestHandler DEFAULT_ERROR_CONTENT_TYPE DEFAULT_ERROR_MESSAGE HTTPServer SimpleHTTPRequestHandler ThreadingHTTPServer test",
+   "cpython": 11
+  },
+  "imaplib": {
+   "both": "AllowedVersions CRLF Commands DEFAULT_BUFFER_SIZE Debug HAVE_SSL IMAP4 IMAP4_PORT IMAP4_SSL IMAP4_SSL_PORT IMAP4_stream Int2AP Internaldate2tuple Mon2num Months ParseFlags Time2Internaldate",
+   "cpython": 17
+  },
+  "imghdr": {
+   "both": "test test_bmp test_exr test_gif test_jpeg test_pbm test_pgm test_png test_ppm test_rast test_rgb test_tiff test_webp test_xbm testall tests what",
+   "cpython": 17
+  },
+  "importlib": {
+   "both": "import_module invalidate_caches reload",
+   "cpython": 4
+  },
+  "importlib.abc": {
+   "both": "ExecutionLoader FileLoader Finder InspectLoader Loader MetaPathFinder PathEntryFinder ResourceLoader SourceLoader Traversable TraversableResources",
+   "cpython": 12
+  },
+  "importlib.machinery": {
+   "both": "BYTECODE_SUFFIXES BuiltinImporter DEBUG_BYTECODE_SUFFIXES EXTENSION_SUFFIXES FileFinder ModuleSpec NamespaceLoader OPTIMIZED_BYTECODE_SUFFIXES PathFinder SOURCE_SUFFIXES SourceFileLoader all_suffixes",
+   "cpython": 16
+  },
+  "importlib.resources": {
+   "both": "Package as_file contents files is_resource open_binary open_text path read_binary read_text",
+   "cpython": 13
+  },
+  "importlib.util": {
+   "both": "LazyLoader MAGIC_NUMBER cache_from_source decode_source find_spec module_from_spec resolve_name source_from_cache source_hash spec_from_file_location spec_from_loader",
+   "cpython": 16
+  },
+  "inspect": {
+   "both": "AGEN_CLOSED AGEN_CREATED AGEN_RUNNING AGEN_SUSPENDED ArgInfo Attribute BoundArguments CORO_CLOSED CORO_CREATED CORO_RUNNING CORO_SUSPENDED CO_ASYNC_GENERATOR CO_COROUTINE CO_GENERATOR CO_ITERABLE_COROUTINE CO_NESTED CO_NEWLOCALS CO_NOFREE CO_OPTIMIZED CO_VARARGS CO_VARKEYWORDS FrameInfo FullArgSpec GEN_CLOSED GEN_CREATED GEN_RUNNING GEN_SUSPENDED Parameter Signature TPFLAGS_IS_ABSTRACT Traceback classify_class_attrs cleandoc currentframe findsource formatannotation formatargvalues get_annotations getabsfile getargvalues getasyncgenlocals getasyncgenstate getattr_static getblock getcallargs getclasstree getcomments getcoroutinelocals getcoroutinestate getdoc getfile getframeinfo getfullargspec getgeneratorlocals getgeneratorstate getinnerframes getlineno getmembers getmembers_static getmodule getmodulename getmro getouterframes getsource getsourcefile getsourcelines indentsize isabstract isasyncgen isasyncgenfunction isawaitable isbuiltin isclass iscode iscoroutine iscoroutinefunction isdatadescriptor isframe isfunction isgenerator isgeneratorfunction isgetsetdescriptor ismemberdescriptor ismethod ismethoddescriptor ismethodwrapper ismodule isroutine istraceback markcoroutinefunction signature stack trace unwrap walktree",
+   "cpython": 106
+  },
+  "io": {
+   "both": "BufferedIOBase BytesIO DEFAULT_BUFFER_SIZE IOBase RawIOBase SEEK_CUR SEEK_END SEEK_SET StringIO TextIOBase TextIOWrapper UnsupportedOperation open open_code text_encoding",
+   "cpython": 22
+  },
+  "ipaddress": {
+   "both": "AddressValueError IPV4LENGTH IPV6LENGTH IPv4Address IPv4Interface IPv4Network IPv6Address IPv6Interface IPv6Network NetmaskValueError collapse_addresses get_mixed_type_key ip_address ip_interface ip_network summarize_address_range v4_int_to_packed v6_int_to_packed",
+   "cpython": 18
+  },
+  "itertools": {
+   "both": "accumulate batched chain combinations combinations_with_replacement compress count cycle dropwhile filterfalse groupby islice pairwise permutations product repeat starmap takewhile tee zip_longest",
+   "cpython": 20
+  },
+  "json": {
+   "both": "JSONDecodeError JSONDecoder JSONEncoder decoder detect_encoding dump dumps encoder load loads",
+   "cpython": 11
+  },
+  "json.decoder": {
+   "both": "JSONDecodeError JSONDecoder NaN NegInf PosInf",
+   "cpython": 11
+  },
+  "json.encoder": {
+   "both": "INFINITY JSONEncoder encode_basestring encode_basestring_ascii py_encode_basestring py_encode_basestring_ascii",
+   "cpython": 13
+  },
+  "keyword": {
+   "both": "iskeyword issoftkeyword kwlist softkwlist",
+   "cpython": 4
+  },
+  "linecache": {
+   "both": "cache checkcache clearcache getline getlines lazycache updatecache",
+   "cpython": 7
+  },
+  "locale": {
+   "both": "ABDAY_1 ABDAY_2 ABDAY_3 ABDAY_4 ABDAY_5 ABDAY_6 ABDAY_7 ABMON_1 ABMON_10 ABMON_11 ABMON_12 ABMON_2 ABMON_3 ABMON_4 ABMON_5 ABMON_6 ABMON_7 ABMON_8 ABMON_9 ALT_DIGITS AM_STR CHAR_MAX CODESET CRNCYSTR DAY_1 DAY_2 DAY_3 DAY_4 DAY_5 DAY_6 DAY_7 D_FMT D_T_FMT ERA ERA_D_FMT ERA_D_T_FMT ERA_T_FMT Error LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME MON_1 MON_10 MON_11 MON_12 MON_2 MON_3 MON_4 MON_5 MON_6 MON_7 MON_8 MON_9 NOEXPR PM_STR RADIXCHAR THOUSEP T_FMT T_FMT_AMPM YESEXPR atof atoi bind_textdomain_codeset bindtextdomain currency dcgettext delocalize dgettext format_string getdefaultlocale getencoding getlocale getpreferredencoding gettext locale_alias locale_encoding_alias localeconv localize nl_langinfo normalize resetlocale setlocale str strcoll strxfrm textdomain windows_locale",
+   "cpython": 92
+  },
+  "logging": {
+   "both": "BASIC_FORMAT BufferingFormatter CRITICAL DEBUG ERROR FATAL FileHandler Filter Filterer Formatter Handler INFO LogRecord Logger LoggerAdapter Manager NOTSET NullHandler PercentStyle PlaceHolder RootLogger StrFormatStyle StreamHandler StringTemplateStyle WARN WARNING addLevelName basicConfig captureWarnings critical currentframe debug disable error exception fatal getHandlerByName getHandlerNames getLevelName getLevelNamesMapping getLogRecordFactory getLogger getLoggerClass info lastResort log logAsyncioTasks logMultiprocessing logProcesses logThreads makeLogRecord raiseExceptions root setLogRecordFactory setLoggerClass shutdown warn warning",
+   "cpython": 58
+  },
+  "lzma": {
+   "both": "CHECK_CRC32 CHECK_CRC64 CHECK_ID_MAX CHECK_NONE CHECK_SHA256 CHECK_UNKNOWN FILTER_ARM FILTER_ARMTHUMB FILTER_DELTA FILTER_IA64 FILTER_LZMA1 FILTER_LZMA2 FILTER_POWERPC FILTER_SPARC FILTER_X86 FORMAT_ALONE FORMAT_AUTO FORMAT_RAW FORMAT_XZ LZMACompressor LZMADecompressor LZMAError LZMAFile MF_BT2 MF_BT3 MF_BT4 MF_HC3 MF_HC4 MODE_FAST MODE_NORMAL PRESET_DEFAULT PRESET_EXTREME compress decompress is_check_supported open",
+   "cpython": 36
+  },
+  "mailbox": {
+   "both": "Babyl BabylMessage Error ExternalClashError FormatError MH MHMessage MMDF MMDFMessage Mailbox Maildir MaildirMessage Message NoSuchMailboxError NotEmptyError linesep mbox mboxMessage",
+   "cpython": 18
+  },
+  "mailcap": {
+   "both": "UnsafeMailcapInput findmatch findparam getcaps lineno_sort_key listmailcapfiles lookup parsefield parseline readmailcapfile show subst test",
+   "cpython": 13
+  },
+  "marshal": {
+   "both": "dump dumps load loads version",
+   "cpython": 5
+  },
+  "math": {
+   "both": "acos acosh asin asinh atan atan2 atanh cbrt ceil comb copysign cos cosh degrees dist e erf erfc exp exp2 expm1 fabs factorial floor fmod frexp fsum gamma gcd hypot inf isclose isfinite isinf isnan isqrt lcm ldexp lgamma log log10 log1p log2 modf nan nextafter perm pi pow prod radians remainder sin sinh sqrt sumprod tan tanh tau trunc ulp",
+   "cpython": 61
+  },
+  "mimetypes": {
+   "both": "MimeTypes add_type common_types encodings_map guess_all_extensions guess_extension guess_type init inited knownfiles read_mime_types suffix_map types_map",
+   "cpython": 13
+  },
+  "mmap": {
+   "both": "ACCESS_COPY ACCESS_DEFAULT ACCESS_READ ACCESS_WRITE ALLOCATIONGRANULARITY MADV_DODUMP MADV_DOFORK MADV_DONTDUMP MADV_DONTFORK MADV_DONTNEED MADV_FREE MADV_HUGEPAGE MADV_HWPOISON MADV_MERGEABLE MADV_NOHUGEPAGE MADV_NORMAL MADV_RANDOM MADV_REMOVE MADV_SEQUENTIAL MADV_UNMERGEABLE MADV_WILLNEED MAP_ANON MAP_ANONYMOUS MAP_DENYWRITE MAP_EXECUTABLE MAP_POPULATE MAP_PRIVATE MAP_SHARED MAP_STACK PAGESIZE PROT_EXEC PROT_READ PROT_WRITE error mmap",
+   "cpython": 35
+  },
+  "modulefinder": {
+   "both": "AddPackagePath Module ModuleFinder ReplacePackage packagePathMap replacePackageMap test",
+   "cpython": 7
+  },
+  "multiprocessing": {
+   "both": "Array AuthenticationError Barrier BoundedSemaphore BufferTooShort Condition Event JoinableQueue Lock Manager Pipe Pool Process ProcessError Queue RLock RawArray RawValue SUBDEBUG SUBWARNING Semaphore SimpleQueue TimeoutError Value active_children allow_connection_pickling context cpu_count current_process freeze_support get_all_start_methods get_context get_logger get_start_method log_to_stderr parent_process process reducer set_executable set_forkserver_preload set_start_method",
+   "cpython": 42
+  },
+  "multiprocessing.connection": {
+   "both": "BUFSIZE Client Connection Listener Pipe wait",
+   "cpython": 24
+  },
+  "multiprocessing.context": {
+   "both": "AuthenticationError BaseContext BufferTooShort DefaultContext Process ProcessError SpawnContext SpawnProcess TimeoutError",
+   "cpython": 16
+  },
+  "multiprocessing.managers": {
+   "both": "BaseManager BaseProxy DictProxy ListProxy Namespace NamespaceProxy Server SyncManager Token ValueProxy",
+   "cpython": 37
+  },
+  "multiprocessing.pool": {
+   "both": "ApplyResult AsyncResult CLOSE ExceptionWithTraceback IMapIterator IMapUnorderedIterator INIT MapResult MaybeEncodingError Pool RUN RemoteTraceback TERMINATE ThreadPool mapstar rebuild_exc starmapstar worker",
+   "cpython": 19
+  },
+  "multiprocessing.process": {
+   "both": "AuthenticationString BaseProcess active_children current_process parent_process",
+   "cpython": 6
+  },
+  "multiprocessing.queues": {
+   "both": "JoinableQueue Queue SimpleQueue",
+   "cpython": 3
+  },
+  "multiprocessing.shared_memory": {
+   "both": "SharedMemory",
+   "cpython": 2
+  },
+  "multiprocessing.sharedctypes": {
+   "both": "Array RawArray RawValue Synchronized SynchronizedArray SynchronizedBase Value copy synchronized",
+   "cpython": 16
+  },
+  "multiprocessing.spawn": {
+   "both": "freeze_support get_executable get_preparation_data is_forking prepare set_executable",
+   "cpython": 12
+  },
+  "multiprocessing.synchronize": {
+   "both": "Barrier BoundedSemaphore Condition Event Lock RLock SemLock Semaphore",
+   "cpython": 11
+  },
+  "netrc": {
+   "both": "NetrcParseError netrc",
+   "cpython": 2
+  },
+  "ntpath": {
+   "both": "ALLOW_MISSING abspath altsep basename commonpath commonprefix curdir defpath devnull dirname exists expanduser expandvars extsep getatime getctime getmtime getsize isabs isdir isfile isjunction islink ismount join lexists normcase normpath pardir pathsep realpath relpath samefile sameopenfile samestat sep split splitdrive splitext splitroot supports_unicode_filenames",
+   "cpython": 42
+  },
+  "numbers": {
+   "both": "Complex Integral Number Rational Real",
+   "cpython": 5
+  },
+  "opcode": {
+   "both": "EXTENDED_ARG HAVE_ARGUMENT cmp_op hasarg hascompare hasconst hasfree hasjabs hasjrel haslocal hasname opmap opname stack_effect",
+   "cpython": 24
+  },
+  "operator": {
+   "both": "abs add and_ attrgetter call concat contains countOf delitem eq floordiv ge getitem gt iadd iand iconcat ifloordiv ilshift imatmul imod imul index indexOf inv invert ior ipow irshift is_ is_not isub itemgetter itruediv ixor le length_hint lshift lt matmul methodcaller mod mul ne neg not_ or_ pos pow rshift setitem sub truediv truth xor",
+   "cpython": 55
+  },
+  "optparse": {
+   "both": "AmbiguousOptionError BadOptionError HelpFormatter IndentedHelpFormatter NO_DEFAULT OptParseError Option OptionConflictError OptionContainer OptionError OptionGroup OptionParser OptionValueError SUPPRESS_HELP SUPPRESS_USAGE TitledHelpFormatter Values check_builtin check_choice make_option",
+   "cpython": 20
+  },
+  "os": {
+   "both": "CLD_CONTINUED CLD_DUMPED CLD_EXITED CLD_KILLED CLD_STOPPED CLD_TRAPPED CLONE_FILES CLONE_FS CLONE_NEWCGROUP CLONE_NEWIPC CLONE_NEWNET CLONE_NEWNS CLONE_NEWPID CLONE_NEWTIME CLONE_NEWUSER CLONE_NEWUTS CLONE_SIGHAND CLONE_SYSVSEM CLONE_THREAD CLONE_VM DirEntry EFD_CLOEXEC EFD_NONBLOCK EFD_SEMAPHORE EX_CANTCREAT EX_CONFIG EX_DATAERR EX_IOERR EX_NOHOST EX_NOINPUT EX_NOPERM EX_NOUSER EX_OK EX_OSERR EX_OSFILE EX_PROTOCOL EX_SOFTWARE EX_TEMPFAIL EX_UNAVAILABLE EX_USAGE F_LOCK F_OK F_TEST F_TLOCK F_ULOCK GRND_NONBLOCK GRND_RANDOM MFD_ALLOW_SEALING MFD_CLOEXEC MFD_HUGETLB MFD_HUGE_16GB MFD_HUGE_16MB MFD_HUGE_1GB MFD_HUGE_1MB MFD_HUGE_256MB MFD_HUGE_2GB MFD_HUGE_2MB MFD_HUGE_32MB MFD_HUGE_512KB MFD_HUGE_512MB MFD_HUGE_64KB MFD_HUGE_8MB MFD_HUGE_MASK MFD_HUGE_SHIFT NGROUPS_MAX O_ACCMODE O_APPEND O_ASYNC O_CLOEXEC O_CREAT O_DIRECT O_DIRECTORY O_DSYNC O_EXCL O_FSYNC O_LARGEFILE O_NDELAY O_NOATIME O_NOCTTY O_NOFOLLOW O_NONBLOCK O_PATH O_RDONLY O_RDWR O_RSYNC O_SYNC O_TMPFILE O_TRUNC O_WRONLY POSIX_FADV_DONTNEED POSIX_FADV_NOREUSE POSIX_FADV_NORMAL POSIX_FADV_RANDOM POSIX_FADV_SEQUENTIAL POSIX_FADV_WILLNEED POSIX_SPAWN_CLOSE POSIX_SPAWN_DUP2 POSIX_SPAWN_OPEN PRIO_PGRP PRIO_PROCESS PRIO_USER P_ALL P_NOWAIT P_NOWAITO P_PGID P_PID P_PIDFD P_WAIT PathLike RTLD_DEEPBIND RTLD_GLOBAL RTLD_LAZY RTLD_LOCAL RTLD_NODELETE RTLD_NOLOAD RTLD_NOW RWF_APPEND RWF_DSYNC RWF_HIPRI RWF_NOWAIT RWF_SYNC R_OK SCHED_BATCH SCHED_FIFO SCHED_IDLE SCHED_OTHER SCHED_RESET_ON_FORK SCHED_RR SEEK_CUR SEEK_DATA SEEK_END SEEK_HOLE SEEK_SET SPLICE_F_MORE SPLICE_F_MOVE SPLICE_F_NONBLOCK ST_APPEND ST_MANDLOCK ST_NOATIME ST_NODEV ST_NODIRATIME ST_NOEXEC ST_NOSUID ST_RDONLY ST_RELATIME ST_SYNCHRONOUS ST_WRITE TMP_MAX WCONTINUED WCOREDUMP WEXITED WEXITSTATUS WIFCONTINUED WIFEXITED WIFSIGNALED WIFSTOPPED WNOHANG WNOWAIT WSTOPPED WSTOPSIG WTERMSIG WUNTRACED W_OK XATTR_CREATE XATTR_REPLACE XATTR_SIZE_MAX X_OK abort access altsep chdir chmod chown chroot close closerange confstr confstr_names copy_file_range cpu_count ctermid curdir defpath device_encoding devnull dup dup2 environ environb error eventfd eventfd_read eventfd_write execl execle execlp execlpe execv execve execvp execvpe extsep fchdir fchmod fchown fdatasync fdopen fork forkpty fpathconf fsdecode fsencode fspath fstat fstatvfs fsync ftruncate fwalk get_blocking get_exec_path get_inheritable get_terminal_size getcwd getcwdb getegid getenv getenvb geteuid getgid getgrouplist getgroups getloadavg getlogin getpgid getpgrp getpid getppid getpriority getrandom getresgid getresuid getsid getuid getxattr initgroups isatty kill killpg lchown linesep link listdir listxattr lockf login_tty lseek lstat major makedev makedirs memfd_create minor mkdir mkfifo mknod name nice open openpty pardir path pathconf pathconf_names pathsep pidfd_open pipe pipe2 popen posix_fadvise posix_fallocate posix_spawn posix_spawnp pread preadv putenv pwrite pwritev read readlink readv register_at_fork remove removedirs removexattr rename renames replace rmdir scandir sched_get_priority_max sched_get_priority_min sched_getaffinity sched_getparam sched_getscheduler sched_param sched_rr_get_interval sched_setaffinity sched_setparam sched_setscheduler sched_yield sendfile sep set_blocking set_inheritable setegid seteuid setgid setgroups setns setpgid setpgrp setpriority setregid setresgid setresuid setreuid setsid setuid setxattr spawnl spawnle spawnlp spawnlpe spawnv spawnve spawnvp spawnvpe splice stat stat_result statvfs statvfs_result strerror supports_bytes_environ supports_dir_fd supports_effective_ids supports_fd supports_follow_symlinks symlink sync sysconf sysconf_names system tcgetpgrp tcsetpgrp terminal_size times times_result truncate ttyname umask uname uname_result unlink unsetenv unshare urandom utime wait wait3 wait4 waitid waitid_result waitpid waitstatus_to_exitcode walk write writev",
+   "cpython": 378
+  },
+  "pathlib": {
+   "both": "Path PosixPath PurePath PurePosixPath PureWindowsPath WindowsPath",
+   "cpython": 10
+  },
+  "pdb": {
+   "both": "Pdb Restart find_function help line_prefix main pm post_mortem run runcall runctx runeval set_trace",
+   "cpython": 16
+  },
+  "pickle": {
+   "both": "ADDITEMS APPEND APPENDS BINBYTES BINBYTES8 BINFLOAT BINGET BININT BININT1 BININT2 BINPERSID BINPUT BINSTRING BINUNICODE BINUNICODE8 BUILD BYTEARRAY8 DEFAULT_PROTOCOL DICT DUP EMPTY_DICT EMPTY_LIST EMPTY_SET EMPTY_TUPLE EXT1 EXT2 EXT4 FALSE FLOAT FRAME FROZENSET GET GLOBAL HIGHEST_PROTOCOL INST INT LIST LONG LONG1 LONG4 LONG_BINGET LONG_BINPUT MARK MEMOIZE NEWFALSE NEWOBJ NEWOBJ_EX NEWTRUE NEXT_BUFFER NONE OBJ PERSID POP POP_MARK PROTO PUT PickleBuffer PickleError Pickler PicklingError READONLY_BUFFER REDUCE SETITEM SETITEMS SHORT_BINBYTES SHORT_BINSTRING SHORT_BINUNICODE STACK_GLOBAL STOP STRING TRUE TUPLE TUPLE1 TUPLE2 TUPLE3 UNICODE Unpickler UnpicklingError compatible_formats dump dumps format_version load loads",
+   "cpython": 92
+  },
+  "pickletools": {
+   "both": "ArgumentDescriptor OpcodeInfo StackObject TAKEN_FROM_ARGUMENT1 TAKEN_FROM_ARGUMENT4 TAKEN_FROM_ARGUMENT4U TAKEN_FROM_ARGUMENT8U UP_TO_NEWLINE anyobject bytearray8 bytes1 bytes4 bytes8 bytes_types code2op decimalnl_long decimalnl_short dis float8 floatnl genops int4 long1 long4 markobject opcodes optimize pybool pybuffer pybytearray pybytes pybytes_or_str pydict pyfloat pyfrozenset pyint pyinteger_or_bool pylist pylong pynone pyset pystring pytuple pyunicode read_bytearray8 read_bytes1 read_bytes4 read_bytes8 read_decimalnl_long read_decimalnl_short read_float8 read_floatnl read_int4 read_long1 read_long4 read_string1 read_string4 read_stringnl read_stringnl_noescape read_stringnl_noescape_pair read_uint1 read_uint2 read_uint4 read_uint8 read_unicodestring1 read_unicodestring4 read_unicodestring8 read_unicodestringnl stackslice string1 string4 stringnl stringnl_noescape stringnl_noescape_pair uint1 uint2 uint4 uint8 unicodestring1 unicodestring4 unicodestring8 unicodestringnl",
+   "cpython": 82
+  },
+  "pkgutil": {
+   "both": "ModuleInfo extend_path find_loader get_data get_importer get_loader iter_importer_modules iter_importers iter_modules read_code resolve_name walk_packages",
+   "cpython": 16
+  },
+  "platform": {
+   "both": "architecture freedesktop_os_release libc_ver mac_ver machine node platform processor python_branch python_build python_compiler python_implementation python_revision python_version python_version_tuple release system system_alias uname uname_result version win32_edition win32_is_iot win32_ver",
+   "cpython": 25
+  },
+  "plistlib": {
+   "both": "FMT_BINARY FMT_XML InvalidFileException PLISTHEADER PlistFormat UID dump dumps load loads",
+   "cpython": 10
+  },
+  "poplib": {
+   "both": "CR CRLF HAVE_SSL LF POP3 POP3_PORT POP3_SSL POP3_SSL_PORT error_proto",
+   "cpython": 9
+  },
+  "posix": {
+   "both": "CLD_CONTINUED CLD_DUMPED CLD_EXITED CLD_KILLED CLD_STOPPED CLD_TRAPPED CLONE_FILES CLONE_FS CLONE_NEWCGROUP CLONE_NEWIPC CLONE_NEWNET CLONE_NEWNS CLONE_NEWPID CLONE_NEWTIME CLONE_NEWUSER CLONE_NEWUTS CLONE_SIGHAND CLONE_SYSVSEM CLONE_THREAD CLONE_VM DirEntry EFD_CLOEXEC EFD_NONBLOCK EFD_SEMAPHORE EX_CANTCREAT EX_CONFIG EX_DATAERR EX_IOERR EX_NOHOST EX_NOINPUT EX_NOPERM EX_NOUSER EX_OK EX_OSERR EX_OSFILE EX_PROTOCOL EX_SOFTWARE EX_TEMPFAIL EX_UNAVAILABLE EX_USAGE F_LOCK F_OK F_TEST F_TLOCK F_ULOCK GRND_NONBLOCK GRND_RANDOM MFD_ALLOW_SEALING MFD_CLOEXEC MFD_HUGETLB MFD_HUGE_16GB MFD_HUGE_16MB MFD_HUGE_1GB MFD_HUGE_1MB MFD_HUGE_256MB MFD_HUGE_2GB MFD_HUGE_2MB MFD_HUGE_32MB MFD_HUGE_512KB MFD_HUGE_512MB MFD_HUGE_64KB MFD_HUGE_8MB MFD_HUGE_MASK MFD_HUGE_SHIFT NGROUPS_MAX O_ACCMODE O_APPEND O_ASYNC O_CLOEXEC O_CREAT O_DIRECT O_DIRECTORY O_DSYNC O_EXCL O_FSYNC O_LARGEFILE O_NDELAY O_NOATIME O_NOCTTY O_NOFOLLOW O_NONBLOCK O_PATH O_RDONLY O_RDWR O_RSYNC O_SYNC O_TMPFILE O_TRUNC O_WRONLY POSIX_FADV_DONTNEED POSIX_FADV_NOREUSE POSIX_FADV_NORMAL POSIX_FADV_RANDOM POSIX_FADV_SEQUENTIAL POSIX_FADV_WILLNEED POSIX_SPAWN_CLOSE POSIX_SPAWN_DUP2 POSIX_SPAWN_OPEN PRIO_PGRP PRIO_PROCESS PRIO_USER P_ALL P_PGID P_PID P_PIDFD RTLD_DEEPBIND RTLD_GLOBAL RTLD_LAZY RTLD_LOCAL RTLD_NODELETE RTLD_NOLOAD RTLD_NOW RWF_APPEND RWF_DSYNC RWF_HIPRI RWF_NOWAIT RWF_SYNC R_OK SCHED_BATCH SCHED_FIFO SCHED_IDLE SCHED_OTHER SCHED_RESET_ON_FORK SCHED_RR SEEK_DATA SEEK_HOLE SPLICE_F_MORE SPLICE_F_MOVE SPLICE_F_NONBLOCK ST_APPEND ST_MANDLOCK ST_NOATIME ST_NODEV ST_NODIRATIME ST_NOEXEC ST_NOSUID ST_RDONLY ST_RELATIME ST_SYNCHRONOUS ST_WRITE TMP_MAX WCONTINUED WCOREDUMP WEXITED WEXITSTATUS WIFCONTINUED WIFEXITED WIFSIGNALED WIFSTOPPED WNOHANG WNOWAIT WSTOPPED WSTOPSIG WTERMSIG WUNTRACED W_OK XATTR_CREATE XATTR_REPLACE XATTR_SIZE_MAX X_OK abort access chdir chmod chown chroot close closerange confstr confstr_names copy_file_range cpu_count ctermid device_encoding dup dup2 environ error eventfd eventfd_read eventfd_write execv execve fchdir fchmod fchown fdatasync fork forkpty fpathconf fspath fstat fstatvfs fsync ftruncate get_blocking get_inheritable get_terminal_size getcwd getcwdb getegid geteuid getgid getgrouplist getgroups getloadavg getlogin getpgid getpgrp getpid getppid getpriority getrandom getresgid getresuid getsid getuid getxattr initgroups isatty kill killpg lchown link listdir listxattr lockf login_tty lseek lstat major makedev memfd_create minor mkdir mkfifo mknod nice open openpty pathconf pathconf_names pidfd_open pipe pipe2 posix_fadvise posix_fallocate posix_spawn posix_spawnp pread preadv putenv pwrite pwritev read readlink readv register_at_fork remove removexattr rename replace rmdir scandir sched_get_priority_max sched_get_priority_min sched_getaffinity sched_getparam sched_getscheduler sched_param sched_rr_get_interval sched_setaffinity sched_setparam sched_setscheduler sched_yield sendfile set_blocking set_inheritable setegid seteuid setgid setgroups setns setpgid setpgrp setpriority setregid setresgid setresuid setreuid setsid setuid setxattr splice stat stat_result statvfs statvfs_result strerror symlink sync sysconf sysconf_names system tcgetpgrp tcsetpgrp terminal_size times times_result truncate ttyname umask uname uname_result unlink unsetenv unshare urandom utime wait wait3 wait4 waitid waitid_result waitpid waitstatus_to_exitcode write writev",
+   "cpython": 328
+  },
+  "posixpath": {
+   "both": "ALLOW_MISSING abspath altsep basename commonpath commonprefix curdir defpath devnull dirname exists expanduser expandvars extsep getatime getctime getmtime getsize isabs isdir isfile isjunction islink ismount join lexists normcase normpath pardir pathsep realpath relpath samefile sameopenfile samestat sep split splitdrive splitext splitroot supports_unicode_filenames",
+   "cpython": 41
+  },
+  "pprint": {
+   "both": "PrettyPrinter isreadable isrecursive pformat pp pprint saferepr",
+   "cpython": 7
+  },
+  "profile": {
+   "both": "Profile main run runctx",
+   "cpython": 4
+  },
+  "pstats": {
+   "both": "FunctionProfile SortKey Stats StatsProfile TupleComp add_callers add_func_stats count_calls f8 func_get_function_name func_std_string func_strip_path",
+   "cpython": 12
+  },
+  "pty": {
+   "both": "CHILD STDERR_FILENO STDIN_FILENO STDOUT_FILENO fork master_open openpty slave_open spawn",
+   "cpython": 9
+  },
+  "pwd": {
+   "both": "getpwall getpwnam getpwuid struct_passwd",
+   "cpython": 4
+  },
+  "py_compile": {
+   "both": "PyCompileError PycInvalidationMode compile main",
+   "cpython": 4
+  },
+  "pyclbr": {
+   "both": "Class Function readmodule readmodule_ex",
+   "cpython": 4
+  },
+  "pydoc": {
+   "both": "Doc ErrorDuringImport Helper ModuleScanner TextDoc TextRepr allmethods apropos classify_class_attrs classname cli cram describe doc getdoc getpager help importfile isdata ispackage ispath locate pager parentname pathdirs pipepager plain plainpager plaintext render_doc replace resolve safeimport sort_attributes source_synopsis splitdoc stripid synopsis tempfilepager text ttypager visiblename writedoc writedocs",
+   "cpython": 48
+  },
+  "queue": {
+   "both": "Empty Full LifoQueue PriorityQueue Queue SimpleQueue",
+   "cpython": 6
+  },
+  "quopri": {
+   "both": "EMPTYSTRING ESCAPE HEX MAXLINESIZE decode decodestring encode encodestring ishex main needsquoting quote unhex",
+   "cpython": 13
+  },
+  "random": {
+   "both": "BPF LOG4 NV_MAGICCONST RECIP_BPF Random SG_MAGICCONST SystemRandom TWOPI betavariate binomialvariate choice choices expovariate gammavariate gauss getrandbits getstate lognormvariate normalvariate paretovariate randbytes randint random randrange sample seed setstate shuffle triangular uniform vonmisesvariate weibullvariate",
+   "cpython": 32
+  },
+  "re": {
+   "both": "A ASCII DEBUG DOTALL I IGNORECASE L LOCALE M MULTILINE Match NOFLAG Pattern RegexFlag S T TEMPLATE U UNICODE VERBOSE X compile error escape findall finditer fullmatch match purge search split sub subn",
+   "cpython": 35
+  },
+  "readline": {
+   "both": "add_history append_history_file clear_history get_begidx get_completer get_completer_delims get_completion_type get_current_history_length get_endidx get_history_item get_history_length get_line_buffer insert_text parse_and_bind read_history_file read_init_file redisplay remove_history_item replace_history_item set_auto_history set_completer set_completer_delims set_completion_display_matches_hook set_history_length set_pre_input_hook set_startup_hook write_history_file",
+   "cpython": 27
+  },
+  "reprlib": {
+   "both": "Repr aRepr recursive_repr repr",
+   "cpython": 4
+  },
+  "resource": {
+   "both": "RLIMIT_AS RLIMIT_CORE RLIMIT_CPU RLIMIT_DATA RLIMIT_FSIZE RLIMIT_MEMLOCK RLIMIT_MSGQUEUE RLIMIT_NICE RLIMIT_NOFILE RLIMIT_NPROC RLIMIT_OFILE RLIMIT_RSS RLIMIT_RTPRIO RLIMIT_RTTIME RLIMIT_SIGPENDING RLIMIT_STACK RLIM_INFINITY RUSAGE_CHILDREN RUSAGE_SELF RUSAGE_THREAD error getpagesize getrlimit getrusage prlimit setrlimit struct_rusage",
+   "cpython": 27
+  },
+  "rlcompleter": {
+   "both": "Completer get_class_members",
+   "cpython": 2
+  },
+  "runpy": {
+   "both": "ModuleType run_module run_path",
+   "cpython": 3
+  },
+  "sched": {
+   "both": "Event scheduler",
+   "cpython": 2
+  },
+  "secrets": {
+   "both": "DEFAULT_ENTROPY SystemRandom choice compare_digest randbelow randbits token_bytes token_hex token_urlsafe",
+   "cpython": 9
+  },
+  "select": {
+   "both": "EPOLLERR EPOLLET EPOLLEXCLUSIVE EPOLLHUP EPOLLIN EPOLLMSG EPOLLONESHOT EPOLLOUT EPOLLPRI EPOLLRDBAND EPOLLRDHUP EPOLLRDNORM EPOLLWRBAND EPOLLWRNORM EPOLL_CLOEXEC PIPE_BUF POLLERR POLLHUP POLLIN POLLMSG POLLNVAL POLLOUT POLLPRI POLLRDBAND POLLRDHUP POLLRDNORM POLLWRBAND POLLWRNORM epoll error poll select",
+   "cpython": 32
+  },
+  "selectors": {
+   "both": "BaseSelector DefaultSelector EVENT_READ EVENT_WRITE EpollSelector PollSelector SelectSelector SelectorKey",
+   "cpython": 12
+  },
+  "shelve": {
+   "both": "BsdDbShelf DEFAULT_PROTOCOL DbfilenameShelf Shelf open",
+   "cpython": 5
+  },
+  "shlex": {
+   "both": "join quote shlex split",
+   "cpython": 4
+  },
+  "shutil": {
+   "both": "COPY_BUFSIZE Error ExecError ReadError RegistryError SameFileError SpecialFileError chown copy copy2 copyfile copyfileobj copymode copystat copytree disk_usage get_archive_formats get_terminal_size get_unpack_formats ignore_patterns make_archive move register_archive_format register_unpack_format rmtree unpack_archive unregister_archive_format unregister_unpack_format which",
+   "cpython": 30
+  },
+  "signal": {
+   "both": "Handlers ITIMER_PROF ITIMER_REAL ITIMER_VIRTUAL ItimerError NSIG SIGABRT SIGALRM SIGBUS SIGCHLD SIGCLD SIGCONT SIGFPE SIGHUP SIGILL SIGINT SIGIO SIGIOT SIGKILL SIGPIPE SIGPOLL SIGPROF SIGPWR SIGQUIT SIGRTMAX SIGRTMIN SIGSEGV SIGSTKFLT SIGSTOP SIGSYS SIGTERM SIGTRAP SIGTSTP SIGTTIN SIGTTOU SIGURG SIGUSR1 SIGUSR2 SIGVTALRM SIGWINCH SIGXCPU SIGXFSZ SIG_BLOCK SIG_DFL SIG_IGN SIG_SETMASK SIG_UNBLOCK Sigmasks Signals alarm default_int_handler getitimer getsignal pause pidfd_send_signal pthread_kill pthread_sigmask raise_signal set_wakeup_fd setitimer siginterrupt signal sigpending sigtimedwait sigwait sigwaitinfo strsignal struct_siginfo valid_signals",
+   "cpython": 69
+  },
+  "site": {
+   "both": "ENABLE_USER_SITE PREFIXES USER_BASE USER_SITE abs_paths addpackage addsitedir addsitepackages addusersitepackages check_enableusersite enablerlcompleter execsitecustomize execusercustomize getsitepackages getuserbase getusersitepackages main makepath removeduppaths setcopyright sethelper setquit venv",
+   "cpython": 23
+  },
+  "smtplib": {
+   "both": "CRLF LMTP LMTP_PORT SMTP SMTPAuthenticationError SMTPConnectError SMTPDataError SMTPException SMTPHeloError SMTPNotSupportedError SMTPRecipientsRefused SMTPResponseException SMTPSenderRefused SMTPServerDisconnected SMTP_PORT SMTP_SSL SMTP_SSL_PORT bCRLF quoteaddr quotedata",
+   "cpython": 20
+  },
+  "sndhdr": {
+   "both": "SndHeaders get_long_be get_long_le get_short_be get_short_le test test_8svx test_aifc test_au test_hcom test_sndr test_sndt test_voc test_wav testall tests what whathdr",
+   "cpython": 18
+  },
+  "socket": {
+   "both": "AF_ALG AF_APPLETALK AF_ASH AF_ATMPVC AF_ATMSVC AF_AX25 AF_BLUETOOTH AF_BRIDGE AF_CAN AF_DECnet AF_ECONET AF_INET AF_INET6 AF_IPX AF_IRDA AF_KEY AF_LLC AF_NETBEUI AF_NETLINK AF_NETROM AF_PACKET AF_PPPOX AF_QIPCRTR AF_RDS AF_ROSE AF_ROUTE AF_SECURITY AF_SNA AF_TIPC AF_UNIX AF_UNSPEC AF_VSOCK AF_WANPIPE AF_X25 AI_ADDRCONFIG AI_ALL AI_CANONNAME AI_NUMERICHOST AI_NUMERICSERV AI_PASSIVE AI_V4MAPPED ALG_OP_DECRYPT ALG_OP_ENCRYPT ALG_OP_SIGN ALG_OP_VERIFY ALG_SET_AEAD_ASSOCLEN ALG_SET_AEAD_AUTHSIZE ALG_SET_IV ALG_SET_KEY ALG_SET_OP ALG_SET_PUBKEY AddressFamily AddressInfo BDADDR_ANY BDADDR_LOCAL BTPROTO_HCI BTPROTO_L2CAP BTPROTO_RFCOMM BTPROTO_SCO CAN_BCM CAN_BCM_CAN_FD_FRAME CAN_BCM_RX_ANNOUNCE_RESUME CAN_BCM_RX_CHANGED CAN_BCM_RX_CHECK_DLC CAN_BCM_RX_DELETE CAN_BCM_RX_FILTER_ID CAN_BCM_RX_NO_AUTOTIMER CAN_BCM_RX_READ CAN_BCM_RX_RTR_FRAME CAN_BCM_RX_SETUP CAN_BCM_RX_STATUS CAN_BCM_RX_TIMEOUT CAN_BCM_SETTIMER CAN_BCM_STARTTIMER CAN_BCM_TX_ANNOUNCE CAN_BCM_TX_COUNTEVT CAN_BCM_TX_CP_CAN_ID CAN_BCM_TX_DELETE CAN_BCM_TX_EXPIRED CAN_BCM_TX_READ CAN_BCM_TX_RESET_MULTI_IDX CAN_BCM_TX_SEND CAN_BCM_TX_SETUP CAN_BCM_TX_STATUS CAN_EFF_FLAG CAN_EFF_MASK CAN_ERR_FLAG CAN_ERR_MASK CAN_ISOTP CAN_J1939 CAN_RAW CAN_RAW_FD_FRAMES CAN_RAW_FILTER CAN_RAW_JOIN_FILTERS CAN_RAW_LOOPBACK CAN_RAW_RECV_OWN_MSGS CAN_RTR_FLAG CAN_SFF_MASK CMSG_LEN CMSG_SPACE EAGAIN EAI_ADDRFAMILY EAI_AGAIN EAI_BADFLAGS EAI_FAIL EAI_FAMILY EAI_MEMORY EAI_NODATA EAI_NONAME EAI_OVERFLOW EAI_SERVICE EAI_SOCKTYPE EAI_SYSTEM EBADF ETHERTYPE_ARP ETHERTYPE_IP ETHERTYPE_IPV6 ETHERTYPE_VLAN ETH_P_ALL EWOULDBLOCK HCI_DATA_DIR HCI_FILTER HCI_TIME_STAMP INADDR_ALLHOSTS_GROUP INADDR_ANY INADDR_BROADCAST INADDR_LOOPBACK INADDR_MAX_LOCAL_GROUP INADDR_NONE INADDR_UNSPEC_GROUP IOCTL_VM_SOCKETS_GET_LOCAL_CID IPPORT_RESERVED IPPORT_USERRESERVED IPPROTO_AH IPPROTO_DSTOPTS IPPROTO_EGP IPPROTO_ESP IPPROTO_FRAGMENT IPPROTO_GRE IPPROTO_HOPOPTS IPPROTO_ICMP IPPROTO_ICMPV6 IPPROTO_IDP IPPROTO_IGMP IPPROTO_IP IPPROTO_IPIP IPPROTO_IPV6 IPPROTO_MPTCP IPPROTO_NONE IPPROTO_PIM IPPROTO_PUP IPPROTO_RAW IPPROTO_ROUTING IPPROTO_RSVP IPPROTO_SCTP IPPROTO_TCP IPPROTO_TP IPPROTO_UDP IPPROTO_UDPLITE IPV6_CHECKSUM IPV6_DONTFRAG IPV6_DSTOPTS IPV6_HOPLIMIT IPV6_HOPOPTS IPV6_JOIN_GROUP IPV6_LEAVE_GROUP IPV6_MULTICAST_HOPS IPV6_MULTICAST_IF IPV6_MULTICAST_LOOP IPV6_NEXTHOP IPV6_PATHMTU IPV6_PKTINFO IPV6_RECVDSTOPTS IPV6_RECVHOPLIMIT IPV6_RECVHOPOPTS IPV6_RECVPATHMTU IPV6_RECVPKTINFO IPV6_RECVRTHDR IPV6_RECVTCLASS IPV6_RTHDR IPV6_RTHDRDSTOPTS IPV6_RTHDR_TYPE_0 IPV6_TCLASS IPV6_UNICAST_HOPS IPV6_V6ONLY IP_ADD_MEMBERSHIP IP_ADD_SOURCE_MEMBERSHIP IP_BIND_ADDRESS_NO_PORT IP_BLOCK_SOURCE IP_DEFAULT_MULTICAST_LOOP IP_DEFAULT_MULTICAST_TTL IP_DROP_MEMBERSHIP IP_DROP_SOURCE_MEMBERSHIP IP_HDRINCL IP_MAX_MEMBERSHIPS IP_MULTICAST_IF IP_MULTICAST_LOOP IP_MULTICAST_TTL IP_OPTIONS IP_PKTINFO IP_RECVOPTS IP_RECVRETOPTS IP_RECVTOS IP_RETOPTS IP_TOS IP_TRANSPARENT IP_TTL IP_UNBLOCK_SOURCE J1939_EE_INFO_NONE J1939_EE_INFO_TX_ABORT J1939_FILTER_MAX J1939_IDLE_ADDR J1939_MAX_UNICAST_ADDR J1939_NLA_BYTES_ACKED J1939_NLA_PAD J1939_NO_ADDR J1939_NO_NAME J1939_NO_PGN J1939_PGN_ADDRESS_CLAIMED J1939_PGN_ADDRESS_COMMANDED J1939_PGN_MAX J1939_PGN_PDU1_MAX J1939_PGN_REQUEST MSG_CMSG_CLOEXEC MSG_CONFIRM MSG_CTRUNC MSG_DONTROUTE MSG_DONTWAIT MSG_EOR MSG_ERRQUEUE MSG_FASTOPEN MSG_MORE MSG_NOSIGNAL MSG_OOB MSG_PEEK MSG_TRUNC MSG_WAITALL MsgFlag NETLINK_CRYPTO NETLINK_DNRTMSG NETLINK_FIREWALL NETLINK_IP6_FW NETLINK_NFLOG NETLINK_ROUTE NETLINK_USERSOCK NETLINK_XFRM NI_DGRAM NI_MAXHOST NI_MAXSERV NI_NAMEREQD NI_NOFQDN NI_NUMERICHOST NI_NUMERICSERV PACKET_BROADCAST PACKET_FASTROUTE PACKET_HOST PACKET_LOOPBACK PACKET_MULTICAST PACKET_OTHERHOST PACKET_OUTGOING PF_CAN PF_PACKET PF_RDS SCM_CREDENTIALS SCM_J1939_DEST_ADDR SCM_J1939_DEST_NAME SCM_J1939_ERRQUEUE SCM_J1939_PRIO SCM_RIGHTS SHUT_RD SHUT_RDWR SHUT_WR SOCK_CLOEXEC SOCK_DGRAM SOCK_NONBLOCK SOCK_RAW SOCK_RDM SOCK_SEQPACKET SOCK_STREAM SOL_ALG SOL_CAN_BASE SOL_CAN_RAW SOL_HCI SOL_IP SOL_RDS SOL_SOCKET SOL_TCP SOL_TIPC SOL_UDP SOMAXCONN SO_ACCEPTCONN SO_BINDTODEVICE SO_BROADCAST SO_DEBUG SO_DOMAIN SO_DONTROUTE SO_ERROR SO_INCOMING_CPU SO_J1939_ERRQUEUE SO_J1939_FILTER SO_J1939_PROMISC SO_J1939_SEND_PRIO SO_KEEPALIVE SO_LINGER SO_MARK SO_OOBINLINE SO_PASSCRED SO_PASSSEC SO_PEERCRED SO_PEERSEC SO_PRIORITY SO_PROTOCOL SO_RCVBUF SO_RCVLOWAT SO_RCVTIMEO SO_REUSEADDR SO_REUSEPORT SO_SNDBUF SO_SNDLOWAT SO_SNDTIMEO SO_TYPE SO_VM_SOCKETS_BUFFER_MAX_SIZE SO_VM_SOCKETS_BUFFER_MIN_SIZE SO_VM_SOCKETS_BUFFER_SIZE SocketIO SocketKind SocketType TCP_CC_INFO TCP_CONGESTION TCP_CORK TCP_DEFER_ACCEPT TCP_FASTOPEN TCP_FASTOPEN_CONNECT TCP_FASTOPEN_KEY TCP_FASTOPEN_NO_COOKIE TCP_INFO TCP_INQ TCP_KEEPCNT TCP_KEEPIDLE TCP_KEEPINTVL TCP_LINGER2 TCP_MAXSEG TCP_MD5SIG TCP_MD5SIG_EXT TCP_NODELAY TCP_NOTSENT_LOWAT TCP_QUEUE_SEQ TCP_QUICKACK TCP_REPAIR TCP_REPAIR_OPTIONS TCP_REPAIR_QUEUE TCP_REPAIR_WINDOW TCP_SAVED_SYN TCP_SAVE_SYN TCP_SYNCNT TCP_THIN_DUPACK TCP_THIN_LINEAR_TIMEOUTS TCP_TIMESTAMP TCP_TX_DELAY TCP_ULP TCP_USER_TIMEOUT TCP_WINDOW_CLAMP TCP_ZEROCOPY_RECEIVE TIPC_ADDR_ID TIPC_ADDR_NAME TIPC_ADDR_NAMESEQ TIPC_CFG_SRV TIPC_CLUSTER_SCOPE TIPC_CONN_TIMEOUT TIPC_CRITICAL_IMPORTANCE TIPC_DEST_DROPPABLE TIPC_HIGH_IMPORTANCE TIPC_IMPORTANCE TIPC_LOW_IMPORTANCE TIPC_MEDIUM_IMPORTANCE TIPC_NODE_SCOPE TIPC_PUBLISHED TIPC_SRC_DROPPABLE TIPC_SUBSCR_TIMEOUT TIPC_SUB_CANCEL TIPC_SUB_PORTS TIPC_SUB_SERVICE TIPC_TOP_SRV TIPC_WAIT_FOREVER TIPC_WITHDRAWN TIPC_ZONE_SCOPE UDPLITE_RECV_CSCOV UDPLITE_SEND_CSCOV VMADDR_CID_ANY VMADDR_CID_HOST VMADDR_PORT_ANY VM_SOCKETS_INVALID_VERSION close create_connection create_server dup error fromfd gaierror getaddrinfo getdefaulttimeout getfqdn gethostbyaddr gethostbyname gethostbyname_ex gethostname getnameinfo getprotobyname getservbyname getservbyport has_dualstack_ipv6 has_ipv6 herror htonl htons if_indextoname if_nameindex if_nametoindex inet_aton inet_ntoa inet_ntop inet_pton ntohl ntohs recv_fds send_fds setdefaulttimeout sethostname socket socketpair timeout",
+   "cpython": 432
+  },
+  "socketserver": {
+   "both": "BaseRequestHandler BaseServer DatagramRequestHandler StreamRequestHandler TCPServer ThreadingMixIn ThreadingTCPServer ThreadingUDPServer UDPServer",
+   "cpython": 18
+  },
+  "sqlite3": {
+   "both": "Binary Blob Connection Cursor DataError DatabaseError Date DateFromTicks Error IntegrityError InterfaceError InternalError LEGACY_TRANSACTION_CONTROL NotSupportedError OperationalError PARSE_COLNAMES PARSE_DECLTYPES PrepareProtocol ProgrammingError Row SQLITE_ABORT SQLITE_ABORT_ROLLBACK SQLITE_ALTER_TABLE SQLITE_ANALYZE SQLITE_ATTACH SQLITE_AUTH SQLITE_AUTH_USER SQLITE_BUSY SQLITE_BUSY_RECOVERY SQLITE_BUSY_SNAPSHOT SQLITE_BUSY_TIMEOUT SQLITE_CANTOPEN SQLITE_CANTOPEN_CONVPATH SQLITE_CANTOPEN_DIRTYWAL SQLITE_CANTOPEN_FULLPATH SQLITE_CANTOPEN_ISDIR SQLITE_CANTOPEN_NOTEMPDIR SQLITE_CANTOPEN_SYMLINK SQLITE_CONSTRAINT SQLITE_CONSTRAINT_CHECK SQLITE_CONSTRAINT_COMMITHOOK SQLITE_CONSTRAINT_FOREIGNKEY SQLITE_CONSTRAINT_FUNCTION SQLITE_CONSTRAINT_NOTNULL SQLITE_CONSTRAINT_PINNED SQLITE_CONSTRAINT_PRIMARYKEY SQLITE_CONSTRAINT_ROWID SQLITE_CONSTRAINT_TRIGGER SQLITE_CONSTRAINT_UNIQUE SQLITE_CONSTRAINT_VTAB SQLITE_CORRUPT SQLITE_CORRUPT_INDEX SQLITE_CORRUPT_SEQUENCE SQLITE_CORRUPT_VTAB SQLITE_CREATE_INDEX SQLITE_CREATE_TABLE SQLITE_CREATE_TEMP_INDEX SQLITE_CREATE_TEMP_TABLE SQLITE_CREATE_TEMP_TRIGGER SQLITE_CREATE_TEMP_VIEW SQLITE_CREATE_TRIGGER SQLITE_CREATE_VIEW SQLITE_CREATE_VTABLE SQLITE_DBCONFIG_DEFENSIVE SQLITE_DBCONFIG_DQS_DDL SQLITE_DBCONFIG_DQS_DML SQLITE_DBCONFIG_ENABLE_FKEY SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION SQLITE_DBCONFIG_ENABLE_QPSG SQLITE_DBCONFIG_ENABLE_TRIGGER SQLITE_DBCONFIG_ENABLE_VIEW SQLITE_DBCONFIG_LEGACY_ALTER_TABLE SQLITE_DBCONFIG_LEGACY_FILE_FORMAT SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE SQLITE_DBCONFIG_RESET_DATABASE SQLITE_DBCONFIG_TRIGGER_EQP SQLITE_DBCONFIG_TRUSTED_SCHEMA SQLITE_DBCONFIG_WRITABLE_SCHEMA SQLITE_DELETE SQLITE_DENY SQLITE_DETACH SQLITE_DONE SQLITE_DROP_INDEX SQLITE_DROP_TABLE SQLITE_DROP_TEMP_INDEX SQLITE_DROP_TEMP_TABLE SQLITE_DROP_TEMP_TRIGGER SQLITE_DROP_TEMP_VIEW SQLITE_DROP_TRIGGER SQLITE_DROP_VIEW SQLITE_DROP_VTABLE SQLITE_EMPTY SQLITE_ERROR SQLITE_ERROR_MISSING_COLLSEQ SQLITE_ERROR_RETRY SQLITE_ERROR_SNAPSHOT SQLITE_FORMAT SQLITE_FULL SQLITE_FUNCTION SQLITE_IGNORE SQLITE_INSERT SQLITE_INTERNAL SQLITE_INTERRUPT SQLITE_IOERR SQLITE_IOERR_ACCESS SQLITE_IOERR_AUTH SQLITE_IOERR_BEGIN_ATOMIC SQLITE_IOERR_BLOCKED SQLITE_IOERR_CHECKRESERVEDLOCK SQLITE_IOERR_CLOSE SQLITE_IOERR_COMMIT_ATOMIC SQLITE_IOERR_CONVPATH SQLITE_IOERR_CORRUPTFS SQLITE_IOERR_DATA SQLITE_IOERR_DELETE SQLITE_IOERR_DELETE_NOENT SQLITE_IOERR_DIR_CLOSE SQLITE_IOERR_DIR_FSYNC SQLITE_IOERR_FSTAT SQLITE_IOERR_FSYNC SQLITE_IOERR_GETTEMPPATH SQLITE_IOERR_LOCK SQLITE_IOERR_MMAP SQLITE_IOERR_NOMEM SQLITE_IOERR_RDLOCK SQLITE_IOERR_READ SQLITE_IOERR_ROLLBACK_ATOMIC SQLITE_IOERR_SEEK SQLITE_IOERR_SHMLOCK SQLITE_IOERR_SHMMAP SQLITE_IOERR_SHMOPEN SQLITE_IOERR_SHMSIZE SQLITE_IOERR_SHORT_READ SQLITE_IOERR_TRUNCATE SQLITE_IOERR_UNLOCK SQLITE_IOERR_VNODE SQLITE_IOERR_WRITE SQLITE_LIMIT_ATTACHED SQLITE_LIMIT_COLUMN SQLITE_LIMIT_COMPOUND_SELECT SQLITE_LIMIT_EXPR_DEPTH SQLITE_LIMIT_FUNCTION_ARG SQLITE_LIMIT_LENGTH SQLITE_LIMIT_LIKE_PATTERN_LENGTH SQLITE_LIMIT_SQL_LENGTH SQLITE_LIMIT_TRIGGER_DEPTH SQLITE_LIMIT_VARIABLE_NUMBER SQLITE_LIMIT_VDBE_OP SQLITE_LIMIT_WORKER_THREADS SQLITE_LOCKED SQLITE_LOCKED_SHAREDCACHE SQLITE_LOCKED_VTAB SQLITE_MISMATCH SQLITE_MISUSE SQLITE_NOLFS SQLITE_NOMEM SQLITE_NOTADB SQLITE_NOTFOUND SQLITE_NOTICE SQLITE_NOTICE_RECOVER_ROLLBACK SQLITE_NOTICE_RECOVER_WAL SQLITE_OK SQLITE_OK_LOAD_PERMANENTLY SQLITE_OK_SYMLINK SQLITE_PERM SQLITE_PRAGMA SQLITE_PROTOCOL SQLITE_RANGE SQLITE_READ SQLITE_READONLY SQLITE_READONLY_CANTINIT SQLITE_READONLY_CANTLOCK SQLITE_READONLY_DBMOVED SQLITE_READONLY_DIRECTORY SQLITE_READONLY_RECOVERY SQLITE_READONLY_ROLLBACK SQLITE_RECURSIVE SQLITE_REINDEX SQLITE_ROW SQLITE_SAVEPOINT SQLITE_SCHEMA SQLITE_SELECT SQLITE_TOOBIG SQLITE_TRANSACTION SQLITE_UPDATE SQLITE_WARNING SQLITE_WARNING_AUTOINDEX Time TimeFromTicks Timestamp TimestampFromTicks Warning adapt adapters apilevel complete_statement connect converters dbapi2 enable_callback_tracebacks enable_shared_cache paramstyle register_adapter register_converter sqlite_version sqlite_version_info threadsafety version version_info",
+   "cpython": 210
+  },
+  "sqlite3.dbapi2": {
+   "both": "Binary Blob Connection Cursor DataError DatabaseError Date DateFromTicks Error IntegrityError InterfaceError InternalError LEGACY_TRANSACTION_CONTROL NotSupportedError OperationalError PARSE_COLNAMES PARSE_DECLTYPES PrepareProtocol ProgrammingError Row SQLITE_ABORT SQLITE_ABORT_ROLLBACK SQLITE_ALTER_TABLE SQLITE_ANALYZE SQLITE_ATTACH SQLITE_AUTH SQLITE_AUTH_USER SQLITE_BUSY SQLITE_BUSY_RECOVERY SQLITE_BUSY_SNAPSHOT SQLITE_BUSY_TIMEOUT SQLITE_CANTOPEN SQLITE_CANTOPEN_CONVPATH SQLITE_CANTOPEN_DIRTYWAL SQLITE_CANTOPEN_FULLPATH SQLITE_CANTOPEN_ISDIR SQLITE_CANTOPEN_NOTEMPDIR SQLITE_CANTOPEN_SYMLINK SQLITE_CONSTRAINT SQLITE_CONSTRAINT_CHECK SQLITE_CONSTRAINT_COMMITHOOK SQLITE_CONSTRAINT_FOREIGNKEY SQLITE_CONSTRAINT_FUNCTION SQLITE_CONSTRAINT_NOTNULL SQLITE_CONSTRAINT_PINNED SQLITE_CONSTRAINT_PRIMARYKEY SQLITE_CONSTRAINT_ROWID SQLITE_CONSTRAINT_TRIGGER SQLITE_CONSTRAINT_UNIQUE SQLITE_CONSTRAINT_VTAB SQLITE_CORRUPT SQLITE_CORRUPT_INDEX SQLITE_CORRUPT_SEQUENCE SQLITE_CORRUPT_VTAB SQLITE_CREATE_INDEX SQLITE_CREATE_TABLE SQLITE_CREATE_TEMP_INDEX SQLITE_CREATE_TEMP_TABLE SQLITE_CREATE_TEMP_TRIGGER SQLITE_CREATE_TEMP_VIEW SQLITE_CREATE_TRIGGER SQLITE_CREATE_VIEW SQLITE_CREATE_VTABLE SQLITE_DBCONFIG_DEFENSIVE SQLITE_DBCONFIG_DQS_DDL SQLITE_DBCONFIG_DQS_DML SQLITE_DBCONFIG_ENABLE_FKEY SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION SQLITE_DBCONFIG_ENABLE_QPSG SQLITE_DBCONFIG_ENABLE_TRIGGER SQLITE_DBCONFIG_ENABLE_VIEW SQLITE_DBCONFIG_LEGACY_ALTER_TABLE SQLITE_DBCONFIG_LEGACY_FILE_FORMAT SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE SQLITE_DBCONFIG_RESET_DATABASE SQLITE_DBCONFIG_TRIGGER_EQP SQLITE_DBCONFIG_TRUSTED_SCHEMA SQLITE_DBCONFIG_WRITABLE_SCHEMA SQLITE_DELETE SQLITE_DENY SQLITE_DETACH SQLITE_DONE SQLITE_DROP_INDEX SQLITE_DROP_TABLE SQLITE_DROP_TEMP_INDEX SQLITE_DROP_TEMP_TABLE SQLITE_DROP_TEMP_TRIGGER SQLITE_DROP_TEMP_VIEW SQLITE_DROP_TRIGGER SQLITE_DROP_VIEW SQLITE_DROP_VTABLE SQLITE_EMPTY SQLITE_ERROR SQLITE_ERROR_MISSING_COLLSEQ SQLITE_ERROR_RETRY SQLITE_ERROR_SNAPSHOT SQLITE_FORMAT SQLITE_FULL SQLITE_FUNCTION SQLITE_IGNORE SQLITE_INSERT SQLITE_INTERNAL SQLITE_INTERRUPT SQLITE_IOERR SQLITE_IOERR_ACCESS SQLITE_IOERR_AUTH SQLITE_IOERR_BEGIN_ATOMIC SQLITE_IOERR_BLOCKED SQLITE_IOERR_CHECKRESERVEDLOCK SQLITE_IOERR_CLOSE SQLITE_IOERR_COMMIT_ATOMIC SQLITE_IOERR_CONVPATH SQLITE_IOERR_CORRUPTFS SQLITE_IOERR_DATA SQLITE_IOERR_DELETE SQLITE_IOERR_DELETE_NOENT SQLITE_IOERR_DIR_CLOSE SQLITE_IOERR_DIR_FSYNC SQLITE_IOERR_FSTAT SQLITE_IOERR_FSYNC SQLITE_IOERR_GETTEMPPATH SQLITE_IOERR_LOCK SQLITE_IOERR_MMAP SQLITE_IOERR_NOMEM SQLITE_IOERR_RDLOCK SQLITE_IOERR_READ SQLITE_IOERR_ROLLBACK_ATOMIC SQLITE_IOERR_SEEK SQLITE_IOERR_SHMLOCK SQLITE_IOERR_SHMMAP SQLITE_IOERR_SHMOPEN SQLITE_IOERR_SHMSIZE SQLITE_IOERR_SHORT_READ SQLITE_IOERR_TRUNCATE SQLITE_IOERR_UNLOCK SQLITE_IOERR_VNODE SQLITE_IOERR_WRITE SQLITE_LIMIT_ATTACHED SQLITE_LIMIT_COLUMN SQLITE_LIMIT_COMPOUND_SELECT SQLITE_LIMIT_EXPR_DEPTH SQLITE_LIMIT_FUNCTION_ARG SQLITE_LIMIT_LENGTH SQLITE_LIMIT_LIKE_PATTERN_LENGTH SQLITE_LIMIT_SQL_LENGTH SQLITE_LIMIT_TRIGGER_DEPTH SQLITE_LIMIT_VARIABLE_NUMBER SQLITE_LIMIT_VDBE_OP SQLITE_LIMIT_WORKER_THREADS SQLITE_LOCKED SQLITE_LOCKED_SHAREDCACHE SQLITE_LOCKED_VTAB SQLITE_MISMATCH SQLITE_MISUSE SQLITE_NOLFS SQLITE_NOMEM SQLITE_NOTADB SQLITE_NOTFOUND SQLITE_NOTICE SQLITE_NOTICE_RECOVER_ROLLBACK SQLITE_NOTICE_RECOVER_WAL SQLITE_OK SQLITE_OK_LOAD_PERMANENTLY SQLITE_OK_SYMLINK SQLITE_PERM SQLITE_PRAGMA SQLITE_PROTOCOL SQLITE_RANGE SQLITE_READ SQLITE_READONLY SQLITE_READONLY_CANTINIT SQLITE_READONLY_CANTLOCK SQLITE_READONLY_DBMOVED SQLITE_READONLY_DIRECTORY SQLITE_READONLY_RECOVERY SQLITE_READONLY_ROLLBACK SQLITE_RECURSIVE SQLITE_REINDEX SQLITE_ROW SQLITE_SAVEPOINT SQLITE_SCHEMA SQLITE_SELECT SQLITE_TOOBIG SQLITE_TRANSACTION SQLITE_UPDATE SQLITE_WARNING SQLITE_WARNING_AUTOINDEX Time TimeFromTicks Timestamp TimestampFromTicks Warning adapt adapters apilevel complete_statement connect converters enable_callback_tracebacks enable_shared_cache paramstyle register_adapter register_converter sqlite_version sqlite_version_info threadsafety version version_info",
+   "cpython": 209
+  },
+  "sqlite3.dump": {
+   "both": "",
+   "cpython": 0
+  },
+  "ssl": {
+   "both": "ALERT_DESCRIPTION_ACCESS_DENIED ALERT_DESCRIPTION_BAD_CERTIFICATE ALERT_DESCRIPTION_BAD_CERTIFICATE_HASH_VALUE ALERT_DESCRIPTION_BAD_CERTIFICATE_STATUS_RESPONSE ALERT_DESCRIPTION_BAD_RECORD_MAC ALERT_DESCRIPTION_CERTIFICATE_EXPIRED ALERT_DESCRIPTION_CERTIFICATE_REVOKED ALERT_DESCRIPTION_CERTIFICATE_UNKNOWN ALERT_DESCRIPTION_CERTIFICATE_UNOBTAINABLE ALERT_DESCRIPTION_CLOSE_NOTIFY ALERT_DESCRIPTION_DECODE_ERROR ALERT_DESCRIPTION_DECOMPRESSION_FAILURE ALERT_DESCRIPTION_DECRYPT_ERROR ALERT_DESCRIPTION_HANDSHAKE_FAILURE ALERT_DESCRIPTION_ILLEGAL_PARAMETER ALERT_DESCRIPTION_INSUFFICIENT_SECURITY ALERT_DESCRIPTION_INTERNAL_ERROR ALERT_DESCRIPTION_NO_RENEGOTIATION ALERT_DESCRIPTION_PROTOCOL_VERSION ALERT_DESCRIPTION_RECORD_OVERFLOW ALERT_DESCRIPTION_UNEXPECTED_MESSAGE ALERT_DESCRIPTION_UNKNOWN_CA ALERT_DESCRIPTION_UNKNOWN_PSK_IDENTITY ALERT_DESCRIPTION_UNRECOGNIZED_NAME ALERT_DESCRIPTION_UNSUPPORTED_CERTIFICATE ALERT_DESCRIPTION_UNSUPPORTED_EXTENSION ALERT_DESCRIPTION_USER_CANCELLED AlertDescription CERT_NONE CERT_OPTIONAL CERT_REQUIRED CHANNEL_BINDING_TYPES CertificateError DER_cert_to_PEM_cert DefaultVerifyPaths HAS_ALPN HAS_ECDH HAS_NEVER_CHECK_COMMON_NAME HAS_NPN HAS_SNI HAS_SSLv2 HAS_SSLv3 HAS_TLSv1 HAS_TLSv1_1 HAS_TLSv1_2 HAS_TLSv1_3 OPENSSL_VERSION OPENSSL_VERSION_INFO OPENSSL_VERSION_NUMBER OP_ALL OP_CIPHER_SERVER_PREFERENCE OP_ENABLE_KTLS OP_ENABLE_MIDDLEBOX_COMPAT OP_IGNORE_UNEXPECTED_EOF OP_LEGACY_SERVER_CONNECT OP_NO_COMPRESSION OP_NO_RENEGOTIATION OP_NO_SSLv2 OP_NO_SSLv3 OP_NO_TICKET OP_NO_TLSv1 OP_NO_TLSv1_1 OP_NO_TLSv1_2 OP_NO_TLSv1_3 OP_SINGLE_DH_USE OP_SINGLE_ECDH_USE Options PEM_FOOTER PEM_HEADER PEM_cert_to_DER_cert PROTOCOL_SSLv23 PROTOCOL_TLS PROTOCOL_TLS_CLIENT PROTOCOL_TLS_SERVER PROTOCOL_TLSv1 PROTOCOL_TLSv1_1 PROTOCOL_TLSv1_2 Purpose RAND_add RAND_bytes RAND_pseudo_bytes RAND_status SOCK_STREAM SOL_SOCKET SO_TYPE SSLCertVerificationError SSLContext SSLEOFError SSLError SSLErrorNumber SSLSocket SSLSyscallError SSLWantReadError SSLWantWriteError SSLZeroReturnError SSL_ERROR_EOF SSL_ERROR_INVALID_ERROR_CODE SSL_ERROR_SSL SSL_ERROR_SYSCALL SSL_ERROR_WANT_CONNECT SSL_ERROR_WANT_READ SSL_ERROR_WANT_WRITE SSL_ERROR_WANT_X509_LOOKUP SSL_ERROR_ZERO_RETURN TLSVersion VERIFY_ALLOW_PROXY_CERTS VERIFY_CRL_CHECK_CHAIN VERIFY_CRL_CHECK_LEAF VERIFY_DEFAULT VERIFY_X509_PARTIAL_CHAIN VERIFY_X509_STRICT VERIFY_X509_TRUSTED_FIRST VerifyFlags VerifyMode cert_time_to_seconds create_connection create_default_context get_default_verify_paths get_protocol_name get_server_certificate match_hostname socket socket_error wrap_socket",
+   "cpython": 128
+  },
+  "stat": {
+   "both": "FILE_ATTRIBUTE_ARCHIVE FILE_ATTRIBUTE_COMPRESSED FILE_ATTRIBUTE_DEVICE FILE_ATTRIBUTE_DIRECTORY FILE_ATTRIBUTE_ENCRYPTED FILE_ATTRIBUTE_HIDDEN FILE_ATTRIBUTE_INTEGRITY_STREAM FILE_ATTRIBUTE_NORMAL FILE_ATTRIBUTE_NOT_CONTENT_INDEXED FILE_ATTRIBUTE_NO_SCRUB_DATA FILE_ATTRIBUTE_OFFLINE FILE_ATTRIBUTE_READONLY FILE_ATTRIBUTE_REPARSE_POINT FILE_ATTRIBUTE_SPARSE_FILE FILE_ATTRIBUTE_SYSTEM FILE_ATTRIBUTE_TEMPORARY FILE_ATTRIBUTE_VIRTUAL SF_APPEND SF_ARCHIVED SF_IMMUTABLE SF_NOUNLINK SF_SNAPSHOT ST_ATIME ST_CTIME ST_DEV ST_GID ST_INO ST_MODE ST_MTIME ST_NLINK ST_SIZE ST_UID S_ENFMT S_IEXEC S_IFBLK S_IFCHR S_IFDIR S_IFDOOR S_IFIFO S_IFLNK S_IFMT S_IFPORT S_IFREG S_IFSOCK S_IFWHT S_IMODE S_IREAD S_IRGRP S_IROTH S_IRUSR S_IRWXG S_IRWXO S_IRWXU S_ISBLK S_ISCHR S_ISDIR S_ISDOOR S_ISFIFO S_ISGID S_ISLNK S_ISPORT S_ISREG S_ISSOCK S_ISUID S_ISVTX S_ISWHT S_IWGRP S_IWOTH S_IWRITE S_IWUSR S_IXGRP S_IXOTH S_IXUSR UF_APPEND UF_COMPRESSED UF_HIDDEN UF_IMMUTABLE UF_NODUMP UF_NOUNLINK UF_OPAQUE filemode",
+   "cpython": 81
+  },
+  "statistics": {
+   "both": "LinearRegression NormalDist StatisticsError correlation covariance fmean geometric_mean harmonic_mean linear_regression mean median median_grouped median_high median_low mode multimode pstdev pvariance quantiles stdev variance",
+   "cpython": 22
+  },
+  "string": {
+   "both": "Formatter Template ascii_letters ascii_lowercase ascii_uppercase capwords digits hexdigits octdigits printable punctuation whitespace",
+   "cpython": 12
+  },
+  "stringprep": {
+   "both": "b1_set b3_exceptions c22_specials c6_set c7_set c8_set c9_set in_table_a1 in_table_b1 in_table_c11 in_table_c11_c12 in_table_c12 in_table_c21 in_table_c21_c22 in_table_c22 in_table_c3 in_table_c4 in_table_c5 in_table_c6 in_table_c7 in_table_c8 in_table_c9 in_table_d1 in_table_d2 map_table_b2 map_table_b3",
+   "cpython": 27
+  },
+  "struct": {
+   "both": "Struct calcsize error iter_unpack pack pack_into unpack unpack_from",
+   "cpython": 8
+  },
+  "subprocess": {
+   "both": "CalledProcessError CompletedProcess DEVNULL PIPE Popen STDOUT SubprocessError TimeoutExpired call check_call check_output getoutput getstatusoutput list2cmdline run",
+   "cpython": 15
+  },
+  "sunau": {
+   "both": "AUDIO_FILE_ENCODING_ADPCM_G721 AUDIO_FILE_ENCODING_ADPCM_G722 AUDIO_FILE_ENCODING_ADPCM_G723_3 AUDIO_FILE_ENCODING_ADPCM_G723_5 AUDIO_FILE_ENCODING_ALAW_8 AUDIO_FILE_ENCODING_DOUBLE AUDIO_FILE_ENCODING_FLOAT AUDIO_FILE_ENCODING_LINEAR_16 AUDIO_FILE_ENCODING_LINEAR_24 AUDIO_FILE_ENCODING_LINEAR_32 AUDIO_FILE_ENCODING_LINEAR_8 AUDIO_FILE_ENCODING_MULAW_8 AUDIO_FILE_MAGIC AUDIO_UNKNOWN_SIZE Au_read Au_write Error namedtuple open",
+   "cpython": 19
+  },
+  "symtable": {
+   "both": "CELL Class DEF_ANNOT DEF_BOUND DEF_GLOBAL DEF_IMPORT DEF_LOCAL DEF_NONLOCAL DEF_PARAM FREE Function GLOBAL_EXPLICIT GLOBAL_IMPLICIT LOCAL SCOPE_MASK SCOPE_OFF Symbol SymbolTable SymbolTableFactory USE symtable",
+   "cpython": 21
+  },
+  "sys": {
+   "both": "abiflags addaudithook api_version argv audit base_exec_prefix base_prefix breakpointhook builtin_module_names byteorder call_tracing copyright displayhook dont_write_bytecode exc_info excepthook exception exec_prefix executable exit flags float_info float_repr_style get_asyncgen_hooks get_coroutine_origin_tracking_depth get_int_max_str_digits getallocatedblocks getdefaultencoding getdlopenflags getfilesystemencodeerrors getfilesystemencoding getprofile getrecursionlimit getrefcount getsizeof getswitchinterval gettrace hash_info hexversion implementation int_info intern is_finalizing maxsize maxunicode meta_path modules orig_argv path path_hooks path_importer_cache platform platlibdir prefix pycache_prefix set_asyncgen_hooks set_coroutine_origin_tracking_depth set_int_max_str_digits setdlopenflags setprofile setrecursionlimit setswitchinterval settrace stderr stdin stdlib_module_names stdout thread_info unraisablehook version version_info warnoptions",
+   "cpython": 77
+  },
+  "sysconfig": {
+   "both": "get_config_h_filename get_config_var get_config_vars get_default_scheme get_makefile_filename get_path get_path_names get_paths get_platform get_preferred_scheme get_python_version get_scheme_names is_python_build parse_config_h",
+   "cpython": 16
+  },
+  "syslog": {
+   "both": "LOG_ALERT LOG_AUTH LOG_AUTHPRIV LOG_CONS LOG_CRIT LOG_CRON LOG_DAEMON LOG_DEBUG LOG_EMERG LOG_ERR LOG_INFO LOG_KERN LOG_LOCAL0 LOG_LOCAL1 LOG_LOCAL2 LOG_LOCAL3 LOG_LOCAL4 LOG_LOCAL5 LOG_LOCAL6 LOG_LOCAL7 LOG_LPR LOG_MAIL LOG_MASK LOG_NDELAY LOG_NEWS LOG_NOTICE LOG_NOWAIT LOG_ODELAY LOG_PERROR LOG_PID LOG_SYSLOG LOG_UPTO LOG_USER LOG_UUCP LOG_WARNING closelog openlog setlogmask syslog",
+   "cpython": 39
+  },
+  "tabnanny": {
+   "both": "NannyNag Whitespace check errprint filename_only format_witnesses main process_tokens verbose",
+   "cpython": 9
+  },
+  "tarfile": {
+   "both": "AREGTYPE AbsoluteLinkError AbsolutePathError BLKTYPE BLOCKSIZE CHRTYPE CONTTYPE CompressionError DEFAULT_FORMAT DIRTYPE ENCODING EOFHeaderError EmptyHeaderError ExFileObject ExtractError FIFOTYPE FilterError GNUTYPE_LONGLINK GNUTYPE_LONGNAME GNUTYPE_SPARSE GNU_FORMAT GNU_MAGIC GNU_TYPES HeaderError InvalidHeaderError LENGTH_LINK LENGTH_NAME LENGTH_PREFIX LNKTYPE LinkOutsideDestinationError NUL OutsideDestinationError PAX_FIELDS PAX_FORMAT PAX_NAME_FIELDS PAX_NUMBER_FIELDS POSIX_MAGIC RECORDSIZE REGTYPE REGULAR_TYPES ReadError SOLARIS_XHDTYPE SUPPORTED_TYPES SYMTYPE SpecialFileError StreamError SubsequentHeaderError TarError TarFile TarInfo TruncatedHeaderError USTAR_FORMAT XGLTYPE XHDTYPE calc_chksums copyfileobj data_filter fully_trusted_filter is_tarfile itn main nti nts open stn tar_filter",
+   "cpython": 69
+  },
+  "telnetlib": {
+   "both": "AO AUTHENTICATION AYT BINARY BM BRK CHARSET COM_PORT_OPTION DEBUGLEVEL DET DM DO DONT EC ECHO EL ENCRYPT EOR EXOPL FORWARD_X GA IAC IP KERMIT LFLOW LINEMODE LOGOUT NAMS NAOCRD NAOFFD NAOHTD NAOHTS NAOL NAOLFD NAOP NAOVTD NAOVTS NAWS NEW_ENVIRON NOOPT NOP OLD_ENVIRON OUTMRK PRAGMA_HEARTBEAT PRAGMA_LOGON RCP RCTE RSP SB SE SEND_URL SGA SNDLOC SSPI_LOGON STATUS SUPDUP SUPDUPOUTPUT SUPPRESS_LOCAL_ECHO TELNET_PORT TLS TM TN3270E TSPEED TTYLOC TTYPE TUID Telnet VT3270REGIME WILL WONT X3PAD XASCII XAUTH XDISPLOC test theNULL",
+   "cpython": 76
+  },
+  "tempfile": {
+   "both": "NamedTemporaryFile SpooledTemporaryFile TMP_MAX TemporaryDirectory TemporaryFile gettempdir gettempdirb gettempprefix gettempprefixb mkdtemp mkstemp mktemp tempdir template",
+   "cpython": 14
+  },
+  "termios": {
+   "both": "B0 B1000000 B110 B115200 B1152000 B1200 B134 B150 B1500000 B1800 B19200 B200 B2000000 B230400 B2400 B2500000 B300 B3000000 B3500000 B38400 B4000000 B460800 B4800 B50 B500000 B57600 B576000 B600 B75 B921600 B9600 BRKINT BS0 BS1 BSDLY CBAUD CBAUDEX CDSUSP CEOF CEOL CEOT CERASE CFLUSH CIBAUD CINTR CKILL CLNEXT CLOCAL CQUIT CR0 CR1 CR2 CR3 CRDLY CREAD CRPRNT CRTSCTS CS5 CS6 CS7 CS8 CSIZE CSTART CSTOP CSTOPB CSUSP CWERASE ECHO ECHOCTL ECHOE ECHOK ECHOKE ECHONL ECHOPRT EXTA EXTB FF0 FF1 FFDLY FIOASYNC FIOCLEX FIONBIO FIONCLEX FIONREAD FLUSHO HUPCL ICANON ICRNL IEXTEN IGNBRK IGNCR IGNPAR IMAXBEL INLCR INPCK IOCSIZE_MASK IOCSIZE_SHIFT ISIG ISTRIP IUCLC IXANY IXOFF IXON NCC NCCS NL0 NL1 NLDLY NOFLSH N_MOUSE N_PPP N_SLIP N_STRIP N_TTY OCRNL OFDEL OFILL OLCUC ONLCR ONLRET ONOCR OPOST PARENB PARMRK PARODD PENDIN TAB0 TAB1 TAB2 TAB3 TABDLY TCFLSH TCGETA TCGETS TCIFLUSH TCIOFF TCIOFLUSH TCION TCOFLUSH TCOOFF TCOON TCSADRAIN TCSAFLUSH TCSANOW TCSBRK TCSBRKP TCSETA TCSETAF TCSETAW TCSETS TCSETSF TCSETSW TCXONC TIOCCONS TIOCEXCL TIOCGETD TIOCGICOUNT TIOCGLCKTRMIOS TIOCGPGRP TIOCGSERIAL TIOCGSOFTCAR TIOCGWINSZ TIOCINQ TIOCLINUX TIOCMBIC TIOCMBIS TIOCMGET TIOCMIWAIT TIOCMSET TIOCM_CAR TIOCM_CD TIOCM_CTS TIOCM_DSR TIOCM_DTR TIOCM_LE TIOCM_RI TIOCM_RNG TIOCM_RTS TIOCM_SR TIOCM_ST TIOCNOTTY TIOCNXCL TIOCOUTQ TIOCPKT TIOCPKT_DATA TIOCPKT_DOSTOP TIOCPKT_FLUSHREAD TIOCPKT_FLUSHWRITE TIOCPKT_NOSTOP TIOCPKT_START TIOCPKT_STOP TIOCSCTTY TIOCSERCONFIG TIOCSERGETLSR TIOCSERGETMULTI TIOCSERGSTRUCT TIOCSERGWILD TIOCSERSETMULTI TIOCSERSWILD TIOCSER_TEMT TIOCSETD TIOCSLCKTRMIOS TIOCSPGRP TIOCSSERIAL TIOCSSOFTCAR TIOCSTI TIOCSWINSZ TOSTOP VDISCARD VEOF VEOL VEOL2 VERASE VINTR VKILL VLNEXT VMIN VQUIT VREPRINT VSTART VSTOP VSUSP VSWTC VSWTCH VT0 VT1 VTDLY VTIME VWERASE XCASE XTABS error tcdrain tcflow tcflush tcgetattr tcgetwinsize tcsendbreak tcsetattr tcsetwinsize",
+   "cpython": 240
+  },
+  "textwrap": {
+   "both": "TextWrapper dedent fill indent shorten wrap",
+   "cpython": 6
+  },
+  "threading": {
+   "both": "Barrier BoundedSemaphore BrokenBarrierError Condition Event Lock RLock Semaphore TIMEOUT_MAX Thread ThreadError Timer activeCount active_count currentThread current_thread enumerate excepthook get_ident get_native_id getprofile gettrace local main_thread setprofile settrace stack_size",
+   "cpython": 30
+  },
+  "time": {
+   "both": "CLOCK_BOOTTIME CLOCK_MONOTONIC CLOCK_MONOTONIC_RAW CLOCK_PROCESS_CPUTIME_ID CLOCK_REALTIME CLOCK_TAI CLOCK_THREAD_CPUTIME_ID altzone asctime clock_getres clock_gettime clock_gettime_ns clock_settime clock_settime_ns ctime daylight get_clock_info gmtime localtime mktime monotonic monotonic_ns perf_counter perf_counter_ns process_time process_time_ns pthread_getcpuclockid sleep strftime strptime struct_time thread_time thread_time_ns time time_ns timezone tzname tzset",
+   "cpython": 38
+  },
+  "timeit": {
+   "both": "Timer default_number default_repeat default_timer dummy_src_name main reindent repeat template timeit",
+   "cpython": 10
+  },
+  "token": {
+   "both": "AMPER AMPEREQUAL ASYNC AT ATEQUAL AWAIT CIRCUMFLEX CIRCUMFLEXEQUAL COLON COLONEQUAL COMMA COMMENT DEDENT DOT DOUBLESLASH DOUBLESLASHEQUAL DOUBLESTAR DOUBLESTAREQUAL ELLIPSIS ENCODING ENDMARKER EQEQUAL EQUAL ERRORTOKEN EXACT_TOKEN_TYPES EXCLAMATION FSTRING_END FSTRING_MIDDLE FSTRING_START GREATER GREATEREQUAL INDENT ISEOF ISNONTERMINAL ISTERMINAL LBRACE LEFTSHIFT LEFTSHIFTEQUAL LESS LESSEQUAL LPAR LSQB MINEQUAL MINUS NAME NEWLINE NL NOTEQUAL NT_OFFSET NUMBER N_TOKENS OP PERCENT PERCENTEQUAL PLUS PLUSEQUAL RARROW RBRACE RIGHTSHIFT RIGHTSHIFTEQUAL RPAR RSQB SEMI SLASH SLASHEQUAL SOFT_KEYWORD STAR STAREQUAL STRING TILDE TYPE_COMMENT TYPE_IGNORE VBAR VBAREQUAL tok_name",
+   "cpython": 75
+  },
+  "tokenize": {
+   "both": "AMPER AMPEREQUAL ASYNC AT ATEQUAL AWAIT BOM_UTF8 CIRCUMFLEX CIRCUMFLEXEQUAL COLON COLONEQUAL COMMA COMMENT DEDENT DOT DOUBLESLASH DOUBLESLASHEQUAL DOUBLESTAR DOUBLESTAREQUAL ELLIPSIS ENCODING ENDMARKER EQEQUAL EQUAL ERRORTOKEN EXACT_TOKEN_TYPES EXCLAMATION FSTRING_END FSTRING_MIDDLE FSTRING_START GREATER GREATEREQUAL INDENT ISEOF ISNONTERMINAL ISTERMINAL LBRACE LEFTSHIFT LEFTSHIFTEQUAL LESS LESSEQUAL LPAR LSQB MINEQUAL MINUS NAME NEWLINE NL NOTEQUAL NT_OFFSET NUMBER N_TOKENS OP PERCENT PERCENTEQUAL PLUS PLUSEQUAL RARROW RBRACE RIGHTSHIFT RIGHTSHIFTEQUAL RPAR RSQB SEMI SLASH SLASHEQUAL SOFT_KEYWORD STAR STAREQUAL STRING StopTokenizing TILDE TYPE_COMMENT TYPE_IGNORE TokenError TokenInfo Untokenizer VBAR VBAREQUAL detect_encoding generate_tokens main open tabsize tok_name tokenize untokenize",
+   "cpython": 122
+  },
+  "tomllib": {
+   "both": "TOMLDecodeError load loads",
+   "cpython": 3
+  },
+  "trace": {
+   "both": "CoverageResults PRAGMA_NOCOVER Trace main",
+   "cpython": 4
+  },
+  "traceback": {
+   "both": "FrameSummary StackSummary TracebackException clear_frames extract_stack extract_tb format_exc format_exception format_exception_only format_list format_stack format_tb print_exc print_exception print_last print_list print_stack print_tb walk_stack walk_tb",
+   "cpython": 20
+  },
+  "tracemalloc": {
+   "both": "BaseFilter DomainFilter Filter Frame Iterable Sequence Snapshot Statistic StatisticDiff Trace Traceback clear_traces get_object_traceback get_traceback_limit get_traced_memory get_tracemalloc_memory is_tracing reset_peak start stop take_snapshot total_ordering",
+   "cpython": 22
+  },
+  "tty": {
+   "both": "B0 B1000000 B110 B115200 B1152000 B1200 B134 B150 B1500000 B1800 B19200 B200 B2000000 B230400 B2400 B2500000 B300 B3000000 B3500000 B38400 B4000000 B460800 B4800 B50 B500000 B57600 B576000 B600 B75 B921600 B9600 BRKINT BS0 BS1 BSDLY CBAUD CBAUDEX CC CDSUSP CEOF CEOL CEOT CERASE CFLAG CFLUSH CIBAUD CINTR CKILL CLNEXT CLOCAL CQUIT CR0 CR1 CR2 CR3 CRDLY CREAD CRPRNT CRTSCTS CS5 CS6 CS7 CS8 CSIZE CSTART CSTOP CSTOPB CSUSP CWERASE ECHO ECHOCTL ECHOE ECHOK ECHOKE ECHONL ECHOPRT EXTA EXTB FF0 FF1 FFDLY FIOASYNC FIOCLEX FIONBIO FIONCLEX FIONREAD FLUSHO HUPCL ICANON ICRNL IEXTEN IFLAG IGNBRK IGNCR IGNPAR IMAXBEL INLCR INPCK IOCSIZE_MASK IOCSIZE_SHIFT ISIG ISPEED ISTRIP IUCLC IXANY IXOFF IXON LFLAG NCC NCCS NL0 NL1 NLDLY NOFLSH N_MOUSE N_PPP N_SLIP N_STRIP N_TTY OCRNL OFDEL OFILL OFLAG OLCUC ONLCR ONLRET ONOCR OPOST OSPEED PARENB PARMRK PARODD PENDIN TAB0 TAB1 TAB2 TAB3 TABDLY TCFLSH TCGETA TCGETS TCIFLUSH TCIOFF TCIOFLUSH TCION TCOFLUSH TCOOFF TCOON TCSADRAIN TCSAFLUSH TCSANOW TCSBRK TCSBRKP TCSETA TCSETAF TCSETAW TCSETS TCSETSF TCSETSW TCXONC TIOCCONS TIOCEXCL TIOCGETD TIOCGICOUNT TIOCGLCKTRMIOS TIOCGPGRP TIOCGSERIAL TIOCGSOFTCAR TIOCGWINSZ TIOCINQ TIOCLINUX TIOCMBIC TIOCMBIS TIOCMGET TIOCMIWAIT TIOCMSET TIOCM_CAR TIOCM_CD TIOCM_CTS TIOCM_DSR TIOCM_DTR TIOCM_LE TIOCM_RI TIOCM_RNG TIOCM_RTS TIOCM_SR TIOCM_ST TIOCNOTTY TIOCNXCL TIOCOUTQ TIOCPKT TIOCPKT_DATA TIOCPKT_DOSTOP TIOCPKT_FLUSHREAD TIOCPKT_FLUSHWRITE TIOCPKT_NOSTOP TIOCPKT_START TIOCPKT_STOP TIOCSCTTY TIOCSERCONFIG TIOCSERGETLSR TIOCSERGETMULTI TIOCSERGSTRUCT TIOCSERGWILD TIOCSERSETMULTI TIOCSERSWILD TIOCSER_TEMT TIOCSETD TIOCSLCKTRMIOS TIOCSPGRP TIOCSSERIAL TIOCSSOFTCAR TIOCSTI TIOCSWINSZ TOSTOP VDISCARD VEOF VEOL VEOL2 VERASE VINTR VKILL VLNEXT VMIN VQUIT VREPRINT VSTART VSTOP VSUSP VSWTC VSWTCH VT0 VT1 VTDLY VTIME VWERASE XCASE XTABS cfmakecbreak cfmakeraw setcbreak setraw",
+   "cpython": 242
+  },
+  "types": {
+   "both": "AsyncGeneratorType BuiltinFunctionType BuiltinMethodType CellType ClassMethodDescriptorType CodeType CoroutineType DynamicClassAttribute EllipsisType FrameType FunctionType GeneratorType GenericAlias GetSetDescriptorType LambdaType MappingProxyType MemberDescriptorType MethodDescriptorType MethodType MethodWrapperType ModuleType NoneType NotImplementedType SimpleNamespace TracebackType UnionType WrapperDescriptorType coroutine get_original_bases new_class prepare_class resolve_bases",
+   "cpython": 32
+  },
+  "typing": {
+   "both": "AbstractSet Annotated Any AnyStr AsyncContextManager AsyncGenerator AsyncIterable AsyncIterator Awaitable BinaryIO ByteString CT_co Callable ChainMap ClassVar Collection Concatenate Container ContextManager Coroutine Counter DefaultDict Deque Dict Final ForwardRef FrozenSet Generator Generic Hashable IO ItemsView Iterable Iterator KT KeysView List Literal LiteralString Mapping MappingView Match MutableMapping MutableSequence MutableSet NamedTuple NamedTupleMeta Never NewType NoReturn NotRequired Optional OrderedDict ParamSpec ParamSpecArgs ParamSpecKwargs Pattern Protocol Required Reversible Self Sequence Set Sized SupportsAbs SupportsBytes SupportsComplex SupportsFloat SupportsIndex SupportsInt SupportsRound T TYPE_CHECKING T_co T_contra Text TextIO Tuple Type TypeAlias TypeGuard TypeVar TypeVarTuple TypedDict Union Unpack VT VT_co V_co ValuesView assert_never assert_type cast clear_overloads dataclass_transform final get_args get_origin get_overloads get_type_hints is_typeddict no_type_check no_type_check_decorator overload override reveal_type runtime_checkable",
+   "cpython": 114
+  },
+  "unicodedata": {
+   "both": "UCD bidirectional category combining decimal decomposition digit east_asian_width is_normalized lookup mirrored name normalize numeric ucd_3_2_0 unidata_version",
+   "cpython": 16
+  },
+  "unittest": {
+   "both": "BaseTestSuite FunctionTestCase IsolatedAsyncioTestCase SkipTest TestCase TestLoader TestProgram TestResult TestSuite TextTestResult TextTestRunner addModuleCleanup defaultTestLoader doModuleCleanups enterModuleContext expectedFailure findTestCases getTestCaseNames installHandler main makeSuite registerResult removeHandler removeResult skip skipIf skipUnless",
+   "cpython": 35
+  },
+  "urllib": {
+   "both": "",
+   "cpython": 0
+  },
+  "urllib.error": {
+   "both": "ContentTooShortError HTTPError URLError",
+   "cpython": 3
+  },
+  "urllib.parse": {
+   "both": "parse_qs parse_qsl quote quote_from_bytes quote_plus unquote unquote_plus unquote_to_bytes unwrap urldefrag urlencode urljoin urlparse urlsplit urlunparse urlunsplit uses_netloc uses_params",
+   "cpython": 42
+  },
+  "urllib.request": {
+   "both": "AbstractBasicAuthHandler AbstractHTTPHandler BaseHandler DataHandler FileHandler HTTPBasicAuthHandler HTTPCookieProcessor HTTPDefaultErrorHandler HTTPErrorProcessor HTTPHandler HTTPPasswordMgr HTTPPasswordMgrWithDefaultRealm HTTPPasswordMgrWithPriorAuth HTTPRedirectHandler HTTPSHandler OpenerDirector ProxyBasicAuthHandler ProxyHandler Request UnknownHandler build_opener getproxies install_opener pathname2url proxy_bypass url2pathname urlcleanup urlopen urlretrieve",
+   "cpython": 48
+  },
+  "uu": {
+   "both": "Error decode encode test",
+   "cpython": 4
+  },
+  "uuid": {
+   "both": "NAMESPACE_DNS NAMESPACE_OID NAMESPACE_URL NAMESPACE_X500 RESERVED_FUTURE RESERVED_MICROSOFT RESERVED_NCS RFC_4122 SafeUUID UUID getnode uuid1 uuid3 uuid4 uuid5",
+   "cpython": 19
+  },
+  "warnings": {
+   "both": "WarningMessage catch_warnings defaultaction filters filterwarnings formatwarning onceregistry resetwarnings showwarning simplefilter warn warn_explicit",
+   "cpython": 12
+  },
+  "wave": {
+   "both": "Error KSDATAFORMAT_SUBTYPE_PCM WAVE_FORMAT_EXTENSIBLE WAVE_FORMAT_PCM Wave_read Wave_write open",
+   "cpython": 7
+  },
+  "weakref": {
+   "both": "CallableProxyType KeyedRef ProxyType ProxyTypes ReferenceType WeakKeyDictionary WeakMethod WeakSet WeakValueDictionary finalize getweakrefcount getweakrefs proxy ref",
+   "cpython": 14
+  },
+  "webbrowser": {
+   "both": "BackgroundBrowser BaseBrowser Chrome Chromium Elinks Error Galeon GenericBrowser Grail Konqueror Mozilla Netscape Opera UnixBrowser get main open open_new open_new_tab register register_X_browsers register_standard_browsers",
+   "cpython": 24
+  },
+  "wsgiref": {
+   "both": "",
+   "cpython": 0
+  },
+  "wsgiref.handlers": {
+   "both": "BaseCGIHandler BaseHandler CGIHandler IISCGIHandler SimpleHandler format_date_time read_environ",
+   "cpython": 7
+  },
+  "wsgiref.headers": {
+   "both": "Headers tspecials",
+   "cpython": 2
+  },
+  "wsgiref.simple_server": {
+   "both": "ServerHandler WSGIRequestHandler WSGIServer demo_app make_server server_version software_version sys_version",
+   "cpython": 8
+  },
+  "wsgiref.types": {
+   "both": "ErrorStream FileWrapper InputStream StartResponse TracebackType WSGIApplication WSGIEnvironment",
+   "cpython": 7
+  },
+  "wsgiref.util": {
+   "both": "FileWrapper application_uri guess_scheme is_hop_by_hop request_uri setup_testing_defaults shift_path_info",
+   "cpython": 7
+  },
+  "wsgiref.validate": {
+   "both": "ErrorWrapper InputWrapper IteratorWrapper PartialIteratorWrapper WSGIWarning WriteWrapper assert_ check_content_type check_environ check_errors check_exc_info check_headers check_input check_iterator check_status check_string_type validator",
+   "cpython": 17
+  },
+  "xml": {
+   "both": "",
+   "cpython": 0
+  },
+  "xml.dom": {
+   "both": "DOMException DOMSTRING_SIZE_ERR DomstringSizeErr EMPTY_NAMESPACE EMPTY_PREFIX HIERARCHY_REQUEST_ERR HierarchyRequestErr INDEX_SIZE_ERR INUSE_ATTRIBUTE_ERR INVALID_ACCESS_ERR INVALID_CHARACTER_ERR INVALID_MODIFICATION_ERR INVALID_STATE_ERR IndexSizeErr InuseAttributeErr InvalidAccessErr InvalidCharacterErr InvalidModificationErr InvalidStateErr NAMESPACE_ERR NOT_FOUND_ERR NOT_SUPPORTED_ERR NO_DATA_ALLOWED_ERR NO_MODIFICATION_ALLOWED_ERR NamespaceErr NoDataAllowedErr NoModificationAllowedErr Node NotFoundErr NotSupportedErr SYNTAX_ERR SyntaxErr UserDataHandler VALIDATION_ERR ValidationErr WRONG_DOCUMENT_ERR WrongDocumentErr XHTML_NAMESPACE XMLNS_NAMESPACE XML_NAMESPACE domreg getDOMImplementation registerDOMImplementation",
+   "cpython": 43
+  },
+  "xml.dom.NodeFilter": {
+   "both": "NodeFilter",
+   "cpython": 1
+  },
+  "xml.dom.domreg": {
+   "both": "getDOMImplementation registerDOMImplementation registered well_known_implementations",
+   "cpython": 4
+  },
+  "xml.dom.expatbuilder": {
+   "both": "CDATA_SECTION_NODE DOCUMENT_NODE EMPTY_NAMESPACE EMPTY_PREFIX ElementInfo ExpatBuilder ExpatBuilderNS FILTER_ACCEPT FILTER_INTERRUPT FILTER_REJECT FILTER_SKIP FilterCrutch FilterVisibilityController FragmentBuilder FragmentBuilderNS InternalSubsetExtractor Namespaces Node NodeFilter ParseEscape Rejecter Skipper TEXT_NODE XMLNS_NAMESPACE makeBuilder parse parseFragment parseFragmentString parseString theDOMImplementation",
+   "cpython": 30
+  },
+  "xml.dom.minicompat": {
+   "both": "EmptyNodeList NodeList StringTypes defproperty",
+   "cpython": 4
+  },
+  "xml.dom.minidom": {
+   "both": "Attr AttributeList CDATASection CharacterData Childless Comment DOMImplementation DOMImplementationLS Document DocumentFragment DocumentLS DocumentType EMPTY_NAMESPACE EMPTY_PREFIX Element ElementInfo EmptyNodeList Entity Identified NamedNodeMap Node NodeList Notation ProcessingInstruction ReadOnlySequentialNamedNodeMap StringTypes Text TypeInfo XMLNS_NAMESPACE defproperty getDOMImplementation parse parseString",
+   "cpython": 33
+  },
+  "xml.dom.xmlbuilder": {
+   "both": "DOMBuilder DOMBuilderFilter DOMEntityResolver DOMImplementationLS DOMInputSource DocumentLS Options",
+   "cpython": 7
+  },
+  "xml.etree": {
+   "both": "",
+   "cpython": 0
+  },
+  "xml.etree.ElementPath": {
+   "both": "find findall findtext get_parent_map iterfind ops prepare_child prepare_descendant prepare_parent prepare_predicate prepare_self prepare_star xpath_tokenizer xpath_tokenizer_re",
+   "cpython": 14
+  },
+  "xml.etree.ElementTree": {
+   "both": "C14NWriterTarget Comment Element ElementTree HTML_EMPTY PI ParseError ProcessingInstruction QName SubElement TreeBuilder VERSION XML XMLID XMLParser XMLPullParser canonicalize dump fromstring fromstringlist indent iselement iterparse parse register_namespace tostring tostringlist",
+   "cpython": 27
+  },
+  "xml.parsers": {
+   "both": "",
+   "cpython": 1
+  },
+  "xml.parsers.expat": {
+   "both": "EXPAT_VERSION ErrorString ExpatError ParserCreate XMLParserType XML_PARAM_ENTITY_PARSING_ALWAYS XML_PARAM_ENTITY_PARSING_NEVER XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE error features native_encoding version_info",
+   "cpython": 13
+  },
+  "xmlrpc": {
+   "both": "",
+   "cpython": 0
+  },
+  "xmlrpc.client": {
+   "both": "APPLICATION_ERROR Binary Boolean BytesIO DateTime Decimal Error ExpatParser FastMarshaller FastParser FastUnmarshaller Fault GzipDecodedResponse INTERNAL_ERROR INVALID_ENCODING_CHAR INVALID_METHOD_PARAMS INVALID_XMLRPC MAXINT METHOD_NOT_FOUND MININT Marshaller MultiCall MultiCallIterator NOT_WELLFORMED_ERROR PARSE_ERROR ProtocolError ResponseError SERVER_ERROR SYSTEM_ERROR SafeTransport Server ServerProxy TRANSPORT_ERROR Transport UNSUPPORTED_ENCODING Unmarshaller WRAPPERS boolean datetime dumps escape getparser gzip_decode gzip_encode loads",
+   "cpython": 45
+  },
+  "xmlrpc.server": {
+   "both": "BaseHTTPRequestHandler CGIXMLRPCRequestHandler DocCGIXMLRPCRequestHandler DocXMLRPCRequestHandler DocXMLRPCServer Fault MultiPathXMLRPCServer ServerHTMLDoc SimpleXMLRPCDispatcher SimpleXMLRPCRequestHandler SimpleXMLRPCServer XMLRPCDocGenerator dumps gzip_decode gzip_encode list_public_methods loads partial resolve_dotted_attribute signature",
+   "cpython": 20
+  },
+  "zipapp": {
+   "both": "MAIN_TEMPLATE ZipAppError create_archive get_interpreter main shebang_encoding",
+   "cpython": 6
+  },
+  "zipfile": {
+   "both": "BZIP2_VERSION BadZipFile BadZipfile DEFAULT_VERSION LZMA_VERSION LargeZipFile MAX_EXTRACT_VERSION Path ZIP64_LIMIT ZIP64_VERSION ZIP_BZIP2 ZIP_DEFLATED ZIP_FILECOUNT_LIMIT ZIP_LZMA ZIP_MAX_COMMENT ZIP_STORED ZipExtFile ZipFile ZipInfo compressor_names error is_zipfile main",
+   "cpython": 43
+  },
+  "zipimport": {
+   "both": "ZipImportError zipimporter",
+   "cpython": 8
+  },
+  "zlib": {
+   "both": "DEFLATED DEF_BUF_SIZE DEF_MEM_LEVEL MAX_WBITS ZLIB_RUNTIME_VERSION ZLIB_VERSION Z_BEST_COMPRESSION Z_BEST_SPEED Z_BLOCK Z_DEFAULT_COMPRESSION Z_DEFAULT_STRATEGY Z_FILTERED Z_FINISH Z_FIXED Z_FULL_FLUSH Z_HUFFMAN_ONLY Z_NO_COMPRESSION Z_NO_FLUSH Z_PARTIAL_FLUSH Z_RLE Z_SYNC_FLUSH Z_TREES adler32 compress compressobj crc32 decompress decompressobj error",
+   "cpython": 29
+  },
+  "zoneinfo": {
+   "both": "InvalidTZPathWarning TZPATH ZoneInfo ZoneInfoNotFoundError available_timezones reset_tzpath",
+   "cpython": 6
+  }
+ },
+ "platform": "linux",
+ "pythons": [
+  "3.11",
+  "3.12"
+ ]
+}

@@ -35,6 +35,19 @@ import collections.abc
 from _sqlite3 import *
 from _sqlite3 import _deprecated_version
 
+# (round 85) 3.11's: shared-cache mode, deprecated (removed in 3.12)
+def enable_shared_cache(enable):
+    from _sqlite3 import enable_shared_cache as _old_enable_shared_cache
+    import warnings
+    var msg = (
+        "enable_shared_cache is deprecated and will be removed in Python 3.12. "
+        "Shared cache is strongly discouraged by the SQLite 3 documentation. "
+        "If shared cache must be used, open the database in URI mode using"
+        "the cache=shared query parameter."
+    )
+    warnings.warn(msg, DeprecationWarning, stacklevel=2)
+    return _old_enable_shared_cache(enable)
+
 _deprecated_names = frozenset({"version", "version_info"})
 
 paramstyle = "qmark"

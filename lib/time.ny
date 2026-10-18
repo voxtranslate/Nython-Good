@@ -16,7 +16,9 @@
 # struct_time   9 fields as a tuple (indexing, slicing, unpacking, len 9,
 #               == with tuples) plus tm_zone and tm_gmtoff; Python's repr
 # clocks        time time_ns monotonic(_ns) perf_counter(_ns) process_time(_ns)
-#               thread_time(_ns) get_clock_info
+#               thread_time(_ns) get_clock_info; POSIX: clock_gettime(_ns)
+#               clock_getres clock_settime(_ns) pthread_getcpuclockid and the
+#               CLOCK_* constants (round 85)
 # conversions   localtime gmtime mktime asctime ctime strftime strptime
 # zone          timezone altzone daylight tzname (from January and July)
 #
@@ -27,9 +29,9 @@
 # errors ("time data '...' does not match format '...'", "unconverted data
 # remains: ..."). lib/datetime.ny uses it for datetime.strptime.
 #
-# Differences: thread_time() is the process's CPU time (no per-thread clock
-# native); strftime(fmt, secs, utc) also takes a timestamp in place of the
-# tuple, as the old time.strftime builtin did.
+# Differences: thread_time() is the process's CPU time except on Linux
+# (CLOCK_THREAD_CPUTIME_ID there, round 85); strftime(fmt, secs, utc) also
+# takes a timestamp in place of the tuple, as the old time.strftime builtin did.
 
 _native_time_ns = time_ns
 
@@ -220,9 +222,69 @@ def get_clock_info(name):
         return _ClockInfo("clock_gettime(CLOCK_REALTIME)", false, true, 1e-09)
     if name == "monotonic" or name == "perf_counter":
         return _ClockInfo("clock_gettime(CLOCK_MONOTONIC)", true, false, 1e-09)
+    if name == "thread_time" and _sys_platform_posix() and os_platform() == "linux":
+        return _ClockInfo("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false, 1e-09)
     if name == "process_time" or name == "thread_time":
         return _ClockInfo("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false, 1e-09)
     raise ValueError("unknown clock")
+
+
+# ── the POSIX clocks (round 85): clock_gettime(_ns), clock_getres,
+# clock_settime(_ns), pthread_getcpuclockid and the CLOCK_* constants of
+# the platform's <time.h> (builtins/os_posix.cpp); POSIX only, as in CPython
+def _clk(clk_id):
+    if isinstance(clk_id, int):
+        return int(clk_id)
+    if hasattr(type(clk_id), "__index__"):
+        return clk_id.__index__()
+    raise TypeError("'" + type(clk_id).__name__ + "' object cannot be interpreted as an integer")
+
+if _sys_platform_posix():
+    def _load_clocks():
+        var g = globals()
+        for pair in _ny_os_call("clock_constants"):
+            g[pair[0]] = pair[1]
+    _load_clocks()
+    del _load_clocks
+
+    def clock_gettime(clk_id):
+        """Return the time of the specified clock clk_id as a float."""
+        return _ny_os_call("clock_gettime", _clk(clk_id))
+
+    def clock_gettime_ns(clk_id):
+        """Return the time of the specified clock clk_id as nanoseconds (int)."""
+        return _ny_os_call("clock_gettime_ns", _clk(clk_id))
+
+    def clock_getres(clk_id):
+        """Return the resolution (precision) of the specified clock clk_id."""
+        return _ny_os_call("clock_getres", _clk(clk_id))
+
+    def clock_settime(clk_id, time):
+        """Set the time of the specified clock clk_id."""
+        var c = _clk(clk_id)
+        if not isinstance(time, float):
+            time = _clk(time)
+        _ny_os_call("clock_settime", c, time)
+
+    def clock_settime_ns(clk_id, time):
+        """Set the time of the specified clock clk_id with nanoseconds."""
+        var c = _clk(clk_id)
+        if isinstance(time, float) or not isinstance(time, int):
+            raise TypeError("expect int, got " + type(time).__name__)
+        _ny_os_call("clock_settime_ns", c, time)
+
+    if os_platform() == "linux":
+        def pthread_getcpuclockid(thread_id):
+            """Return the clk_id of a thread's CPU time clock."""
+            return _sig_pthread("cpuclock", _clk(thread_id))
+
+        def thread_time():
+            """Thread time for profiling: sum of the kernel and user-space CPU time."""
+            return _ny_os_call("clock_gettime", CLOCK_THREAD_CPUTIME_ID)
+
+        def thread_time_ns():
+            """Thread time for profiling as nanoseconds."""
+            return _ny_os_call("clock_gettime_ns", CLOCK_THREAD_CPUTIME_ID)
 
 
 # ── conversions ──

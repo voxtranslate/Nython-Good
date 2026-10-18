@@ -562,7 +562,7 @@ struct NythonExecutor {
     void ensureMirror(const std::string& chunk) {
         if (mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if (chunk != "base" && chunk != "os" && chunk != "buffer") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer")
+        if (chunk != "base" && chunk != "os" && chunk != "buffer" && chunk != "posix") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix")
         if (chunk == "dictview") ensureMirror("dict");
         try {
             auto source = SourceCode(nyrt::builtin_mirror_chunk(chunk));
@@ -664,6 +664,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_main_globals","_ny_exc_current","_ny_stack",
             "_ny_exc_init","_ny_exc_str","_ny_exc_repr",        // BaseException's members as values (round 84)
             "_ny_audit_enable",                                  // sys.addaudithook (round 84)
+            "_ny_gc_objects",                                    // gc.get_objects (round 85)
             "_ny_buf_export","_ny_buf_unexport","_ny_buf_exports","_ny_buf_addr","_ny_load_chunk",   // the buffer protocol: memoryview (round 84)
             "_ny_main_set","_ny_main_del","_ny_globals_view",   // globals() as a live view (round 81)
             "_ny_getrefcount","_ny_frame_jump",                 // sys.getrefcount, frame.f_lineno = n (round 81)
@@ -4361,7 +4362,15 @@ public:   // NythonExecutor is a struct: members default to public
         switch (v.type) {
             case ValueType::NONE: return nypy::spell_none();   // round 84: Python's in a Python program
             case ValueType::BOOLEAN: return nypy::spell_bool(v.value.b);
-            case ValueType::INTEGER: return intToString(v.value.i);
+            case ValueType::INTEGER: {
+                int64_t sv;
+                if (bigint_fits_i64(v.value.i, sv)) return std::to_string(sv);
+                std::string t = bigint_to_nbig(v.value.i).to_string();
+                // (round 85) sys.set_int_max_str_digits: str/repr/print of a
+                // longer int raise ValueError, as CPython 3.11's
+                if (t.size() > 640) nyCall([&] { nypy::int_digits_check_out(t.size() - (t[0] == '-' ? 1 : 0)); return 0; });
+                return t;
+            }
             case ValueType::DOUBLE: return nypy::float_repr((double)v.value.d);
             case ValueType::UNDEFINED: return "undefined";
             default: break;
@@ -16802,6 +16811,19 @@ public:
         }
         return wv;
     }
+    // (round 85) An exception a __del__, a weakref callback or a generator's
+    // finalization raised, given to the program's sys.unraisablehook (the
+    // prelude's _ny_unraisable): false when the default hook stands, and the
+    // engine prints its own report.
+    bool reportUnraisable(const std::string& flow, const Value& obj) {
+        Value fn = global_ctx ? global_ctx->getByName("_ny_unraisable") : NONE_VALUE;
+        if (fn.type == ValueType::NONE || fn.type == ValueType::UNDEFINED) return false;
+        try {
+            std::string caught = tbCaught(flow);   // caught here: its frames become its __traceback__
+            std::vector<Value> a{exceptionObject(caught), NONE_VALUE, obj};
+            return isTruthy(callFunctionValue(fn, a, global_ctx));
+        } catch (...) { return false; }
+    }
     // A weak reference's callback, its target dead (round 77): called once
     // with the reference; what it raises is reported and ignored, as in Python.
     void runWeakCallback(nyheap::Weak* w) {
@@ -16812,7 +16834,10 @@ public:
         node_ptr saved_stmt = last_stmt();
         std::vector<Value> a{self};
         try { callFunctionValue(cb, a, global_ctx); }
-        catch (std::string& flow) { std::cerr << "Exception ignored in: " << valueToDisplay(cb) << "\n" << describeException(flow) << "\n"; }
+        catch (std::string& flow) {
+            if (!reportUnraisable(flow, cb))   // (round 85) sys.unraisablehook
+                std::cerr << "Exception ignored in: " << valueToDisplay(cb) << "\n" << describeException(flow) << "\n";
+        }
         catch (nython::node::ReturnSignal&) {}
         catch (std::exception& e) { std::cerr << "Exception ignored in: " << valueToDisplay(cb) << "\n" << e.what() << "\n"; }
         catch (...) {}
@@ -16836,8 +16861,17 @@ public:
         std::vector<Value> no_args;
         try { callMethod(self, "__del__", no_args, global_ctx); }
         catch (std::string& flow) {
-            std::cerr << "Exception ignored in: <function " << instanceClassName(self) << ".__del__>\n"
-                      << describeException(flow) << "\n";
+            // (round 85) sys.unraisablehook gets the class's __del__, as CPython's
+            Value del = NONE_VALUE;
+            try {
+                if (Node* cn = classNodeOfInstance(self)) {
+                    Value d;
+                    if (getAttrValue(classValueOfNode(cn), "__del__", global_ctx, d)) del = d;
+                }
+            } catch (...) {}
+            if (!reportUnraisable(flow, del))
+                std::cerr << "Exception ignored in: <function " << instanceClassName(self) << ".__del__>\n"
+                          << describeException(flow) << "\n";
         }
         catch (nython::node::ReturnSignal&) {}
         catch (std::exception& e) {

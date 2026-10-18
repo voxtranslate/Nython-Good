@@ -71,6 +71,9 @@
 #  include <sys/wait.h>
 #  include <syslog.h>
 #  include <langinfo.h>
+#  if defined(__linux__) && __has_include(<linux/fs.h>)
+#    include <linux/fs.h>     // (round 85) FICLONE, FICLONERANGE, as CPython's fcntl
+#  endif
 #  if defined(__linux__)
 #    include <pty.h>
 #    include <utmp.h>
@@ -797,6 +800,40 @@ KV termios_consts() {
 #ifdef TCGETS
     K(TCGETS); K(TCSETS); K(TCSETSW); K(TCSETSF); K(TCGETA); K(TCSETA); K(TCSETAW); K(TCSETAF);
     K(TCSBRK); K(TCXONC); K(TCFLSH); K(TCSBRKP);
+#endif
+    // (round 85) the rest of CPython's termios names, where the headers have them
+#ifdef IOCSIZE_MASK
+    K(IOCSIZE_MASK); K(IOCSIZE_SHIFT);
+#endif
+#ifdef NCC
+    K(NCC);
+#endif
+#ifdef N_TTY
+    K(N_TTY); K(N_SLIP); K(N_MOUSE); K(N_PPP); K(N_STRIP);
+#endif
+#ifdef TIOCGICOUNT
+    K(TIOCGICOUNT);
+#endif
+#ifdef TIOCGLCKTRMIOS
+    K(TIOCGLCKTRMIOS); K(TIOCSLCKTRMIOS);
+#endif
+#ifdef TIOCGSOFTCAR
+    K(TIOCGSOFTCAR); K(TIOCSSOFTCAR);
+#endif
+#ifdef TIOCMIWAIT
+    K(TIOCMIWAIT);
+#endif
+#ifdef TIOCSERCONFIG
+    K(TIOCSERCONFIG); K(TIOCSERGETLSR); K(TIOCSERGETMULTI); K(TIOCSERGSTRUCT); K(TIOCSERGWILD);
+    K(TIOCSERSETMULTI); K(TIOCSERSWILD);
+#endif
+#ifdef TIOCSER_TEMT
+    K(TIOCSER_TEMT);
+#endif
+#ifdef VSWTCH
+    K(VSWTCH);
+#elif defined(VSWTC)
+    kv.push_back({"VSWTCH", (int64_t)VSWTC});
 #endif
 #endif
     return kv;

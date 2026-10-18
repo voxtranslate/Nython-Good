@@ -2,8 +2,8 @@
 # nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/hashlib.ny - Python's hashlib (round 77): md5, sha1, sha224/256/384/512,
 # sha3_224/256/384/512, shake_128/256, blake2b/blake2s, new(name),
-# pbkdf2_hmac, file_digest. The digests are NyHash.hpp's, the same on every
-# platform; incremental (update) and copyable (copy).
+# pbkdf2_hmac, scrypt (round 85), file_digest. The digests are NyHash.hpp's,
+# the same on every platform; incremental (update) and copyable (copy).
 #
 #     import hashlib
 #     hashlib.sha256(b"abc").hexdigest()
@@ -103,6 +103,30 @@ def blake2s(data=b"", digest_size=32, key=b"", **kwargs):
 
 def pbkdf2_hmac(hash_name, password, salt, iterations, dklen=none):
     return _hash_pbkdf2(hash_name, _hd(password), _hd(salt), iterations, dklen)
+
+def _scrypt_bytes(v):
+    var b = _hd(v)
+    if not isinstance(b, (bytes, bytearray)):
+        raise TypeError("a bytes-like object is required, not '" + type(v).__name__ + "'")
+    return bytes(b)
+
+def _scrypt_uint(v, name):
+    if v is None or isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise TypeError(name + " is required and must be an unsigned int")
+    return v
+
+def scrypt(password, *, salt=None, n=None, r=None, p=None, maxmem=0, dklen=64):
+    """scrypt password-based key derivation function (round 85: RFC 7914,
+    native - builtins/hashing.cpp - with OpenSSL's limits and CPython's
+    messages)."""
+    var pw = _scrypt_bytes(password)
+    if salt is None:
+        raise TypeError("salt is required")
+    var s = _scrypt_bytes(salt)
+    var nn = _scrypt_uint(n, "n")
+    var rr = _scrypt_uint(r, "r")
+    var pp = _scrypt_uint(p, "p")
+    return _hash_scrypt(pw, s, nn, rr, pp, maxmem, dklen)
 
 def file_digest(fileobj, digest):
     var h = digest

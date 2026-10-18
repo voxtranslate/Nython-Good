@@ -24,7 +24,8 @@
 # namereplace_errors (and "surrogateescape"/"surrogatepass"); _codecs'
 # utf_8_encode/decode, utf_16_*, utf_32_*, latin_1_*, ascii_*,
 # unicode_escape_*, raw_unicode_escape_*, escape_encode/decode,
-# charmap_encode/decode/build.
+# charmap_encode/decode/build; utf_32_ex_decode and readbuffer_encode
+# (round 85).
 #
 # Codecs: utf-8, utf-8-sig, utf-16, utf-16-le, utf-16-be, utf-32, utf-32-le,
 # utf-32-be, latin-1, ascii, cp437, cp850, cp1252, mac-roman,
@@ -1800,6 +1801,32 @@ def utf_32_encode(str, errors=None, byteorder=0):
 
 def utf_32_decode(data, errors=None, final=False):
     return _decode_native("utf-32", data, errors, final)
+
+
+def utf_32_ex_decode(data, errors=None, byteorder=0, final=False):
+    # (round 85) as utf_16_ex_decode: the byte order found in the BOM
+    data = _as_bytes(data, "utf_32_ex_decode")
+    var name = "utf-32" if byteorder == 0 else "utf-32-le" if byteorder < 0 else "utf-32-be"
+    var order = 0
+    if byteorder == 0 and len(data) >= 4:
+        if data[:4] == BOM_UTF32_LE:
+            order = -1
+        elif data[:4] == BOM_UTF32_BE:
+            order = 1
+    var r = _decode_native(name, data, errors, final)
+    return (r[0], r[1], order if byteorder == 0 else byteorder)
+
+
+def readbuffer_encode(data, errors=None):
+    # (round 85) a buffer's bytes as they are, a str's UTF-8 (CPython's
+    # _codecs.readbuffer_encode, for the "s#" style codecs)
+    if isinstance(data, str):
+        data = data.encode("utf-8", "surrogateescape" if errors == "surrogateescape" else "strict")
+    elif isinstance(data, (bytes, bytearray)):
+        data = bytes(data)
+    else:
+        data = bytes(_ny_bytes_like(data))
+    return (data, len(data))
 
 
 def escape_encode(data, errors=None):

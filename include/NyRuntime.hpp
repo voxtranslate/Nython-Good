@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "NyBuiltinFns.hpp"   // round 84: the functions CPython implements in C
+#include "NyBigInt.hpp"       // round 85: nypy::int_max_str_digits
 
 namespace nyrt {
 
@@ -163,9 +164,13 @@ struct CliFlags {
     int debug = 0, inspect = 0, interactive = 0, optimize = 0, dont_write_bytecode = 1, no_user_site = 0,
         no_site = 0, ignore_environment = 0, verbose = 0, bytes_warning = 0, quiet = 0,
         hash_randomization = 0, isolated = 0, dev_mode = 0, utf8_mode = 1, warn_default_encoding = 0,
-        safe_path = 0, int_max_str_digits = 0;
+        safe_path = 0, int_max_str_digits = -1;   // (round 85: -1 when neither -X nor the environment set it)
 };
 inline CliFlags& cli_flags() { static CliFlags f; return f; }
+// (round 85) sys.get/set_int_max_str_digits: the most decimal digits an int
+// <-> str conversion takes (CPython 3.11's gh-95778 limit; 0: none). The
+// engines check it where a program converts (NyBigInt.hpp int_digits_*).
+inline int& int_max_str_digits() { return nypy::int_max_str_digits(); }
 // sys.getrecursionlimit() / setrecursionlimit(): the one limit both engines
 // check - the VM's frames (VirtualMachine::check_depth), the interpreter's
 // call depth (evalCall, which keeps its old margin of 100 below it).
@@ -580,6 +585,11 @@ inline std::string builtin_public(const std::string& tag, std::string* module = 
         return k.substr(d + 1);
     }
     if (module) *module = k.substr(0, d);
+#ifdef _WIN32
+    if (module && *module == "os") *module = "nt";   // (round 85) os re-exports nt's natives
+#else
+    if (module && *module == "os") *module = "posix";   // (round 85) os re-exports posix's (lib/posix.ny)
+#endif
     return k.substr(d + 1);
 }
 inline std::string class_repr(const std::string& full) {

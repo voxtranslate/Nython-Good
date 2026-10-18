@@ -4,6 +4,7 @@ Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
 Last updated: round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
+Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
 Round 84, part B — **§0x2** (the Unicode database - unicodedata complete from compact generated tables; str's case mappings and predicates by it on both engines; PEP 3131 identifiers; the CJK codecs ported from CPython's cjkcodecs; utf-7; mbcs/oem on Windows; idna's nameprep; Unicode-aware fuzzy matching; vm_audit113)
 Round 84, part C — **§0x3** (tkinter, ttk and turtle over Nython's own GUI backend: a Tcl subset, Tk's core, pack/grid/place, the classic and ttk widgets, photo images, dialogs; CPython's tkinter package and turtle.py; vm_audit114)
 Round 84, part D — **§0x4** (curses without ncurses: terminfo, tparm, ncurses' screen model and update algorithm, input and mouse, panels; a VT/xterm emulator the test compares with CPython+ncurses through; vm_audit115)
@@ -97,7 +98,234 @@ collisions.
 
 ---
 
-## 0yF. Round 85, part F — Python's binding rule for Python-language source (vm_audit119)
+## 0y. Round 85, part E — the names CPython's system modules have and Nython's lacked (vm_audit118)
+
+`examples/vm_audit118.ny` (155 checks on Linux; 154 under python3.11, where
+os.unshare is 3.12's) passes on the interpreter, the VM and python3. Every
+expected value is CPython's: fixed ones written in the test, the host's own
+(constants, the sysconf/pathconf/confstr tables, interfaces, groups, what
+the file system answers for xattrs on the test's own file) asked of a
+python3 child (`host(...)`, skipped without one).
+
+### The measure: `tools/api_diff.py` (the innovation)
+A living conformance measure, after the compatibility dashboards PyPy and
+GraalPy keep against CPython. Every module of `lib/` CPython also has (and
+its packages' submodules), plus the engines' os, sys, time, gc, math,
+builtins and posix, is imported under python3.11 and python3.12 (the union
+of their names, each tagged with the versions that have it) and under both
+engines (`hasattr`, so PEP 562 `__getattr__` counts); per module: CPython's
+names, each engine's, the missing ones by kind (function, class, constant,
+module; `-v`) and the coverage; then the totals. Public names are dir()'s
+without a leading underscore, less modules a module merely imported (os.sys)
+and less other modules' names it re-exports outside its `__all__`
+(os.Mapping) - which also hides a few real ones (functools.get_cache_token
+was found by hand). `--write-baseline FILE` / `--check FILE`: the check
+needs no CPython - it imports the baseline's modules under both engines and
+fails when a name the baseline has is gone; `tools/sweep.py` runs it as one
+row (`tools/api_baseline.json`, Linux; skipped without python3 or for a
+binary of another platform). A full measure takes about a minute.
+
+| | CPython names | missing | coverage |
+|---|---|---|---|
+| before (e8aea6f), 420 modules | 9676 | 1695 | 82.5% |
+| after | 9676 | 574 | 94.1% |
+
+| module | before | after |
+|---|---|---|
+| os | 170/378 (45.0%) | 378/378 |
+| posix | no module | 328/328 |
+| socket | 79/432 (18.3%) | 431/432 (CAPI) |
+| ssl | 27/128 (21.1%) | 124/128 (MemoryBIO, SSLObject, SSLSession) |
+| signal | 45/69 | 69/69 |
+| select | 9/32 | 32/32 |
+| time | 25/38 | 38/38 |
+| sys | 61/77 | 72/77 (3.12's perf trampolines, monitoring, getunicodeinternedsize) |
+| gc | 22/25 | 25/25 |
+| termios, tty | 217/240, 219/242 | all |
+| hashlib, codecs, fcntl | 19/20, 79/81, 56/58 | all |
+| locale | 85/92 | 91/92 (3.11's format, removed in 3.12) |
+
+### os and posix
+- **`src/builtins/os_posix.cpp`** (new unit, `_ny_os_call` ops that
+  os_fd.cpp forwards): statvfs/fstatvfs, sysconf/pathconf/fpathconf/confstr
+  and CPython's name tables (`os_posix_sysconf.inc` generated from
+  CPython's), getgrouplist, getpriority/setpriority/nice, the uid/gid
+  setters, getresuid/getresgid/setres*, setgroups/initgroups, the scheduler
+  (sched_get_priority_max/min, getscheduler/setscheduler, getparam/setparam,
+  rr_get_interval, setaffinity, yield), wait3/wait4/waitid (EINTR: handlers
+  run, the wait resumes), pipe2, lockf, posix_fadvise/posix_fallocate,
+  copy_file_range, splice, memfd_create, pidfd_open, eventfd/eventfd_read/
+  eventfd_write, getrandom, getxattr/setxattr/listxattr/removexattr (path,
+  descriptor, follow_symlinks), posix_spawn/posix_spawnp (file actions,
+  setpgroup, setsid, setsigmask, setsigdef, resetids, scheduler), chroot,
+  ctermid, fchdir, fdatasync, sync, setpgrp, tcgetpgrp/tcsetpgrp, setns/
+  unshare, abort, and the constants (CLD_*, EFD_*, EX_*, F_LOCK..., GRND_*,
+  MFD_*, NGROUPS_MAX, O_FSYNC, POSIX_FADV_*, POSIX_SPAWN_*, PRIO_*, P_*,
+  RTLD_*, RWF_*, SCHED_*, SPLICE_F_*, ST_*, TMP_MAX, WEXITED/WSTOPPED/WNOWAIT,
+  XATTR_*, CLONE_*). Also the clocks, signal masks, socket and epoll ops below.
+- **`src/NyPreludePosix.cpp`** (new unit, the mirror chunk "posix", loaded
+  by the os chunk; editing it rebuilds one file): the Python side -
+  CPython's argument checks and messages, `os.statvfs_result`,
+  `os.waitid_result`, `os.sched_param`, **register_at_fork** (os.fork and
+  os.forkpty run the callbacks: before last-registered first, a raising one
+  reported through sys.unraisablehook), **popen** with CPython's
+  `_wrap_close` over subprocess, the spawn* family on fork + exec (os.py's
+  `_spawnvef`: 127 when the program cannot run), fwalk (dirfd opened by
+  path), getenvb, P_WAIT/P_NOWAIT/P_NOWAITO, device_encoding, the
+  supports_* sets (CPython's lists less what Nython's functions do not take;
+  supports_dir_fd is empty), and `__module__` "posix" for every posix name,
+  "os" for os.py's, "posixpath" for os.path's.
+- **`lib/posix.ny`** (and `lib/nt.ny` for Windows): os's own objects for
+  every name CPython's posix has; `posix.environ` a bytes dict. Natives show
+  posix as their module (NyRuntime.hpp builtin_public), so
+  `os.getcwd.__module__ == "posix"` and pickles name posix.
+- `os.pipe()`, `os.pipe2()` ... return real tuples (os_fd.cpp's `tuple_of`
+  set its "__tuple__" mark through a cast that never reached the container:
+  every native "tuple" of os was a list).
+- **subprocess on posix_spawn**: the process layer's `start_process`
+  (os_proc.cpp) uses posix_spawnp where it means the same as its fork +
+  execvp (CPython's _posixsubprocess vfork path): not for an env= that sets
+  PATH for a bare name, nor a cwd= without glibc 2.29's addchdir_np;
+  `NY_SPAWN_FORK=1` forces fork. `subprocess.run(["true"])`, 200 runs, min
+  of 3: 2.3 -> 1.7 ms; with 300,000 objects alive in the parent 24.9 -> 1.6
+  ms (fork copies the page tables; CPython 1.6 / 2.3 ms).
+
+### time, signal, socket, select, selectors
+- time: clock_gettime(_ns), clock_getres, clock_settime(_ns),
+  pthread_getcpuclockid, the CLOCK_* of <time.h>; thread_time() is
+  CLOCK_THREAD_CPUTIME_ID on Linux (it was the process's).
+- signal: **set_wakeup_fd** (the C handler writes each signal's number to
+  the descriptor - asyncio's self-pipe; CPython's checks), siginterrupt
+  (SA_RESTART per signal, kept for later installs), pthread_kill and
+  time.pthread_getcpuclockid (NyConc's thread records now keep their
+  pthread), pthread_sigmask, sigpending, sigwait, sigwaitinfo/sigtimedwait
+  (struct_siginfo), pidfd_send_signal, ItimerError (`signal.itimer_error`,
+  as CPython names it), valid_signals as sigfillset's (glibc keeps 32 and
+  33), SIG_BLOCK..., SIGRTMIN/SIGRTMAX, SIGCLD/SIGPOLL/SIGPWR/SIGIOT/
+  SIGSTKFLT, and Signals/Handlers/Sigmasks made on first use (module
+  `__getattr__`; the module's SIGINT stay ints, equal to the members).
+- socket: sendmsg/recvmsg with ancillary data, **send_fds/recv_fds**,
+  CMSG_LEN/CMSG_SPACE, close/dup/fromfd, gethostbyname_ex, getprotobyname,
+  has_dualstack_ipv6, if_nameindex/if_nametoindex/if_indextoname,
+  sethostname, error/timeout/gaierror/herror/SocketType, every integer
+  constant CPython has where this platform's headers define it
+  (`os_posix_socket.inc`, generated from CPython's; the Linux headers' enum
+  members and Bluetooth's kernel values written out), and AddressFamily/
+  SocketKind/MsgFlag/AddressInfo on first use.
+- select.epoll (Linux: register/modify/unregister/poll/fromfd/close, a
+  context manager; the wait releases the GIL and resumes after a signal's
+  handler with the time left), the EPOLL*/POLL* constants, PIPE_BUF;
+  selectors.BaseSelector and EpollSelector (DefaultSelector stays the socket
+  layer's, which parks an async task instead of blocking its loop).
+
+### sys, gc, the rest
+- **sys.get/set_int_max_str_digits, enforced** (CPython 3.11's gh-95778):
+  int(str) in a base that is not a power of two (NyFormat.hpp
+  `parse_int_str`) and str/repr/print/f-strings/format/%d of an int (the
+  interpreter's `toText`, the VM's `vm_str`/`vm_repr`, NyFormat's
+  `format_int`/`format_value`) raise ValueError past 4300 digits with
+  CPython's messages; `-X int_max_str_digits=N`, `PYTHONINTMAXSTRDIGITS`
+  (an invalid one exits 1 as CPython's "Fatal Python error"),
+  sys.flags.int_max_str_digits (-1 unset), sys.int_info's 4300. The engines'
+  own uses of the text (dict keys, the VM's big ints kept as decimal) are
+  not limited; a literal in source is not checked (CPython: SyntaxError).
+- **sys.unraisablehook / sys.__unraisablehook__**: the engines' "Exception
+  ignored in" reports - a `__del__`, a weakref callback, a generator closed
+  by finalization - go to a program's hook (`_ny_unraisable` in the prelude;
+  `UnraisableHookArgs`, with a traceback); with the default hook the
+  engines print as before. lib/weakref.ny's callbacks and os.register_at_fork
+  report through it too.
+- sys.getallocatedblocks, getdlopenflags/setdlopenflags,
+  get/set_coroutine_origin_tracking_depth (the depth is kept; coroutines
+  have no cr_origin yet), abiflags, pycache_prefix, thread_info.
+- **gc.get_objects(generation)** over the collectors: the interpreter's
+  tracked objects (`nygc::each_tracked`), the VM's values in its tracked
+  containers of that generation (`vmgc::for_each_value_in`) and its globals;
+  lib/gc.ny adds what the running frames and modules hold directly.
+  get_referents follows CPython's traversal for the builtin containers (a
+  list's items last first, a dict's values - and keys when one is not a
+  str -), get_referrers scans get_objects and the module namespaces;
+  is_tracked as CPython 3.11 untracks.
+- ssl: RAND_bytes/RAND_status/RAND_add/RAND_pseudo_bytes over libcrypto
+  (tls.cpp), DER/PEM conversion, cert_time_to_seconds, get_protocol_name,
+  get_server_certificate, 3.11's wrap_socket, OPENSSL_VERSION_NUMBER/INFO,
+  the OP_/ALERT_/SSL_ERROR_/VERIFY_/PROTOCOL_ constants (OpenSSL 3's),
+  HAS_*, get_default_verify_paths as DefaultVerifyPaths, the enums.
+- hashlib.scrypt (native RFC 7914, its vectors checked; OpenSSL's limits
+  and messages), functools.get_cache_token (abc's, on first use), locale's
+  gettext/dgettext/dcgettext/textdomain/bindtextdomain/
+  bind_textdomain_codeset (glibc's libintl), codecs.utf_32_ex_decode and
+  readbuffer_encode, _sqlite3.enable_shared_cache (sqlite3's 3.11 wrapper
+  warns), termios' remaining constants, fcntl.FICLONE/FICLONERANGE.
+- threading's Lock/RLock/Condition/Event have `_at_fork_reinit`
+  (concurrent.futures registers it now that os.register_at_fork exists).
+- collections.namedtuple's classes are named as asked (`type(p).__name__`
+  was `_NT`), with `__module__` the caller's and CPython's docstring.
+
+### Engine changes (all marked "round 85")
+- `include/NyPrelude.hpp`: `prelude_posix_source()` and the "posix" chunk
+  in `builtin_mirror_chunk`; the os chunk's member list ends with
+  `_ny_load_chunk("posix")` / `_ny_posix_extend(m)`; sys's new members
+  (`_ny_sys_extend` and the functions before `_ny_stdlib_names`:
+  `_ny_get/set_int_max_str_digits`, `_NyUnraisableHookArgs`,
+  `_ny_unraisablehook`, `_ny_unraisable`, dlopen flags, coroutine depth,
+  `_NySysThreadInfo`); sys.int_info's default_max_str_digits 4300.
+- `include/NythonExecutor.hpp`: ensureMirror loads "posix" without the base
+  mirror; `_ny_gc_objects` registered; toText of a big int checks the digit
+  limit; `reportUnraisable(flow, obj)` (the exception caught by tbCaught so
+  it has its traceback) used by runWeakCallback and runFinalizer.
+- `include/VirtualMachine.hpp`: load_mirror likewise; int() parses under
+  nycall (the digit limit's ValueError); `int_text_check` in vm_str/vm_repr;
+  `report_unraisable(ev, obj)` in the weak-callback queue, gc_run_finalizer
+  and gen_finalize; native `_ny_gc_objects`.
+- `include/NyBigInt.hpp`: `nypy::int_max_str_digits()`,
+  `int_digits_check_in/out`. `include/NyFormat.hpp`: the checks in
+  parse_int_str, format_int, format_value. `include/NyRuntime.hpp`: CliFlags
+  int_max_str_digits -1, `nyrt::int_max_str_digits()`, builtin_public's os
+  natives in module posix (nt). `include/NyGC.hpp`/`src/NyGC.cpp`:
+  `each_tracked`. `include/VMGC.hpp`/`src/VMGC.cpp`: `for_each_value_in`.
+  `include/builtins/os.hpp`: `os_call_posix`.
+- `src/NyConc.cpp`: ThreadRec keeps its pthread; the signal trampoline
+  writes to the wakeup fd; per-signal SA_RESTART; `_sig_set_wakeup_fd`,
+  `_sig_siginterrupt`, `_sig_pthread`. `src/NyGen.cpp`: report_ignored goes
+  through reportUnraisable. `src/main.cpp`: -X int_max_str_digits,
+  PYTHONINTMAXSTRDIGITS. `src/builtins/core.cpp`: `_ny_sys_info`'s
+  int_max_str_digits/allocated_blocks/libc_version, `_ny_gc_objects`.
+  `src/builtins/pycore.cpp`: int() under nyCall. `src/builtins/os_fd.cpp`:
+  forwards to os_call_posix; real tuples. `src/builtins/os_proc.cpp`: the
+  posix_spawn path. `tls.cpp`: `_tls_rand`; `hashing.cpp`: `_hash_scrypt`;
+  `nysqlite.cpp`: `_sql_shared_cache`; `nysysmods.cpp`: termios/fcntl
+  constants. `nython.cbp`: the two new units.
+
+### Not done
+- os: no dir_fd anywhere (supports_dir_fd is empty), so fwalk opens each
+  directory by path; posix_spawn's `setsid` needs glibc 2.26; spawn* fork.
+  Windows: nt's own extras (startfile, _getfinalpathname ...) are absent and
+  nothing here was run under Wine (os_posix.cpp is POSIX-only and returns
+  "unknown operation" there; the chunk binds only nt's names).
+- sys: 3.12's perf trampolines, sys.monitoring, getunicodeinternedsize;
+  coroutines record no cr_origin; a big-int literal in source is not
+  limited; 3.12's checks (validating a string before the limit,
+  sys.flags.int_max_str_digits 4300) are not followed - 3.11's are.
+- The interpreter's generator finalized when its object dies gives the hook
+  `object=None` (the object is being destroyed); CPython gives the
+  generator.
+- gc: is_finalized is always False; get_referents of other objects than the
+  builtin containers, instances, functions, modules and classes gives
+  their type only.
+- socket: sendmsg's destination address, CAPI; family/type of a socket are
+  plain ints (not AddressFamily members).
+- ssl: MemoryBIO/SSLObject/SSLSession; OP_* are OpenSSL 3's values whatever
+  library was loaded.
+- `_sqlite3.version` and `locale.format` (3.11's, removed in 3.12) are left
+  out: Nython's library is 3.12's.
+- NyBuiltinFns.hpp: not regenerated - its os, posix, signal, socket, select,
+  time and gc rows already list the new functions (a regeneration would also
+  add round 84's curses and CJK rows).
+
+---
+
+## 0y2. Round 85, part F — Python's binding rule for Python-language source (vm_audit119)
 
 **The rule.** Nython's ruling (round 75) stays for `.ny` code: inside a
 function a plain assignment rebinds the nearest existing binding.

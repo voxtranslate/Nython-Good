@@ -104,13 +104,78 @@ bool os_random(std::string& out, size_t n) {
 #endif
 }
 
+// ── scrypt (RFC 7914; round 85): PBKDF2-HMAC-SHA256 around ROMix over
+// BlockMix of Salsa20/8, as the RFC's reference code and OpenSSL's
+// EVP_PBE_scrypt compute it (hashlib.scrypt) ─────────────────────────────
+inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+void salsa20_8(uint32_t B[16]) {
+    uint32_t x[16];
+    std::memcpy(x, B, sizeof x);
+    for (int i = 0; i < 8; i += 2) {
+        x[4] ^= rotl32(x[0] + x[12], 7);  x[8] ^= rotl32(x[4] + x[0], 9);
+        x[12] ^= rotl32(x[8] + x[4], 13); x[0] ^= rotl32(x[12] + x[8], 18);
+        x[9] ^= rotl32(x[5] + x[1], 7);   x[13] ^= rotl32(x[9] + x[5], 9);
+        x[1] ^= rotl32(x[13] + x[9], 13); x[5] ^= rotl32(x[1] + x[13], 18);
+        x[14] ^= rotl32(x[10] + x[6], 7); x[2] ^= rotl32(x[14] + x[10], 9);
+        x[6] ^= rotl32(x[2] + x[14], 13); x[10] ^= rotl32(x[6] + x[2], 18);
+        x[3] ^= rotl32(x[15] + x[11], 7); x[7] ^= rotl32(x[3] + x[15], 9);
+        x[11] ^= rotl32(x[7] + x[3], 13); x[15] ^= rotl32(x[11] + x[7], 18);
+        x[1] ^= rotl32(x[0] + x[3], 7);   x[2] ^= rotl32(x[1] + x[0], 9);
+        x[3] ^= rotl32(x[2] + x[1], 13);  x[0] ^= rotl32(x[3] + x[2], 18);
+        x[6] ^= rotl32(x[5] + x[4], 7);   x[7] ^= rotl32(x[6] + x[5], 9);
+        x[4] ^= rotl32(x[7] + x[6], 13);  x[5] ^= rotl32(x[4] + x[7], 18);
+        x[11] ^= rotl32(x[10] + x[9], 7); x[8] ^= rotl32(x[11] + x[10], 9);
+        x[9] ^= rotl32(x[8] + x[11], 13); x[10] ^= rotl32(x[9] + x[8], 18);
+        x[12] ^= rotl32(x[15] + x[14], 7); x[13] ^= rotl32(x[12] + x[15], 9);
+        x[14] ^= rotl32(x[13] + x[12], 13); x[15] ^= rotl32(x[14] + x[13], 18);
+    }
+    for (int i = 0; i < 16; i++) B[i] += x[i];
+}
+// BlockMix: B is 2r 64-byte blocks (as 32-bit words); Y the scratch
+void blockmix(uint32_t* B, uint32_t* Y, size_t r) {
+    uint32_t X[16];
+    std::memcpy(X, &B[(2 * r - 1) * 16], 64);
+    for (size_t i = 0; i < 2 * r; i++) {
+        for (int k = 0; k < 16; k++) X[k] ^= B[i * 16 + k];
+        salsa20_8(X);
+        std::memcpy(&Y[i * 16], X, 64);
+    }
+    for (size_t i = 0; i < r; i++) std::memcpy(&B[i * 16], &Y[(2 * i) * 16], 64);
+    for (size_t i = 0; i < r; i++) std::memcpy(&B[(i + r) * 16], &Y[(2 * i + 1) * 16], 64);
+}
+std::string scrypt(const std::string& pass, const std::string& salt, uint64_t N, uint32_t r, uint32_t p, size_t dklen) {
+    const size_t words = 32 * (size_t)r;   // 128 r bytes
+    std::string B = nyhash::pbkdf2_hmac("sha256", pass, salt, 1, (size_t)p * 128 * r);
+    std::vector<uint32_t> X(words), Y(words), V(words * (size_t)N);
+    for (uint32_t i = 0; i < p; i++) {
+        unsigned char* blk = (unsigned char*)&B[(size_t)i * 128 * r];
+        for (size_t k = 0; k < words; k++)
+            X[k] = (uint32_t)blk[4 * k] | ((uint32_t)blk[4 * k + 1] << 8) | ((uint32_t)blk[4 * k + 2] << 16) | ((uint32_t)blk[4 * k + 3] << 24);
+        for (uint64_t j = 0; j < N; j++) {
+            std::memcpy(&V[(size_t)j * words], X.data(), words * 4);
+            blockmix(X.data(), Y.data(), r);
+        }
+        for (uint64_t j = 0; j < N; j++) {
+            uint64_t idx = X[(2 * r - 1) * 16] & (N - 1);
+            const uint32_t* v = &V[(size_t)idx * words];
+            for (size_t k = 0; k < words; k++) X[k] ^= v[k];
+            blockmix(X.data(), Y.data(), r);
+        }
+        for (size_t k = 0; k < words; k++) {
+            blk[4 * k] = (unsigned char)X[k]; blk[4 * k + 1] = (unsigned char)(X[k] >> 8);
+            blk[4 * k + 2] = (unsigned char)(X[k] >> 16); blk[4 * k + 3] = (unsigned char)(X[k] >> 24);
+        }
+    }
+    return nyhash::pbkdf2_hmac("sha256", pass, B, 1, dklen);
+}
+
 } // namespace
 
 std::vector<std::string> hash_builtin_names() {
     std::vector<std::string> v{"_hash_new", "_hash_update", "_hash_digest", "_hash_copy", "_hash_free", "_hash_info",
             "_hash_algorithms", "_hash_hmac", "_hash_pbkdf2", "_hash_crc32", "_hash_adler32",
             "_hash_b64encode", "_hash_b64decode", "_hash_b32encode", "_hash_b32decode", "_hash_compare",
-            "os_urandom", "_ws_mask"};
+            "os_urandom", "_ws_mask", "_hash_scrypt"};
     for (auto& n : zlib_builtin_names()) v.push_back(n);   // round 79
     for (auto& n : codec_builtin_names()) v.push_back(n);  // round 80
     for (auto& n : pickle_builtin_names()) v.push_back(n); // round 80
@@ -221,6 +286,31 @@ Value dispatch_hash(NythonExecutor& E, const std::string& name, std::vector<Valu
         if (A.has(4, "dklen") && A.get(4, "dklen").type != ValueType::NONE && dk < 1) fail("ValueError", "key length must be greater than 0.");
         return E.makeBytesValue(nyhash::pbkdf2_hmac(algo, bytes_of(E, A.get(1, "password"), "hashing"),
                                                     bytes_of(E, A.get(2, "salt"), "hashing"), (uint64_t)it, (size_t)dk));
+    }
+    if (name == "_hash_scrypt") {
+        // (round 85) hashlib.scrypt(password, salt, n, r, p, maxmem, dklen):
+        // lib/hashlib.ny checked the types; the limits are OpenSSL's
+        // (EVP_PBE_scrypt) with CPython's messages
+        if (args.size() < 7) fail("TypeError", "_hash_scrypt takes 7 arguments");
+        std::string pass = bytes_of(E, args[0], "hashing"), salt = bytes_of(E, args[1], "hashing");
+        int64_t n = nyos::to_int(args[2], 0), r = nyos::to_int(args[3], 0), p = nyos::to_int(args[4], 0);
+        int64_t maxmem = nyos::to_int(args[5], 0), dklen = nyos::to_int(args[6], 64);
+        if (n < 2 || (n & (n - 1)) != 0) fail("ValueError", "n must be a power of 2.");
+        if (maxmem < 0 || maxmem > INT32_MAX) fail("ValueError", "maxmem must be positive and smaller than " + std::to_string(INT32_MAX));
+        if (dklen < 1 || dklen > INT32_MAX) fail("ValueError", "dklen must be greater than 0 and smaller than " + std::to_string(INT32_MAX));
+        // OpenSSL's checks: r * p < 2^30, n < 2^(128 r / 8), memory within maxmem (32 MiB when 0)
+        uint64_t mem_limit = maxmem ? (uint64_t)maxmem : (uint64_t)32 * 1024 * 1024;
+        bool bad = r < 1 || p < 1 || (uint64_t)r * (uint64_t)p >= ((uint64_t)1 << 30);
+        if (!bad && 16 * r <= 63 && (uint64_t)n >= ((uint64_t)1 << (16 * r))) bad = true;
+        if (bad) fail("ValueError", "Invalid parameter combination for n, r, p, maxmem.");
+        long double need = 128.0L * (long double)r * ((long double)n + (long double)p + 2.0L);
+        if (need > (long double)mem_limit) fail("ValueError", "[digital envelope routines] memory limit exceeded");
+        std::string out;
+        {
+            nyconc::GilRelease un;   // seconds of work at real parameters
+            out = scrypt(pass, salt, (uint64_t)n, (uint32_t)r, (uint32_t)p, (size_t)dklen);
+        }
+        return E.makeBytesValue(out);
     }
     if (name == "_hash_crc32")
         return Value((int64_t)nyhash::crc32(bytes_of(E, A.get(0, "data"), "hashing"), (uint32_t)A.integer(1, "value", 0)));

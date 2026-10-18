@@ -111,6 +111,7 @@ struct Api {
     sqlite3_int64 (*total_changes64)(sqlite3*) = nullptr;
     sqlite3_int64 (*last_insert_rowid)(sqlite3*) = nullptr;
     void (*interrupt)(sqlite3*) = nullptr;
+    int (*enable_shared_cache)(int) = nullptr;   // (round 85) _sqlite3.enable_shared_cache
     int (*limit)(sqlite3*, int, int) = nullptr;
     int (*db_config)(sqlite3*, int, ...) = nullptr;
     int (*prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**) = nullptr;
@@ -252,6 +253,7 @@ Api& api() {
     bind(a, a.total_changes64, "sqlite3_total_changes64", false);
     bind(a, a.last_insert_rowid, "sqlite3_last_insert_rowid");
     bind(a, a.interrupt, "sqlite3_interrupt");
+    bind(a, a.enable_shared_cache, "sqlite3_enable_shared_cache", false);   // round 85
     bind(a, a.limit, "sqlite3_limit");
     bind(a, a.db_config, "sqlite3_db_config", false);
     bind(a, a.prepare_v2, "sqlite3_prepare_v2");
@@ -805,7 +807,7 @@ std::vector<std::string> sqlite_builtin_names() {
             "_sql_set_authorizer", "_sql_set_progress", "_sql_set_trace", "_sql_backup_init", "_sql_backup_step",
             "_sql_backup_finish", "_sql_blob_open", "_sql_blob_close", "_sql_blob_bytes", "_sql_blob_read",
             "_sql_blob_write", "_sql_serialize", "_sql_deserialize", "_sql_enable_load_extension",
-            "_sql_load_extension", "_sql_txn_state", "_sql_filename", "_sql_has"};
+            "_sql_load_extension", "_sql_txn_state", "_sql_filename", "_sql_has", "_sql_shared_cache"};
 }
 
 Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Value>& A, Context* ctx) {
@@ -924,6 +926,11 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         return intValue(nogil([&] { return a.total_changes64 ? (int64_t)a.total_changes64(c->db) : (int64_t)a.total_changes(c->db); }));
     }
     if (name == "_sql_last_rowid") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); return intValue((int64_t)nogil([&] { return a.last_insert_rowid(c->db); })); }
+    if (name == "_sql_shared_cache") {   // (round 85) sqlite3_enable_shared_cache(do_enable)
+        Api& a = need();
+        int rc = a.enable_shared_cache ? a.enable_shared_cache(A.empty() ? 0 : (E.isTruthy(A[0]) ? 1 : 0)) : 0;
+        return intValue((int64_t)rc);
+    }
     if (name == "_sql_interrupt") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); a.interrupt(c->db); return NONE_VALUE; }
     if (name == "_sql_limit") {
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));

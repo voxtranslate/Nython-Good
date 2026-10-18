@@ -112,6 +112,9 @@ long collect(VirtualMachine& vm, int generation = 2);
 // generator frame), for in-place updates (round 79: __class__ assignment
 // renames an instance's class in each value that refers to it).
 void for_each_value(const std::function<void(VMVal&)>& f);
+// (round 85) gc.get_objects(generation): the values held in the live
+// tracked containers of one generation (-1: all three)
+void for_each_value_in(int gen, const std::function<void(VMVal&)>& f);
 void set_enabled(bool on);
 bool is_enabled();
 void set_threshold(int gen, long v);

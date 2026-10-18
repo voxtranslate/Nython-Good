@@ -89,9 +89,9 @@ int win_errno(DWORD e) {
 #endif
 
 Value tuple_of(NythonExecutor& E, const std::vector<Value>& items) {
-    Value t = make_list(E, items);
-    if (auto* o = dynamic_cast<Object*>((Collectable*)t.value.p)) o->set("__tuple__", Value(1));
-    return t;
+    // (round 85) a real tuple: the "__tuple__" mark set through a cast of
+    // value.p never reached the container, so os.pipe() gave a list
+    return E.makeListValue(items, true);
 }
 
 // A file descriptor argument: an int, or a file object's handle (open()'s
@@ -859,7 +859,7 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
     }
 #endif
     (void)Str;
-    return UNDEFINED_VALUE;
+    return os_call_posix(E, op, args);   // (round 85) the rest of posixmodule.c: os_posix.cpp
 }
 
 } // namespace nyos

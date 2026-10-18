@@ -713,6 +713,19 @@ def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
 
     class _NT(_NamedTupleBase):
         pass
+    # (round 85) the class is named typename (it showed as _NT), in the
+    # module that made it unless module= says otherwise, as CPython's
+    _NT.__name__ = typename
+    _NT.__qualname__ = typename
+    if module is none:
+        try:
+            import sys as _nt_sys
+            module = _nt_sys._getframe(1).f_globals.get("__name__", "__main__")
+        except (AttributeError, ValueError):
+            module = none
+    if module is not none:
+        _NT.__module__ = module
+    _NT.__doc__ = typename + "(" + ", ".join(names) + ")"
     _NT._typename = typename
     _NT._fields = tuple(names)
     _NT._field_defaults = field_defaults

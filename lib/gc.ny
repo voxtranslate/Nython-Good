@@ -20,10 +20,22 @@
 #     allocations since the last collection;
 #   - get_stats() reports collections per generation; "collected" and
 #     "uncollectable" totals are attributed to the oldest generation;
-#   - is_tracked() answers by kind (atoms are not tracked, containers and
+#   - is_tracked() answers by kind as CPython 3.11 untracks (atoms, empty
+#     tuples and dicts holding only atoms are not tracked; containers and
 #     instances are), freeze() only counts, set_debug() only records flags;
-#   - get_objects, get_referrers and get_referents are not provided (the
-#     collectors do not expose their object lists).
+#   - get_objects(generation) (round 85) lists the collector's own tracked
+#     objects on the interpreter (src/NyGC.cpp: lists, dicts, sets, tuples,
+#     modules, generators, instances, functions, bound methods - not the
+#     engine's scopes); on the VM, which tracks containers by weak pointer,
+#     the containers, instances, generators and functions the live tracked
+#     containers and the globals hold (src/VMGC.cpp). Objects a native holds
+#     only from C++ are not listed;
+#   - get_referents (round 85) follows CPython's traversal order for the
+#     builtin containers (a list's and a tuple's items last first, a dict's
+#     values - and keys when one is not a str -, a set's items) and gives an
+#     instance's attribute values then its class, a function's code,
+#     globals, defaults and closure cells' contents; get_referrers scans
+#     get_objects() and the modules' namespaces (CPython's module dicts).
 
 DEBUG_STATS = 1
 DEBUG_COLLECTABLE = 2
@@ -92,12 +104,157 @@ def get_stats():
         i = i + 1
     return out
 
+def _atom(obj):
+    return obj is None or isinstance(obj, (bool, int, float, complex, str, bytes))
+
 def is_tracked(obj):
     # atoms hold no references, so no collector tracks them (CPython's rule
-    # for its own atoms; empty dicts/tuples untracked lazily is not modelled)
-    if obj is None or isinstance(obj, (bool, int, float, complex, str, bytes)):
+    # for its own atoms); CPython 3.11 also never tracks an empty tuple, and
+    # tracks a dict only once it holds something that can be tracked
+    if _atom(obj):
+        return False
+    if type(obj) is tuple and len(obj) == 0:
+        return False
+    if type(obj) is dict:
+        for k in obj:
+            if not _atom(k) or not _atom(obj[k]):
+                return True
         return False
     return True
+
+# ── round 85: get_objects, get_referents, get_referrers ──────────────────
+def get_objects(generation=None):
+    _ny_sys_audit("gc.get_objects", -1 if generation is None else generation)
+    var g = -1
+    if generation is not None:
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise TypeError("argument should be integer or None, not '" + type(generation).__name__ + "'")
+        if generation >= 3:
+            raise ValueError("generation parameter must be less than the number of available generations (3)")
+        if generation < -1:
+            raise ValueError("generation parameter cannot be negative")
+        g = generation
+    return _objects(g)
+
+def _objects(g):
+    var out = list(_ny_gc_objects(g))
+    if g == -1 or g == 2:
+        # what the running frames and the modules hold directly, when the
+        # collector's lists miss it (the VM tracks containers it reaches
+        # from other containers; a frame's variables are no container)
+        var seen = set()
+        for o in out:
+            seen.add(id(o))
+        def take(v):
+            if not _atom(v) and id(v) not in seen and type(v) is not _ModuleType:
+                seen.add(id(v))
+                out.append(v)
+        var f = _sys._getframe(2)
+        while f is not None:
+            for v in list(f.f_locals.values()):
+                take(v)
+            f = f.f_back
+        for m in list(_sys.modules.values()):
+            try:
+                for v in list(vars(m).values()):
+                    take(v)
+            except TypeError:
+                pass
+    return out
+
+import sys as _sys
+_ModuleType = type(_sys)
+
+def _referents(o):
+    # an object the engine cannot take apart has none
+    try:
+        return _referents1(o)
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return []
+
+def _referents1(o):
+    if _atom(o):
+        return []
+    var t = type(o)
+    if t is _ModuleType:
+        # CPython's module_traverse: its dict
+        try:
+            return [vars(o)]
+        except TypeError:
+            return []
+    if isinstance(o, (list, tuple)):
+        var r = list(o)
+        r.reverse()
+        return r
+    if isinstance(o, (set, frozenset)):
+        return list(o)
+    if isinstance(o, dict):
+        var all_str = True
+        for k in o:
+            if type(k) is not str:
+                all_str = False
+                break
+        if all_str:
+            return list(o.values())
+        var out = []
+        for k in o:
+            out.append(o[k])
+            out.append(k)
+        return out
+    if t.__name__ == "function":
+        var out = []
+        for name in ("__code__", "__globals__", "__module__", "__defaults__", "__kwdefaults__", "__doc__", "__name__",
+                     "__dict__", "__closure__", "__annotations__", "__qualname__"):
+            var v = getattr(o, name, None)
+            if v is not None:
+                out.append(v)
+        return out
+    if isinstance(o, type):
+        var out = []
+        for name in ("__dict__", "__mro__", "__bases__"):
+            var v = getattr(o, name, None)
+            if v is not None:
+                out.append(v)
+        return out
+    var d = getattr(o, "__dict__", None)
+    if isinstance(d, dict) or hasattr(d, "values"):
+        var out = list(d.values())
+        out.append(t)
+        return out
+    return [t]
+
+def get_referents(*objs):
+    _ny_sys_audit("gc.get_referents", objs)
+    var out = []
+    for o in objs:
+        out.extend(_referents(o))
+    return out
+
+def get_referrers(*objs):
+    _ny_sys_audit("gc.get_referrers", objs)
+    if not objs:
+        return []
+    var ids = set()
+    for o in objs:
+        ids.add(id(o))
+    var out = []
+    var seen = set()
+    var cands = _objects(-1)
+    import sys
+    for m in list(sys.modules.values()):
+        try:
+            cands.append(vars(m))
+        except TypeError:
+            pass
+    for o in cands:
+        if id(o) in ids or id(o) in seen:
+            continue
+        for r in _referents(o):
+            if id(r) in ids:
+                seen.add(id(o))
+                out.append(o)
+                break
+    return out
 
 def is_finalized(obj):
     return False

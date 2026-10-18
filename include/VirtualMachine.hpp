@@ -3856,6 +3856,9 @@ public:
                 VMVal saved_exc = last_exception_obj_;
                 std::vector<VMVal> args{weak_value(c)};
                 try { vm_call(cb, args, std::nullopt); }
+                catch (VMException& e) {   // (round 85) sys.unraisablehook
+                    if (!report_unraisable(e.value, cb)) std::cerr << "Exception ignored in: " << vm_repr(cb) << "\n" << e.what() << "\n";
+                }
                 catch (std::exception& e) {
                     std::cerr << "Exception ignored in: " << vm_repr(cb) << "\n" << e.what() << "\n";
                 }
@@ -3863,6 +3866,16 @@ public:
                 last_exception_obj_ = saved_exc;
             }
         }
+    }
+    // (round 85) An exception a __del__, a weakref callback or a generator's
+    // finalization raised, given to the program's sys.unraisablehook (the
+    // prelude's _ny_unraisable): false when the default hook stands, and the
+    // VM prints its own report.
+    bool report_unraisable(const VMVal& ev, const VMVal& obj) {
+        auto it=globals_.find("_ny_unraisable");
+        if(it==globals_.end()||it->second.type==VMType::NONE) return false;
+        try { std::vector<VMVal> a{ev, VMVal::make_none(), obj}; return vm_call(it->second, a, std::nullopt).is_truthy(); }
+        catch(...){ return false; }
     }
     void gc_run_finalizer(const std::string& cls, const std::shared_ptr<VMMap>& attrs) {
         if (vm_finalizers_off_) return;
@@ -3872,6 +3885,10 @@ public:
         VMVal saved_exc = last_exception_obj_;
         std::vector<VMVal> no_args;
         try { invoke_method(m, inst, no_args, cls); }
+        catch (VMException& e) {   // (round 85) sys.unraisablehook gets the class's __del__
+            if (!report_unraisable(e.value, m))
+                std::cerr << "Exception ignored in: <function " << cls << ".__del__>\n" << e.what() << "\n";
+        }
         catch (std::exception& e) {
             std::cerr << "Exception ignored in: <function " << cls << ".__del__>\n" << e.what() << "\n";
         }
@@ -3983,6 +4000,30 @@ public:
         globals_["gc_is_enabled"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { return VMVal::make_bool(vmgc::is_enabled()); });
         globals_["gc_isenabled"] = globals_["gc_is_enabled"];
         globals_["gc_live_objects"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal { return I(vmgc::live_objects()); });
+        // (round 85) gc.get_objects(generation): the lists, dicts, sets,
+        // tuples, instances, generators and functions the live tracked
+        // containers (and, for the oldest generation, the globals) hold -
+        // what the collector reaches, each once
+        globals_["_ny_gc_objects"] = VMVal::make_native([this](std::vector<VMVal>& a) -> VMVal {
+            int g = !a.empty() && a[0].type == VMType::INT ? (int)a[0].i : -1;
+            std::unordered_set<const void*> seen;
+            std::vector<VMVal> out;
+            auto add = [&](VMVal& v) {
+                const void* id = nullptr;
+                switch (v.type) {
+                    case VMType::LIST: id = v.list.get(); break;
+                    case VMType::MAP: case VMType::INSTANCE: id = v.map.get(); break;
+                    case VMType::GENERATOR: id = v.gen.get(); break;
+                    case VMType::FUNCTION: id = v.iter ? (const void*)v.iter.get() : (const void*)v.closure_env.get(); break;
+                    default: return;
+                }
+                if (!id || !seen.insert(id).second) return;
+                out.push_back(v);
+            };
+            vmgc::for_each_value_in(g, add);
+            if (g < 0 || g == 2) for (auto& kv : globals_) add(kv.second);
+            return VMVal::make_list(std::move(out));
+        });
         globals_["gc_set_threshold"] = VMVal::make_native([](std::vector<VMVal>& a) -> VMVal {
             for (size_t i = 0; i < a.size() && i < 3; i++) if (a[i].type == VMType::INT) vmgc::set_threshold((int)i, (long)a[i].i);
             return VMVal::make_none();
@@ -5184,7 +5225,10 @@ private:
     void gen_finalize(const std::shared_ptr<GenState>& sp) {
         GenState& gs=*sp;
         try { gen_close(gs, true); }
-        catch(VMException& e){ gen_report_ignored(gs, e.value); }
+        catch(VMException& e){
+            VMVal gv; gv.type=VMType::GENERATOR; gv.gen=sp;   // (round 85) sys.unraisablehook gets the generator
+            if(!report_unraisable(e.value, gv)) gen_report_ignored(gs, e.value);
+        }
         catch(std::exception& e){ std::cerr<<"Exception ignored in: "<<vm_gen_repr(&gs)<<"\n"<<e.what()<<"\n"; }
         if(!gs.done) gen_finish(gs);
     }
@@ -6023,7 +6067,13 @@ private:
         std::snprintf(buf, sizeof buf, "0x%llx", id);
         return "<"+(mod.empty()||mod=="builtins"?qn:mod+"."+qn)+" object at "+buf+">";
     }
+    // (round 85) sys.set_int_max_str_digits: str/repr of a longer int raise
+    // ValueError, as CPython 3.11's (a big int's s is its decimal text)
+    void int_text_check(const VMVal& v) {
+        if(v.type==VMType::INT&&v.s.size()>640) nycall([&]{ nypy::int_digits_check_out(v.s.size()-(v.s[0]=='-'?1:0)); return 0; });
+    }
     std::string vm_str(const VMVal& v) {
+        if(v.type==VMType::INT){ int_text_check(v); return v.to_string(); }   // (round 85)
         if(v.type==VMType::MAP&&is_module_ns(v)&&!is_property_desc(v)&&v.class_name.rfind("__",0)!=0) return module_text(v);   // round 78
         if(v.type==VMType::CLASS&&!class_meta_.empty()){
             VMVal r;
@@ -6045,6 +6095,7 @@ private:
         return v.to_string();
     }
     std::string vm_repr(const VMVal& v) {
+        if(v.type==VMType::INT) int_text_check(v);   // (round 85)
         if(v.type==VMType::MAP&&is_module_ns(v)&&!is_property_desc(v)&&v.class_name.rfind("__",0)!=0) return module_text(v);   // round 78
         if(v.type==VMType::CLASS&&!class_meta_.empty()){
             VMVal r;
@@ -6241,7 +6292,7 @@ private:
     void load_mirror(const std::string& chunk) {
         if(mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if(chunk!="base"&&chunk!="os"&&chunk!="buffer") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer")
+        if(chunk!="base"&&chunk!="os"&&chunk!="buffer"&&chunk!="posix") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix")
         if(chunk=="dictview") load_mirror("dict");
         try {
             auto source=nython::reader::SourceCode(nyrt::builtin_mirror_chunk(chunk));
@@ -16031,7 +16082,7 @@ private:
                 if(b.k!=1||(base!=0&&(base<2||base>36))) vm->raise_native_exception("ValueError","int() base must be >= 2 and <= 36, or 0");
                 nypy::BigInt out;
                 const std::string& txt=v.type==VMType::BYTES?v.bdata():v.s;
-                if(!nypy::parse_int_str(v.type==VMType::BYTES?txt:nypy::uni_to_ascii(txt),base,out))   // (round 84: Unicode digits and spaces)
+                if(!vm->nycall([&]{ return nypy::parse_int_str(v.type==VMType::BYTES?txt:nypy::uni_to_ascii(txt),base,out); }))   // (round 84: Unicode digits and spaces; round 85: nycall, the digit limit raises)
                     vm->raise_native_exception("ValueError","invalid literal for int() with base "+std::to_string(base)+": "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                 return VMVal::make_bigint(out);
             }
@@ -16048,7 +16099,7 @@ private:
                 case VMType::STRING: case VMType::BYTES: {
                     nypy::BigInt out;
                     const std::string& txt=v.type==VMType::BYTES?v.bdata():v.s;
-                    if(!nypy::parse_int_default(v.type==VMType::BYTES?txt:nypy::uni_to_ascii(txt),out))   // (round 84)
+                    if(!vm->nycall([&]{ return nypy::parse_int_default(v.type==VMType::BYTES?txt:nypy::uni_to_ascii(txt),out); }))   // (round 84; round 85: nycall)
                         vm->raise_native_exception("ValueError","invalid literal for int() with base 10: "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                     return VMVal::make_bigint(out);
                 }

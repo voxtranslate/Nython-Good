@@ -717,6 +717,25 @@ Value dispatch_core(NythonExecutor& E,
             if (bo->mut) bo->exports++;
             return E.makeListValue({intValue((int64_t)(intptr_t)bo->s.data()), intValue((int64_t)bo->s.size()), Value(!bo->mut), v});
         }
+        if (name == "_ny_gc_objects") {
+            // (round 85) gc.get_objects(generation): the collector's tracked
+            // objects a program can see - containers (lists, dicts, sets,
+            // tuples, modules, generators), instances, functions, bound
+            // methods; not the engine's scopes or its builtins' members
+            int gen = -1;
+            if (!args.empty() && args[0].type == ValueType::INTEGER) gen = (int)bigint_to_i64(args[0].value.i);
+            struct Acc { std::vector<Value> out; };
+            Acc acc;
+            nygc::each_tracked(gen, [](Collectable* c, void* p) {
+                auto* a = static_cast<Acc*>(p);
+                uint16_t f = c->gc_flags;
+                if (f & nygc::F_KINST) { auto* in = static_cast<nyheap::Inst*>(c); a->out.push_back(nyheap::userValue(in, (void*)&in->tag)); return; }
+                if (f & nygc::F_KFUNC) { auto* fn = static_cast<nyheap::Func*>(c); a->out.push_back(nyheap::userValue(fn, (void*)&fn->id)); return; }
+                if (auto* b = dynamic_cast<nyheap::Bound*>(c)) { a->out.push_back(nyheap::userValue(b, (void*)&b->tag)); return; }
+                if ((f & nygc::F_KCONT) && !dynamic_cast<Context*>(c)) a->out.push_back(Value(c));
+            }, &acc);
+            return E.makeListValue(acc.out);
+        }
         if (name == "_ny_load_chunk") {
             // (round 84) a prelude chunk loaded on first need - "buffer":
             // memoryview's members and the buffer helpers (NyPreludeBuffer.cpp)
@@ -786,6 +805,26 @@ Value dispatch_core(NythonExecutor& E,
                     return NONE_VALUE;
                 }
                 return Value(nyconc::switch_interval());
+            }
+            // (round 85) sys.get/set_int_max_str_digits (checked by the
+            // prelude), sys.getallocatedblocks, sys.thread_info's version
+            if (k == "int_max_str_digits") {
+                if (args.size() > 1) {
+                    nyrt::int_max_str_digits() = (int)std::min<int64_t>(bigint_to_i64(args[1].value.i), INT32_MAX);
+                    return NONE_VALUE;
+                }
+                return Value((int)nyrt::int_max_str_digits());
+            }
+            if (k == "allocated_blocks") {
+                auto st = nygc::stats();
+                return intValue((int64_t)(st.tracked + st.live_strings));
+            }
+            if (k == "libc_version") {
+#if defined(__GLIBC__)
+                return E.makeStringValue(std::string("NPTL ") + std::to_string(__GLIBC__) + "." + std::to_string(__GLIBC_MINOR__));
+#else
+                return NONE_VALUE;
+#endif
             }
             if (k == "prefix") {
                 // the directory holding the standard library's lib/
