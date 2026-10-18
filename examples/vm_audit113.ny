@@ -22,7 +22,9 @@
 #
 # Every expected value is what CPython 3.11 computes (the file is generated
 # by tools/vm_audit113_spec.py), so `python3 examples/vm_audit113.ny` passes
-# too. The Nython-only additions are checked at the end, on Nython only.
+# too. The Nython-only additions are checked at the end, on Nython only,
+# and mbcs/oem/code_page_* on Windows only (their values written by hand:
+# CPython's on Windows; build-win/nywin runs them under Wine).
 #
 #     ./build/nython-cli examples/vm_audit113.ny
 #     ./build/nython-cli --vm examples/vm_audit113.ny
@@ -978,6 +980,28 @@ msg113b = email.message.Message()
 msg113b.set_payload("中文正文", "gb2312")
 check('email messages in CJK charsets', [msg113.get_content(), msg113['Content-Type'], msg113.get_payload(decode=True), msg113b.get_payload(decode=True).decode('gb2312'), msg113b['Content-Transfer-Encoding']],
       ['本文です。\n', 'text/plain; charset="iso-2022-jp"', b'\x1b$BK\\J8$G$9!#\x1b(B\n', '中文正文', 'base64'])
+
+# ── Windows only: mbcs, oem and code_page_* (CPython's encode_code_page /
+# decode_code_page over WideCharToMultiByte / MultiByteToWideChar; the
+# values are CPython's on Windows - the code pages used do not depend on
+# the system's ANSI code page, mbcs only round-trips ASCII and Latin-1 here)
+if sys.platform == "win32":
+    import codecs
+    check("code_page_encode / code_page_decode", [codecs.code_page_encode(1252, "a\u00e9\u20ac"), codecs.code_page_decode(1252, b"a\xe9\x80"),
+          codecs.code_page_decode(932, b"\x82\xa0\x93\xfa"), codecs.code_page_encode(932, "\u3042\u65e5"), codecs.code_page_decode(932, b"a\x82", "strict", False),
+          codecs.code_page_encode(65001, "\u00e9\U0001f600"), codecs.code_page_decode(65001, b"\xc3\xa9\xff", "replace", True)],
+          [(b"a\xe9\x80", 3), ("a\u00e9\u20ac", 3), ("\u3042\u65e5", 4), (b"\x82\xa0\x93\xfa", 2), ("a", 1),
+           (b"\xc3\xa9\xf0\x9f\x98\x80", 2), ("\u00e9\ufffd", 3)])
+    check("code pages: errors as CPython reports them", [err(lambda: codecs.code_page_decode(932, b"a\x82", "strict", True)),
+          codecs.code_page_decode(932, b"a\x82", "replace", True), err(lambda: codecs.code_page_encode(1252, "a\u4e00")),
+          codecs.code_page_encode(1252, "a\u4e00b", "replace"), codecs.code_page_encode(1252, "a\u4e00b", "xmlcharrefreplace"),
+          codecs.code_page_encode(1252, "a\u4e00b", "backslashreplace"), err(lambda: codecs.code_page_encode(-1, "a"))],
+          ["UnicodeDecodeError: 'cp932' codec can't decode bytes in position 0--1: No mapping for the Unicode character exists in the target code page.",
+           ("a\ufffd", 2), "UnicodeEncodeError: 'cp1252' codec can't encode characters in position 0--1: invalid character",
+           (b"a?b", 3), (b"a&#19968;b", 3), (b"a\\u4e00b", 3), "ValueError: invalid code page number"])
+    check("mbcs and oem", [codecs.lookup("mbcs").name, codecs.lookup("oem").name, codecs.lookup("dbcs").name, "abc".encode("mbcs"),
+          b"abc".decode("mbcs"), "abc".encode("oem"), b"abc".decode("oem")],
+          ["mbcs", "oem", "mbcs", b"abc", "abc", b"abc", "abc"])
 
 # ── Nython only ──────────────────────────────────────────────────────────────
 if nython:
