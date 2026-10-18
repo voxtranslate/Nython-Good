@@ -5,6 +5,8 @@ this file describes it **as it actually is**, including the traps.
 
 Last updated: round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
 Round 84, part B — **§0x2** (the Unicode database - unicodedata complete from compact generated tables; str's case mappings and predicates by it on both engines; PEP 3131 identifiers; the CJK codecs ported from CPython's cjkcodecs; utf-7; mbcs/oem on Windows; idna's nameprep; Unicode-aware fuzzy matching; vm_audit113)
+Round 84, part C — **§0x3** (tkinter, ttk and turtle over Nython's own GUI backend: a Tcl subset, Tk's core, pack/grid/place, the classic and ttk widgets, photo images, dialogs; CPython's tkinter package and turtle.py; vm_audit114)
+Round 84, part D — **§0x4** (curses without ncurses: terminfo, tparm, ncurses' screen model and update algorithm, input and mouse, panels; a VT/xterm emulator the test compares with CPython+ncurses through; vm_audit115)
 Round 84, ctypes and Windows — **§0w1** (ctypes structures passed and returned by value on every ABI without libffi - SysV eightbyte classification, AAPCS64, Win64, i686; Windows callback trampolines per float mask and stdcall; the Windows gaps round 83 left: zipapp path-hook recursion, liblzma's header errors, faulthandler's SIGSEGV, mmap's messages, AF_UNIX)
 Round 84, part 0 — **§0w** (the semantic gaps rounds 82-83 found: module attribute messages, BaseException's members and builtins' docstrings as values, a finally body seeing its exception, strict and starred comprehension targets, sys.audit, True/None spelled by the program's language)
 Round 83, ctypes — **§0v4** (ctypes over libffi loaded at run time, or Nython's own caller built on the calling conventions' register files; type's own members; a metaclass's operators on its classes)
@@ -465,6 +467,131 @@ clean.
   main checkout's /home/user/Nython-Good/lib/ast.ny, whose `_ny_ast` this
   build lacks. Gone once merged; how the VM reached a directory outside
   its installation was not traced.
+
+## 0x3. Round 84, part C — tkinter, ttk and turtle over Nython's own GUI backend (vm_audit114)
+
+`examples/vm_audit114.ny` (215 checks) passes on both engines. Under a
+python3 without tkinter (this container's) it prints a skip line and 0
+checks; with tkinter but no display it would run the Tcl-layer and variable
+checks on `Tcl()` (that branch has not run anywhere).
+
+Tk is written in Nython over the `gui_*` natives (the SDL3 backend or the
+headless stub), so tkinter programs run without Tcl/Tk installed:
+- **`lib/_tkinter/`** (package): `tcl.ny` - a Tcl subset (set/unset/incr/
+  append/lappend, list, llength, lindex, lrange, concat, join, split,
+  string, expr, if/while/for/foreach, break/continue/return/catch/error,
+  eval, puts, info, proc, global, uplevel, subst, format, rename); `core.ny`
+  - the application: event loop with timers and idle work, bindings and
+  bindtags, focus with Tab traversal, grab, wm, winfo, the option database,
+  clipboard, selection, fonts, images, `tk`, `bgerror`; `geom.ny` - pack,
+  grid and place after tkPack.c / tkGrid.c / tkPlace.c; the classic widgets
+  (`widgets.ny`, `entry.ny`, `text.ny`, `canvas.ny` with real PostScript,
+  `menu.ny`); `image.ny` - photo images (PNG/GIF/PPM, put/get/copy with
+  zoom and subsample, write) and bitmaps; `ttk.ny` - ttk's style engine
+  (themes default/clam/alt/classic, elements, layouts, state maps) and the
+  simple widgets; `ttk2.ny` - Entry, Combobox, Spinbox, Scrollbar, Scale,
+  Progressbar, Notebook, Panedwindow, Treeview; `dialogs.ny` -
+  tk_messageBox, tk_dialog, the file dialogs over the native one,
+  tk_chooseColor.
+- **`lib/tkinter/`**: CPython 3.12's package (with two 3.13 additions) -
+  constants, ttk (3.13's), font, messagebox, simpledialog, filedialog,
+  commondialog, dialog, colorchooser, scrolledtext, dnd. `TkVersion` /
+  `TclVersion` 8.6; `tkinter._nython` is True.
+- **`lib/turtle.ny`**: CPython 3.12's turtle.py, one line changed (marked
+  "Nython:": an f-string nesting its own quote, PEP 701, which the lexer
+  did not read).
+- Nython's additions: `_ny_accessibility()` (role, name, state and bounds of
+  every viewable widget), damage-only repainting at idle (`_ny_frames()`
+  counts frames), and the scripted-input harness `_ny_drive` / `_ny_queue` /
+  `_ny_snapshot` the test drives the widgets with.
+
+**Engine changes** (both engines where both had the defect; marked
+`(round 84)`):
+- `abs()` / `round()` of a builtin-subclass instance whose own class
+  defines `__abs__` / `__round__` calls it (`abs(Vec2D)` raised TypeError;
+  `nyrt::payload_dunder`, interpreter `ownDunder()` in `unwrapBuiltinArgs`,
+  VM `own_dunder()` in `unwrap_native_args`).
+- Interpreter: a handled exception is forgotten when its clause ends
+  (`forgetRaised`: `exc_instance_map_` / `exc_ring_`), unless an enclosing
+  clause handles the same one - the 256-entry ring kept caught exceptions,
+  and with them the locals of every frame they passed through, alive (a
+  PhotoImage outlived its last reference). Also when `with` suppresses.
+
+### Not done
+- Tcl: namespaces beyond `::name`, upvar, arrays beyond `name(index)`,
+  clock/file/channels (regexp is Python's re); `createfilehandler`, `send`;
+  results are plain values, not Tcl_Obj.
+- ttk: the Windows/macOS native themes and the vsapi element factory
+  (clam/alt/classic draw with the default theme's elements); Treeview's
+  8.7 additions; Notebook tabs only along the top; no Panedwindow sash grips.
+- Photo images: `-gamma`/`-palette` stored but not applied; no SVG or
+  `-metadata`. Tk's own Tcl file dialog (the native one is always used).
+- Menu tear-offs and `-columnbreak`; text peers and full `-tabs`; canvas
+  stipples and text `-angle`; `place configure .w` with no options gives
+  the info string.
+- The exception ring still keeps exceptions caught inside native code.
+- Stub harness: scripted input goes to the most recent window unless
+  `window N` is used; text-input events carry no modifier state; the key
+  name `ctrl+slash` is unknown (`ctrl+/` works).
+
+## 0x4. Round 84, part D — curses without ncurses, and a VT/xterm emulator to test it (vm_audit115)
+
+`examples/vm_audit115.ny` (611 checks) passes on both engines; under
+python3.11 with ncurses 6.4, 585. Under Wine 82 per engine (the pty groups
+skipped: no pty or terminfo tools there).
+
+Ten curses programs (basic, windows, pads, panels, scroll, textpad, input,
+mouse_resize, colors, resume) run under a pty on xterm-256color and vt100;
+after each step the emulated cells, cursor, alternate-screen state and
+bells/flashes are compared with CPython+ncurses running the same program
+live (or with its recorded screens, `tools/gen_vm_audit115.py`). Also:
+terminfo entries against `infocmp` (tic-compiled 32- and 16-bit entries,
+the hex directory layout, `TERMINFO_DIRS`, the built-in entries), tparm
+cases, the emulator's parser, output byte counts.
+
+- **`src/builtins/nycurses.cpp`** (`_curses_*` natives, reached by the VM
+  through the sysmods bridge): terminfo in both formats (magic 0432 and
+  01036, extended capabilities, the full search path, letter and hex
+  layouts) with built-in xterm-256color and vt100 entries
+  (`nycurses_tables.inc` from `tools/gen_nycurses_tables.py`;
+  `NY_TERMINFO_BUILTIN=1` forces them); tparm's whole language with
+  lib_tparm.c's corner cases, delays stripped or slept as tputs does;
+  ncurses' screen model (windows, subwindows, pads, wide and combining
+  characters, background rules); doupdate after tty_update.c (hashmap.c
+  line matching, hardscroll.c scrolling, ClrBottom, TransformLine with
+  el/el1/ich/dch/rep/ech, the mvcur cost model); input in ncurses' program
+  tty mode with a key trie from the k* capabilities and ESCDELAY, SGR 1006
+  and X10 mouse with click merging, SIGWINCH through a self-pipe giving
+  KEY_RESIZE; on Windows the Console API in VT mode.
+- **`lib/_curses.ny`** (CPython's `_curses` API, constants and messages;
+  Nython's `nython_stats()` - bytes written, updates, the update mode
+  `NY_CURSES_UPDATE` set - and `nython_terminfo()`), **`lib/_curses_panel.ny`**
+  (ncurses' panel algorithms), **`lib/curses/`** (CPython 3.11's
+  `__init__`, ascii, textpad, has_key, plus panel).
+- **`lib/_nyvt.ny`**: a VT100/xterm emulator after Paul Williams' DEC
+  parser (SGR with 256 and direct colours, scroll regions, insert/delete,
+  the alternate screen, cursor save/restore, wide characters, mouse modes
+  and replies); python3 can load it too.
+- Beyond ncurses: each attribute change takes the cheapest of the
+  individual exit codes, sgr0-then-set and `sgr`; colours are re-sent only
+  when they change; on ECMA-48 terminals one change is one `CSI ... m`;
+  `rep` for ASCII runs in a UTF-8 locale; ACS characters written as Unicode
+  in a UTF-8 locale (lib_wacs.c's table). Scrolling workload: 7709 bytes
+  (ncurses 7981); the test's 19 program runs: 12527 bytes (ncurses 18555).
+- Engine: interpreter `importDotted` binds the submodule over a same-named
+  attribute (`import curses.has_key` left `curses.has_key` the function;
+  `Object::set` never overwrites). The VM already did.
+
+### Not done
+- ncurses' putwin/getwin file format (Nython writes its own,
+  `NYCURSESWIN1`); slk soft labels, ripoffline; curses' own line editing in
+  nocbreak mode; multibyte input assembled by `getch` (it returns bytes;
+  `get_wch`/`getstr` decode UTF-8); xmc terminals, null padding,
+  Berkeley-DB terminfo.
+- Under Wine the console size reads 24x80 whatever the pty says and keys
+  never reach `getch` (Wine keeps line mode): the pty programs are tested
+  on POSIX only.
+- `os.popen` is missing (the test works around it).
 
 ## 0w. Round 84 (main session) — the semantic gaps rounds 82-83 found (vm_audit116)
 

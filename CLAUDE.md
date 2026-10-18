@@ -403,6 +403,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit108 | 224 | round 83: ast (the real parser's tree: dump of a corpus with positions, f-string parts, unparse round trips, literal_eval, visitors/transformers, compile of a tree, SyntaxErrors), tokenize/token (3.12 f-string tokens, detect_encoding, untokenize), symtable, dis/opcode (Nython's VM bytecode, the adaptive view on the VM), marshal bytes, pickletools.dis/optimize text, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, multi-line string lines; generated from CPython 3.12's values (`tools/gen_vm_audit108.py`; 206 under python3.12, 191 under 3.11) |
 | vm_audit112 | 135 | round 84 (part A): memoryview and the buffer protocol (PEP 3118/688) - views of bytes/bytearray/array/mmap/ctypes/memoryview/`__buffer__` classes, attributes, casts, N-dim shapes and strides, every native format, slicing and slice assignment, ==/hash, CPython's messages, exports blocking resizes (BufferError), bytes-like arguments everywhere (struct/zlib/bz2/lzma/binascii/hashlib/io/files/sockets/os/wave/sqlite3/pickle), readinto into views, ctypes from_buffer, bytes % args (PEP 461) (passes under python3.12; 132 under 3.11) |
 | vm_audit113 | 389 | round 84 (part B): unicodedata (every property over a sample, NormalizationTest-14.0.0, ucd_3_2_0, aliases and named sequences), str by the database (full case mapping, final sigma, casefold, title, the is* predicates, Unicode whitespace and line breaks, int/float/complex/Decimal of Unicode digits), PEP 3131 identifiers, re's Unicode classes, the CJK codecs (every one, every error handler, incremental, streams), utf-7, the single-byte code pages, idna's nameprep, email charsets, mbcs/oem/code_page_* on Windows (392 there, run under Wine); generated from python3.11's values (`tools/vm_audit113_spec.py`; the 380 shared checks pass under python3.11) |
+| vm_audit114 | 215 | round 84 (part C): tkinter/ttk/turtle over Nython's own Tk (the Tcl subset, widgets, geometry managers, events and bindings, variables, images, fonts, ttk styles, dialogs, turtle) driven through the scripted-input harness (python3: skipped without tkinter) |
+| vm_audit115 | 611 | round 84 (part D): curses without ncurses - ten programs under a pty on xterm-256color and vt100 compared cell for cell with CPython+ncurses through the VT emulator, terminfo against infocmp, tparm, byte counts (585 under python3.11 with ncurses) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1603,6 +1605,28 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   encodes). utf-7 is native; mbcs/oem/code_page_* on Windows.
 - A bound method kept as a class attribute stays bound on the interpreter
   (`class Codec: encode = codec.encode`), as on the VM.
+
+## Round 84, part C: tkinter, ttk, turtle (see `HANDOFF.md` §0x3)
+
+- `lib/_tkinter/` is Tk written in Nython over the `gui_*` natives (a Tcl
+  subset, Tk's core and event loop, pack/grid/place after Tk's C, the
+  classic and ttk widgets, photo images, dialogs); `lib/tkinter/` is
+  CPython's package over it, `lib/turtle.ny` CPython's turtle.py. Tests
+  drive it with `_ny_drive`/`_ny_queue`/`_ny_snapshot`.
+- `abs()`/`round()` of a builtin subclass with its own `__abs__`/`__round__`
+  call it; the interpreter forgets a handled exception when its clause ends.
+
+## Round 84, part D: curses (see `HANDOFF.md` §0x4)
+
+- `src/builtins/nycurses.cpp` (`_curses_*`): terminfo (both formats,
+  built-in xterm-256color/vt100), tparm, ncurses' screen model and
+  tty_update.c's algorithm, input/mouse/SIGWINCH; `lib/_curses.ny`,
+  `lib/_curses_panel.ny`, `lib/curses/`. `lib/_nyvt.ny` is a VT/xterm
+  emulator (the test compares screens with CPython+ncurses through it).
+- **Ported Python code and the scope rule**: two round 84 agents hit
+  Nython's rule that a plain assignment in a function rebinds a module name
+  of the same name (tkinter's `W` became a widget path); write `var` for
+  locals in ported modules.
 
 ## Transcripts
 
