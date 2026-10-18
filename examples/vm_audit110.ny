@@ -552,8 +552,19 @@ def sqlite_thread_checks():
     shared.create_function("twice", 1, lambda v: v * 2)
     out = []
     lock = threading.Lock()
+    # CPython binds parameters holding the GIL while a statement paused in
+    # twice() holds the connection's mutex and waits for the GIL: the threads
+    # are serialized there (now and then they deadlock otherwise). Nython
+    # releases the GIL around every SQLite call, so its threads run at once.
+    serial = None if nython else threading.Lock()
     def user(i):
-        v = shared.execute("select twice(n) from t where n = ?", (i,)).fetchone()[0]
+        if serial is not None:
+            serial.acquire()
+        try:
+            v = shared.execute("select twice(n) from t where n = ?", (i,)).fetchone()[0]
+        finally:
+            if serial is not None:
+                serial.release()
         with lock:
             out.append(v)
     ts = [threading.Thread(target=user, args=(i,)) for i in range(8)]
