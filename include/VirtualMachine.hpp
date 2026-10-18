@@ -3697,17 +3697,20 @@ public:
         // (target), 1 a function (its identity cell, fn_id; tmpl is the
         // value without its counted parts), 2 a set or frozenset (its items
         // and index), 3 a class (held in tmpl: classes live as long as the
-        // program), 4 a bound method (target: its map).
+        // program), 4 a bound method (target: its map), 5 a generator or
+        // coroutine (round 85: its state, gen_w).
         int kind = 0;
         VMVal tmpl;
         std::weak_ptr<std::pair<int,std::vector<VMVal>>> fn_id;
         std::weak_ptr<VMMap> fn_env;
         std::weak_ptr<std::vector<VMVal>> fn_defaults, set_items;
+        std::weak_ptr<struct GenState> gen_w;
         bool alive() const {
             switch (kind) {
                 case 1: return !fn_id.expired();
                 case 2: return !set_items.expired();
                 case 3: return true;
+                case 5: return !gen_w.expired();
                 default: return !target.expired();
             }
         }
@@ -3787,6 +3790,13 @@ public:
                 return v;
             }
             case 3: return c.tmpl;
+            case 5: {   // round 85
+                auto g = c.gen_w.lock();
+                if (!g) return VMVal::make_none();
+                VMVal v = c.tmpl;
+                v.gen = g;
+                return v;
+            }
             case 4: {
                 auto sp = c.target.lock();
                 if (!sp) return VMVal::make_none();
@@ -3942,6 +3952,11 @@ public:
                 cell->kind = 2;
                 cell->tmpl = *o; cell->tmpl.list.reset(); cell->tmpl.map.reset();
                 cell->set_items = o->list; cell->target = o->map;
+                if (cb) weak_polled().push_back(cell);
+            } else if (o && o->type == VMType::GENERATOR && o->gen) {
+                cell->kind = 5;            // round 85: generators are weakly referenceable, as in Python
+                cell->tmpl = *o; cell->tmpl.gen.reset();
+                cell->gen_w = o->gen;
                 if (cb) weak_polled().push_back(cell);
             } else if (o && (o->type == VMType::CLASS || o->type == VMType::FUNCTION)) {
                 cell->kind = 3;            // a class (or a function made without an identity)
@@ -13497,7 +13512,15 @@ private:
         for(auto& v:a) ba.push_back(to_barg(v));
         nypy::BRes r;
         std::string& data=obj.bdata_mut();
-        if(nycall([&]{ return nypy::bytes_method(data,obj.b,m,ba,r,obj.ba_exports()); })) return from_bres(r);   // round 84: exports
+        if(nycall([&]{ return nypy::bytes_method(data,obj.b,m,ba,r,obj.ba_exports()); })){   // round 84: exports
+            // round 85: bytes.partition/rpartition give the separator object they
+            // were passed when it is found (CPython's stringlib_partition keeps
+            // sep_obj; bytearray's copies it into a bytearray)
+            if(!obj.b&&r.k==nypy::BRes::TUPLE&&r.v.size()==3&&!r.v[1].empty()&&a.size()==1&&(m=="partition"||m=="rpartition")){
+                VMVal out=VMVal::make_list({VMVal::make_bytes(r.v[0],false),a[0],VMVal::make_bytes(r.v[2],false)}); out.b=true; return out;
+            }
+            return from_bres(r);
+        }
         if(m=="class_name"||m=="type_name") return VMVal::make_str(vm_type_name(obj));
         if(m=="to_string"||m=="str") return VMVal::make_str(obj.to_string());
         return missing_attr(obj,m);

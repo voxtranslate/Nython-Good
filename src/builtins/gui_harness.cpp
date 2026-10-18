@@ -327,6 +327,8 @@ static bool g_batch_break = false;
 static FILE* g_script = nullptr;
 static bool g_script_checked = false;
 static std::string g_partial;
+static long g_script_pos = 0;      // where the next unread line starts
+static bool g_script_eof = false;
 static float g_mouse_x = 0, g_mouse_y = 0;
 static SDL_Keymod g_mods = SDL_KMOD_NONE;
 static SDL_Window* g_target = nullptr;
@@ -355,20 +357,32 @@ static bool read_command(std::string& line) {
     if (!g_script_checked) {
         g_script_checked = true;
         const char* p = script_path();
-        if (p) { g_script = fopen(p, "r"); if (!g_script) fprintf(stderr, "[nyh] cannot open %s\n", p); }
+        if (p) { g_script = fopen(p, "rb"); if (!g_script) fprintf(stderr, "[nyh] cannot open %s\n", p); }
     }
     if (!g_script) return false;
+    // The script grows while it is read (a test appends commands as it goes).
+    // A stream that has met its end is repositioned before every new attempt:
+    // clearerr alone is not enough on the Windows C runtime, whose stream
+    // never read lines appended to a file that was empty when it hit EOF.
+    if (g_script_eof) {
+        fseek(g_script, g_script_pos, SEEK_SET);
+        g_script_eof = false;
+    }
     char buf[8192];
     while (fgets(buf, sizeof(buf), g_script)) {
         g_partial += buf;
         if (!g_partial.empty() && g_partial.back() == '\n') {
             line = g_partial;
             g_partial.clear();
+            g_script_pos = ftell(g_script);
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
             return true;
         }
     }
+    // a partial last line is read again whole, from its start, next time
+    g_partial.clear();
     clearerr(g_script);
+    g_script_eof = true;
     return false;
 }
 

@@ -751,6 +751,8 @@ static bool g_batch_break = false;
 static FILE* g_script = nullptr;
 static bool g_script_checked = false;
 static std::string g_partial;
+static long g_script_pos = 0;      // where the next unread line starts
+static bool g_script_eof = false;
 static float g_mouse_x = 0.0f, g_mouse_y = 0.0f;
 
 static long event_gap() {
@@ -775,22 +777,32 @@ static bool read_command(std::string& line) {
         g_script_checked = true;
         const char* p = getenv("NY_STUB_EVENTS");
         if (p && *p) {
-            g_script = fopen(p, "r");
+            g_script = fopen(p, "rb");
             if (!g_script) fprintf(stderr, "[SDL3-stub] cannot open NY_STUB_EVENTS=%s\n", p);
         }
     }
     if (!g_script) return false;
+    // A stream that has met its end is repositioned before the next attempt
+    // (clearerr alone does not make the Windows C runtime read what was
+    // appended to a file that was empty when it hit EOF).
+    if (g_script_eof) {
+        fseek(g_script, g_script_pos, SEEK_SET);
+        g_script_eof = false;
+    }
     char buf[8192];
     while (fgets(buf, sizeof(buf), g_script)) {
         g_partial += buf;
         if (!g_partial.empty() && g_partial.back() == '\n') {
             line = g_partial;
             g_partial.clear();
+            g_script_pos = ftell(g_script);
             while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
             return true;
         }
     }
+    g_partial.clear();   // read again whole, from its start, next time
     clearerr(g_script);
+    g_script_eof = true;
     return false;
 }
 

@@ -183,10 +183,9 @@ std::string hex_ptr(const void* p) {
     if (rv.type != ValueType::NONE && rv.type != ValueType::UNDEFINED) a.push_back(rv);
     static const nyrt::OrderedKw<Value> no_kw;
     Value inst = E.instantiateClass(cv, a, no_kw, ctx ? ctx : E.global_ctx);
-    E.exc_instance_map_[inst.value.p] = inst;
-    char buf[64];
-    std::snprintf(buf, sizeof buf, "%llx", (unsigned long long)reinterpret_cast<uintptr_t>(inst.value.p));
-    throw std::string("__exc__:StopIteration:__obj__:") + buf;
+    // round 85: kept by the exception ring under a serial, as `raise` does
+    // (it was kept in exc_instance_map_ by address, never let go)
+    throw E.rememberRaised("StopIteration", inst);
 }
 
 // What `raise v` (with extra constructor arguments) throws: an exception
@@ -206,11 +205,10 @@ std::string exc_string_for(NythonExecutor& E, Value v, const std::vector<Value>&
         }
     }
     if (E.isInstanceValue(v)) {
-        std::string cls = E.instanceClassName(v);
-        E.exc_instance_map_[v.value.p] = v;
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%llx", (unsigned long long)reinterpret_cast<uintptr_t>(v.value.p));
-        return "__exc__:" + cls + ":__obj__:" + buf;
+        // round 85: through the exception ring by serial, as `raise` does - an
+        // instance thrown into a generator was kept in exc_instance_map_ by its
+        // address forever (outside the ring, never evicted)
+        return E.rememberRaised(E.instanceClassName(v), v);
     }
     if (E.isStringValue(v)) return E.getStringValue(v);
     raise("TypeError", "exceptions must derive from BaseException");
@@ -362,6 +360,7 @@ bool step(NythonExecutor& E, Cursor& cu, Value& out, Context* ctx) {
                     if (vv.type != ValueType::UNDEFINED) cu.stop_value = vv;
                 }
             }
+            E.forgetRaised(s, false);   // round 85: the loop is done with it
             cu.k = Cursor::END;
             return false;
         }
@@ -371,7 +370,7 @@ bool step(NythonExecutor& E, Cursor& cu, Value& out, Context* ctx) {
         std::vector<Value> ia{intValue(cu.i)};
         try { out = E.callMethod(cu.hold, "__getitem__", ia, ctx); }
         catch (std::string& s) {
-            if (is_exc(E, s, "IndexError") || is_exc(E, s, "StopIteration")) { cu.k = Cursor::END; return false; }
+            if (is_exc(E, s, "IndexError") || is_exc(E, s, "StopIteration")) { E.forgetRaised(s, false); cu.k = Cursor::END; return false; }
             throw;
         }
         cu.i++;
@@ -1074,6 +1073,7 @@ Value yield_from(NythonExecutor& E, const Value& src, Context* ctx) {
                 try { v = E.callMethod(cu.it, "throw", a, ctx); got = true; }
                 catch (std::string& s) {
                     if (!is_exc(E, s, "StopIteration")) throw;
+                    E.forgetRaised(s, false);   // round 85
                     got = false;
                 }
             } else {
@@ -1086,6 +1086,7 @@ Value yield_from(NythonExecutor& E, const Value& src, Context* ctx) {
             try { v = E.callMethod(cu.it, "send", a, ctx); got = true; }
             catch (std::string& s) {
                 if (!is_exc(E, s, "StopIteration")) throw;
+                E.forgetRaised(s, false);   // round 85
                 got = false;
             }
         } else {
@@ -1164,7 +1165,7 @@ void close(NythonExecutor& E, Gen* g) {
         yielded = resume_function(E, g, Mode::Close);
     } catch (std::string& s) {
         // its traceback's frames go with it (round 78)
-        if (is_exc(E, s, "GeneratorExit") || is_exc(E, s, "StopIteration")) { NythonExecutor::tbDropFrames(); return; }
+        if (is_exc(E, s, "GeneratorExit") || is_exc(E, s, "StopIteration")) { NythonExecutor::tbDropFrames(); E.forgetRaised(s, false); return; }   // round 85
         throw;
     }
     if (yielded) raise("RuntimeError", "generator ignored GeneratorExit");

@@ -1494,7 +1494,7 @@ public:   // NythonExecutor is a struct: members default to public
             while (n < 0 || (int)items.size() <= n) {
                 Value item;
                 try { item = callMethod(val, "__next__", no_args, ctx); }
-                catch (std::string& exc) { if (excTypeMatches(exc, "StopIteration")) break; throw; }
+                catch (std::string& exc) { if (excSwallowed(exc, "StopIteration")) break; throw; }   // round 85
                 items.push_back(item);
             }
             if (n >= 0 && (int)items.size() > n)
@@ -3028,6 +3028,7 @@ public:   // NythonExecutor is a struct: members default to public
         try { return callMethod(obj, "__getattribute__", a, ctx ? ctx : global_ctx); }
         catch (std::string& flow) {
             if (!excTypeMatches(flow, "AttributeError") || !instanceHasMethod(obj, "__getattr__")) throw;
+            forgetRaised(flow, false);   // round 85
         }
         std::vector<Value> b{makeStringValue(name)};
         return callMethod(obj, "__getattr__", b, ctx ? ctx : global_ctx);
@@ -4138,7 +4139,7 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (isInstanceVal(obj) && instanceHasMethod(obj, "__getitem__")) {
             try { out = getItem(obj, idx, ctx); }
             catch (std::string& e) {
-                if (excTypeMatches(e, "KeyError") || excTypeMatches(e, "IndexError")) return false;
+                if (excSwallowed(e, "KeyError") || excSwallowed(e, "IndexError")) return false;   // round 85
                 throw;
             }
             return true;
@@ -5206,7 +5207,7 @@ public:   // NythonExecutor is a struct: members default to public
                     Value v;
                     try { v = callMethod(it, "__next__", no_args, ctx); }
                     catch (nython::node::ReturnSignal& r) { v = r.value; }
-                    catch (std::string& exc) { if (excTypeMatches(exc, "StopIteration")) break; throw; }
+                    catch (std::string& exc) { if (excSwallowed(exc, "StopIteration")) break; throw; }   // round 85
                     out.push_back(v);
                 }
             }
@@ -5523,7 +5524,7 @@ public:   // NythonExecutor is a struct: members default to public
                     item = rs.value;
                 } catch (std::string& exc) {
                     if (by_index ? (excTypeMatches(exc, "IndexError") || excTypeMatches(exc, "StopIteration"))
-                                 : (excTypeMatches(exc, "StopIteration") || exc.find("StopIteration") != std::string::npos)) { stop = true; }
+                                 : (excTypeMatches(exc, "StopIteration") || exc.find("StopIteration") != std::string::npos)) { stop = true; forgetRaised(exc, false); }   // round 85
                     else throw;
                 }
                 if (stop) break;
@@ -5983,7 +5984,17 @@ public:   // NythonExecutor is a struct: members default to public
         ba.reserve(args.size());
         for (auto& a : args) ba.push_back(toBArg(a, ctx));
         nypy::BRes r;
-        if (nyCall([&] { return nypy::bytes_method(bo->s, bo->mut, m, ba, r, bo->exports); })) return fromBRes(r);   // round 84: exports
+        if (nyCall([&] { return nypy::bytes_method(bo->s, bo->mut, m, ba, r, bo->exports); })) {   // round 84: exports
+            // round 85: bytes.partition/rpartition give the separator object
+            // they were passed when it is found (CPython's stringlib_partition
+            // keeps sep_obj; bytearray's copies it into a bytearray)
+            if (!bo->mut && r.k == nypy::BRes::TUPLE && r.v.size() == 3 && !r.v[1].empty() && args.size() == 1
+                && (m == "partition" || m == "rpartition")) {
+                std::vector<Value> items{makeBytesValue(r.v[0], false), args[0], makeBytesValue(r.v[2], false)};
+                return makeListValue(items, true);
+            }
+            return fromBRes(r);
+        }
         Value pm;
         if (primitiveMember(obj, m, args, ctx, pm)) return pm;
         pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + m + "'");
@@ -10985,7 +10996,7 @@ public:
                     std::vector<Value> ia{Value(i)};
                     try { out.push_back(callMethod(v, "__getitem__", ia, ctx)); }
                     catch (std::string& flow) {
-                        if (excTypeMatches(flow, "IndexError") || excTypeMatches(flow, "StopIteration")) break;
+                        if (excSwallowed(flow, "IndexError") || excSwallowed(flow, "StopIteration")) break;   // round 85
                         throw;
                     }
                 }
@@ -10996,7 +11007,10 @@ public:
             while (true) {
                 try { out.push_back(callMethod(iterator, "__next__", no_args, ctx)); }
                 catch (std::string& flow) {
-                    if (excTypeMatches(flow, "StopIteration") || flow.find("StopIteration") != std::string::npos) break;
+                    if (excTypeMatches(flow, "StopIteration") || flow.find("StopIteration") != std::string::npos) {
+                        forgetRaised(flow, false);   // round 85
+                        break;
+                    }
                     throw;
                 }
             }
@@ -11072,7 +11086,7 @@ public:
                         Value item;
                         try { item = callMethod(hold, "__next__", no_args, cc); }
                         catch (std::string& exc) {
-                            if (excTypeMatches(exc, "StopIteration")) break;
+                            if (excSwallowed(exc, "StopIteration")) break;   // round 85
                             throw;
                         }
                         one(item);
@@ -11490,6 +11504,15 @@ public:
     // An enclosing clause still handling the same exception keeps it
     // (`own` - the clause's own entry, on top - is not counted).
     void forgetRaised(const std::string& flow, bool own) {
+        // round 85: a runtime error that left an except clause holds the
+        // exception that clause handled for its __context__ until its object
+        // is made (tbHandlerExit); one swallowed before that (a generator's
+        // GeneratorExit raised inside a clause, caught by close()) let go of
+        // it only when the next exception was caught
+        if (!pending_ctx_flow_.empty() && pending_ctx_flow_ == flow) {
+            pending_ctx_flow_.clear();
+            pending_ctx_ = NONE_VALUE;
+        }
         size_t op = flow.find(":__obj__:");
         if (op == std::string::npos || flow.compare(0, 8, "__exc__:") != 0) return;
         size_t n = handling_obj_.size() - (own && !handling_obj_.empty() ? 1 : 0);
@@ -11500,6 +11523,16 @@ public:
             --it;
             if (*it == key) { exc_ring_.erase(it); break; }
         }
+    }
+    // round 85: native code that catches an exception and carries on (a
+    // loop's StopIteration, hasattr's AttributeError, next()'s default, a
+    // missing key it treats as absent) is done with it as a completed except
+    // clause is: the ring lets go of it - and of the frames its traceback
+    // holds (they stayed alive until 256 more exceptions were raised)
+    bool excSwallowed(const std::string& flow, const char* type) {
+        if (!excTypeMatches(flow, type)) return false;
+        forgetRaised(flow, false);
+        return true;
     }
     // The exception object an except clause binds: the raised instance, or
     // for an error raised as "__exc__:Type:message" (runtime errors, native
@@ -13383,7 +13416,7 @@ public:
     bool moduleGetattrForImport(const Value& obj, Container* cont, const std::string& name, Context* ctx, Value& out) {
         try { return moduleGetattr(obj, cont, name, ctx, out); }
         catch (std::string& flow) {
-            if (excTypeMatches(flow, "AttributeError")) return false;
+            if (excSwallowed(flow, "AttributeError")) return false;   // round 85
             throw;
         }
     }
@@ -16246,6 +16279,7 @@ public:
                 // getattr(o, n) without a default raises the AttributeError a
                 // property's getter or __getattr__ raised (round 77)
                 if (!excTypeMatches(e, "AttributeError") || (name == "getattr" && args.size() == 2)) throw;
+                forgetRaised(e, false);   // round 85
                 has = false;
             }
             if (name == "hasattr") { out = Value(has); return true; }
@@ -16321,7 +16355,7 @@ public:
                 std::vector<Value> none;
                 try { out = callMethod(args[0], "__next__", none, ctx); }
                 catch (std::string& e) {
-                    if (args.size() >= 2 && excTypeMatches(e, "StopIteration")) { out = args[1]; return true; }
+                    if (args.size() >= 2 && excSwallowed(e, "StopIteration")) { out = args[1]; return true; }   // round 85
                     throw;
                 }
                 return true;
@@ -16673,7 +16707,8 @@ public:
         // int, str, list, tuple, dict or bytes.
         bool heap = obj.type == ValueType::USERDATA && obj.value.p && obj.value.o
                     && (isInstanceVal(obj) || isPlainFunction(obj) || bound_self_.count(obj.value.p));
-        bool coll = !heap && obj.isCollectable() && obj.value.gc && setOf(obj) != nullptr;
+        // round 85: a generator too (a GenObject container), as in Python
+        bool coll = !heap && obj.isCollectable() && obj.value.gc && (setOf(obj) != nullptr || nygen::is_gen(obj));
         bool cls = !heap && !coll && classNodeOfValue(obj) != nullptr;
         if (!heap && !coll && !cls)
             pyRaise("TypeError", "cannot create weak reference to '" + typeNameOf(obj) + "' object");

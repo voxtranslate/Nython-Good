@@ -391,6 +391,16 @@ check("bytes methods take buffers",
        b"abc".partition(memoryview(b"c"))[0], int.from_bytes(memoryview(b"\x01\x02"), "big"),
        int.from_bytes(Array("B", [1, 0]), "little")],
       [b"xyz-a-b-\x01\x00\x02\x00", 1, True, True, [b"a", b"b"], b"axyza", 1, 2, b"y", b"ab", 258, 1])
+# the separator partition returns is the object passed (bytes) or its copy (bytearray)
+psep = memoryview(b"-")
+pt1 = b"a-b".partition(psep)
+pt2 = b"a-b".rpartition(psep)
+pt3 = bytearray(b"a-b").partition(psep)
+pt4 = b"a-b".partition(Array("B", [45]))
+check("partition's separator object",
+      [pt1[1] is psep, pt2[1] is psep, pt1[0], pt2[2], type(pt3[1]).__name__, bytes(pt3[1]), pt3[1] is psep,
+       type(pt4[1]).__name__, b"ab".partition(psep), b"ab".rpartition(psep), type(b"a-b".partition(bytearray(b"-"))[1]).__name__],
+      [True, True, b"a", b"b", "bytearray", b"-", False, "array", (b"ab", b"", b""), (b"", b"", b"ab"), "bytearray"])
 pbuf = bytearray(8)
 struct.pack_into("<hi", memoryview(pbuf), 1, -2, 7)
 pv = memoryview(bytearray(10))
@@ -478,18 +488,28 @@ sb.close()
 
 # ── os: write, readv, writev, pread, preadv ──────────────────────────────────
 pr, pw = os.pipe()
-ow = [os.write(pw, memoryview(b"ab")), os.writev(pw, [b"cd", memoryview(b"ef"), bytearray(b"gh"), Array("B", [105])])]
-ob1 = bytearray(2)
-ob2 = bytearray(10)
-orv = os.readv(pr, [ob1, memoryview(ob2)[2:5]])
-os.close(pr)
-os.close(pw)
-check("os.write / writev / readv with buffers",
-      [ow, orv, bytes(ob1), bytes(ob2), err(lambda: os.readv(0, 5)), err(lambda: os.readv(0, [b"x"])),
-       err(lambda: os.readv(0, ["x"])), err(lambda: os.writev(1, 5)), err(lambda: os.write(1, "x"))],
-      [[2, 7], 5, b"ab", b"\x00\x00cde\x00\x00\x00\x00\x00", "TypeError: readv() arg 2 must be a sequence",
-       "BufferError: Object is not writable.", "TypeError: a bytes-like object is required, not 'str'",
-       "TypeError: writev() arg 2 must be a sequence", "TypeError: a bytes-like object is required, not 'str'"])
+if WIN:
+    # os.readv/os.writev are POSIX-only (CPython has neither on Windows)
+    ow = [os.write(pw, memoryview(b"ab")), os.write(pw, bytearray(b"cdefghi"))]
+    ob = os.read(pr, 9)
+    os.close(pr)
+    os.close(pw)
+    check("os.write with buffers (Windows: no readv/writev)",
+          [ow, ob, hasattr(os, "readv"), hasattr(os, "writev"), err(lambda: os.write(1, "x"))],
+          [[2, 7], b"abcdefghi", False, False, "TypeError: a bytes-like object is required, not 'str'"])
+else:
+    ow = [os.write(pw, memoryview(b"ab")), os.writev(pw, [b"cd", memoryview(b"ef"), bytearray(b"gh"), Array("B", [105])])]
+    ob1 = bytearray(2)
+    ob2 = bytearray(10)
+    orv = os.readv(pr, [ob1, memoryview(ob2)[2:5]])
+    os.close(pr)
+    os.close(pw)
+    check("os.write / writev / readv with buffers",
+          [ow, orv, bytes(ob1), bytes(ob2), err(lambda: os.readv(0, 5)), err(lambda: os.readv(0, [b"x"])),
+           err(lambda: os.readv(0, ["x"])), err(lambda: os.writev(1, 5)), err(lambda: os.write(1, "x"))],
+          [[2, 7], 5, b"ab", b"\x00\x00cde\x00\x00\x00\x00\x00", "TypeError: readv() arg 2 must be a sequence",
+           "BufferError: Object is not writable.", "TypeError: a bytes-like object is required, not 'str'",
+           "TypeError: writev() arg 2 must be a sequence", "TypeError: a bytes-like object is required, not 'str'"])
 if not WIN:
     pf = os.path.join(TMP, "vm112p_" + PID + ".bin")
     pfd = os.open(pf, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -639,20 +659,23 @@ class Q3(Structure):
 class U(Union):
     _fields_ = [("a", c_int), ("b", c_double)]
 LF = "<q" if LONG == 8 else "<l"
+# c_int is c_long where int and long have one size (Windows, 32-bit), as CPython's ctypes
+IF = "<l" if ctypes.sizeof(c_int) == ctypes.sizeof(c_long) else "<i"
+UF = "<L" if ctypes.sizeof(c_int) == ctypes.sizeof(c_long) else "<I"
 check("ctypes formats (PEP 3118, as CPython's ctypes gives them)",
       [cinfo(c_int(5)), cinfo(c_long(5)), cinfo(c_double(1)), cinfo(c_char(b"a")), cinfo(c_bool(1)), cinfo(c_ubyte(1)),
        cinfo(c_short(1)), cinfo(c_uint(1)), cinfo(c_float(1)), cinfo(c_ulonglong(1)), cinfo((c_int * 3)()),
        cinfo(((c_int * 3) * 2)()), cinfo((c_char * 4)()), cinfo(U()), cinfo(pointer(c_int(1)))[0], cinfo(c_void_p(0))[0],
        cinfo(c_char_p(b"x"))[0]],
-      [["<i", 4, 0, (), (), 4, False], [LF, LONG, 0, (), (), LONG, False], ["<d", 8, 0, (), (), 8, False],
+      [[IF, 4, 0, (), (), 4, False], [LF, LONG, 0, (), (), LONG, False], ["<d", 8, 0, (), (), 8, False],
        ["<c", 1, 0, (), (), 1, False], ["<?", 1, 0, (), (), 1, False], ["<B", 1, 0, (), (), 1, False],
-       ["<h", 2, 0, (), (), 2, False], ["<I", 4, 0, (), (), 4, False], ["<f", 4, 0, (), (), 4, False],
-       ["<Q", 8, 0, (), (), 8, False], ["<i", 4, 1, (3,), (4,), 12, False], ["<i", 4, 2, (2, 3), (12, 4), 24, False],
-       ["<c", 1, 1, (4,), (1,), 4, False], ["B", 8, 0, (), (), 8, False], "&<i", "<P", "<z"])
+       ["<h", 2, 0, (), (), 2, False], [UF, 4, 0, (), (), 4, False], ["<f", 4, 0, (), (), 4, False],
+       ["<Q", 8, 0, (), (), 8, False], [IF, 4, 1, (3,), (4,), 12, False], [IF, 4, 2, (2, 3), (12, 4), 24, False],
+       ["<c", 1, 1, (4,), (1,), 4, False], ["B", 8, 0, (), (), 8, False], "&" + IF, "<P", "<z"])
 # CPython 3.12 writes the padding of a structure into its format ("4x")
-SF = "T{<i:x:4x<d:y:}" if (PY312 or nython) else "T{<i:x:<d:y:}"
-PF3 = "T{<c:a:3x<i:b:<h:c:2x}" if (PY312 or nython) else "T{<c:a:<i:b:<h:c:}"
-QF = "T{(3)<i:a:4xT{<i:x:4x<d:y:}:s:&<i:p:}" if (PY312 or nython) else "T{(3)<i:a:T{<i:x:<d:y:}:s:&<i:p:}"
+SF = ("T{<i:x:4x<d:y:}" if (PY312 or nython) else "T{<i:x:<d:y:}").replace("<i", IF)
+PF3 = ("T{<c:a:3x<i:b:<h:c:2x}" if (PY312 or nython) else "T{<c:a:<i:b:<h:c:}").replace("<i", IF)
+QF = ("T{(3)<i:a:4xT{<i:x:4x<d:y:}:s:&<i:p:}" if (PY312 or nython) else "T{(3)<i:a:T{<i:x:<d:y:}:s:&<i:p:}").replace("<i", IF)
 check("ctypes structure formats",
       [cinfo(S()), cinfo(P3())[0], cinfo(Q3())[:2], cinfo((S * 2)())[:4]],
       [[SF, 16, 0, (), (), 16, False], PF3, [QF, 40], [SF, 16, 1, (2,)]])
@@ -661,8 +684,8 @@ cm = memoryview(ci)
 check("ctypes views: 0-dim, non-native formats",
       [cm.tobytes(), cm.cast("B").tolist(), cm.cast("B").cast("i")[0], err(lambda: cm[()]), err(lambda: cm.tolist()),
        cm == memoryview(c_int(5)), cm == memoryview(c_int(6)), memoryview(S()) == memoryview(S())],
-      [b"\x05\x00\x00\x00", [5, 0, 0, 0], 5, "NotImplementedError: memoryview: unsupported format <i",
-       "NotImplementedError: memoryview: unsupported format <i", True, False, False])
+      [b"\x05\x00\x00\x00", [5, 0, 0, 0], 5, "NotImplementedError: memoryview: unsupported format " + IF,
+       "NotImplementedError: memoryview: unsupported format " + IF, True, False, False])
 cbm = cm.cast("B")
 cbm[0] = 9
 cm.release()
