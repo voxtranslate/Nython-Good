@@ -363,6 +363,7 @@ private:
     node_ptr comprehension(Token tok, int kind, node_ptr elt, node_ptr value);
     node_ptr compTarget();
     node_ptr compTargetOne();
+    node_ptr starTargetSpec(node_ptr& target);   // round 84
     node_ptr mapLiteral();
     node_ptr tupleLiteral();
 

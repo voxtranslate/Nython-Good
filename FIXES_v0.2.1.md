@@ -5824,3 +5824,23 @@ both engines and under python3).
 | No `ctypes` | - | `lib/ctypes/` over `src/builtins/ffi.cpp` (libffi at run time, else Nython's built-in caller) |
 | ctypes: `strtod(b"3.25xyz", byref(end))` left `end` pointing at freed memory | a `bytes` argument was copied into a temporary C string freed after the call (CPython passes the bytes object's own buffer, which lives as long as the object) | C strings made from bytes are kept in a 512-entry cache keyed by their contents (`_cstr_cached`) |
 | ctypes: a `BigEndianStructure` subclass was laid out little-endian | its byte order was read from the class's own attributes only | read through the MRO |
+
+## Round 84, part 0 — the semantic gaps rounds 82-83 found
+
+Full detail in `HANDOFF.md` §0w. New test: `vm_audit116` (34 checks; both engines and python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `sys.nosuch` said "'dict' object has no attribute" (both engines) | a module is a namespace map and the message named the map's type | "module 'sys' has no attribute 'nosuch'" (`attributeErrorText` / `attr_error_text`) |
+| Interpreter: `{}.append(x)` turned the dict into `[, x]` | `callMethod`'s generic list/set method block took any container | a plain dict raises AttributeError for the list and set methods |
+| `e.__str__()`, `ValueError.__init__`, `getattr(e, "__repr__")` raised AttributeError (both engines) | the engines supply BaseException's methods only when calling them through a class | the prelude's `_NyExcExtra` over `_ny_exc_init/_ny_exc_str/_ny_exc_repr`, read where the class lookup fails |
+| `p.__module__`, `p.__weakref__` raised AttributeError (both engines) | read only on classes | an instance's class's `__module__`; `__weakref__` None |
+| `len.__doc__`, `int.__doc__`, `str.upper.__doc__` raised; `ValueError.__doc__`, `range.__doc__` were None | no docstrings for builtins | CPython's, from `lib/_nydocs.ny` (generated) |
+| `range.__module__`, `property.__module__` were `__main__` | prelude classes were taken for the program's | `builtins` (`nyrt::is_python_builtin_class`) |
+| Interpreter: `math.__name__` raised AttributeError | the math namespace had no `__name__` | set |
+| `sys.exc_info()` in a finally run by an exception was (None, None, None); an exception raised there had no `__context__` (both engines) | only except clauses registered the exception being handled | the finally body registers it too (interpreter `run_finally_exc`, VM `FIN_EXC_OF` + `fin_held`) |
+| `[a for a, b in [(1, 2, 3)]]` gave `[1]`; `[(1,)]` bound b to None (both engines) | comprehension targets were unpacked laxly | `forUnpackParts` / strict `UNPACK_SEQ`: CPython's ValueError |
+| `[b for a, *b in xs]` was a SyntaxError (both engines) | comprehension targets had no starred form | `Parser::starTargetSpec` + the prelude's `_ny_star_iter` |
+| No `sys.audit` / `sys.addaudithook` | - | PEP 578 hooks; exec/compile/import/open/builtins.input events |
+| VM: a comprehension's targets (`__cN_x`) stayed bound - the last item alive, class attributes in a class body | kept for lambdas made in the element | deleted unless the comprehension made a function or class |
+| `print(True)` printed `true` in a `.py` program | one spelling for every program | Python's spelling for Python source (`nypy::python_spelling`) |

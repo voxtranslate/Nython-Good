@@ -789,6 +789,31 @@ Value dispatch_core(NythonExecutor& E,
             if (held.type != ValueType::NONE) return held;
             return E.exceptionObject(E.handling_exc_.back());
         }
+        // round 84: BaseException's own __init__/__str__/__repr__ as values
+        // (the prelude's _NyExcExtra): the instance's args and fields set
+        // from (args, kwargs) as a constructor sets them, and the text the
+        // engine makes for str()/repr() whatever a subclass overrides.
+        if (name == "_ny_exc_init") {
+            if (args.size() < 1 || !E.isInstanceValue(args[0])) return NONE_VALUE;
+            std::vector<Value> items = args.size() > 1 ? E.listItems(args[1]) : std::vector<Value>{};
+            E.setExceptionArgs(args[0], items);
+            if (args.size() > 2) {
+                nyrt::OrderedKw<Value> kw;
+                if (Container* kc = E.contOf(args[2]))
+                    for (auto& kv : *kc->container) if (!E.isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+                E.setExceptionKw(args[0], kw);
+            }
+            return NONE_VALUE;
+        }
+        if (name == "_ny_audit_enable") { nyrt::audit_on() = true; return NONE_VALUE; }   // round 84
+        if (name == "_ny_exc_str") {
+            if (args.empty() || !E.isInstanceValue(args[0])) return E.makeStringValue("");
+            return E.makeStringValue(E.exceptionMessage(args[0]));
+        }
+        if (name == "_ny_exc_repr") {
+            if (args.empty() || !E.isInstanceValue(args[0])) return E.makeStringValue("");
+            return E.makeStringValue(E.exceptionRepr(args[0], ctx));
+        }
         // The running frames, innermost first: (filename, lineno, function,
         // module) - sys._getframe, traceback.extract_stack, warnings (round 77).
         if (name == "_ny_stack") return E.pyStackValue();
@@ -952,6 +977,7 @@ Value dispatch_core(NythonExecutor& E,
             return NONE_VALUE;
         }
         if (name == "input") {
+            if (nyrt::audit_on()) E.auditEvent("builtins.input", {args.empty() ? NONE_VALUE : args[0]}, ctx);   // round 84
             // input(prompt): one line from stdin (NyConc.cpp: read_stdin_line -
             // the GIL is released while it waits, Ctrl+C raises
             // KeyboardInterrupt); EOFError at the end of input, as in Python.

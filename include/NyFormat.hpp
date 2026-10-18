@@ -18,6 +18,16 @@
 
 namespace nypy {
 
+// round 84: how True, False and None are spelled when shown - Python's
+// ("True", "None") when the program is Python source (a .py main file, or
+// one whose leading comments say `# nython: python`; NYTHON_SPELLING=python
+// or =nython overrides), Nython's ("true", "none") otherwise. One setting
+// per process, chosen by main.cpp before the program runs; JSON's true/false
+// are not this.
+inline bool& python_spelling() { static bool on = false; return on; }
+inline const char* spell_bool(bool b) { return python_spelling() ? (b ? "True" : "False") : (b ? "true" : "false"); }
+inline const char* spell_none() { return python_spelling() ? "None" : "none"; }
+
 // ── repr(float) ─────────────────────────────────────────────────────────
 // Shortest string that round-trips, laid out the way Python does: fixed
 // notation for 1e-4 <= |x| < 1e16, otherwise d.ddde+XX; always a '.' or an
@@ -73,8 +83,8 @@ struct FmtVal {
     }
     static FmtVal of_float(double v) { FmtVal f; f.kind = FLOAT; f.d = v; f.type_name = "float"; return f; }
     static FmtVal of_str(std::string v) { FmtVal f; f.kind = STR; f.s = std::move(v); f.type_name = "str"; return f; }
-    static FmtVal of_bool(bool v) { FmtVal f; f.kind = BOOL; f.b = v; f.s = v ? "true" : "false"; f.type_name = "bool"; return f; }
-    static FmtVal of_none() { FmtVal f; f.kind = NONE; f.s = "none"; f.type_name = "NoneType"; return f; }
+    static FmtVal of_bool(bool v) { FmtVal f; f.kind = BOOL; f.b = v; f.s = spell_bool(v); f.type_name = "bool"; return f; }
+    static FmtVal of_none() { FmtVal f; f.kind = NONE; f.s = spell_none(); f.type_name = "NoneType"; return f; }
     static FmtVal of_other(std::string str, std::string tn) { FmtVal f; f.kind = OTHER; f.s = std::move(str); f.type_name = std::move(tn); return f; }
     BigInt as_big() const { return is_big ? big : BigInt(kind == BOOL ? (int64_t)b : i); }
     bool is_numeric() const { return kind == INT || kind == FLOAT || kind == BOOL; }

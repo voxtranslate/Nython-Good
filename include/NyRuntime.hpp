@@ -169,6 +169,10 @@ inline CliFlags& cli_flags() { static CliFlags f; return f; }
 // check - the VM's frames (VirtualMachine::check_depth), the interpreter's
 // call depth (evalCall, which keeps its old margin of 100 below it).
 inline int& recursion_limit() { static int n = 1000; return n; }
+// round 84: sys.addaudithook (PEP 578) - set once a hook is added (never
+// cleared: hooks cannot be removed). The engines' audit points test it
+// first and call the prelude's _ny_audit_fire only then.
+inline bool& audit_on() { static bool on = false; return on; }
 // locals() / globals() (round 80): a program's variable named like a dunder
 // (__x__, __all__, __version__) is listed; the engines' own names
 // (__parent_class__ ...) and the parser's temporaries (__exc3__, __cmp0__:
@@ -521,6 +525,27 @@ inline bool is_prelude_builtin_class(const std::string& n) {
     return n == "property" || n == "staticmethod" || n == "classmethod" || n == "ellipsis"
         // round 78: the dict views and mappingproxy are the prelude's too
         || n == "dict_keys" || n == "dict_values" || n == "dict_items" || n == "mappingproxy";
+}
+// round 84: a builtin class of Python's that Nython defines as a class
+// (object, the exceptions, range, property ... - the prelude's): its
+// __module__ is "builtins" and its __doc__ CPython's (builtin_doc_key).
+inline bool is_python_builtin_class(const std::string& n) {
+    return is_builtin_type_name(n) || is_prelude_builtin_class(n);
+}
+// The key of a builtin's docstring in lib/_nydocs.ny (the prelude's
+// _ny_builtin_doc): Python's dotted name for the name a builtin is tagged
+// with - "math_sqrt" is math.sqrt, the dict builtin is tagged "map".
+inline std::string builtin_doc_key(const std::string& tag) {
+    if (tag == "map") return "dict";
+    if (tag.rfind("math_", 0) == 0) return "math." + tag.substr(5);
+    if (tag.rfind("cmath_", 0) == 0) return "cmath." + tag.substr(6);
+    static const char* const sysn[][2] = {{"_ny_getrefcount", "sys.getrefcount"}, {"_ny_getsizeof", "sys.getsizeof"},
+                                          {"_ny_intern", "sys.intern"}, {"_ny_exc_info", "sys.exc_info"},
+                                          {"_ny_getframe", "sys._getframe"}, {"_ny_settrace", "sys.settrace"},
+                                          {"_ny_setprofile", "sys.setprofile"}, {"_ny_gettrace", "sys.gettrace"},
+                                          {"_ny_getprofile", "sys.getprofile"}};
+    for (auto& p : sysn) if (tag == p[0]) return p[1];
+    return tag;
 }
 inline std::string class_repr(const std::string& full) {
     std::string n = shown_class_name(full);

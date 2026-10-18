@@ -112,14 +112,13 @@ std::string Value::getName() const{
 	std::string name;
 	switch(type){
 		case ValueType::NONE:
-			name = "none";
+			name = nypy::spell_none();   // round 84
 		break;
 		case ValueType::DOUBLE:
 			name = std::to_string(value.d);
 		break;
 		case ValueType::BOOLEAN:
-			if(value.b) name = "true";
-			else name = "false";
+			name = nypy::spell_bool(value.b);   // round 84
 		break;
 		case ValueType::INTEGER:
 			name = value.i.toString();
@@ -252,9 +251,9 @@ inline std::string _format<long double>(long double value){ return format_long_d
 
 std::string Value::format() const{
 	switch(type){
-		case ValueType::NONE: return "none";
+		case ValueType::NONE: return nypy::spell_none();
 		case ValueType::USERDATA:  return "user-data";
-		case ValueType::BOOLEAN: return value.b?"true":"false";
+		case ValueType::BOOLEAN: return nypy::spell_bool(value.b);
 		case ValueType::DOUBLE:  return format_long_double(value.d);
 		case ValueType::INTEGER: return _format(value.i);
 		case ValueType::COLLECTABLE:  return value.gc->toString();
@@ -266,14 +265,14 @@ std::string Value::format() const{
 
 std::string _toString(Value* that){
 	switch(that->type){
-		case ValueType::NONE: return "none";
+		case ValueType::NONE: return nypy::spell_none();
 		case ValueType::USERDATA:  return "user-data";
-		case ValueType::BOOLEAN: return that->value.b?"true":"false";
+		case ValueType::BOOLEAN: return nypy::spell_bool(that->value.b);
 		case ValueType::DOUBLE: return format_long_double(that->value.d);
 		case ValueType::INTEGER: return _format(that->value.i);
 		case ValueType::UNDEFINED: return "undefined";
 		case ValueType::COLLECTABLE:
-			if(that->value.gc==nullptr) return "none";
+			if(that->value.gc==nullptr) return nypy::spell_none();
 		return that->value.gc->toString();
 		default: return "unknown";
 	}

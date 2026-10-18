@@ -200,7 +200,31 @@ static void setenv_default_unbuffered() {
 }
 static void interactive_interp(NythonExecutor& exec, Runnable* runner, bool banner);
 
+// round 84: True/False/None are shown as Python spells them when the
+// program is Python source - a .py file, or one whose leading comment block
+// says `# nython: python` - and as Nython does otherwise (nypy::
+// python_spelling); NYTHON_SPELLING=python / =nython chooses either way.
+static void choose_spelling(const Program& prog) {
+    const char* env = std::getenv("NYTHON_SPELLING");
+    if (env && *env) { nypy::python_spelling() = std::string(env) == "python"; return; }
+    if (!prog.is_file) return;
+    const std::string& p = prog.path;
+    if (p.size() > 3 && p.compare(p.size() - 3, 3, ".py") == 0) { nypy::python_spelling() = true; return; }
+    std::ifstream in(p);
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t b = line.find_first_not_of(" \t\r");
+        if (b == std::string::npos) continue;
+        if (line[b] != '#') break;
+        size_t k = line.find("nython:", b);
+        if (k == std::string::npos) continue;
+        size_t w = line.find_first_not_of(" \t", k + 7);
+        if (w != std::string::npos && line.compare(w, 6, "python") == 0) { nypy::python_spelling() = true; return; }
+    }
+}
+
 int run_program(const Program& prog, bool show_ast = false) {
+    choose_spelling(prog);
     const std::string filename = prog.display();
     struct stat buf;
     if (prog.is_file && stat(filename.c_str(), &buf) != 0) {
@@ -1130,6 +1154,7 @@ static void interactive_vm(nython::vm::VirtualMachine& vm, VMMap& session, bool 
 }
 
 static int run_program_vm(const Program& prog, bool inspect) {
+    choose_spelling(prog);   // round 84
     // SourceCode treats a string that is not an existing file as program
     // TEXT, so a mistyped path used to be run as code (`--vm t/x.ny`
     // evaluated `t / x.ny`). Refuse it like the interpreter does.

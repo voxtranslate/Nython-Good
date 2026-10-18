@@ -657,6 +657,8 @@ public:   // NythonExecutor is a struct: members default to public
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_method_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
+            "_ny_exc_init","_ny_exc_str","_ny_exc_repr",        // BaseException's members as values (round 84)
+            "_ny_audit_enable",                                  // sys.addaudithook (round 84)
             "_ny_main_set","_ny_main_del","_ny_globals_view",   // globals() as a live view (round 81)
             "_ny_getrefcount","_ny_frame_jump",                 // sys.getrefcount, frame.f_lineno = n (round 81)
             "_ny_modules","_ny_module_new","_ny_module_exec","_ny_find_module",   // sys.modules, importlib (round 80)
@@ -4279,8 +4281,8 @@ public:   // NythonExecutor is a struct: members default to public
     std::string reprOf(const Value& v, Context* ctx = nullptr) { return toText(v, true, ctx, 0); }
     std::string toText(const Value& v, bool repr, Context* ctx, int depth) {
         switch (v.type) {
-            case ValueType::NONE: return "none";
-            case ValueType::BOOLEAN: return v.value.b ? "true" : "false";
+            case ValueType::NONE: return nypy::spell_none();   // round 84: Python's in a Python program
+            case ValueType::BOOLEAN: return nypy::spell_bool(v.value.b);
             case ValueType::INTEGER: return intToString(v.value.i);
             case ValueType::DOUBLE: return nypy::float_repr((double)v.value.d);
             case ValueType::UNDEFINED: return "undefined";
@@ -6083,6 +6085,14 @@ public:   // NythonExecutor is a struct: members default to public
         // Built-in list methods
         if (obj.isCollectable() && obj.value.gc) {
             auto* cont = dynamic_cast<Container*>(obj.value.gc);
+            // round 84: a dict has none of the list/set methods below
+            // ({}.append(x) made the dict a list, `[, x]`; the VM raised)
+            if (cont && cont->container && isPlainDict(cont)
+                && (method_name == "append" || method_name == "push" || method_name == "add"
+                    || method_name == "discard" || method_name == "remove" || method_name == "extend"
+                    || method_name == "insert" || method_name == "sort" || method_name == "reverse"
+                    || method_name == "index" || method_name == "count"))
+                pyRaise("AttributeError", attributeErrorText(obj, method_name));
             if (cont && cont->container) {
                 if (method_name == "append" || method_name == "push") {
                     if (!args.empty()) {
@@ -10003,6 +10013,8 @@ public:
                     return true;
                 }
                 if (attr == "__module__") { out = makeStringValue("builtins"); return true; }
+                // round 84: CPython's docstring (lib/_nydocs.ny)
+                if (attr == "__doc__") { out = builtinDoc(nyrt::builtin_doc_key(base), global_ctx); return true; }
                 // int.__mro__ / int.__bases__ of a builtin type (round 77):
                 // (int, object), and bool's MRO is (bool, int, object)
                 if (attr == "__mro__" || attr == "__bases__") {
@@ -10289,6 +10301,16 @@ public:
                 return "type object '" + cn + "' has no attribute '" + name + "'";
             }
         }
+        // round 84: a module's, as CPython says it (it read "'dict' object")
+        if (isModuleNamespace(obj)) {
+            std::string mn;
+            if (Container* c = contOf(obj)) {
+                auto it = c->container->find("__name__");
+                if (it != c->container->end() && isStringValue(it->second)) mn = getStringValue(it->second);
+            }
+            if (mn.empty()) { auto it = namespace_objs_.find((const void*)contOf(obj)); if (it != namespace_objs_.end()) mn = it->second; }
+            return "module '" + mn + "' has no attribute '" + name + "'";
+        }
         return "'" + typeNameOf(obj) + "' object has no attribute '" + name + "'";
     }
     // A missing attribute read: AttributeError, or - NY_LENIENT_READS=log, a
@@ -10527,8 +10549,19 @@ public:
                     if (ait != func_ast_nodes.end()) n = (Node*)ait->second;
                 }
                 out = NONE_VALUE;
-                if (auto* cn = dynamic_cast<ClassNode*>(n)) { if (cn->has_doc) out = makeStringValue(cn->doc); }
+                if (auto* cn = dynamic_cast<ClassNode*>(n)) {
+                    if (cn->has_doc) out = makeStringValue(cn->doc);
+                    // round 84: a builtin class's is CPython's (object, the
+                    // exceptions, range, property ...; not a redefinition)
+                    else if (cn->name.find('#') == std::string::npos
+                             && (nython::ny_is_builtin_exc(cn->name) || nyrt::is_python_builtin_class(cn->name)))
+                        out = builtinDoc(cn->name == "map" ? std::string("dict") : cn->name, ctx);
+                }
                 else if (auto* fnode = dynamic_cast<FunctionNode*>(n)) { if (fnode->has_doc) out = makeStringValue(fnode->doc); }
+                else {
+                    std::string key = builtinDocKey(obj);   // round 84: len, [].append ...
+                    if (!key.empty()) out = builtinDoc(key, ctx);
+                }
                 return true;
             }
             if (attr == "__name__" || attr == "__qualname__" || attr == "__module__") {
@@ -10557,9 +10590,17 @@ public:
                     bool is_class = t.rfind("__class__:", 0) == 0;
                     size_t dot = is_class ? nm.rfind('.') : std::string::npos;
                     if (attr == "__module__") {
-                        if (!is_class) return false;
-                        // the builtin exceptions and object are builtins' (round 80)
-                        if (dot == std::string::npos && (nm == "object" || nython::ny_is_builtin_exc(nm)) && t.find('#') == std::string::npos) {
+                        if (!is_class) {
+                            // round 84: an instance's is its class's, as Python
+                            // finds it in the class's namespace
+                            if (t.rfind("__instance__:", 0) == 0)
+                                if (Node* icn = classNodeOfInstance(obj)) return getAttrValue(classValueOfNode(icn), "__module__", ctx, out);
+                            return false;
+                        }
+                        // the builtin exceptions and object are builtins' (round
+                        // 80), and the prelude's builtin classes (round 84)
+                        if (dot == std::string::npos && (nm == "object" || nython::ny_is_builtin_exc(nm) || nyrt::is_python_builtin_class(nm))
+                            && t.find('#') == std::string::npos) {
                             out = makeStringValue("builtins");
                             return true;
                         }
@@ -10601,6 +10642,10 @@ public:
                     out = instanceDictView(obj);
                     return true;
                 }
+                // round 84: an instance's weak-reference slot - None (the
+                // engines keep weak references aside), absent with __slots__
+                // that do not name it
+                if (attr == "__weakref__" && (slot_flags_.empty() || !isDictless(obj))) { out = NONE_VALUE; return true; }
                 // (not for object.__getattribute__'s lookup - round 77)
                 if (raw_getattr_obj_ != obj.value.p && instanceHasMethod(obj, "__getattr__")) {
                     std::vector<Value> a{makeStringValue(attr)};
@@ -10626,7 +10671,37 @@ public:
             if (k != nypy::MemberKind::Other && builtinValueDunder(obj, attr, out)) return true;
             if (k != nypy::MemberKind::Other && nypy::kind_has_method(k, attr)) { out = boundMember(obj, attr); return true; }
         }
+        // round 84: a builtin's __doc__ is CPython's (None's is None)
+        if (attr == "__doc__") {
+            if (obj.type == ValueType::NONE) { out = NONE_VALUE; return true; }
+            std::string key = builtinDocKey(obj);
+            if (!key.empty()) { out = builtinDoc(key, ctx); return true; }
+        }
         return false;
+    }
+    // round 84: the key of a builtin's docstring (lib/_nydocs.ny): a builtin
+    // function's Python name, a builtin method's "type.name", a builtin
+    // value's type; "" for anything else.
+    std::string builtinDocKey(const Value& obj) {
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto fit = func_names.find(obj.value.p);
+            if (fit != func_names.end() && fit->second.rfind("__builtin__:", 0) == 0)
+                return nyrt::builtin_doc_key(fit->second.substr(12));
+            if (!bound_members_.empty()) {
+                auto bm = bound_members_.find(obj.value.p);
+                if (bm != bound_members_.end()) return typeNameOf(bm->second->recv) + "." + bm->second->name;
+            }
+            if (isInstanceValue(obj) || fit != func_names.end()) return std::string();
+        }
+        if (memberKindOf(obj) == nypy::MemberKind::Other) return std::string();
+        std::string t = typeNameOf(obj);
+        return t == "map" ? std::string("dict") : t;
+    }
+    Value builtinDoc(const std::string& key, Context* ctx) {
+        Value fn = global_ctx->getByName("_ny_builtin_doc");
+        if (fn.type == ValueType::NONE || fn.type == ValueType::UNDEFINED) return NONE_VALUE;
+        std::vector<Value> a{makeStringValue(key)};
+        return callFunctionValue(fn, a, ctx);
     }
 
     // ─── RETURN ─────────────────────────────────────────────────────────
@@ -10702,10 +10777,13 @@ public:
     void bindTarget(node_ptr target, const Value& v, Context* ctx) {
         if (!target) return;
         if (target->type() == NodeType::TUPLE || target->type() == NodeType::LIST) {
-            std::vector<Value> items = iterValues(v, ctx);
             auto elems = target->statements();
-            for (size_t i = 0; i < elems.size(); i++)
-                bindTarget(elems[i], i < items.size() ? items[i] : NONE_VALUE, ctx);
+            // round 84: unpacked as Python unpacks (a for statement's
+            // targets since round 82: exactly that many values, CPython's
+            // ValueError; a non-iterable a TypeError) - missing values were
+            // none and extra ones dropped
+            std::vector<Value> items = forUnpackParts(v, elems.size(), ctx);
+            for (size_t i = 0; i < elems.size(); i++) bindTarget(elems[i], items[i], ctx);
             return;
         }
         ctx->defineByName(target->value(), v);
@@ -12368,8 +12446,17 @@ public:
         auto run_finally = [&]() { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); };
         // ... with an exception on its way out (its traceback record kept,
         // round 77); true when the body's own flow replaced it (round 82)
-        auto run_finally_exc = [&]() -> bool {
+        // round 84: the exception is being handled while the body runs, as
+        // in CPython - sys.exc_info(), a bare raise and the __context__ of
+        // one raised there see it (they saw the enclosing clause's, or none)
+        auto run_finally_exc = [&](const std::string& e) -> bool {
             if (!tn->finally_clause) return false;
+            handling_exc_.push_back(e);
+            handling_obj_.emplace_back(e, excInstanceOf(e));
+            struct PopFin {
+                std::vector<std::string>& v; std::vector<std::pair<std::string, Value>>& o;
+                ~PopFin() { v.pop_back(); o.pop_back(); }
+            } _pf{handling_exc_, handling_obj_};
             tbFinally([&]() { evalNode(tn->finally_clause, ctx); });
             return fast && fl.pending;
         };
@@ -12401,15 +12488,15 @@ public:
                 catch (nython::node::ReturnSignal&) { run_finally(); throw; }
                 catch (std::string& f2) {
                     if (f2 == "break" || f2 == "continue") run_finally();
-                    else { tbSee(f2); if (run_finally_exc()) return result; }
+                    else { tbSee(f2); if (run_finally_exc(f2)) return result; }
                     throw;
                 }
-                catch (std::exception& e3) { tbSee(excFromCpp(e3.what())); if (run_finally_exc()) return result; throw; }
+                catch (std::exception& e3) { std::string f3 = excFromCpp(e3.what()); tbSee(f3); if (run_finally_exc(f3)) return result; throw; }
                 catch (...) { run_finally(); throw; }
                 if (fast && fl.pending == kPendExc) {   // round 82: the else clause raised
                     std::string f2 = takeExc(fl);
                     tbSee(f2);
-                    if (run_finally_exc()) return result;
+                    if (run_finally_exc(f2)) return result;
                     pendExc(std::move(f2));
                     return NONE_VALUE;
                 }
@@ -12425,7 +12512,7 @@ public:
             if (excClauseMatches(en, exc, ctx)) { match = en; break; }
         }
         if (!match) {
-            if (run_finally_exc()) return result;
+            if (run_finally_exc(exc)) return result;
             if (may_pend) { pendExc(std::move(exc)); return NONE_VALUE; }   // round 82
             throw exc;
         }
@@ -12471,17 +12558,17 @@ public:
             if (f2 == "break" || f2 == "continue") { run_finally(); throw; }
             tbHandlerExit(f2);
             tbSee(f2);
-            if (run_finally_exc()) return result;
+            if (run_finally_exc(f2)) return result;
             if (may_pend) { pendExc(f2); return NONE_VALUE; }   // round 82
             throw;
         }
-        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); if (run_finally_exc()) return result; throw; }
+        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); if (run_finally_exc(f3)) return result; throw; }
         catch (...) { run_finally(); throw; }
         if (fast && fl.pending == kPendExc) {   // round 82: the handler raised (a bare raise, a new exception)
             std::string f2 = takeExc(fl);
             tbHandlerExit(f2);
             tbSee(f2);
-            if (run_finally_exc()) return result;
+            if (run_finally_exc(f2)) return result;
             pendExc(std::move(f2));
             return NONE_VALUE;
         }
@@ -13193,6 +13280,7 @@ public:
     // `into` (round 80): an existing module namespace to run the file in -
     // importlib.reload(m), a loader's exec_module(m) - instead of a new one.
     Value runModuleFile(const std::string& filepath, const std::string& module_name, Value into = UNDEFINED_VALUE) {
+        if (nyrt::audit_on()) auditEvent("import", {makeStringValue(module_name), NONE_VALUE}, global_ctx);   // round 84
         auto source = SourceCode(filepath);
         auto reporter = std::make_shared<Reporter>(source);
         auto lex = std::make_shared<Lexer>(source);
@@ -13925,6 +14013,7 @@ public:
             }
             auto* cont = dynamic_cast<Container*>(math_obj.value.gc);
             if (cont && cont->container) {
+                (*cont->container)["__name__"] = makeStringValue("math");   // round 84 (math.__name__ raised)
                 (*cont->container)["pi"] = Value(3.14159265358979323846);
                 (*cont->container)["e"] = Value(2.71828182845904523536);
                 (*cont->container)["tau"] = Value(6.28318530717958647692);
@@ -14584,8 +14673,13 @@ public:
     // __repr__ are BaseException's, which the engine supplies itself.
     bool objectMember(const std::string& name, Value& out, Node** owner = nullptr, Node* cls = nullptr) {
         if (!objectFallbackName(name)) return false;
+        // round 84: they are the prelude's _NyExcExtra, over the engine's
+        // own (reading one raised AttributeError)
         if (cls && cls->type() == NodeType::CLASS && (name == "__init__" || name == "__str__" || name == "__repr__")
-            && isExceptionClass(static_cast<ClassNode*>(cls)->name)) return false;
+            && isExceptionClass(static_cast<ClassNode*>(cls)->name)) {
+            Node* xn = classNodeByName("_NyExcExtra");
+            return xn && findClassMember(xn, name, out, owner);
+        }
         Node* objn = classNodeByName("object");
         if (objn && findClassMember(objn, name, out, owner)) return true;
         Node* ex = classNodeByName("_NyObjectExtra");
@@ -14937,9 +15031,22 @@ public:
         catch (std::string& flow) { tbUnwind(flow); throw; }
         catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
     }
+    // round 84: an audit event (PEP 578) - the prelude's _ny_audit_fire runs
+    // the hooks sys.addaudithook added; nothing is made while there are none
+    void auditEvent(const char* event, std::vector<Value> args, Context* ctx) {
+        if (__builtin_expect(!nyrt::audit_on(), 1)) return;
+        Value fn = global_ctx->getByName("_ny_audit_fire");
+        if (fn.type == ValueType::NONE || fn.type == ValueType::UNDEFINED) return;
+        std::vector<Value> a{makeStringValue(event), makeListValue(args, true)};
+        callFunctionValue(fn, a, ctx);
+    }
     Value evalExecBuiltin(bool is_exec, std::vector<Value>& args, Context* ctx) {
         const char* who = is_exec ? "exec" : "eval";
         if (args.empty()) pyRaise("TypeError", std::string(who) + "() missing required argument 'source' (pos 1)");
+        if (nyrt::audit_on()) {   // round 84: as CPython - a source is compiled first; eval's too
+            if (isStringValue(args[0]) || bytesOf(args[0])) auditEvent("compile", {args[0], makeStringValue("<string>")}, ctx);
+            auditEvent("exec", {args[0]}, ctx);
+        }
         if (any_payload_) { Value p; if (payloadOf(args[0], p)) args[0] = p; }   // a str subclass (round 81: exec is payload-transparent)
         std::string mode = is_exec ? "exec" : "eval", fname = "<string>";
         std::string src = snippetSource(args[0], mode, fname, who);
@@ -15065,6 +15172,7 @@ public:
     }
     Value compileBuiltin(std::vector<Value>& args, Context* ctx) {
         if (args.size() < 3) pyRaise("TypeError", "compile() missing required argument (source, filename, mode)");
+        if (nyrt::audit_on()) auditEvent("compile", {args[0], args[1]}, ctx);   // round 84
         std::string fname = getStringValue(args[1]), mode = getStringValue(args[2]);
         if (mode != "exec" && mode != "eval" && mode != "single") pyRaise("ValueError", "compile() mode must be 'exec', 'eval' or 'single'");
         std::string m2 = mode, f2 = fname;

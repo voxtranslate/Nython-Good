@@ -4575,6 +4575,15 @@ node_ptr Parser::comprehension(Token tok, int kind, node_ptr elt, node_ptr value
         cl.target = compTarget();
         mustBe(TokenType::In);
         cl.iter = logicalOr();
+        // round 84: a starred target (`for a, *b in it`): the names stay
+        // the target and each item is reshaped first (the prelude's
+        // _ny_star_iter: the starred part a list, CPython's count errors)
+        if(node_ptr spec = starTargetSpec(cl.target)){
+            if(async_clause) throw SyntaxError(tok.location(), "a starred target in an async comprehension is not supported");
+            auto call = std::static_pointer_cast<CallNode>(wrap_call("_ny_star_iter", cl.iter));
+            call->add(spec);
+            cl.iter = call;
+        }
         if(async_clause) cl.iter = wrap_call("_ny_aiter", cl.iter);
         while(have(TokenType::If)) cl.conds.push_back(logicalOr());
         cp->clauses.push_back(std::move(cl));
@@ -4602,9 +4611,51 @@ node_ptr Parser::compTargetOne(){
         }
         return t;
     }
+    // round 84: `*name` (a starred target, lowered by starTargetSpec)
+    if(see(TokenType::Mul)){
+        Token st = token();
+        next();
+        st.value = "*";
+        Token id = token();
+        id.value = identifier();
+        return make_node<UnaryNode>(st, make_node<VariableNode>(id));
+    }
     Token id = token();
     id.value = identifier();
     return make_node<VariableNode>(id);
+}
+
+// round 84: a comprehension target holding a starred name, rewritten in
+// place to the plain names, and the shape _ny_star_iter reshapes items to:
+// a list per tuple level, 1 for its starred element, 0 for a name, a list
+// for a nested tuple. nullptr when the target has no starred name.
+node_ptr Parser::starTargetSpec(node_ptr& target){
+    if(!target || target->type() != NodeType::TUPLE) return nullptr;
+    bool any = false;
+    std::function<node_ptr(node_ptr&)> walk = [&](node_ptr& t) -> node_ptr {
+        Token tk = t->token();
+        auto spec = std::static_pointer_cast<ListNode>(make_node<ListNode>(tk));
+        auto& elems = static_cast<TupleNode*>(t.get())->elements;   // rewritten in place
+        int stars = 0;
+        for(auto& e : elems){
+            Token it = tk; it.type(TokenType::Integer);
+            if(isStarElem(e)){
+                if(++stars > 1) throw SyntaxError(e->token().location(), "multiple starred expressions in assignment");
+                any = true;
+                e = static_cast<UnaryNode*>(e.get())->operand;
+                it.value = "1";
+                spec->add(make_node<IntegerNode>(it));
+            } else if(e->type() == NodeType::TUPLE){
+                spec->add(walk(e));
+            } else {
+                it.value = "0";
+                spec->add(make_node<IntegerNode>(it));
+            }
+        }
+        return spec;
+    };
+    node_ptr spec = walk(target);
+    return any ? spec : nullptr;
 }
 
 node_ptr Parser::compTarget(){

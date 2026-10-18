@@ -526,6 +526,40 @@ def _ny_union(a, b):
         return args[0]
     return _NyUnionType(tuple(args))
 
+def _ny_star_shape(item, spec):
+    # round 84: a comprehension's starred target (`for a, *b in it`): the
+    # item reshaped to the target's names - its starred part a list, as
+    # Python unpacks (spec: 1 for the starred element, 0 a name, a list a
+    # nested tuple; Parser::starTargetSpec)
+    var vals = None
+    try:
+        vals = list(item)
+    except TypeError:
+        raise TypeError("cannot unpack non-iterable " + type(item).__name__ + " object") from None
+    var n = len(spec)
+    var star = -1
+    for i in range(n):
+        if not isinstance(spec[i], list) and spec[i] == 1:
+            star = i
+    if star < 0:
+        if len(vals) > n:
+            raise ValueError("too many values to unpack (expected " + str(n) + ")")
+        if len(vals) < n:
+            raise ValueError("not enough values to unpack (expected " + str(n) + ", got " + str(len(vals)) + ")")
+    else:
+        if len(vals) < n - 1:
+            raise ValueError("not enough values to unpack (expected at least " + str(n - 1) + ", got " + str(len(vals)) + ")")
+        var after = n - 1 - star
+        vals = vals[:star] + [vals[star:len(vals) - after]] + vals[len(vals) - after:]
+    for i in range(n):
+        if isinstance(spec[i], list):
+            vals[i] = _ny_star_shape(vals[i], spec[i])
+    return tuple(vals)
+
+def _ny_star_iter(it, spec):
+    for item in it:
+        yield _ny_star_shape(item, spec)
+
 def _ny_list_cat(*parts):
     # [*a, b, *c] (the parser hands the pieces here)
     var out = []
@@ -1205,6 +1239,65 @@ class _NyObjectExtra:
         return dir(self)
 _ny_object_extra_hash = _NyObjectExtra.__hash__
 
+# sys.audit / sys.addaudithook (round 84, PEP 578): the hooks, called in
+# the order they were added for every event; the engines raise exec,
+# compile, import and builtins.input (only once a hook exists:
+# nyrt::audit_on), open() raises open, and the library modules their own.
+_ny_audit_hooks = []
+
+def _ny_audit_fire(event, args):
+    if event == "import" and len(args) == 2:
+        var sm = _ny_sys_ref[0]
+        args = args + (getattr(sm, "path", None), getattr(sm, "meta_path", None), getattr(sm, "path_hooks", None))
+    for h in list(_ny_audit_hooks):
+        h(event, args)
+
+def _ny_sys_audit(event, *args):
+    if not isinstance(event, str):
+        raise TypeError("expected str for argument 'event', not " + type(event).__name__)
+    if len(_ny_audit_hooks) > 0:
+        _ny_audit_fire(event, args)
+
+def _ny_sys_addaudithook(hook):
+    # the existing hooks hear of it first; one raising a RuntimeError keeps
+    # the new hook out (silently), as CPython's PySys_AddAuditHook
+    try:
+        _ny_sys_audit("sys.addaudithook")
+    except RuntimeError:
+        return None
+    _ny_audit_hooks.append(hook)
+    _ny_audit_enable()
+
+_ny_docs_mod = [None, False]
+def _ny_builtin_doc(key):
+    # round 84: a builtin's docstring - CPython's, from lib/_nydocs.ny
+    # (imported the first time one is asked for); None when it has none
+    if not _ny_docs_mod[1]:
+        _ny_docs_mod[1] = True
+        try:
+            import _nydocs
+            _ny_docs_mod[0] = _nydocs
+        except ImportError:
+            pass
+    var m = _ny_docs_mod[0]
+    if m is None:
+        return None
+    return m.doc(key)
+
+class _NyExcExtra:
+    # BaseException's own __init__, __str__ and __repr__ read as values
+    # (round 84): `e.__str__()`, `ValueError.__init__`, `getattr(e,
+    # "__repr__")` raised AttributeError. Read, as _NyObjectExtra's, only
+    # where nothing in the exception's class lookup has the name; str(),
+    # repr() and constructors still go to the engines directly. They give
+    # the engine's own results, whatever a subclass overrides.
+    def __init__(self, *args, **kwargs):
+        _ny_exc_init(self, args, kwargs)
+    def __str__(self):
+        return _ny_exc_str(self)
+    def __repr__(self):
+        return _ny_exc_repr(self)
+
 def _ny_complex_part(x):
     # a component as Python shows it: 2.0 -> 2, 1.5 -> 1.5
     var t = repr(float(x))
@@ -1472,6 +1565,22 @@ def _ny_codec_decode(b, encoding, errors):
     import codecs
     return codecs._ny_text_decode(b, encoding, errors)
 
+def _ny_open_flags(mode):
+    # the os.open flags a mode means (the "open" audit event's third value,
+    # as CPython's _io computes them): O_RDONLY 0, O_WRONLY 1, O_RDWR 2,
+    # O_CREAT 64, O_EXCL 128, O_TRUNC 512, O_APPEND 1024 (Linux's values)
+    var f = 0
+    var plus = "+" in mode
+    if "x" in mode:
+        f = 128 | 64 | (2 if plus else 1)
+    elif "w" in mode:
+        f = 64 | 512 | (2 if plus else 1)
+    elif "a" in mode:
+        f = 1024 | 64 | (2 if plus else 1)
+    else:
+        f = 2 if plus else 0
+    return f | 524288   # O_CLOEXEC, as CPython opens every file
+
 def _ny_open_fd(path, mode, encoding, newline, closefd, opener):
     # open(fd) and open(path, opener=f) (round 80; the VM's open calls this
     # for them too)
@@ -1510,6 +1619,8 @@ def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=no
     # Python's parameters in Python's order (round 77: encoding was third)
     if hasattr(path, "__fspath__"):
         path = path.__fspath__()
+    if len(_ny_audit_hooks) > 0:
+        _ny_audit_fire("open", (path, mode.replace("b", "").replace("t", ""), _ny_open_flags(mode)))   # round 84, as CPython's
     if (isinstance(path, int) and not isinstance(path, bool)) or opener is not none:
         return _ny_open_fd(path, mode, encoding, newline, closefd, opener)
     if "b" in mode and encoding != "utf-8" and encoding is not none:
@@ -3477,6 +3588,8 @@ def _ny_sys_extend(sysmod):
     sysmod.copyright = "Copyright (c) the Nython authors."
     sysmod.excepthook = _ny_excepthook
     sysmod.__excepthook__ = _ny_excepthook
+    sysmod.audit = _ny_sys_audit                 # round 84 (PEP 578)
+    sysmod.addaudithook = _ny_sys_addaudithook
     sysmod.getswitchinterval = _ny_getswitchinterval
     sysmod.setswitchinterval = _ny_setswitchinterval
     # where the standard library is: <prefix>/lib (no virtual environments)

@@ -206,6 +206,11 @@ enum class Op : uint8_t {
     STORE_SUBSCR_DICT,   // d[k] = v, k a str or 64-bit int
     LOAD_NAME_ENV,       // a name of the closure environment the function was made in
     FOR_ITER_GEN,        // a generator (or lazy builtin) iterated by a for loop
+    // round 84 (generic): the exception of the finally state on top of the
+    // stack (none for the others), pushed above it - a finally body run
+    // while an exception propagates keeps it where sys.exc_info(), the
+    // __context__ of one raised there and a bare raise find it
+    FIN_EXC_OF,
     OP_COUNT_
 };
 
@@ -641,6 +646,9 @@ struct ExceptionEntry {
     // `raise`, _ny_exc_current): an exception leaving a clause clears it
     // (round 77 - it stayed, and sys.exc_info() / __context__ saw it later).
     std::string held;
+    // round 84: the hidden variable its finally body keeps the exception it
+    // runs for in (none when it runs for anything else)
+    std::string fin_held;
 };
 
 // ── Inline caches (round 80) ────────────────────────────────────────────
@@ -954,8 +962,8 @@ inline std::string vm_gen_repr(const GenState* g);   // after GenState
 
 inline std::string VMVal::to_string() const {
     switch(type){
-    case VMType::NONE:    return "none";
-    case VMType::BOOL:    return b?"true":"false";
+    case VMType::NONE:    return nypy::spell_none();   // round 84: Python's in a Python program
+    case VMType::BOOL:    return nypy::spell_bool(b);
     case VMType::INT:     return s.empty()?std::to_string(i):s;
     // Shortest text that reads back as the same float, as Python prints it
     // (0.1 + 0.2 -> 0.30000000000000004, 2.0, 1e+16) - NyFormat.hpp, the
@@ -1104,7 +1112,8 @@ class Compiler {
         code_stack_.push_back(code_); code_=c;
         body_saves_.push_back({std::move(loops_),std::move(fin_stack_),persist_depth_,std::move(exc_vars_)});
         body_saves_.back().fbl=std::move(fin_body_loops_);   // round 82
-        loops_.clear(); fin_stack_.clear(); persist_depth_=0; exc_vars_.clear(); fin_body_loops_.clear();
+        body_saves_.back().fbh=std::move(fin_body_held_);    // round 84
+        loops_.clear(); fin_stack_.clear(); persist_depth_=0; exc_vars_.clear(); fin_body_loops_.clear(); fin_body_held_.clear();
     }
     std::shared_ptr<VMCode> pop_code() {
         {
@@ -1112,6 +1121,7 @@ class Compiler {
             loops_=std::move(sv.loops); fin_stack_=std::move(sv.fins);
             persist_depth_=sv.depth; exc_vars_=std::move(sv.ev);
             fin_body_loops_=std::move(sv.fbl);   // round 82
+            fin_body_held_=std::move(sv.fbh);    // round 84
             body_saves_.pop_back();
         }
         auto c=code_; code_=code_stack_.back(); code_stack_.pop_back();
@@ -1156,7 +1166,7 @@ class Compiler {
     void store_target(const nython::node::node_ptr& t, int l){
         if(t->type()==nython::node::NodeType::TUPLE||t->type()==nython::node::NodeType::LIST){
             auto el=t->statements();
-            emit(Op::UNPACK_SEQ,(int)el.size(),l);
+            emit(Op::UNPACK_SEQ,(int)el.size()|kUnpackStrict,l);   // round 84: Python's unpacking (it was lax)
             for(auto& e:el) store_target(e,l);
             return;
         }
@@ -1237,7 +1247,7 @@ class Compiler {
     // A function, lambda or class body starts with none of the above: a
     // `break` in a nested function does not belong to the enclosing loop and
     // a `return` there does not run the enclosing function's finally blocks.
-    struct SavedBody { std::vector<LoopCtx> loops; std::vector<FinCtx> fins; int depth; std::vector<std::string> ev; std::vector<size_t> fbl{}; };
+    struct SavedBody { std::vector<LoopCtx> loops; std::vector<FinCtx> fins; int depth; std::vector<std::string> ev; std::vector<size_t> fbl{}; std::vector<std::string> fbh{}; };
     std::vector<SavedBody> body_saves_;
     // round 82: the finally bodies being compiled (innermost last), each as
     // the loop depth it began at. Such a body runs over its try's state on
@@ -1245,8 +1255,14 @@ class Compiler {
     // a break or continue in it leaving a loop around the try drops that
     // state first: FOR_ITER read it as its iterator (the loop ended).
     std::vector<size_t> fin_body_loops_;
+    // round 84: each one's hidden exception variable (Op::FIN_EXC_OF), which
+    // a break or continue leaving it clears as it drops the state
+    std::vector<std::string> fin_body_held_;
     void drop_fin_states(int l){
-        for(size_t k=fin_body_loops_.size(); k-- > 0 && fin_body_loops_[k]>=loops_.size();) emit(Op::POP_TOP,0,l);
+        for(size_t k=fin_body_loops_.size(); k-- > 0 && fin_body_loops_[k]>=loops_.size();){
+            if(k<fin_body_held_.size()&&!fin_body_held_[k].empty()) emit(Op::DELETE_NAME,C().add_name(fin_body_held_[k]),l);
+            emit(Op::POP_TOP,0,l);
+        }
     }
 
 public:
@@ -1952,6 +1968,7 @@ private:
             }
             int id=comp_id_++;
             std::string acc="__comp"+std::to_string(id)+"__";
+            const int comp_start=C().here();   // round 84 (the targets' clean-up below)
             if(cn->kind==CK::DICT) emit(Op::BUILD_MAP,0,l); else emit(Op::BUILD_LIST,0,l);
             emit(Op::DEFINE_NAME,C().add_name(acc),l);
             // The first iterable is evaluated in the enclosing scope.
@@ -1990,6 +2007,19 @@ private:
                 emit(Op::JUMP_ABSOLUTE,tops[k],l);
                 C().patch(exits[k],C().here());
             }
+            // round 84: the renamed targets go too, unless something made in
+            // the comprehension (a lambda, a def, a generator expression, a
+            // class) may read them later: they kept the last item alive and
+            // were class attributes in a class body
+            std::vector<std::string> comp_targets;
+            {
+                bool closes=false;
+                for(int q=comp_start;q<C().here()&&!closes;q++){
+                    Op o=base_op(C().instructions[q].op);
+                    closes=o==Op::MAKE_FUNCTION||o==Op::MAKE_CLASS;
+                }
+                if(!closes) for(auto& kv:renames_.back()) comp_targets.push_back(kv.second);
+            }
             renames_.pop_back();
             if(cn->kind==CK::SET){
                 emit_ln("set",l);
@@ -2002,6 +2032,7 @@ private:
             // was a class attribute). The renamed targets stay - a lambda
             // made in the element may read them later.
             emit(Op::DELETE_NAME,C().add_name(acc),l);
+            for(auto& t:comp_targets) emit(Op::DELETE_NAME,C().add_name(t),l);   // round 84 (never bound: ignored)
             break;
         }
         case NT::LIST: {
@@ -2150,9 +2181,18 @@ private:
                 C().exc_table[idx].finally_start=fs;
                 for(int j:fc.jumps) C().patch(j,fs);
                 persist_depth_++;
+                // round 84: the exception it runs for, in a hidden variable
+                // as an except clause keeps its own (vm_exc_current)
+                std::string fheld="__exc"+std::to_string(try_counter_++)+"__";
+                C().exc_table[idx].fin_held=rn(fheld);
+                emit(Op::FIN_EXC_OF,0,l);
+                emit_dn(fheld,l);
                 fin_body_loops_.push_back(loops_.size());   // round 82
+                fin_body_held_.push_back(rn(fheld));
                 visit_stmt(tn->finally_clause);
                 fin_body_loops_.pop_back();
+                fin_body_held_.pop_back();
+                emit(Op::DELETE_NAME,C().add_name(rn(fheld)),l);
                 persist_depth_--;
                 emit(Op::END_FINALLY, fin_stack_.empty()?-1:fin_stack_.back().entry, l);
             }
@@ -5987,7 +6027,9 @@ private:
     // __repr__ are BaseException's, which the engine supplies itself.
     bool object_member(const std::string& attr, VMVal& out, std::string* owner=nullptr, const std::string& cls=std::string()) {
         if(!object_fallback_name(attr)) return false;
-        if(!cls.empty()&&(attr=="__init__"||attr=="__str__"||attr=="__repr__")&&is_exception_class(cls)) return false;
+        // round 84: they are the prelude's _NyExcExtra, over the engine's own
+        if(!cls.empty()&&(attr=="__init__"||attr=="__str__"||attr=="__repr__")&&is_exception_class(cls))
+            return class_lookup("_NyExcExtra",attr,out,owner);
         if(class_lookup("object",attr,out,owner)) return true;
         return class_lookup("_NyObjectExtra",attr,out,owner);
     }
@@ -6258,9 +6300,21 @@ private:
         pop_frame();
         if(stack_.size()>base) stack_.resize(base);
     }
+    // round 84: an audit event (PEP 578), as the interpreter's auditEvent
+    void audit_event(const char* event, std::vector<VMVal> args){
+        if(__builtin_expect(!nyrt::audit_on(),1)) return;
+        VMVal fn=load_var("_ny_audit_fire");
+        if(fn.type==VMType::NONE||fn.type==VMType::UNDEFINED) return;
+        std::vector<VMVal> a{VMVal::make_str(event), VMVal::make_tuple(std::move(args))};
+        vm_call(fn, a, std::nullopt);
+    }
     VMVal vm_eval_exec(bool is_exec, std::vector<VMVal>& a) {
         const char* who=is_exec?"exec":"eval";
         if(a.empty()) raise_native_exception("TypeError",std::string(who)+"() missing required argument 'source' (pos 1)");
+        if(nyrt::audit_on()){   // round 84: as CPython - a source is compiled first; eval's too
+            if(a[0].type==VMType::STRING||a[0].type==VMType::BYTES) audit_event("compile",{a[0],VMVal::make_str("<string>")});
+            audit_event("exec",{a[0]});
+        }
         a[0]=unwrap_payload(a[0]);   // a str subclass (round 81: exec is payload-transparent)
         std::string mode=is_exec?"exec":"eval", fname="<string>";
         std::string src=snippet_source(a[0],mode,fname,who);
@@ -6435,6 +6489,7 @@ private:
     }
     VMVal vm_compile(std::vector<VMVal>& a) {
         if(a.size()<3) raise_native_exception("TypeError","compile() missing required argument (source, filename, mode)");
+        if(nyrt::audit_on()) audit_event("compile",{a[0],a[1]});   // round 84
         std::string fname=a[1].to_string(), mode=a[2].to_string();
         if(mode!="exec"&&mode!="eval"&&mode!="single") raise_native_exception("ValueError","compile() mode must be 'exec', 'eval' or 'single'");
         std::string m2=mode, f2=fname;
@@ -8551,6 +8606,8 @@ private:
                 const std::string& n=fr.code->names[ins.arg];
                 if(!delete_var(n)){
                     if(n.rfind("__exc",0)==0) break;   // an except clause's hidden name (see TRY)
+                    // round 84: a comprehension's renamed target (__c<id>_x) it never bound
+                    if(n.size()>3&&n.compare(0,3,"__c")==0&&std::isdigit((unsigned char)n[3])) break;
                     throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
                 }
                 break;
@@ -9627,6 +9684,11 @@ private:
 
             // ── try/finally, with (see ExceptionEntry) ─────────────────────
             case Op::FIN_NORMAL: push(make_fin_state(FIN_K_NORMAL)); break;
+            case Op::FIN_EXC_OF: {   // round 84
+                const VMVal& st=stack_.back();
+                push(is_fin_state(st)&&st.i==FIN_K_EXC&&!st.list->empty()?(*st.list)[0]:VMVal::make_none());
+                break;
+            }
             case Op::FIN_RETURN: push(make_fin_state(FIN_K_RETURN, pop())); break;
             case Op::FIN_JUMP:   push(make_fin_state(FIN_K_JUMP, VMVal::make_none(), ins.arg)); break;
             case Op::END_FINALLY: {
@@ -10153,7 +10215,7 @@ private:
                         :en.else_handler>=0?en.else_handler:en.finally_start>=0?en.finally_start-1:en.end;
                 if(ip>=h&&ip<hend) out.push_back({2,e*64+(int)k,h,en.held});
             }
-            if(en.finally_start>=0&&ip>=en.finally_start&&ip<en.end) out.push_back({3,e,en.finally_start,""});
+            if(en.finally_start>=0&&ip>=en.finally_start&&ip<en.end) out.push_back({3,e,en.finally_start,en.fin_held});
         }
         std::stable_sort(out.begin(),out.end(),[](const VMBlk& a,const VMBlk& b){ return a.start<b.start; });
         return out;
@@ -10196,7 +10258,7 @@ private:
             pl=VMJumpPlan{};
             for(size_t q=p;q<from.size();q++){
                 if(from[q].kind==1||from[q].kind==3) pl.pops++;
-                else if(from[q].kind==2&&!from[q].held.empty()) pl.clears.push_back(from[q].held);
+                if((from[q].kind==2||from[q].kind==3)&&!from[q].held.empty()) pl.clears.push_back(from[q].held);   // round 84: a finally's too
             }
             for(size_t q=p;q<to.size();q++) if(to[q].kind==3) pl.pushes++;
             pl.pending=true; pl.idx=idx; pl.target_ip=i;
@@ -10346,13 +10408,17 @@ private:
         if(tbl.empty()) return false;
         // Leaving an except clause by an exception: it no longer handles its
         // own (round 77).
-        for(auto& e:tbl)
-            if(!e.held.empty() && ip>=e.try_end && ip<e.end){
-                auto hv=f.locals.find(e.held);
-                if(hv!=f.locals.end()) hv->second=VMVal::make_none();
-                if(f.own_env&&f.closure_env){ auto he=f.closure_env->find(e.held); if(he!=f.closure_env->end()) he->second=VMVal::make_none(); }
-                if(f.code->module_top&&f.code->module_env){ auto hm=f.code->module_env->find(e.held); if(hm!=f.code->module_env->end()) hm->second=VMVal::make_none(); }
-            }
+        auto clear_held=[&](const std::string& name){
+            auto hv=f.locals.find(name);
+            if(hv!=f.locals.end()) hv->second=VMVal::make_none();
+            if(f.own_env&&f.closure_env){ auto he=f.closure_env->find(name); if(he!=f.closure_env->end()) he->second=VMVal::make_none(); }
+            if(f.code->module_top&&f.code->module_env){ auto hm=f.code->module_env->find(name); if(hm!=f.code->module_env->end()) hm->second=VMVal::make_none(); }
+        };
+        for(auto& e:tbl){
+            if(!e.held.empty() && ip>=e.try_end && ip<e.end) clear_held(e.held);
+            // round 84: leaving a finally body by an exception, likewise
+            if(!e.fin_held.empty() && e.finally_start>=0 && ip>=e.finally_start && ip<e.end) clear_held(e.fin_held);
+        }
         std::vector<int> cands;
         for(int i=0;i<(int)tbl.size();i++){
             auto& e=tbl[i];
@@ -11580,6 +11646,44 @@ private:
     // obj has no such attribute - nothing is raised for that. Property
     // getters and __getattr__ run, and what they raise propagates. `bind`
     // false: a builtin's method is not made into a bound value.
+    // round 84: a builtin's docstring (lib/_nydocs.ny through the prelude's
+    // _ny_builtin_doc), as the interpreter's builtinDoc / builtinDocKey
+    VMVal builtin_doc(const std::string& key){
+        VMVal fn=load_var("_ny_builtin_doc");
+        if(fn.type==VMType::NONE||fn.type==VMType::UNDEFINED) return VMVal::make_none();
+        std::vector<VMVal> a{VMVal::make_str(key)};
+        return vm_call(fn, a, std::nullopt);
+    }
+    // a builtin class's (object, the exceptions, range ...) when it has none
+    VMVal builtin_class_doc(const std::string& cname){
+        if(cname.find('#')==std::string::npos&&(nython::ny_is_builtin_exc(cname)||nyrt::is_python_builtin_class(cname)))
+            return builtin_doc(cname=="map"?std::string("dict"):cname);
+        return VMVal::make_none();
+    }
+    bool builtin_doc_attr(const VMVal& obj, VMVal& out){
+        std::string key;
+        switch(obj.type){
+        case VMType::NONE: out=VMVal::make_none(); return true;
+        case VMType::NATIVE: {
+            const std::string& c=obj.class_name;
+            if(c.rfind("__bmethod__:",0)==0) key=c.substr(12);
+            else if(c.rfind("__builtin__:",0)==0) key=nyrt::builtin_doc_key(c.substr(12));
+            else if(c.rfind("__native__:",0)==0) key=nyrt::builtin_doc_key(c.substr(11));
+            else if(c.rfind("__rtype__:",0)==0){ const nyrt::RuntimeType* rt=nyrt::runtime_type(c.substr(10)); if(rt) key=rt->name; }
+            else if(!c.empty()&&c.find(':')==std::string::npos) key=nyrt::builtin_doc_key(c);
+            break;
+        }
+        case VMType::MAP:
+            if(!obj.map||(!obj.class_name.empty()&&obj.class_name!="map")) return false;   // modules, kwargs, views ...
+            key="dict"; break;
+        case VMType::BOOL: case VMType::INT: case VMType::FLOAT: case VMType::STRING: case VMType::LIST: case VMType::BYTES:
+            key=vm_type_name(obj); break;
+        default: return false;
+        }
+        if(key.empty()) return false;
+        out=builtin_doc(key);
+        return true;
+    }
     bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true) {
         if(any_getattribute_){
             // a class's __getattribute__ (round 77); object.__getattribute__
@@ -11664,6 +11768,9 @@ private:
         }
         // a generator's __name__, gi_frame, gi_code, ... (round 77)
         if(obj.type==VMType::GENERATOR&&gen_attr(obj,attr,out)) return true;
+        // round 84: a builtin's __doc__ is CPython's (None's is None)
+        if(attr=="__doc__"&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS&&obj.type!=VMType::FUNCTION
+           &&builtin_doc_attr(obj,out)) return true;
         switch(obj.type){
         case VMType::INSTANCE: {
             VMVal m;
@@ -11672,9 +11779,13 @@ private:
             if(attr=="__class__"){ out=class_value(obj.class_name); return true; }
             if(attr=="__doc__"){
                 auto cr=class_reg_.find(obj.class_name);
-                out=cr!=class_reg_.end()&&cr->second&&cr->second->has_doc?VMVal::make_str(cr->second->doc):VMVal::make_none();
+                out=cr!=class_reg_.end()&&cr->second&&cr->second->has_doc?VMVal::make_str(cr->second->doc):builtin_class_doc(obj.class_name);
                 return true;
             }
+            // round 84: an instance's __module__ is its class's; __weakref__
+            // None (weak references are kept aside), absent with __slots__
+            if(attr=="__module__"){ VMVal c=class_value(obj.class_name); if(c.type==VMType::CLASS&&lookup_attr(c,"__module__",out,false)) return true; }
+            if(attr=="__weakref__"){ VMVal sl; if(!class_lookup(obj.class_name,"__slots__",sl)){ out=VMVal::make_none(); return true; } }
             if(attr=="__dict__"){
                 // (none for a class with __slots__ and no __dict__ - round 79)
                 if(!slot_flags_.empty()&&is_dictless(obj)) return false;
@@ -11755,12 +11866,13 @@ private:
             if(attr=="__module__"){
                 size_t dot=cname.rfind('.');
                 // the builtin exceptions and object are builtins' (round 80)
-                if(dot==std::string::npos&&(cname=="object"||nython::ny_is_builtin_exc(cname))){ out=VMVal::make_str("builtins"); return true; }
+                // and the prelude's builtin classes (round 84)
+                if(dot==std::string::npos&&(cname=="object"||nython::ny_is_builtin_exc(cname)||nyrt::is_python_builtin_class(cname))){ out=VMVal::make_str("builtins"); return true; }
                 out=VMVal::make_str(dot==std::string::npos?std::string("__main__"):cname.substr(0,dot)); return true;
             }
             if(attr=="__doc__"){
                 auto cr=class_reg_.find(cname);
-                out=cr!=class_reg_.end()&&cr->second&&cr->second->has_doc?VMVal::make_str(cr->second->doc):VMVal::make_none();
+                out=cr!=class_reg_.end()&&cr->second&&cr->second->has_doc?VMVal::make_str(cr->second->doc):builtin_class_doc(cname);
                 return true;
             }
             if(attr=="__mro__"){
@@ -11989,6 +12101,13 @@ private:
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             return "type object '"+cname+"' has no attribute '"+attr+"'";
+        }
+        // round 84: a module's, as CPython says it (it read "'dict' object")
+        if(is_module_ns(obj)&&!is_property_desc(obj)&&obj.class_name.rfind("__",0)!=0){
+            std::string mn=obj.class_name;
+            auto it=obj.map->find("__name__");
+            if(it!=obj.map->end()&&it->second.type==VMType::STRING) mn=it->second.s;
+            return "module '"+mn+"' has no attribute '"+attr+"'";
         }
         return "'"+vm_type_name(obj)+"' object has no attribute '"+attr+"'";
     }
@@ -13496,6 +13615,7 @@ private:
     // `into` (round 80): an existing module namespace to run the file in -
     // importlib.reload(m), a loader's exec_module(m).
     VMVal load_module_file(const std::string& filepath, const std::string& name, const VMVal* into=nullptr) {
+        if(nyrt::audit_on()) audit_event("import",{VMVal::make_str(name),VMVal::make_none()});   // round 84
         auto source=nython::reader::SourceCode(filepath);
         auto reporter=std::make_shared<nython::exception::Reporter>(source);
         auto lx=std::make_shared<nython::lexer::Lexer>(source);
@@ -14449,6 +14569,25 @@ private:
         // "__excN__" variable for a bare `raise` and deletes it when it
         // completes; the innermost clause has the highest N in its frame.
         globals_["_ny_exc_current"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_exc_current(); });
+        // round 84: BaseException's own __init__/__str__/__repr__ as values
+        // (the prelude's _NyExcExtra), as on the interpreter
+        globals_["_ny_exc_init"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()||a[0].type!=VMType::INSTANCE||!a[0].map) return VMVal::make_none();
+            std::vector<VMVal> items;
+            if(a.size()>1&&a[1].type==VMType::LIST&&a[1].list) items=*a[1].list;
+            set_exc_args(*a[0].map, a[0].class_name, items);
+            if(a.size()>2) set_exc_kw(*a[0].map, a[0].class_name, &a[2]);
+            return VMVal::make_none();
+        });
+        globals_["_ny_audit_enable"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{ nyrt::audit_on()=true; return VMVal::make_none(); });   // round 84
+        globals_["_ny_exc_str"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()||a[0].type!=VMType::INSTANCE) return VMVal::make_str("");
+            return VMVal::make_str(a[0].to_string());
+        });
+        globals_["_ny_exc_repr"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()||a[0].type!=VMType::INSTANCE) return VMVal::make_str("");
+            return VMVal::make_str(a[0].repr());
+        });
         // The running frames (round 77): sys._getframe, traceback.extract_stack, warnings.
         globals_["_ny_stack"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_stack_value(); });
         // Frame objects (round 78; frame_object)
@@ -14501,6 +14640,7 @@ private:
         globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });
         globals_["dir"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_dir(a); });
         globals_["input"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(nyrt::audit_on()) audit_event("builtins.input",{a.empty()?VMVal::make_none():a[0]});   // round 84
             // one line from stdin (NyConc.cpp: read_stdin_line); EOFError at
             // the end of input, Ctrl+C raises KeyboardInterrupt
             if(!a.empty()) std::cout<<vm_str(a[0])<<std::flush;
@@ -15930,6 +16070,7 @@ private:
                 return hf?VMVal::make_float(s):VMVal::make_int((int64_t)s);}
             return VMVal::make_int(0);});
         globals_["input"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(nyrt::audit_on()) audit_event("builtins.input",{a.empty()?VMVal::make_none():a[0]});   // round 84
             // one line from stdin (NyConc.cpp: read_stdin_line); EOFError at
             // the end of input, Ctrl+C raises KeyboardInterrupt
             if(!a.empty()) std::cout<<vm_str(a[0])<<std::flush;
@@ -16697,6 +16838,7 @@ private:
         case Op::SETUP_EXCEPT: return "SETUP_EXCEPT";
         case Op::END_EXCEPT:   return "END_EXCEPT";
         case Op::FIN_NORMAL:   return "FIN_NORMAL";
+        case Op::FIN_EXC_OF:   return "FIN_EXC_OF";
         case Op::FIN_RETURN:   return "FIN_RETURN";
         case Op::FIN_JUMP:     return "FIN_JUMP";
         case Op::END_FINALLY:  return "END_FINALLY";
