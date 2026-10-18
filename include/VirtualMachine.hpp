@@ -6332,12 +6332,18 @@ private:
             if(stores.count(n)) return;
             if(second.count(n)) keep_from=1;
         }
-        for(size_t i=0;i<args.size()&&i<keep_from;i++){ auto& a=args[i]; VMVal p; if(a.type==VMType::INSTANCE&&!iter_overridden(a)&&payload_of(a,p)) a=p; }
+        const char* own_d=nyrt::payload_dunder(n);   // round 84: abs/round of an instance defining __abs__/__round__
+        for(size_t i=0;i<args.size()&&i<keep_from;i++){ auto& a=args[i]; VMVal p; if(a.type==VMType::INSTANCE&&!iter_overridden(a)&&!(own_d&&own_dunder(a,own_d))&&payload_of(a,p)) a=p; }
     }
     // A class with an __iter__ of its own (Flag's, a list subclass's): a
     // native is given the instance and iterates it through that, as
     // CPython's slots would (round 77); per class, cleared with mro_cache_.
     std::unordered_map<std::string,bool> iter_own_cache_;
+    // round 84: the instance's class (not the builtin's mirror) defines d
+    bool own_dunder(const VMVal& v, const char* d) {
+        VMVal m; std::string owner;
+        return class_lookup(v.class_name,d,m,&owner)&&nyrt::mirror_builtin(owner).empty();
+    }
     bool iter_overridden(const VMVal& v) {
         auto it=iter_own_cache_.find(v.class_name);
         if(it!=iter_own_cache_.end()) return it->second;

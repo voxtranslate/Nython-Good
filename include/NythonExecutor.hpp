@@ -11362,6 +11362,26 @@ public:
         out.append("__exc__:").append(class_name).append(":__obj__:").append(hex, (size_t)(r.ptr - hex));
         return out;
     }
+    // round 84: an except clause that completed (or a with statement whose
+    // __exit__ suppressed the exception) is done with it, and the ring lets
+    // go of it - CPython frees a handled exception with its clause, and
+    // with it the frames its traceback holds; the ring kept the last 256
+    // alive, and every local of the frames they were raised through (a
+    // tkinter PhotoImage outlived its last reference, so its image stayed).
+    // An enclosing clause still handling the same exception keeps it
+    // (`own` - the clause's own entry, on top - is not counted).
+    void forgetRaised(const std::string& flow, bool own) {
+        size_t op = flow.find(":__obj__:");
+        if (op == std::string::npos || flow.compare(0, 8, "__exc__:") != 0) return;
+        size_t n = handling_obj_.size() - (own && !handling_obj_.empty() ? 1 : 0);
+        for (size_t i = 0; i < n; i++) if (handling_obj_[i].first == flow) return;
+        void* key = reinterpret_cast<void*>((uintptr_t)std::strtoull(flow.c_str() + op + 9, nullptr, 16));
+        if (!exc_instance_map_.erase(key)) return;
+        for (auto it = exc_ring_.end(); it != exc_ring_.begin();) {
+            --it;
+            if (*it == key) { exc_ring_.erase(it); break; }
+        }
+    }
     // The exception object an except clause binds: the raised instance, or
     // for an error raised as "__exc__:Type:message" (runtime errors, native
     // builtins) a new instance of that builtin class with the message as its
@@ -12671,19 +12691,22 @@ public:
         }
         catch (nython::node::YieldSignal&) { throw; }
         catch (JumpSignal&) { throw; }   // round 81: a jump out of the clause runs no finally
+        catch (nython::node::ReturnSignal&) { forgetRaised(exc, true); run_finally(); throw; }   // round 84
         catch (std::string& f2) {
-            if (f2 == "break" || f2 == "continue") { run_finally(); throw; }
+            if (f2 == "break" || f2 == "continue") { forgetRaised(exc, true); run_finally(); throw; }   // round 84
             tbHandlerExit(f2);
+            if (f2 != exc) forgetRaised(exc, true);   // round 84: a new exception holds it as __context__
             tbSee(f2);
             if (run_finally_exc(f2)) return result;
             if (may_pend) { pendExc(f2); return NONE_VALUE; }   // round 82
             throw;
         }
-        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); if (run_finally_exc(f3)) return result; throw; }
+        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); forgetRaised(exc, true); tbSee(f3); if (run_finally_exc(f3)) return result; throw; }
         catch (...) { run_finally(); throw; }
         if (fast && fl.pending == kPendExc) {   // round 82: the handler raised (a bare raise, a new exception)
             std::string f2 = takeExc(fl);
             tbHandlerExit(f2);
+            if (f2 != exc) forgetRaised(exc, true);   // round 84
             tbSee(f2);
             if (run_finally_exc(f2)) return result;
             pendExc(std::move(f2));
@@ -12691,6 +12714,7 @@ public:
         }
         // a return/break/continue left the handler: as the thrown one did
         // (the finally body, no pyExcHandled) - round 81
+        forgetRaised(exc, true);   // round 84: the clause is done with it
         if (fast && fl.pending) { leaveWithPending(fl, tn->finally_clause, ctx); return result; }
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyExcHandled();   // round 79
         run_finally();
@@ -15005,6 +15029,7 @@ public:
             if (!payloadOf(a, p) || iterOverridden(a)) continue;
             if (!decided) decided = nyrt::payload_transparent(name) ? -1 : 1;
             if (decided < 0) return;
+            if (const char* d = nyrt::payload_dunder(name)) if (ownDunder(a, d)) continue;   // round 84
             a = p;
         }
     }
@@ -15085,6 +15110,13 @@ public:
     // CPython's slots would (round 77); cached per class, cleared with the
     // attribute-hook caches.
     std::unordered_map<const Node*, bool> iter_own_cache_;
+    // round 84: the instance's class (not the builtin's mirror) defines d
+    bool ownDunder(const Value& v, const char* d) {
+        Node* cn = classNodeOfInstance(v);
+        Value m; Node* owner = nullptr;
+        return cn && findClassMember(cn, d, m, &owner) && owner && owner->type() == NodeType::CLASS
+               && nyrt::mirror_builtin(static_cast<ClassNode*>(owner)->name).empty();
+    }
     bool iterOverridden(const Value& v) {
         Node* cn = classNodeOfInstance(v);
         if (!cn) return false;
@@ -16286,6 +16318,7 @@ public:
             std::vector<Value> a{exceptionClassValue(flow), ev, tb};
             bool sup = isTruthy(callMethod(v, "__exit__", a, ctx));
             if (!sup) tbReraise(flow);
+            else forgetRaised(flow, false);   // round 84: suppressed, it is done
             return sup;
         };
         Value result = NONE_VALUE;

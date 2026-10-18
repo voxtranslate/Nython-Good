@@ -334,6 +334,14 @@ inline bool payload_transparent(const std::string& n) {
     };
     return names.count(n) > 0;
 }
+// round 84: the builtins whose dunder a payload instance's own class may
+// define (abs(v) of a tuple subclass with __abs__ - turtle's Vec2D): such
+// an instance is given as itself, for the builtin to call that dunder
+inline const char* payload_dunder(const std::string& n) {
+    if (n == "abs") return "__abs__";
+    if (n == "round") return "__round__";
+    return nullptr;
+}
 // Builtins that take a range or a dict view as the object itself (round 78):
 // Python's builtins and the protocol helpers. Every other builtin - Nython's
 // own flat natives (random_sample, json_encode, string and tensor
