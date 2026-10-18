@@ -46,6 +46,8 @@
 #                           showwarning; record=True gives the list of
 #                           WarningMessage objects shown inside
 # WarningMessage            .message .category .filename .lineno .file .line .source
+# _deprecated(name, message=..., *, remove)   CPython's: the import-time
+#                           warning of a module slated for removal
 # deprecated(message, /, *, category=DeprecationWarning, stacklevel=1)
 #                           PEP 702 (Python 3.13): a decorator that makes a
 #                           function, or a class's construction, warn on
@@ -688,6 +690,20 @@ class deprecated:
 
 
 # Private utility function called by _PyErr_WarnUnawaitedCoroutine
+_DEPRECATED_MSG = "{name!r} is deprecated and slated for removal in Python {remove}"
+
+# CPython's warnings._deprecated (round 83): the modules Python deprecated
+# for removal (aifc, audioop, cgi, telnetlib ... in 3.12) call it at import.
+def _deprecated(name, message=_DEPRECATED_MSG, *, remove, _version=sys.version_info):
+    remove_formatted = str(remove[0]) + "." + str(remove[1])
+    if (tuple(_version[:2]) > tuple(remove)) or (tuple(_version[:2]) == tuple(remove) and _version[3] != "alpha"):
+        msg = repr(name) + " was slated for removal after Python " + remove_formatted + " alpha"
+        raise RuntimeError(msg)
+    else:
+        msg = message.format(name=name, remove=remove_formatted)
+        warn(msg, DeprecationWarning, stacklevel=3)
+
+
 def _warn_unawaited_coroutine(coro):
     var msg = "coroutine '" + str(getattr(coro, "__qualname__", coro)) + "' was never awaited"
     warn(msg, category=RuntimeWarning, stacklevel=2, source=coro)

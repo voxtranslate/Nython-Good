@@ -6113,7 +6113,19 @@ private:
         const std::string& c=f.class_name;
         std::string n=c.rfind("__builtin__:",0)==0?c.substr(12):c.rfind("__native__:",0)==0?c.substr(11):c;
         if(n.empty()||nyrt::payload_transparent(n)) return;
-        for(auto& a:args){ VMVal p; if(a.type==VMType::INSTANCE&&!iter_overridden(a)&&payload_of(a,p)) a=p; }
+        // round 83: what a builtin container's method stores or gives back
+        // stays the instance it is - list.append(x), list.insert(i, x),
+        // set.add(x), dict.setdefault/get/pop(k, d) (a str subclass appended
+        // to a list subclass came back a plain str: email's TokenList)
+        size_t keep_from=args.size();
+        if(n.rfind("__bmethod__:",0)==0){
+            static const std::unordered_set<std::string> stores={"__bmethod__:list.append","__bmethod__:set.add"};
+            static const std::unordered_set<std::string> second={"__bmethod__:list.insert","__bmethod__:dict.setdefault",
+                                                                  "__bmethod__:dict.get","__bmethod__:dict.pop"};
+            if(stores.count(n)) return;
+            if(second.count(n)) keep_from=1;
+        }
+        for(size_t i=0;i<args.size()&&i<keep_from;i++){ auto& a=args[i]; VMVal p; if(a.type==VMType::INSTANCE&&!iter_overridden(a)&&payload_of(a,p)) a=p; }
     }
     // A class with an __iter__ of its own (Flag's, a list subclass's): a
     // native is given the instance and iterates it through that, as
@@ -6797,13 +6809,15 @@ private:
         return vm_call(m, args, std::nullopt, kwargs);
     }
     // The constructor, first class in the MRO defining __init__ (or init).
-    bool find_ctor(const std::string& cls, VMVal& out, std::string* owner=nullptr) {
+    // round 83: alias=false (a class with a __new__ of its own: a Python
+    // class, where `init` is an ordinary method) looks for __init__ only.
+    bool find_ctor(const std::string& cls, VMVal& out, std::string* owner=nullptr, bool alias=true) {
         auto mro=class_mro(cls);
         for(auto& c:*mro){
             auto cv=class_vars_at(c);
             if(cv==class_vars_.end()) continue;
             auto f=cv->second.find("__init__");
-            if(f==cv->second.end()) f=cv->second.find("init");
+            if(f==cv->second.end()&&alias) f=cv->second.find("init");
             if(f!=cv->second.end()&&(f->second.type==VMType::FUNCTION||f->second.type==VMType::NATIVE)){
                 out=f->second;
                 if(owner) *owner=c;
@@ -7379,7 +7393,7 @@ private:
                     if(vm_exc_classes().count(cls.class_name)&&inst.map){ set_exc_args(*inst.map, inst.class_name, args); set_exc_kw(*inst.map, inst.class_name, kwargs); }
                     VMVal init; std::string owner;
                     // (round 81: object's __init__ does nothing; not called)
-                    if(find_ctor(cls.class_name, init, &owner)&&nyrt::shown_class_name(owner)!="object") invoke_method(init, inst, args, cls.class_name, kwargs);
+                    if(find_ctor(cls.class_name, init, &owner, false)&&nyrt::shown_class_name(owner)!="object") invoke_method(init, inst, args, cls.class_name, kwargs);   // round 83: no init alias
                 }
                 return inst;
             }
@@ -13766,6 +13780,9 @@ private:
         if(filepath.empty()){
             // A builtin module has no file and that is not an error.
             if(builtin_modules.count(name)) return;
+            // (round 83) not imported: a later `import name` looks again (a
+            // second `try: import m` used to succeed, binding nothing)
+            globals_.erase(guard_key);
             // std::runtime_error, not std::string: the VM's try/except handler
             // catches what Op::RAISE throws, which is runtime_error. Throwing a
             // std::string unwound straight out of run_loop, so an import error
@@ -15340,6 +15357,11 @@ private:
             if(v.type==VMType::STRING){
                 double d;
                 if(!nypy::parse_float_str(v.s,d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::str_repr(v.s));
+                return VMVal::make_float(d);
+            }
+            if(v.type==VMType::BYTES){   // (round 83) float(b"1.5"), as CPython
+                double d;
+                if(!nypy::parse_float_str(v.bdata(),d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::bytes_repr(v.bdata(),v.b));
                 return VMVal::make_float(d);
             }
             if(v.type==VMType::INSTANCE){ VMVal r=vm->call_dunder(v,"__float__",{}); if(r.type!=VMType::NONE) return r; }

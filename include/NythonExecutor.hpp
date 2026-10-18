@@ -55,6 +55,7 @@
 #include "NyScope.hpp"
 #include "builtins/net.hpp"
 #include "builtins/sysmods.hpp"   // round 83: errno, fcntl, mmap, bz2, lzma, cmath, ...
+#include "builtins/nysqlite.hpp"   // (round 83) sqlite3
 #include "NyFormat.hpp"
 #include "NyMembers.hpp"
 
@@ -805,6 +806,7 @@ public:   // NythonExecutor is a struct: members default to public
         // The socket and TLS layers (round 77): the VM reaches them through the bridge.
         for (auto& name : net_builtin_names()) registerBuiltin(name);
         for (auto& name : tls_builtin_names()) registerBuiltin(name);
+        for (auto& name : sqlite_builtin_names()) registerBuiltin(name);   // (round 83) libsqlite3, at run time
         for (auto& name : hash_builtin_names()) registerBuiltin(name);
         for (auto& name : pymath_builtin_names()) registerBuiltin(name);
         for (auto& name : pyjson_builtin_names()) registerBuiltin(name);
@@ -2465,7 +2467,7 @@ public:   // NythonExecutor is a struct: members default to public
             "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
         };
         if (named.count(n)) return true;
-        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_"};
+        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_", "_sql_"};   // _sql_: round 83
         for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
         size_t dot = n.find('.');
         return dot != std::string::npos && nypy::type_kind(n.substr(0, dot)) != nypy::MemberKind::Other;
@@ -9588,6 +9590,7 @@ public:
             // the round 77 socket and TLS layers (builtins/net.cpp, tls.cpp)
             result = dispatch_net(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_tls(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+            if (name.compare(0, 5, "_sql_") == 0) return dispatch_sqlite(*this, name, args, ctx);   // (round 83)
             result = dispatch_hash(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             if (name.compare(0, 4, "_re_") == 0) return dispatch_re(*this, name, args, ctx);
             result = dispatch_sysmods(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;   // round 83
@@ -14081,6 +14084,9 @@ public:
         // it would have defined then failed later with no hint that the import
         // was the cause. Name the module and where it was looked for.
         if (filepath.empty()) {
+            // (round 83) not imported: a later `import name` looks again (a
+            // second `try: import m` used to succeed, binding nothing)
+            imported_modules_.erase(module_name);
             std::string tried;
             for (size_t i = 0; i < search_paths.size(); ++i) {
                 if (i) tried += ", ";
@@ -15877,7 +15883,11 @@ public:
             if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
             auto& cont = *cit->second->container;
             auto it = cont.find("__init__");
-            if (it == cont.end()) it = cont.find("init");
+            // round 83: Nython's `def init` constructor alias is not used for
+            // a class with a __new__ of its own - a Python class, where `init`
+            // is an ordinary method (email.headerregistry's BaseHeader.__new__
+            // calls self.init(name, **kw) itself)
+            if (it == cont.end() && !own_new) it = cont.find("init");
             if (it == cont.end()) continue;
             if (it->second.type != ValueType::USERDATA || !it->second.value.p || !func_names.count(it->second.value.p)) continue;
             invokeMember(it->second, c, inst, args, kw, ctx);

@@ -262,6 +262,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             if (!nypy::parse_float_str(s, d)) E.pyRaise("ValueError", "could not convert string to float: " + nypy::str_repr(s));
             return Value(d);
         }
+        if (auto* bo = E.bytesOf(v)) {   // (round 83) float(b"1.5"), as CPython
+            double d;
+            if (!nypy::parse_float_str(bo->s, d)) E.pyRaise("ValueError", "could not convert string to float: " + nypy::bytes_repr(bo->s, bo->mut));
+            return Value(d);
+        }
         if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__float__")) {
             std::vector<Value> no;
             Value r = E.callMethod(v, "__float__", no, ctx);
