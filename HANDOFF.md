@@ -90,6 +90,7 @@ and under python3 (3.11: 253 checks - the Nython-only lzma fallback check and
 the 3.12-only tty.cfmakeraw check are skipped there). Every expected value is
 CPython's; bz2 streams are compared byte for byte with libbz2's.
 `import errno` / `mmap` / `locale` / `optparse` ... all failed before.
+Sweep 441 runs, 0 not ok; `tools/ide_e2e.py` 463 passed, 0 failed.
 
 ### Native parts (one entry point: `include/builtins/sysmods.hpp`)
 - **`src/builtins/nysysmods.cpp`** (`_sys_*`): the errno table (an `#ifdef`
