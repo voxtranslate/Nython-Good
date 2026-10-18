@@ -389,6 +389,7 @@ std::string Lexer::fileName() {
 void Lexer::reset_token() {
     source.location.reset(source.location.row, source.location.column);
     token_start = source.location;
+    token_start_off = source.getCurrent();   // round 83: where its bytes start (make_token's end)
     // round 82: in place (a Token was made and moved in for each token read)
     token.ident = TokenIdent(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
     token.value.assign("invalid");
@@ -470,12 +471,33 @@ Token& Lexer::make_token(TokenIdent ident) {
 	this->token.ident     = ident;
 	// A token is located where it starts. The column used to be reset to 1
 	// for every token, so every error said column 2. A token that spans
-	// lines (a triple-quoted string, a newline) keeps the position where it
-	// ends, as before: statement line numbers (tracing, the debugger, error
-	// lines) are taken from those rows.
+	// lines - a newline - keeps the position where it ends: statement line
+	// numbers are taken from those rows.
+	// round 83: a string literal that spans lines (triple-quoted) is located
+	// where it starts, as CPython has it - a docstring's or a multi-line
+	// string statement's line is its first one (it was the last); and every
+	// token records where it ends (end_row/end_col, just past its last
+	// character), for lib/ast.ny's end positions.
 	this->token._location = source.location;
+	// the end: the token's start advanced over its bytes (source.location
+	// itself can be off after a newline was read and put back)
+	{
+	    uint32_t r = token_start.row, c = token_start.column;
+	    int cur = source.getCurrent();
+	    for (int k = token_start_off; k < cur; k++) {
+	        unsigned char ch = (unsigned char)source.peek_char(k - cur);
+	        if (ch == '\n') { r++; c = 1; }
+	        else if ((ch & 0xC0) != 0x80) c++;
+	    }
+	    this->token.end_row = r;
+	    this->token.end_col = c;
+	}
 	if (token_start.row == source.location.row)
 	    this->token._location.column = token_start.column;
+	else if (ident.id() == TokenType::String || ident.id() == TokenType::Bytes) {
+	    this->token._location.row = token_start.row;
+	    this->token._location.column = token_start.column;
+	}
 	return this->token;
 }
 
@@ -556,6 +578,15 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
                     if(f_tok < 0 || pc.first) { token.value += pc.second; continue; }
                     for(char c : pc.second) { token.value += c; if(c=='{' || c=='}') token.value += c; }
                 }
+                // round 83: the joined literal ends where its last piece
+                // does, and an f-string's `f` token stands where the run
+                // starts (`"a" f"{x}"` is one literal from the "a")
+                token.end_row = tk[last].end_row;
+                token.end_col = tk[last].end_col;
+                if(f_tok >= 0) {
+                    int run0 = f_at(i) ? i : first_str;
+                    tk[f_tok]._location = tk[run0]._location;
+                }
                 if(f_tok >= 0) ret.push_back(std::move(tk[f_tok]));
                 ret.push_back(std::move(token));
                 i = last + 1;
@@ -635,7 +666,7 @@ static bool python_string_mode(const std::string& file, const std::string& code)
 const std::vector<Token>& Lexer::tokenize() {   // round 82: the tokens in place (each call copied them)
     reset();
     if(source.line_number()<0) source.read();
-    python_strings = python_string_mode(source.fileName(), source.sourceCode());
+    python_strings = force_python_strings || python_string_mode(source.fileName(), source.sourceCode());   // round 83: forced by lib/ast.ny's parse
     while (!source.isAtEnd()) { /// this->token.type() != TokenType::End
         this->read_token();
     }

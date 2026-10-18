@@ -68,8 +68,9 @@
 #
 # Not here: signatures of builtins (they carry no __text_signature__:
 # ValueError "no signature found for builtin", as CPython for builtins
-# without one); getclosurevars (no __closure__ cells); classify_class_attrs;
-# walktree / getclasstree; BufferFlags; column positions. A function's
+# without one); getclosurevars (no __closure__ cells); BufferFlags; column
+# positions. (classify_class_attrs, walktree / getclasstree and getabsfile
+# came in round 83, for pydoc.) A function's
 # __code__.co_varnames (and a frame's f_code.co_varnames) lists its
 # parameters, not its other locals.
 
@@ -1595,6 +1596,10 @@ def getmodule(object, _filename=None):
             g = None
     elif isclass(object):
         g = _class_globals(object)
+    elif (not isroutine(object) and isclass(type(object))
+          and getattr(type(object), "__module__", "builtins") != "builtins"):
+        # an instance: its __module__ is its class's (round 83, for pydoc)
+        g = _class_globals(type(object))
     if g is None:
         return None
     var m = types.ModuleType(getattr(object, "__module__", "__main__"))
@@ -2251,3 +2256,132 @@ def signature_diff(expected, actual):
             if e is None:
                 problems.append("extra required keyword-only parameter " + repr(a.name))
     return problems
+
+
+# ── round 83 (for pydoc): classify_class_attrs, getclasstree, getabsfile ────
+
+class Attribute(_InfoTuple):
+    # classify_class_attrs(): Attribute(name, kind, defining_class, object)
+    _fields = ("name", "kind", "defining_class", "object")
+
+    def __init__(self, name, kind, defining_class, object):
+        self.name = name
+        self.kind = kind
+        self.defining_class = defining_class
+        self.object = object
+        self._values = (name, kind, defining_class, object)
+
+
+def classify_class_attrs(cls):
+    """Return list of attribute-descriptor tuples.
+
+    For each name in dir(cls), the return list contains a 4-tuple
+    (name, kind, defining class, object); kind is 'class method',
+    'static method', 'property', 'method' or 'data' (CPython's algorithm:
+    the object as getattr gives it, the kind from the defining class's
+    __dict__ entry).
+    """
+    var mro = getmro(cls)
+    var class_bases = (cls,) + tuple(mro)
+    var names = list(dir(cls))
+    var result = []
+    var processed = set()
+    for name in names:
+        var homecls = None
+        var get_obj = None
+        var dict_obj = None
+        if name not in processed:
+            try:
+                if name == "__dict__":
+                    raise Exception("__dict__ is special, don't want the proxy")
+                get_obj = getattr(cls, name)
+            except Exception:
+                pass
+            else:
+                homecls = getattr(get_obj, "__objclass__", homecls)
+                if homecls not in class_bases:
+                    homecls = None
+                    var last_cls = None
+                    for srch_cls in class_bases:
+                        var srch_obj = getattr(srch_cls, name, None)
+                        if srch_obj is get_obj:
+                            last_cls = srch_cls
+                    if last_cls is not None:
+                        homecls = last_cls
+        for base in class_bases:
+            var d = _class_dict(base)
+            if name in d:
+                dict_obj = d[name]
+                homecls = base
+                break
+        if homecls is None:
+            continue
+        var obj = get_obj if get_obj is not None else dict_obj
+        var kind = "data"
+        if isinstance(dict_obj, (staticmethod, types.BuiltinMethodType)):
+            kind = "static method"
+            obj = dict_obj
+        elif isinstance(dict_obj, classmethod):
+            kind = "class method"
+            obj = dict_obj
+        elif isinstance(dict_obj, property):
+            kind = "property"
+            obj = dict_obj
+        elif isroutine(obj):
+            kind = "method"
+        result.append(Attribute(name, kind, homecls, obj))
+        processed.add(name)
+    return result
+
+
+def walktree(classes, children, parent):
+    """Recursive helper function for getclasstree()."""
+    var results = []
+    classes.sort(key=lambda c: (c.__module__, c.__name__))
+    for c in classes:
+        results.append((c, c.__bases__))
+        if c in children:
+            results.append(walktree(children[c], children, c))
+    return results
+
+
+def getclasstree(classes, unique=False):
+    """Arrange the given list of classes into a hierarchy of nested lists.
+
+    Where a nested list appears, it contains classes derived from the class
+    whose entry immediately precedes the list.  Each entry is a 2-tuple
+    containing a class and a tuple of its base classes.  If the 'unique'
+    argument is true, exactly one entry appears in the returned structure
+    for each class in the given list.  Otherwise, classes using multiple
+    inheritance and their descendants will appear multiple times."""
+    var children = {}
+    var roots = []
+    for c in classes:
+        if c.__bases__:
+            for parent in c.__bases__:
+                if parent not in children:
+                    children[parent] = []
+                if c not in children[parent]:
+                    children[parent].append(c)
+                if unique and parent in classes:
+                    break
+        elif c not in roots:
+            roots.append(c)
+    for parent in children:
+        if parent not in classes:
+            roots.append(parent)
+    return walktree(roots, children, None)
+
+
+def getabsfile(object, _filename=None):
+    """Return an absolute path to the source or compiled file for an object.
+
+    The idea is for each object to have a unique origin, so this routine
+    normalizes the result as much as possible."""
+    import os as _os
+    if _filename is None:
+        _filename = getsourcefile(object) or getfile(object)
+    return _os.path.normcase(_os.path.abspath(_filename))
+
+
+__all__.extend(["Attribute", "classify_class_attrs", "walktree", "getclasstree", "getabsfile"])

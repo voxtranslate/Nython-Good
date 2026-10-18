@@ -22,6 +22,7 @@
 //   text_format_nython(source, indent_unit, opts)     conservative formatter (see below)
 //   text_defuse(source)                               per line: reads, writes, controlling predicates (round 79)
 //   ny_facts(source)                                  per function: parameters, calls, returns, raises, ... (round 82)
+//   _ny_ast(source, mode, filename)                   Python's tree from the real parser (lib/ast.ny, round 83)
 //
 // Lists arrive either as a Nython list of strings or as one string (split on
 // newlines). All rows/columns are 0-based; columns count characters.
@@ -1269,12 +1270,10 @@ struct FactsWalker {
         for (auto& c : n->statements()) R(c);
     }
 
-    // A string token carries the line it ends on: a triple-quoted
-    // docstring starts as many lines earlier as it holds newlines.
+    // A string token carries the line it starts on (round 83: it was the
+    // line it ended on, and this counted the newlines back).
     static int string_first_line(const node_ptr& n) {
-        int nl = 0;
-        for (char ch : n->token().value) if (ch == '\n') nl++;
-        return std::max(1, n->line() - nl);
+        return std::max(1, n->line());
     }
     static bool is_dec_block(const node_ptr& n) {
         if (!n || n->type() != NodeType::BLOCK) return false;
@@ -1860,6 +1859,1215 @@ Value ny_facts(NythonExecutor& E, std::vector<Value>& args) {
     for (auto& p : W.none_cmps) { ListBuilder e(E); e.add_int(p.first); e.add_str(p.second); nc.add(e.done()); }
     M["none_compares"] = nc.done();
     return out;
+}
+
+// ── _ny_ast (round 83) ───────────────────────────────────────────────────────
+// lib/ast.ny's ast.parse is the real parser's tree: Parser::parseAst parses
+// in ast mode (Parser.cpp: Python's shapes kept where the parser would
+// desugar, every node's token span recorded), and this turns that tree into
+// Python's own, as nested maps:
+//
+//   {"_t": "BinOp", "lineno": 1, "col_offset": 0, "end_lineno": 1,
+//    "end_col_offset": 5, "left": {...}, "op": "Add", "right": {...}}
+//
+// Operators and contexts are their class names ("Add", "Store"); a field
+// that is None is absent; constants carry "value", except an int that does
+// not fit 64 bits ("_int": its text), bytes ("_bytes": one character per
+// byte), complex ("_complex": the imaginary literal) and Ellipsis
+// ("_ellipsis") - lib/ast.ny makes those. Positions are CPython's: lines
+// from 1, columns UTF-8 byte offsets from 0, ends just past the node.
+// Nython-only syntax has Nython node kinds ("NyRange", "NyCoalesce" ...).
+//
+//   _ny_ast(source, mode="exec", filename="<unknown>")
+//     -> {"_t": "Module"/"Expression"/"Interactive"/"FunctionType", ...}
+//        or {"_error": [message, line, column, text]} (a SyntaxError)
+
+struct AstPos { long long l = 0, c = 0, el = 0, ec = 0; bool ok = false; };
+
+struct AstExporter {
+    NythonExecutor& E;
+    Parser& P;
+    const std::vector<Token>& toks;
+    std::vector<std::string> lines;
+    bool in_fstr = false;   // inside an f-string's field: its nodes are located at the f-string
+    AstPos fpos;
+
+    AstExporter(NythonExecutor& e, Parser& p, const std::vector<Token>& t) : E(e), P(p), toks(t) {}
+
+    // ── positions ──
+    long long bytecol(long long row, long long ccol) const {
+        if (ccol < 0) ccol = 0;
+        if (row < 1 || row > (long long)lines.size()) return ccol;
+        const std::string& s = lines[(size_t)row - 1];
+        long long n = 0;
+        size_t i = 0;
+        while (i < s.size() && n < ccol) {
+            i++;
+            while (i < s.size() && u8_cont((unsigned char)s[i])) i++;
+            n++;
+        }
+        return (long long)i + (ccol - n);
+    }
+    AstPos tokPos(const Token& t) const {
+        AstPos p;
+        p.l = t._location.row;
+        p.c = bytecol(p.l, (long long)t._location.column - 1);
+        if (t.end_row) {
+            p.el = t.end_row;
+            p.ec = bytecol(p.el, (long long)t.end_col - 1);
+        } else {
+            p.el = p.l;
+            p.ec = p.c + (long long)t.value.size();
+        }
+        p.ok = p.l > 0;
+        return p;
+    }
+    // a token by index: the lexer's, or (from Parser::kAstExtra) one of an
+    // f-string field's, moved to the source's coordinates (round 83)
+    const Token* tokAt(int i) const {
+        if (i >= Parser::kAstExtra) {
+            size_t k = (size_t)(i - Parser::kAstExtra);
+            return k < P.ast_extra_toks_.size() ? &P.ast_extra_toks_[k] : nullptr;
+        }
+        return i >= 0 && i < (int)toks.size() ? &toks[(size_t)i] : nullptr;
+    }
+    AstPos spanPos(int t0, int t1) const {
+        if (t0 < 0 || t1 < t0) return AstPos{};
+        const Token* x0 = tokAt(t0);
+        const Token* x1 = tokAt(t1);
+        if (!x0 || !x1) return AstPos{};
+        AstPos a = tokPos(*x0);
+        AstPos b = tokPos(*x1);
+        a.el = b.el;
+        a.ec = b.ec;
+        return a;
+    }
+    static AstPos merge(AstPos a, const AstPos& b) {
+        if (!b.ok) return a;
+        if (!a.ok) return b;
+        if (b.l < a.l || (b.l == a.l && b.c < a.c)) { a.l = b.l; a.c = b.c; }
+        if (b.el > a.el || (b.el == a.el && b.ec > a.ec)) { a.el = b.el; a.ec = b.ec; }
+        return a;
+    }
+    // A node's own position: the parser's span for it, else `derived` (its
+    // token and what its children cover).
+    AstPos own(const Node* n, const AstPos& derived) const {
+        if (in_fstr) return fpos;
+        auto it = P.ast_spans_.find(n);
+        if (it != P.ast_spans_.end()) {
+            AstPos p = spanPos(it->second.first, it->second.second);
+            if (p.ok) return p;
+        }
+        return derived;
+    }
+    // ... and with the parentheses written around it
+    AstPos outer(const Node* n, const AstPos& p) const {
+        if (in_fstr) return fpos;
+        auto it = P.ast_outer_.find(n);
+        if (it != P.ast_outer_.end() && it->second.first >= 0) {
+            AstPos o = spanPos(it->second.first, it->second.second);
+            if (o.ok) return o;
+        }
+        return p;
+    }
+    bool parenthesized(const Node* n) const { return P.ast_outer_.count(n) > 0; }
+    std::string flag(const Node* n) const {
+        auto it = P.ast_flags_.find(n);
+        return it == P.ast_flags_.end() ? std::string() : it->second;
+    }
+
+    // ── values ──
+    struct NMap { Object* o; Value v; };
+    Value S(const std::string& s) { return E.makeStringValue(s); }
+    Value I(long long x) { return Value(bigint(x)); }
+    NMap node(const char* t) {
+        NMap m{new Object((Runnable*)E.runner, "map", Type::MAP), Value()};
+        m.v = Value((Collectable*)m.o);
+        set(m, "_t", S(t));
+        return m;
+    }
+    void set(NMap& m, const char* k, const Value& v) { (*m.o->container)[k] = v; }
+    void setp(NMap& m, const AstPos& p) {
+        if (!p.ok) return;
+        set(m, "lineno", I(p.l));
+        set(m, "col_offset", I(p.c));
+        set(m, "end_lineno", I(p.el));
+        set(m, "end_col_offset", I(p.ec));
+    }
+    void setx(NMap& m, const char* k, const node_ptr& n, const char* ctx = "Load") {
+        if (!n) return;
+        AstPos p;
+        set(m, k, expr(n, ctx, p));
+    }
+    Value exprs(const std::vector<node_ptr>& v, const char* ctx, AstPos* cover = nullptr) {
+        ListBuilder l(E);
+        for (auto& n : v) {
+            AstPos p;
+            if (!n) { l.add(NONE_VALUE); continue; }
+            l.add(expr(n, ctx, p));
+            if (cover) *cover = merge(*cover, p);
+        }
+        return l.done();
+    }
+    Value strs(const std::vector<std::string>& v) {
+        ListBuilder l(E);
+        for (auto& s : v) l.add_str(s);
+        return l.done();
+    }
+    Value emptyList() { ListBuilder l(E); return l.done(); }
+
+    // ── operators ──
+    static const char* binop(const std::string& o) {
+        static const std::map<std::string, const char*> m = {
+            {"+", "Add"}, {"-", "Sub"}, {"*", "Mult"}, {"/", "Div"}, {"//", "FloorDiv"}, {"\\", "FloorDiv"},
+            {"%", "Mod"}, {"**", "Pow"}, {"<<", "LShift"}, {">>", "RShift"}, {">>>", "RShift"}, {"|", "BitOr"},
+            {"^", "BitXor"}, {"&", "BitAnd"}, {"@", "MatMult"}, {"??", "NyCoalesce"}, {"xor", "NyXor"}, {"^^", "NyXor"}};
+        auto it = m.find(o);
+        return it == m.end() ? nullptr : it->second;
+    }
+    static const char* cmpop(const std::string& o) {
+        static const std::map<std::string, const char*> m = {
+            {"==", "Eq"}, {"!=", "NotEq"}, {"<", "Lt"}, {"<=", "LtE"}, {">", "Gt"}, {">=", "GtE"},
+            {"is", "Is"}, {"is not", "IsNot"}, {"in", "In"}, {"not in", "NotIn"},
+            {"===", "NyStrictEq"}, {"!==", "NyStrictNotEq"}, {"instanceof", "NyInstanceOf"}};
+        auto it = m.find(o);
+        return it == m.end() ? nullptr : it->second;
+    }
+    static const char* augop(std::string o) {
+        if (o == "??=") return "NyCoalesce";
+        if (!o.empty() && o.back() == '=') o.pop_back();
+        if (o == "&&") return "BitAnd";
+        if (o == "||") return "BitOr";
+        if (o == "~") return "Invert";
+        return binop(o);
+    }
+
+    // ── expressions ──
+    // `p` gets the node's position with any parentheses around it (what its
+    // parent covers).
+    Value expr(const node_ptr& n, const char* ctx, AstPos& p) {
+        if (!n) { p = AstPos{}; return NONE_VALUE; }
+        AstPos inner;
+        Value v = expr1(n, ctx, inner);
+        p = outer(n.get(), inner);
+        return v;
+    }
+
+    Value constant(const char* /*kindless*/, const Value& v, const AstPos& p) {
+        NMap m = node("Constant");
+        set(m, "value", v);
+        setp(m, p);
+        return m.v;
+    }
+
+    Value name(const std::string& id, const char* ctx, const AstPos& p) {
+        NMap m = node("Name");
+        set(m, "id", S(id));
+        set(m, "ctx", S(ctx));
+        setp(m, p);
+        return m.v;
+    }
+
+    void flattenBool(const node_ptr& n, const std::string& op, std::vector<node_ptr>& out) {
+        if (n && n->type() == NodeType::BINARY && !parenthesized(n.get())) {
+            auto* b = static_cast<BinaryNode*>(n.get());
+            std::string o = b->op == "&&" ? "and" : b->op == "||" ? "or" : b->op;
+            if (o == op) { flattenBool(b->left, op, out); out.push_back(b->right); return; }
+        }
+        out.push_back(n);
+    }
+
+    Value intConst(const Token& t, const AstPos& p) {
+        std::string s;
+        for (char c : t.value) if (c != '_') s += c;
+        NMap m = node("Constant");
+        int base = 10;
+        std::string digits = s;
+        if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; digits = s.substr(2); }
+        else if (s.size() > 2 && s[0] == '0' && (s[1] == 'o' || s[1] == 'O')) { base = 8; digits = s.substr(2); }
+        else if (s.size() > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) { base = 2; digits = s.substr(2); }
+        bool done = false;
+        if (digits.size() < 16 || (base == 10 && digits.size() < 18)) {
+            try {
+                size_t used = 0;
+                long long x = std::stoll(digits, &used, base);
+                if (used == digits.size()) { set(m, "value", I(x)); done = true; }
+            } catch (...) {}
+        }
+        if (!done) set(m, "_int", S(s));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value bytesConst(const std::string& raw, const AstPos& p) {
+        std::string u;   // one character per byte (U+0000..U+00FF)
+        for (unsigned char c : raw) {
+            if (c < 0x80) u += (char)c;
+            else { u += (char)(0xC0 | (c >> 6)); u += (char)(0x80 | (c & 0x3F)); }
+        }
+        NMap m = node("Constant");
+        set(m, "_bytes", S(u));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value keyword(const std::string* arg, const node_ptr& val, AstPos p) {
+        NMap m = node("keyword");
+        if (arg) set(m, "arg", S(*arg));
+        AstPos vp;
+        set(m, "value", expr(val, "Load", vp));
+        setp(m, merge(p, vp));
+        return m.v;
+    }
+
+    Value call(CallNode* c, const AstPos& own_p, AstPos& cover) {
+        NMap m = node("Call");
+        AstPos fp;
+        set(m, "func", expr(c->callee, "Load", fp));
+        cover = merge(cover, fp);
+        ListBuilder args(E), kws(E);
+        for (auto& a : c->args) {
+            if (!a) continue;
+            AstPos ap;
+            if (a->type() == NodeType::KEYWORD_ARG) {
+                auto* k = static_cast<KeywordArgNode*>(a.get());
+                Value kv = keyword(&k->name, k->val, own(a.get(), tokPos(a->tok())));
+                kws.add(kv);
+                continue;
+            }
+            if (a->type() == NodeType::UNARY && static_cast<UnaryNode*>(a.get())->op == "**") {
+                Value kv = keyword(nullptr, static_cast<UnaryNode*>(a.get())->operand, own(a.get(), tokPos(a->tok())));
+                kws.add(kv);
+                continue;
+            }
+            args.add(expr(a, "Load", ap));
+            cover = merge(cover, ap);
+        }
+        set(m, "args", args.done());
+        set(m, "keywords", kws.done());
+        setp(m, own(c, own_p));
+        return m.v;
+    }
+
+    Value arg(const node_ptr& pn, const std::string& nm, const node_ptr& ann) {
+        NMap m = node("arg");
+        set(m, "arg", S(nm));
+        AstPos ap;
+        if (ann) set(m, "annotation", expr(ann, "Load", ap));
+        AstPos p = own(pn.get(), tokPos(pn->tok()));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value arguments(const std::vector<node_ptr>& params, const std::vector<node_ptr>& defs, size_t posonly,
+                    const node_ptr& anns) {
+        std::map<std::string, node_ptr> ann;
+        if (anns && anns->type() == NodeType::MAP)
+            for (auto& e : static_cast<MapNode*>(anns.get())->entries) {
+                auto* me = static_cast<MapEntryNode*>(e.get());
+                if (me->key) ann[me->key->tok().value] = me->val;
+            }
+        ListBuilder po(E), as(E), kwo(E), kwd(E), dfl(E);
+        Value vararg = NONE_VALUE, kwarg = NONE_VALUE;
+        bool star = false;
+        size_t npos = 0;
+        for (size_t i = 0; i < params.size(); i++) {
+            std::string pn = params[i]->value();
+            node_ptr d = i < defs.size() ? defs[i] : nullptr;
+            if (pn == "*") { star = true; continue; }
+            if (pn.size() > 1 && pn[0] == '*' && pn[1] == '*') {
+                std::string nm = pn.substr(2);
+                kwarg = arg(params[i], nm, ann.count(nm) ? ann[nm] : nullptr);
+                continue;
+            }
+            if (pn.size() > 1 && pn[0] == '*') {
+                std::string nm = pn.substr(1);
+                vararg = arg(params[i], nm, ann.count(nm) ? ann[nm] : nullptr);
+                star = true;
+                continue;
+            }
+            Value a = arg(params[i], pn, ann.count(pn) ? ann[pn] : nullptr);
+            if (star) {
+                kwo.add(a);
+                if (d) { AstPos dp; kwd.add(expr(d, "Load", dp)); } else kwd.add(NONE_VALUE);
+                continue;
+            }
+            if (npos < posonly) po.add(a); else as.add(a);
+            npos++;
+            if (d) { AstPos dp; dfl.add(expr(d, "Load", dp)); }
+        }
+        NMap m = node("arguments");
+        set(m, "posonlyargs", po.done());
+        set(m, "args", as.done());
+        if (vararg.type != ValueType::NONE) set(m, "vararg", vararg);
+        set(m, "kwonlyargs", kwo.done());
+        set(m, "kw_defaults", kwd.done());
+        if (kwarg.type != ValueType::NONE) set(m, "kwarg", kwarg);
+        set(m, "defaults", dfl.done());
+        return m.v;
+    }
+
+    Value comprehension(ComprehensionNode* c, AstPos& cover) {
+        static const char* kinds[] = {"ListComp", "SetComp", "DictComp", "GeneratorExp"};
+        NMap m = node(kinds[c->kind & 3]);
+        AstPos ep;
+        if (c->kind == ComprehensionNode::DICT) {
+            set(m, "key", expr(c->elt, "Load", ep));
+            cover = merge(cover, ep);
+            set(m, "value", expr(c->value, "Load", ep));
+        } else set(m, "elt", expr(c->elt, "Load", ep));
+        cover = merge(cover, ep);
+        ListBuilder gens(E);
+        for (auto& cl : c->clauses) {
+            NMap g = node("comprehension");
+            AstPos tp, ip;
+            set(g, "target", expr(cl.target, "Store", tp));
+            set(g, "iter", expr(cl.iter, "Load", ip));
+            cover = merge(cover, merge(tp, ip));
+            AstPos cp;
+            set(g, "ifs", exprs(cl.conds, "Load", &cp));
+            cover = merge(cover, cp);
+            set(g, "is_async", I(flag(cl.iter.get()) == "async" ? 1 : 0));
+            gens.add(g.v);
+        }
+        set(m, "generators", gens.done());
+        return m.v;
+    }
+
+    Value joinedStr(PyAstNode* js, const AstPos& p, bool is_spec) {
+        NMap m = node("JoinedStr");
+        ListBuilder vals(E);
+        const std::vector<node_ptr>* parts = js->listOf("values");
+        bool last_field = false;
+        // round 83: an f-string the parser located part by part
+        // (Parser::fstringAst): each part at its own position
+        const bool exact = js->numOf("exact", 0) != 0 && !in_fstr;
+        if (parts) for (auto& part : *parts) {
+            if (!part) continue;
+            if (part->type() == NodeType::STRING) {
+                NMap c = node("Constant");
+                set(c, "value", S(part->tok().value));
+                setp(c, exact ? tokPos(part->tok()) : p);
+                vals.add(c.v);
+                last_field = false;
+                continue;
+            }
+            if (part->type() == NodeType::PY_AST) {
+                auto* fv = static_cast<PyAstNode*>(part.get());
+                NMap f = node("FormattedValue");
+                const AstPos fp = exact ? tokPos(fv->tok()) : p;
+                bool saved = in_fstr;
+                AstPos saved_p = fpos;
+                if (!(exact && fv->numOf("exact", 0))) {
+                    in_fstr = true;
+                    fpos = p;
+                }
+                AstPos vp;
+                set(f, "value", expr(fv->kidOf("value"), "Load", vp));
+                in_fstr = saved;
+                fpos = saved_p;
+                set(f, "conversion", I(fv->numOf("conversion", -1)));
+                node_ptr spec = fv->kidOf("format_spec");
+                if (spec && spec->type() == NodeType::PY_AST)
+                    set(f, "format_spec", joinedStr(static_cast<PyAstNode*>(spec.get()), exact ? tokPos(spec->tok()) : p, true));
+                setp(f, fp);
+                vals.add(f.v);
+                last_field = true;
+            }
+        }
+        // CPython 3.12 ends a format spec whose last part is a field with an
+        // empty Constant (its tokenizer's empty FSTRING_MIDDLE), located
+        // where the spec ends
+        if (is_spec && last_field) {
+            NMap c = node("Constant");
+            set(c, "value", S(""));
+            AstPos z = p;
+            if (exact) { z.l = p.el; z.c = p.ec; }
+            setp(c, z);
+            vals.add(c.v);
+        }
+        set(m, "values", vals.done());
+        setp(m, p);
+        return m.v;
+    }
+
+    Value pyAstExpr(PyAstNode* a, const node_ptr& n, const char* ctx, AstPos& p) {
+        const std::string& k = a->kind;
+        AstPos d = tokPos(n->tok());
+        if (k == "Compare") {
+            NMap m = node("Compare");
+            AstPos lp;
+            set(m, "left", expr(a->kidOf("left"), "Load", lp));
+            ListBuilder ops(E);
+            if (auto* os = a->strlOf("ops")) for (auto& o : *os) { const char* c = cmpop(o); ops.add_str(c ? c : o); }
+            set(m, "ops", ops.done());
+            AstPos cp;
+            set(m, "comparators", exprs(*a->listOf("comparators"), "Load", &cp));
+            p = own(n.get(), merge(lp, cp));
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "NamedExpr") {
+            NMap m = node("NamedExpr");
+            AstPos tp, vp;
+            set(m, "target", expr(a->kidOf("target"), "Store", tp));
+            set(m, "value", expr(a->kidOf("value"), "Load", vp));
+            p = own(n.get(), merge(tp, vp));
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "Await") {
+            NMap m = node("Await");
+            AstPos vp;
+            set(m, "value", expr(a->kidOf("value"), "Load", vp));
+            p = own(n.get(), merge(d, vp));
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "Ellipsis") {
+            p = own(n.get(), d);
+            NMap m = node("Constant");
+            set(m, "_ellipsis", Value(true));
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "Complex") {
+            p = own(n.get(), d);
+            NMap m = node("Constant");
+            const std::string* t = a->strOf("text");
+            set(m, "_complex", S(t ? *t : std::string("0j")));
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "JoinedStr") {
+            p = own(n.get(), d);
+            return joinedStr(a, p, false);
+        }
+        if (k == "Slice") {
+            NMap m = node("Slice");
+            AstPos c = d, x;
+            if (a->kidOf("lower")) { set(m, "lower", expr(a->kidOf("lower"), "Load", x)); c = merge(c, x); }
+            if (a->kidOf("upper")) { set(m, "upper", expr(a->kidOf("upper"), "Load", x)); c = merge(c, x); }
+            if (a->kidOf("step")) { set(m, "step", expr(a->kidOf("step"), "Load", x)); c = merge(c, x); }
+            p = own(n.get(), c);
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "Set") {
+            NMap m = node("Set");
+            AstPos c = d;
+            set(m, "elts", exprs(*a->listOf("elts"), "Load", &c));
+            p = own(n.get(), c);
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "Dict") {
+            NMap m = node("Dict");
+            AstPos c = d;
+            set(m, "keys", exprs(*a->listOf("keys"), "Load", &c));
+            set(m, "values", exprs(*a->listOf("values"), "Load", &c));
+            p = own(n.get(), c);
+            setp(m, p);
+            return m.v;
+        }
+        if (k == "keyword") {
+            p = own(n.get(), d);
+            return keyword(a->strOf("arg"), a->kidOf("value"), p);
+        }
+        // a statement-only kind where an expression stands
+        p = own(n.get(), d);
+        NMap m = node("NyNode");
+        set(m, "kind", S(k));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value expr1(const node_ptr& n, const char* ctx, AstPos& p) {
+        Node* raw = n.get();
+        AstPos d = tokPos(raw->tok());
+        switch (raw->type()) {
+        case NodeType::INTEGER:
+            p = own(raw, d);
+            return intConst(raw->tok(), p);
+        case NodeType::FLOAT: {
+            p = own(raw, d);
+            std::string s;
+            for (char c : raw->tok().value) if (c != '_') s += c;
+            return constant(nullptr, Value(std::strtod(s.c_str(), nullptr)), p);
+        }
+        case NodeType::STRING: {
+            p = own(raw, d);
+            NMap m = node("Constant");
+            set(m, "value", S(raw->tok().value));
+            // u"..." keeps its prefix as the kind
+            const Token& t = raw->tok();
+            if (t._location.row >= 1 && t._location.row <= lines.size() && !in_fstr) {
+                const std::string& ln = lines[t._location.row - 1];
+                size_t b = (size_t)bytecol(t._location.row, (long long)t._location.column - 1);
+                if (b < ln.size() && (ln[b] == 'u' || ln[b] == 'U')) set(m, "kind", S("u"));
+            }
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::BYTES:
+            p = own(raw, d);
+            return bytesConst(raw->tok().value, p);
+        case NodeType::TRUE: case NodeType::FALSE: case NodeType::NONE: {
+            p = own(raw, d);
+            const std::string& t = raw->tok().value;
+            if (t == "True") return constant(nullptr, Value(true), p);
+            if (t == "False") return constant(nullptr, Value(false), p);
+            if (t == "None") return constant(nullptr, NONE_VALUE, p);
+            return name(t, ctx, p);   // true / false / none / null are names in Python
+        }
+        case NodeType::UNDEFINED:
+            p = own(raw, d);
+            return name(raw->tok().value, ctx, p);
+        case NodeType::VARIABLE:
+            p = own(raw, d);
+            return name(static_cast<VariableNode*>(raw)->name, ctx, p);
+        case NodeType::SELF: case NodeType::SUPER:
+            p = own(raw, d);
+            return name(raw->tok().value, ctx, p);
+        case NodeType::LIST: case NodeType::TUPLE: case NodeType::ARRAY: {
+            NMap m = node(raw->type() == NodeType::TUPLE ? "Tuple" : "List");
+            AstPos c = raw->type() == NodeType::TUPLE ? AstPos{} : d;
+            set(m, "elts", exprs(raw->statements(), ctx, &c));
+            set(m, "ctx", S(ctx));
+            p = own(raw, c.ok ? c : d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::MAP: {
+            NMap m = node("Dict");
+            ListBuilder ks(E), vs(E);
+            AstPos c = d;
+            for (auto& e : static_cast<MapNode*>(raw)->entries) {
+                auto* me = static_cast<MapEntryNode*>(e.get());
+                AstPos kp, vp;
+                ks.add(expr(me->key, "Load", kp));
+                vs.add(expr(me->val, "Load", vp));
+                c = merge(c, merge(kp, vp));
+            }
+            set(m, "keys", ks.done());
+            set(m, "values", vs.done());
+            p = own(raw, c);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::UNARY: {
+            auto* u = static_cast<UnaryNode*>(raw);
+            AstPos op;
+            if (u->op == "*") {
+                NMap m = node("Starred");
+                set(m, "value", expr(u->operand, ctx, op));
+                set(m, "ctx", S(ctx));
+                p = own(raw, merge(d, op));
+                setp(m, p);
+                return m.v;
+            }
+            const char* o = u->op == "-" ? "USub" : u->op == "+" ? "UAdd" : u->op == "~" ? "Invert"
+                          : (u->op == "not" || u->op == "!") ? "Not" : nullptr;
+            NMap m = node(o ? "UnaryOp" : "NyUnaryOp");
+            set(m, "op", S(o ? o : u->op));
+            set(m, "operand", expr(u->operand, "Load", op));
+            p = own(raw, merge(d, op));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::BINARY: {
+            auto* b = static_cast<BinaryNode*>(raw);
+            std::string o = b->op == "&&" ? "and" : b->op == "||" ? "or" : b->op;
+            if (o == "and" || o == "or") {
+                std::vector<node_ptr> vals;
+                flattenBool(b->left, o, vals);
+                vals.push_back(b->right);
+                NMap m = node("BoolOp");
+                set(m, "op", S(o == "and" ? "And" : "Or"));
+                AstPos c;
+                set(m, "values", exprs(vals, "Load", &c));
+                p = own(raw, c);
+                setp(m, p);
+                return m.v;
+            }
+            if (const char* co = cmpop(o)) {
+                NMap m = node("Compare");
+                AstPos lp, rp;
+                set(m, "left", expr(b->left, "Load", lp));
+                ListBuilder ops(E);
+                ops.add_str(co);
+                set(m, "ops", ops.done());
+                ListBuilder cs(E);
+                cs.add(expr(b->right, "Load", rp));
+                set(m, "comparators", cs.done());
+                p = own(raw, merge(lp, rp));
+                setp(m, p);
+                return m.v;
+            }
+            const char* bo = binop(o);
+            NMap m = node("BinOp");
+            AstPos lp, rp;
+            set(m, "left", expr(b->left, "Load", lp));
+            set(m, "op", S(bo ? bo : o));
+            set(m, "right", expr(b->right, "Load", rp));
+            p = own(raw, merge(lp, rp));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::IF: {
+            auto* in = static_cast<IfNode*>(raw);
+            NMap m = node("IfExp");
+            AstPos tp, bp, ep;
+            set(m, "test", expr(in->condition, "Load", tp));
+            set(m, "body", expr(in->then_branch, "Load", bp));
+            set(m, "orelse", expr(in->else_branch, "Load", ep));
+            p = own(raw, merge(merge(tp, bp), ep));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::ATTRIBUTE: {
+            auto* a = static_cast<AttributeNode*>(raw);
+            NMap m = node("Attribute");
+            AstPos vp;
+            set(m, "value", expr(a->object, "Load", vp));
+            set(m, "attr", S(a->attr));
+            set(m, "ctx", S(ctx));
+            p = own(raw, merge(vp, d));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::SUBSCRIPT: {
+            auto* s = static_cast<SubscriptNode*>(raw);
+            NMap m = node("Subscript");
+            AstPos vp, ip;
+            set(m, "value", expr(s->object, "Load", vp));
+            set(m, "slice", expr(s->index, "Load", ip));
+            set(m, "ctx", S(ctx));
+            p = own(raw, merge(vp, ip));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::CALL: {
+            AstPos c = d;
+            Value v = call(static_cast<CallNode*>(raw), d, c);
+            p = own(raw, c);
+            return v;
+        }
+        case NodeType::LAMBDA: {
+            auto* l = static_cast<LambdaNode*>(raw);
+            NMap m = node("Lambda");
+            set(m, "args", arguments(l->params, l->defaults, l->posonly, nullptr));
+            AstPos bp;
+            set(m, "body", expr(l->body, "Load", bp));
+            p = own(raw, merge(d, bp));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::YIELD: case NodeType::YIELD_FROM: {
+            node_ptr e = raw->type() == NodeType::YIELD ? static_cast<YieldNode*>(raw)->expr : static_cast<YieldFromNode*>(raw)->expr;
+            NMap m = node(raw->type() == NodeType::YIELD ? "Yield" : "YieldFrom");
+            AstPos vp;
+            if (e) set(m, "value", expr(e, "Load", vp));
+            p = own(raw, merge(d, vp));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::WALRUS: {
+            auto* w = static_cast<WalrusNode*>(raw);
+            NMap m = node("NamedExpr");
+            set(m, "target", name(w->name, "Store", d));
+            AstPos vp;
+            set(m, "value", expr(w->init, "Load", vp));
+            p = own(raw, merge(d, vp));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::COMPREHENSION: {
+            AstPos c;
+            Value v = comprehension(static_cast<ComprehensionNode*>(raw), c);
+            p = own(raw, c);
+            Object* o = static_cast<Object*>(v.value.gc);
+            NMap m{o, v};
+            setp(m, p);
+            return v;
+        }
+        case NodeType::RANGE: {
+            auto* r = static_cast<RangeNode*>(raw);
+            NMap m = node("NyRange");
+            AstPos a, b, c;
+            set(m, "lower", expr(r->start, "Load", a));
+            set(m, "upper", expr(r->end_node, "Load", b));
+            if (r->step) set(m, "step", expr(r->step, "Load", c));
+            set(m, "inclusive", I(flag(raw) == "inclusive" ? 1 : 0));
+            p = own(raw, merge(merge(a, b), c));
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::PY_AST:
+            return pyAstExpr(static_cast<PyAstNode*>(raw), n, ctx, p);
+        default: {
+            p = own(raw, d);
+            NMap m = node("NyNode");
+            set(m, "kind", S(std::to_string((int)raw->type())));
+            setp(m, p);
+            return m.v;
+        }
+        }
+    }
+
+    // ── statements ──
+    void stmts(const node_ptr& n, ListBuilder& out) {
+        if (!n) return;
+        NodeType t = n->type();
+        if (t == NodeType::BLOCK || t == NodeType::STATEMENTS || t == NodeType::SCRIPT) {
+            for (auto& s : n->statements()) stmts(s, out);
+            return;
+        }
+        AstPos p;
+        out.add(stmt(n, p));
+    }
+    Value body(const node_ptr& n) {
+        ListBuilder l(E);
+        stmts(n, l);
+        return l.done();
+    }
+
+    Value funcDef(FunctionNode* f, const node_ptr& n, Value decos, AstPos& p) {
+        NMap m = node(f->is_async ? "AsyncFunctionDef" : "FunctionDef");
+        set(m, "name", S(f->name));
+        set(m, "args", arguments(f->params, f->defaults, f->posonly, f->annotations));
+        set(m, "body", body(f->body));
+        set(m, "decorator_list", decos);
+        if (f->annotations && f->annotations->type() == NodeType::MAP)
+            for (auto& e : static_cast<MapNode*>(f->annotations.get())->entries) {
+                auto* me = static_cast<MapEntryNode*>(e.get());
+                if (me->key && me->key->tok().value == "return") { AstPos rp; set(m, "returns", expr(me->val, "Load", rp)); }
+            }
+        set(m, "type_params", emptyList());
+        p = own(n.get(), tokPos(n->tok()));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value classDef(ClassNode* c, const node_ptr& n, Value decos, AstPos& p) {
+        NMap m = node("ClassDef");
+        set(m, "name", S(c->name));
+        ListBuilder bs(E), ks(E);
+        for (auto& b : c->bases) { AstPos bp; bs.add(expr(b, "Load", bp)); }
+        for (auto& kv : c->keywords) {
+            if (kv.second && kv.second->type() == NodeType::PY_AST) { AstPos kp; ks.add(expr(kv.second, "Load", kp)); continue; }
+            ks.add(keyword(kv.first == "**" ? nullptr : &kv.first, kv.second, AstPos{}));
+        }
+        set(m, "bases", bs.done());
+        set(m, "keywords", ks.done());
+        set(m, "body", body(c->body));
+        set(m, "decorator_list", decos);
+        set(m, "type_params", emptyList());
+        p = own(n.get(), tokPos(n->tok()));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value ifStmt(IfNode* in, const node_ptr& n, size_t from, AstPos& p) {
+        // an If; elif branches [from..] become nested Ifs in orelse
+        NMap m = node("If");
+        AstPos tp;
+        if (from == 0) {
+            set(m, "test", expr(in->condition, "Load", tp));
+            set(m, "body", body(in->then_branch));
+            p = own(n.get(), tokPos(n->tok()));
+        } else {
+            auto* ei = static_cast<IfNode*>(in->elseif_branches[from - 1].get());
+            set(m, "test", expr(ei->condition, "Load", tp));
+            set(m, "body", body(ei->then_branch));
+            p = own(in->elseif_branches[from - 1].get(), tokPos(ei->tok()));
+        }
+        if (from < in->elseif_branches.size()) {
+            ListBuilder l(E);
+            AstPos ep;
+            l.add(ifStmt(in, n, from + 1, ep));
+            set(m, "orelse", l.done());
+        } else set(m, "orelse", body(in->else_branch));
+        setp(m, p);
+        return m.v;
+    }
+
+    Value assignChain(AssignmentNode* a, const node_ptr& n, AstPos& p) {
+        // x = y = v: Assign(targets=[x, y], value=v)
+        ListBuilder ts(E);
+        node_ptr v = n;
+        AstPos cover;
+        while (v && v->type() == NodeType::ASSIGNMENT && v->tok().value != ":=") {
+            auto* av = static_cast<AssignmentNode*>(v.get());
+            AstPos tp;
+            ts.add(expr(av->target, "Store", tp));
+            cover = merge(cover, tp);
+            v = av->value_node;
+        }
+        NMap m = node("Assign");
+        set(m, "targets", ts.done());
+        AstPos vp;
+        set(m, "value", expr(v, "Load", vp));
+        // (the parser's span can end at a tuple value's first item: `x = *a, b`)
+        p = merge(own(n.get(), merge(cover, vp)), merge(cover, vp));
+        setp(m, p);
+        (void)a;
+        return m.v;
+    }
+
+    Value pyAstStmt(PyAstNode* a, const node_ptr& n, AstPos& p) {
+        const std::string& k = a->kind;
+        AstPos d = tokPos(n->tok());
+        if (k == "Decorated") {
+            Value decos = exprs(*a->listOf("decorators"), "Load");
+            node_ptr t = a->kidOf("target");
+            if (t && t->type() == NodeType::FUNCTION) return funcDef(static_cast<FunctionNode*>(t.get()), t, decos, p);
+            if (t && t->type() == NodeType::CLASS) return classDef(static_cast<ClassNode*>(t.get()), t, decos, p);
+            return stmt(t, p);
+        }
+        NMap m = node(k.c_str());
+        if (k == "Assign") {
+            set(m, "targets", exprs(*a->listOf("targets"), "Store"));
+            setx(m, "value", a->kidOf("value"));
+        } else if (k == "AnnAssign") {
+            setx(m, "target", a->kidOf("target"), "Store");
+            setx(m, "annotation", a->kidOf("annotation"));
+            setx(m, "value", a->kidOf("value"));
+            set(m, "simple", I(a->numOf("simple")));
+        } else if (k == "Global" || k == "Nonlocal") {
+            set(m, "names", strs(*a->strlOf("names")));
+        } else if (k == "Import" || k == "ImportFrom") {
+            if (const std::string* mod = a->strOf("module")) set(m, "module", S(*mod));
+            ListBuilder l(E);
+            for (auto& al : *a->listOf("names")) {
+                auto* aa = static_cast<PyAstNode*>(al.get());
+                NMap am = node("alias");
+                set(am, "name", S(*aa->strOf("name")));
+                if (const std::string* as = aa->strOf("asname")) set(am, "asname", S(*as));
+                setp(am, own(al.get(), tokPos(al->tok())));
+                l.add(am.v);
+            }
+            set(m, "names", l.done());
+            if (k == "ImportFrom") set(m, "level", I(a->numOf("level")));
+        } else if (k == "Delete") {
+            set(m, "targets", exprs(*a->listOf("targets"), "Del"));
+        } else if (k == "With" || k == "AsyncWith") {
+            ListBuilder l(E);
+            for (auto& it : *a->listOf("items")) {
+                auto* wi = static_cast<PyAstNode*>(it.get());
+                NMap w = node("withitem");
+                setx(w, "context_expr", wi->kidOf("context_expr"));
+                setx(w, "optional_vars", wi->kidOf("optional_vars"), "Store");
+                l.add(w.v);
+            }
+            set(m, "items", l.done());
+            set(m, "body", body(a->kidOf("body")));
+        } else if (k == "Match") {
+            setx(m, "subject", a->kidOf("subject"));
+            ListBuilder l(E);
+            for (auto& c : *a->listOf("cases")) {
+                auto* mc = static_cast<PyAstNode*>(c.get());
+                NMap cm = node("match_case");
+                set(cm, "pattern", pattern(mc->kidOf("pattern")));
+                setx(cm, "guard", mc->kidOf("guard"));
+                set(cm, "body", body(mc->kidOf("body")));
+                l.add(cm.v);
+            }
+            set(m, "cases", l.done());
+        } else {
+            // an expression kind as a statement
+            AstPos ep;
+            Value v = pyAstExpr(a, n, "Load", ep);
+            NMap e = node("Expr");
+            set(e, "value", v);
+            p = outer(n.get(), ep);
+            setp(e, p);
+            return e.v;
+        }
+        p = own(n.get(), d);
+        setp(m, p);
+        return m.v;
+    }
+
+    Value pattern(const node_ptr& n) {
+        if (!n || n->type() != NodeType::PY_AST) return NONE_VALUE;
+        auto* a = static_cast<PyAstNode*>(n.get());
+        const std::string& k = a->kind;
+        NMap m = node(k.c_str());
+        if (k == "MatchValue" || k == "MatchSingleton") {
+            node_ptr v = a->kidOf("value");
+            if (k == "MatchSingleton") {
+                const std::string& t = v->tok().value;
+                set(m, "value", t == "True" || t == "true" ? Value(true) : t == "False" || t == "false" ? Value(false) : NONE_VALUE);
+            } else setx(m, "value", v);
+        } else if (k == "MatchSequence" || k == "MatchOr") {
+            ListBuilder l(E);
+            for (auto& s : *a->listOf("patterns")) l.add(pattern(s));
+            set(m, "patterns", l.done());
+        } else if (k == "MatchStar") {
+            if (const std::string* nm = a->strOf("name")) set(m, "name", S(*nm));
+        } else if (k == "MatchMapping") {
+            set(m, "keys", exprs(*a->listOf("keys"), "Load"));
+            ListBuilder l(E);
+            for (auto& s : *a->listOf("patterns")) l.add(pattern(s));
+            set(m, "patterns", l.done());
+            if (const std::string* r = a->strOf("rest")) set(m, "rest", S(*r));
+        } else if (k == "MatchClass") {
+            setx(m, "cls", a->kidOf("cls"));
+            ListBuilder l(E), kp(E);
+            for (auto& s : *a->listOf("patterns")) l.add(pattern(s));
+            for (auto& s : *a->listOf("kwd_patterns")) kp.add(pattern(s));
+            set(m, "patterns", l.done());
+            set(m, "kwd_attrs", strs(*a->strlOf("kwd_attrs")));
+            set(m, "kwd_patterns", kp.done());
+        } else if (k == "MatchAs") {
+            if (node_ptr pp = a->kidOf("pattern")) set(m, "pattern", pattern(pp));
+            if (const std::string* nm = a->strOf("name")) set(m, "name", S(*nm));
+        }
+        setp(m, own(n.get(), AstPos{}));
+        return m.v;
+    }
+
+    Value stmt(const node_ptr& n, AstPos& p) {
+        Node* raw = n.get();
+        AstPos d = tokPos(raw->tok());
+        switch (raw->type()) {
+        case NodeType::FUNCTION:
+            return funcDef(static_cast<FunctionNode*>(raw), n, emptyList(), p);
+        case NodeType::CLASS:
+            return classDef(static_cast<ClassNode*>(raw), n, emptyList(), p);
+        case NodeType::INTERFACE: {
+            auto* in = static_cast<InterfaceNode*>(raw);
+            NMap m = node("ClassDef");
+            set(m, "name", S(in->name));
+            set(m, "bases", emptyList());
+            set(m, "keywords", emptyList());
+            set(m, "body", body(in->body));
+            set(m, "decorator_list", emptyList());
+            set(m, "type_params", emptyList());
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::RETURN: {
+            NMap m = node("Return");
+            setx(m, "value", static_cast<ReturnNode*>(raw)->expr);
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::ASSIGNMENT:
+            return assignChain(static_cast<AssignmentNode*>(raw), n, p);
+        case NodeType::ASSIGNMENT_AUG: {
+            auto* a = static_cast<AugAssignNode*>(raw);
+            NMap m = node("AugAssign");
+            setx(m, "target", a->target, "Store");
+            const char* o = augop(a->op);
+            set(m, "op", S(o ? o : a->op));
+            setx(m, "value", a->value_node);
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::VARIABLE_DECL: {
+            // Nython's var/let/const x = v: an assignment of x
+            auto* v = static_cast<VarDeclNode*>(raw);
+            NMap m = node("Assign");
+            ListBuilder ts(E);
+            ts.add(name(v->name, "Store", d));
+            set(m, "targets", ts.done());
+            if (v->init) setx(m, "value", v->init);
+            else set(m, "value", constant(nullptr, NONE_VALUE, d));
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::FOR: {
+            auto* f = static_cast<ForNode*>(raw);
+            NMap m = node(flag(raw) == "async" ? "AsyncFor" : "For");
+            if (f->unpack_vars.empty()) setx(m, "target", f->var, "Store");
+            else {
+                NMap t = node("Tuple");
+                std::vector<node_ptr> all{f->var};
+                for (auto& u : f->unpack_vars) all.push_back(u);
+                AstPos c;
+                set(t, "elts", exprs(all, "Store", &c));
+                set(t, "ctx", S("Store"));
+                setp(t, c);
+                set(m, "target", t.v);
+            }
+            setx(m, "iter", f->iterable);
+            set(m, "body", body(f->body));
+            set(m, "orelse", body(f->else_branch));
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::WHILE: {
+            auto* w = static_cast<WhileNode*>(raw);
+            NMap m = node("While");
+            setx(m, "test", w->condition);
+            set(m, "body", body(w->body));
+            set(m, "orelse", body(w->else_branch));
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::IF: {
+            auto* in = static_cast<IfNode*>(raw);
+            if (in->is_expr) break;
+            return ifStmt(in, n, 0, p);
+        }
+        case NodeType::TRY: {
+            auto* t = static_cast<TryNode*>(raw);
+            NMap m = node(flag(raw) == "star" ? "TryStar" : "Try");
+            set(m, "body", body(t->body));
+            ListBuilder hs(E);
+            for (auto& h : t->except_clauses) {
+                if (!h || h->type() != NodeType::PY_AST) continue;
+                auto* ha = static_cast<PyAstNode*>(h.get());
+                NMap hm = node("ExceptHandler");
+                setx(hm, "type", ha->kidOf("type"));
+                if (const std::string* nm = ha->strOf("name")) set(hm, "name", S(*nm));
+                set(hm, "body", body(ha->kidOf("body")));
+                setp(hm, own(h.get(), tokPos(h->tok())));
+                hs.add(hm.v);
+            }
+            set(m, "handlers", hs.done());
+            set(m, "orelse", body(t->else_clause));
+            set(m, "finalbody", body(t->finally_clause));
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::RAISE: {
+            auto* r = static_cast<RaiseNode*>(raw);
+            NMap m = node("Raise");
+            setx(m, "exc", r->expr);
+            setx(m, "cause", r->cause);
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::ASSERT: {
+            auto* a = static_cast<AssertNode*>(raw);
+            NMap m = node("Assert");
+            setx(m, "test", a->condition);
+            setx(m, "msg", a->message);
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::PASS: case NodeType::BREAK: case NodeType::CONTINUE: {
+            NMap m = node(raw->type() == NodeType::PASS ? "Pass" : raw->type() == NodeType::BREAK ? "Break" : "Continue");
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::DELETE: {
+            NMap m = node("Delete");
+            std::vector<node_ptr> one{static_cast<DeleteNode*>(raw)->target};
+            set(m, "targets", exprs(one, "Del"));
+            p = own(raw, d);
+            setp(m, p);
+            return m.v;
+        }
+        case NodeType::PRINT: {
+            // Nython's print statement: print(args, sep=, end=)
+            auto* pr = static_cast<PrintNode*>(raw);
+            p = own(raw, d);
+            NMap c = node("Call");
+            set(c, "func", name("print", "Load", d));
+            set(c, "args", exprs(pr->args, "Load"));
+            ListBuilder kws(E);
+            std::string sep = "sep", end = "end";
+            if (pr->sep) kws.add(keyword(&sep, pr->sep, p));
+            if (pr->end) kws.add(keyword(&end, pr->end, p));
+            set(c, "keywords", kws.done());
+            setp(c, p);
+            NMap e = node("Expr");
+            set(e, "value", c.v);
+            setp(e, p);
+            return e.v;
+        }
+        case NodeType::PY_AST:
+            return pyAstStmt(static_cast<PyAstNode*>(raw), n, p);
+        default:
+            break;
+        }
+        // an expression statement
+        AstPos ep;
+        Value v = expr(n, "Load", ep);
+        NMap e = node("Expr");
+        set(e, "value", v);
+        p = ep;
+        setp(e, p);
+        return e.v;
+    }
+};
+
+Value ny_ast(NythonExecutor& E, std::vector<Value>& args) {
+    std::string src = args.empty() ? std::string() : E.getStringValue(args[0]);
+    std::string mode = args.size() > 1 && args[1].type != ValueType::NONE ? E.getStringValue(args[1]) : std::string("exec");
+    std::string fname = args.size() > 2 && args[2].type != ValueType::NONE ? E.getStringValue(args[2]) : std::string("<unknown>");
+    std::vector<std::string> src_lines;
+    split_lines(src, src_lines);
+    auto err_map = [&](const std::string& msg, long long line, long long col) {
+        auto* m = new Object((Runnable*)E.runner, "map", Type::MAP);
+        Value mv((Collectable*)m);
+        ListBuilder e(E);
+        e.add_str(msg);
+        e.add_int(line);
+        e.add_int(col);
+        e.add_str(line >= 1 && line <= (long long)src_lines.size() ? src_lines[(size_t)line - 1] : std::string());
+        (*m->container)["_error"] = e.done();
+        return mv;
+    };
+    try {
+        auto source = SourceCode::from_text(src + "\n", fname);
+        auto reporter = std::make_shared<Reporter>(source);
+        auto lexer = std::make_shared<Lexer>(source);
+        lexer->force_python_strings = true;
+        auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)E.runner, lexer.get());
+        lexer->tokenize();
+        if (lexer->hasErrors()) {
+            for (auto& inf : lexer->info) {
+                if (inf.level != LexerInfoLevel::Error) continue;
+                const Token& t = inf.info;
+                std::string what = t.type() == TokenType::UnterminatedStringError ? "unterminated string literal"
+                                 : "invalid syntax";
+                return err_map(what + " (detected at line " + std::to_string(t.line()) + ")", t.line(), t.column());
+            }
+        }
+        node_ptr ast = parser->parseAst(mode);
+        AstExporter X(E, *parser, lexer->tokens);
+        X.lines = src_lines;
+        if (mode == "eval") {
+            AstExporter::NMap m = X.node("Expression");
+            AstPos p;
+            X.set(m, "body", X.expr(ast, "Load", p));
+            return m.v;
+        }
+        if (mode == "func_type") {
+            auto* ft = static_cast<PyAstNode*>(ast.get());
+            AstExporter::NMap m = X.node("FunctionType");
+            X.set(m, "argtypes", X.exprs(*ft->listOf("argtypes"), "Load"));
+            X.setx(m, "returns", ft->kidOf("returns"));
+            return m.v;
+        }
+        AstExporter::NMap m = X.node(mode == "single" ? "Interactive" : "Module");
+        X.set(m, "body", X.body(ast));
+        if (mode != "single") X.set(m, "type_ignores", X.emptyList());
+        return m.v;
+    } catch (nython::exception::Error& e) {
+        return err_map(e.message(), (long long)e.location().row, (long long)e.location().column);
+    } catch (std::exception& e) {
+        return err_map(e.what(), 0, 0);
+    } catch (std::string& s) {
+        return err_map(s, 0, 0);
+    } catch (...) {
+        return err_map("invalid syntax", 0, 0);
+    }
 }
 
 // ── text_diff (Myers, O((N+M)D) time, snapshots of V for the backtrack) ─────
@@ -2744,6 +3952,9 @@ Value dispatch_text(NythonExecutor& E, const std::string& name, std::vector<Valu
             if (name == "ny_check_syntax") return ny_check_syntax(E, args);
             if (name == "ny_check_file") return ny_check_file(E, args);
             if (name == "ny_facts") return ny_facts(E, args);   // round 82
+            break;
+        case '_':
+            if (name == "_ny_ast") return ny_ast(E, args);   // round 83: lib/ast.ny's parse
             break;
         case 'f':
             if (name == "fs_list_files") return fs_list_files(E, args);

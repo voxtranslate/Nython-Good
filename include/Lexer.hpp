@@ -40,6 +40,7 @@ struct Lexer final extends ILexer{   // round 82: final (direct calls)
     SourceCode& source;
     Token token;
     Location token_start;   // where the token being read began (reset_token)
+    int token_start_off = 0;   // round 83: ... and its byte offset in the source
     char first_indet_char         = 0;
     int level_                    = 0;
     int tab                       = TabSize;/// default tabulation.
@@ -49,6 +50,7 @@ struct Lexer final extends ILexer{   // round 82: final (direct calls)
     /// `# nython: python`); such string tokens - and raw strings anywhere -
     /// are made with TokenClass::Default instead of Literal.
     bool python_strings           = false;
+    bool force_python_strings     = false;   // round 83: always (ast.parse: Python's semantics)
     int warnings                  = 0;/// number of errors
     int indent                    = 0;///  current indent level is the number of spaces in the last indent.
     /// Open ( [ { count. Indentation is meaningless inside a bracketed

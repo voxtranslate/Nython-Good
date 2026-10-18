@@ -409,6 +409,7 @@ inline std::string builtin_exc_parent(const std::string& t) {
         {"SSLZeroReturnError", "SSLError"}, {"SSLWantReadError", "SSLError"},
         {"SSLWantWriteError", "SSLError"}, {"SSLSyscallError", "SSLError"},
         {"SyntaxError", "Exception"}, {"EOFError", "Exception"},
+        {"IndentationError", "SyntaxError"}, {"TabError", "IndentationError"},   // round 83
     };
     for (auto& row : table) if (t == row[0]) return row[1];
     return "";
