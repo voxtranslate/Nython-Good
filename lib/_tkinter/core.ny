@@ -203,6 +203,7 @@ class App:
         self.after_n = 0
         self.idle_q = []
         self.idle_once = set()
+        self.frame_images = []
         self.layout_queued = False
         self.in_layout = False
         self.layout_dirty = False
@@ -363,13 +364,23 @@ class App:
     def call(self, *args):
         if len(args) == 1 and isinstance(args[0], tuple):
             args = args[0]
-        words = [a for a in args]
+        # _tkinter's Tkapp_CallArgs: a None ends the argument list
+        words = []
+        for a in args:
+            if a is None:
+                break
+            words.append(a)
         if not words:
             raise TclError("wrong # args")
         return self.interp.invoke(words)
 
     def eval(self, script):
-        r = self.interp.eval(script)
+        # a `return` at the top level ends the script with its value
+        # (Tcl_EvalEx turns TCL_RETURN into TCL_OK at level 0)
+        try:
+            r = self.interp.eval(script)
+        except _Return as ret:
+            r = ret.value
         return tcl_str(r)
 
     def evalfile(self, fileName):
@@ -3060,22 +3071,29 @@ class App:
 
     def watch_image(self, w, name):
         # widgets showing an image are told when it changes (Tk's
-        # ImageChangedProc): the image keeps a set of its users
-        for im in self.images.values():
-            users = getattr(im, "users", None)
-            if users is not None and w in users and im.name != name:
-                users.discard(w)
-        im = self.images.get(name) if name else None
-        if im is not None and hasattr(im, "users"):
-            im.users.add(w)
+        # ImageChangedProc): the image keeps a set of its users (a widget
+        # that stopped using it is told once more, harmlessly)
+        for n in split_list(name)[:1] if name else []:
+            im = self.images.get(n)
+            if im is not None:
+                im.users.add(w)
 
     def image_changed(self, im):
-        for w in list(getattr(im, "users", [])):
+        for w in list(im.users):
             if w.destroyed:
                 im.users.discard(w)
                 continue
+            hook = getattr(w, "on_image_changed", None)
+            if hook is not None:
+                hook(im)
+                continue
             w.compute_geometry()
             w.damage()
+
+    def image_ops(self, path):
+        # the images the last frame of path's toplevel drew (for the harness)
+        w = self.window(path)
+        return list(getattr(w.top, "image_ops", []))
 
     def accessibility(self, path):
         # Nython: an accessibility tree (WAI-ARIA roles) of viewable widgets
@@ -3089,7 +3107,10 @@ class App:
         for top in tops:
             if top.destroyed or not top.mapped or top.native is None:
                 continue
+            self.frame_images = []
             top.paint()
+            top.image_ops = self.frame_images
+            self.frame_images = []
             self.frames_drawn += 1
 
 

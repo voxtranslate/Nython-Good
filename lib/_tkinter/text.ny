@@ -1832,6 +1832,14 @@ class TkText(TkWin):
         e.w = w.reqw
         e.h = w.reqh
 
+    def on_image_changed(self, im):
+        for e in self.embedded.values():
+            if e.kind == "image" and e.opts.get("image", "") == im.name:
+                live = self.app.images.get(im.name)
+                e.w = live.width() if live is not None else 0
+                e.h = live.height() if live is not None else 0
+        self.invalidate()
+
     def w_image(self, args):
         sub = match_prefix(tcl_str(args[0]), ["cget", "configure", "create", "names"], "option")
         if sub == "names":
@@ -1853,6 +1861,7 @@ class TkText(TkWin):
             if im is not None:
                 e.w = im.width()
                 e.h = im.height()
+                self.app.watch_image(self, img)
             self.raw_insert(off, OBJ, None, True)
             self.embedded[off] = e
             self.invalidate()

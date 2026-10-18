@@ -2037,6 +2037,8 @@ class Misc:
                 ln = ln.strip()
                 if ln:
                     ops.append(json.loads(ln))
+        # the images drawn (the backend's display list does not show them)
+        ops.extend(self.tk.image_ops(self._w))
         return ops
 
     def _ny_frames(self):

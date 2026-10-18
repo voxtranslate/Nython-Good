@@ -37,7 +37,16 @@ CREATE_ONLY = set(["class", "container", "visual", "colormap", "screen", "use"])
 
 def _norm(app, kind, v, optname):
     # -> the value stored for the option, or raises TclError
-    if kind == "string" or kind == "cursor" or kind == "command" or kind == "var" or kind == "bitmap":
+    if kind == "bitmap":
+        s = join_list(v) if isinstance(v, (tuple, list)) else tcl_str(v)
+        if s != "":
+            from _tkinter.image import builtin_bitmap
+            if builtin_bitmap(s) is None:
+                if s.startswith("@"):
+                    raise TclError("error reading bitmap file \"" + s[1:] + "\"")
+                raise TclError("bitmap \"" + s + "\" not defined")
+        return s
+    if kind == "string" or kind == "cursor" or kind == "command" or kind == "var":
         if isinstance(v, (tuple, list)):
             return join_list(v)
         return tcl_str(v)

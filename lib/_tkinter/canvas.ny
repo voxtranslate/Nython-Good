@@ -200,6 +200,12 @@ class TkCanvas(TkWin):
         self.sel_anchor = 0
         self.scan_mark = (0, 0, 0, 0)
 
+    def on_image_changed(self, im):
+        for it in self.items.values():
+            if it.kind == "image" and it.opts.get("image", "") == im.name:
+                it.bbox = None
+        self.damage()
+
     # ── configuration ──
     def reconfigured(self, changed):
         self.inset = self.px("borderwidth") + self.px("highlightthickness")
