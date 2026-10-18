@@ -405,6 +405,10 @@ struct VMVal {
     bool is_bytearray() const { return type==VMType::BYTES&&b; }
     const std::string& bdata() const { return (b&&list&&!list->empty())?(*list)[0].s:s; }
     std::string& bdata_mut() { return (b&&list&&!list->empty())?(*list)[0].s:s; }
+    // (round 84) a bytearray's buffer exports (memoryview, _ny_buf_export),
+    // kept in the shared element's `i`: while there are any its data must
+    // keep its size (BufferError) and its storage (writes go in place).
+    int64_t ba_exports() const { return (type==VMType::BYTES&&b&&list&&!list->empty())?(*list)[0].i:0; }
     static VMVal make_none()              { return {}; }
     // UNDEFINED carries a tag in s: "undefined" is the language's
     // `undefined` value (distinct from none, falsy, absent to ?? and ?.);
@@ -6205,7 +6209,7 @@ private:
     void load_mirror(const std::string& chunk) {
         if(mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if(chunk!="base"&&chunk!="os") load_mirror("base");   // (round 80: "os" needs no mirror base)
+        if(chunk!="base"&&chunk!="os"&&chunk!="buffer") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer")
         if(chunk=="dictview") load_mirror("dict");
         try {
             auto source=nython::reader::SourceCode(nyrt::builtin_mirror_chunk(chunk));
@@ -8952,12 +8956,13 @@ private:
                         for(int64_t k=0,i=st;k<n;k++,i+=step) gone[(size_t)i]=true;
                         std::string kept;
                         for(int64_t k=0;k<len;k++) if(!gone[(size_t)k]) kept+=d[(size_t)k];
-                        d=std::move(kept);
+                        nycall([&]{ nypy::ba_assign(d,std::move(kept),obj.ba_exports()); return 0; });   // round 84: exported
                         break;
                     }
                     int64_t i=index_of(key,"bytearray");
                     if(i<0) i+=len;
                     if(i<0||i>=len) raise_native_exception("IndexError","bytearray index out of range");
+                    nycall([&]{ nypy::ba_resize_check(obj.ba_exports(),1,0); return 0; });   // round 84
                     d.erase((size_t)i,1);
                 }
                 else if(obj.type==VMType::LIST&&obj.list){
@@ -10970,11 +10975,14 @@ private:
         bool lb=l.type==VMType::BYTES, rb=r.type==VMType::BYTES;
         if(!lb&&!rb) return false;
         switch(op){
-        case nypy::A_ADD:
+        case nypy::A_ADD: {
             if(lb&&rb){ out=VMVal::make_bytes(l.bdata()+r.bdata(),l.b); return true; }
+            std::string rbuf;   // round 84: bytes + any buffer (memoryview, array ...), as CPython's
+            if(lb&&buffer_bytes(r,rbuf)){ out=VMVal::make_bytes(l.bdata()+rbuf,l.b); return true; }
             if(lb) raise_native_exception("TypeError","can't concat "+vm_type_name(r)+" to "+vm_type_name(l));
             if(l.type==VMType::STRING) raise_native_exception("TypeError","can only concatenate str (not \""+vm_type_name(r)+"\") to str");
             raise_native_exception("TypeError","unsupported operand type(s) for +: '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        }
         case nypy::A_MUL: {
             int64_t times;
             const VMVal* seq=nullptr;
@@ -10985,11 +10993,70 @@ private:
             return true;
         }
         case nypy::A_MOD:
-            if(lb) raise_native_exception("TypeError","%-formatting of bytes is not supported; use b''.join or .format on str and encode()");
+            if(lb){ out=bytes_percent(l,r); return true; }   // round 84: PEP 461
             return false;
         default:
             raise_native_exception("TypeError",std::string("unsupported operand type(s) for ")+nypy::arith_symbol(op)+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
         }
+    }
+    // (round 84) An object exporting a buffer that is not bytes or bytearray
+    // (a memoryview, array.array, mmap, ctypes data, any class with
+    // __buffer__ - PEP 688): the bytes it holds, in C order, through the
+    // prelude's _ny_buffer_bytes. False for anything else.
+    bool buffer_bytes(const VMVal& v, std::string& out) {
+        if(v.type!=VMType::INSTANCE) return false;
+        VMVal m;
+        if(!class_lookup(v.class_name,"__buffer__",m)) return false;
+        std::vector<VMVal> args{v};
+        VMVal r=vm_call(load_var("_ny_buffer_bytes"),args,std::nullopt,nullptr);
+        if(r.type!=VMType::BYTES) return false;
+        out=r.bdata();
+        return true;
+    }
+    // b"fmt" % args / bytearray % args (PEP 461; round 84): NyBytes.hpp's
+    // bytes_percent_format. A tuple gives the arguments, a mapping (a dict,
+    // a list, an object with __getitem__ - CPython's mp_subscript test) the
+    // %(key)s values under bytes keys; anything else is one argument.
+    nypy::FmtVal pct_bytes_arg(const VMVal& v_in, char conv) {
+        VMVal v=unwrap_payload(v_in);
+        if(conv=='b'&&v.type==VMType::BYTES) return nypy::FmtVal::of_str(v.bdata());
+        if(conv=='a') return to_fmtval(v,'a');
+        if(v.type==VMType::BYTES){ nypy::FmtVal f=nypy::FmtVal::of_str(v.bdata()); f.type_name=v.b?"bytearray":"bytes"; return f; }
+        if(conv=='b'||v.type==VMType::INSTANCE){
+            // the prelude's conversions: __bytes__ / a buffer for %b and %s,
+            // __index__ / __int__ / __float__ for the numbers, CPython's errors
+            std::vector<VMVal> a{v,VMVal::make_str(std::string(1,conv))};
+            VMVal r=vm_call(load_var("_ny_pct_arg"),a,std::nullopt,nullptr);
+            if(r.type==VMType::BYTES){ nypy::FmtVal f=nypy::FmtVal::of_str(r.bdata()); f.type_name=r.b?"bytearray":"bytes"; return f; }
+            return to_fmtval(r,0);
+        }
+        return to_fmtval(v,0);
+    }
+    VMVal bytes_percent(const VMVal& l, const VMVal& r_in) {
+        VMVal r=r_in, p;
+        if(any_payload_&&payload_of(r_in,p)&&(p.type==VMType::LIST||p.type==VMType::MAP)) r=p;   // a tuple / dict subclass's value
+        std::vector<VMVal> args;
+        bool mapping=false;
+        if(r.is_tuple()&&r.list) args=*r.list;
+        else {
+            args.push_back(r);
+            VMVal gi;
+            mapping=(r.type==VMType::MAP||(r.type==VMType::LIST&&!r.is_set()))
+                    ||(r.type==VMType::INSTANCE&&class_lookup(r.class_name,"__getitem__",gi));
+        }
+        std::string fmt=l.bdata();
+        std::string out=nycall([&]{
+            return nypy::bytes_percent_format(fmt,(int64_t)args.size(),mapping,
+                [&](int64_t idx,const std::string& key,char conv)->nypy::FmtVal{
+                    if(idx<0){
+                        VMVal k=VMVal::make_bytes(key);
+                        if(r.type==VMType::INSTANCE){ bool f=false; VMVal res=call_dunder_f(r,"__getitem__",{k},f); if(f) return pct_bytes_arg(res,conv); }
+                        return pct_bytes_arg(get_sub(r,k),conv);
+                    }
+                    return pct_bytes_arg(args[(size_t)idx],conv);
+                });
+        });
+        return VMVal::make_bytes(std::move(out),l.b);
     }
     // A value as an argument of a bytes method (NyBytes.hpp: BArg).
     nypy::BArg to_barg(const VMVal& v_in, int depth=0) {
@@ -11003,6 +11070,7 @@ private:
             case VMType::BYTES: a.k=nypy::BArg::BYTES; a.s=v.bdata(); return a;
             case VMType::STRING: a.k=nypy::BArg::STR; a.s=v.s; return a;
             case VMType::LIST: case VMType::MAP: case VMType::ITERATOR: case VMType::GENERATOR: case VMType::INSTANCE:
+                if(v.type==VMType::INSTANCE&&buffer_bytes(v,a.s)){ a.k=nypy::BArg::BYTES; return a; }   // round 84: any buffer
                 if(depth==0){
                     a.k=nypy::BArg::SEQ;
                     for(auto& it:iter_items(v)) a.items.push_back(to_barg(it,1));
@@ -11158,14 +11226,16 @@ private:
         if(l.is_bytearray()&&(op==nypy::A_ADD||op==nypy::A_MUL)){
             // bytearray += b / *= n change it in place
             if(op==nypy::A_ADD){
-                if(r.type!=VMType::BYTES) raise_native_exception("TypeError","can't concat "+vm_type_name(r)+" to bytearray");
-                std::string add=r.bdata();
+                std::string add;
+                if(r.type==VMType::BYTES) add=r.bdata();
+                else if(!buffer_bytes(r,add)) raise_native_exception("TypeError","can't concat "+vm_type_name(r)+" to bytearray");   // round 84: any buffer
+                nycall([&]{ nypy::ba_resize_check(l.ba_exports(),0,add.size()); return 0; });   // round 84: exported
                 l.bdata_mut()+=add;
                 return l;
             }
             int64_t times;
             if(!seq_times(r,times)) raise_native_exception("TypeError","can't multiply sequence by non-int of type '"+vm_type_name(r)+"'");
-            l.bdata_mut()=nypy::repeat_str(l.bdata(),times);
+            nycall([&]{ nypy::ba_assign(l.bdata_mut(),nypy::repeat_str(l.bdata(),times),l.ba_exports()); return 0; });   // round 84
             return l;
         }
         if(l.type==VMType::LIST&&!l.b&&l.list){
@@ -12742,6 +12812,7 @@ private:
                 if(step==1){
                     if(n<0) n=0;
                     if(st>len) st=len;
+                    nycall([&]{ nypy::ba_resize_check(obj.ba_exports(),(size_t)n,repl.size()); return 0; });   // round 84: exported
                     d.replace((size_t)st,(size_t)n,repl);
                 } else {
                     if((int64_t)repl.size()!=n)
@@ -13363,7 +13434,7 @@ private:
         for(auto& v:a) ba.push_back(to_barg(v));
         nypy::BRes r;
         std::string& data=obj.bdata_mut();
-        if(nycall([&]{ return nypy::bytes_method(data,obj.b,m,ba,r); })) return from_bres(r);
+        if(nycall([&]{ return nypy::bytes_method(data,obj.b,m,ba,r,obj.ba_exports()); })) return from_bres(r);   // round 84: exports
         if(m=="class_name"||m=="type_name") return VMVal::make_str(vm_type_name(obj));
         if(m=="to_string"||m=="str") return VMVal::make_str(obj.to_string());
         return missing_attr(obj,m);
@@ -14725,6 +14796,46 @@ private:
         globals_["_ny_main_del"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::STRING) raise_native_exception("TypeError","_ny_main_del(name)");
             return VMVal::make_bool(vm_main_del(a[0].s));
+        });
+        // The buffer protocol (round 84; the prelude's memoryview): a bytes /
+        // bytearray value's storage as [address, length, readonly, owner],
+        // counting an export of a bytearray (its size is then fixed:
+        // BufferError) - the owner the object a view keeps alive: the
+        // bytearray itself, or for bytes (a value the VM copies) a bytearray
+        // holding the data, whose storage does not move; None for anything
+        // else. _ny_buf_unexport gives an export back, _ny_buf_exports counts.
+        globals_["_ny_buf_export"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_none();
+            VMVal v=unwrap_payload(a[0]);
+            if(v.type!=VMType::BYTES) return VMVal::make_none();
+            VMVal owner=v.b?v:VMVal::make_bytes(v.bdata(),true);
+            if(v.b) (*owner.list)[0].i++;
+            const std::string& d=owner.bdata();
+            return VMVal::make_list({VMVal::make_int((int64_t)(intptr_t)d.data()),VMVal::make_int((int64_t)d.size()),
+                                     VMVal::make_bool(!v.b),owner});
+        });
+        globals_["_ny_buf_unexport"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_int(0);
+            VMVal v=unwrap_payload(a[0]);
+            if(!v.is_bytearray()||!v.list||v.list->empty()) return VMVal::make_int(0);
+            int64_t& n=(*v.list)[0].i;
+            if(n>0) n--;
+            return VMVal::make_int(n);
+        });
+        globals_["_ny_buf_exports"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            return VMVal::make_int(a.empty()?0:unwrap_payload(a[0]).ba_exports());
+        });
+        // (round 84) a prelude chunk loaded on first need - "buffer":
+        // memoryview's members and the buffer helpers (NyPreludeBuffer.cpp)
+        globals_["_ny_load_chunk"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(!a.empty()&&a[0].type==VMType::STRING) load_mirror(a[0].s);
+            return VMVal::make_none();
+        });
+        globals_["_ny_buf_addr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_none();
+            VMVal v=unwrap_payload(a[0]);
+            if(!v.is_bytearray()) return VMVal::make_none();
+            return VMVal::make_int((int64_t)(intptr_t)v.bdata().data());
         });
         // sys.getrefcount(x) (round 81): the object's shared count without the
         // references this call holds itself, plus one for the argument, as

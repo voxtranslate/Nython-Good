@@ -1135,7 +1135,7 @@ class _ConcretePath(PurePath):
         Open the file in bytes mode, write to it, and close the file.
         """
         if not (isinstance(data, bytes) or isinstance(data, bytearray)):
-            raise TypeError("memoryview: a bytes-like object is required, not '" + _tname(data) + "'")
+            data = memoryview(data)          # any buffer (round 84), CPython's message otherwise
         var f = self.open("wb")
         try:
             f.write(data)

@@ -57,7 +57,7 @@ def new(key, msg=none, digestmod=none):
     return HMAC(key, msg, digestmod)
 
 def digest(key, msg, digest):
-    return _hash_hmac(_algo(digest), key, msg)
+    return _hash_hmac(_algo(digest), hashlib._hd(key), hashlib._hd(msg))
 
 def compare_digest(a, b):
-    return _hash_compare(a, b)
+    return _hash_compare(hashlib._hd(a), hashlib._hd(b))

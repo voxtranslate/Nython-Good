@@ -401,6 +401,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit111 | 55 | round 83 (structures by value without libffi: round 84): ctypes - type's own members (`type.__new__/__call__/__setattr__` in metaclasses), simple types, structures (bit fields, packing, anonymous, byte order), unions, arrays, pointers, libc calls (strlen/labs/strtod/sprintf/div, errcheck), callbacks (qsort, a double callback, a struct by value), errno, util/wintypes, the built-in caller without libffi (passes under python3) |
 | vm_audit116 | 34 | round 84 (part 0): module AttributeError text, `{}.append` on the interpreter, BaseException's members as values, instance `__module__`/`__weakref__`, builtins' docstrings, a finally body seeing its exception, strict and starred comprehension targets, `sys.audit`/`addaudithook` events, VM comprehension targets freed, True/None spelled by the program's language (passes under python3) |
 | vm_audit108 | 224 | round 83: ast (the real parser's tree: dump of a corpus with positions, f-string parts, unparse round trips, literal_eval, visitors/transformers, compile of a tree, SyntaxErrors), tokenize/token (3.12 f-string tokens, detect_encoding, untokenize), symtable, dis/opcode (Nython's VM bytecode, the adaptive view on the VM), marshal bytes, pickletools.dis/optimize text, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, multi-line string lines; generated from CPython 3.12's values (`tools/gen_vm_audit108.py`; 206 under python3.12, 191 under 3.11) |
+| vm_audit112 | 135 | round 84 (part A): memoryview and the buffer protocol (PEP 3118/688) - views of bytes/bytearray/array/mmap/ctypes/memoryview/`__buffer__` classes, attributes, casts, N-dim shapes and strides, every native format, slicing and slice assignment, ==/hash, CPython's messages, exports blocking resizes (BufferError), bytes-like arguments everywhere (struct/zlib/bz2/lzma/binascii/hashlib/io/files/sockets/os/wave/sqlite3/pickle), readinto into views, ctypes from_buffer, bytes % args (PEP 461) (passes under python3.12; 132 under 3.11) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1538,6 +1539,44 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   arguments, i686 stdcall trampolines per word count.
 - `socket.AF_UNIX` exists only where the platform has it: read it with
   `getattr(socket, "AF_UNIX", None)`.
+
+## Round 84, part A: memoryview and the buffer protocol, bytes % args (see `HANDOFF.md` §0x)
+
+- **`memoryview`** on both engines after CPython's memoryobject.c: a view is
+  native memory (address, format, itemsize, shape, strides) read and written
+  by the `_mv_*` natives (`src/builtins/nybuffer.cpp`, both engines through
+  `nyconc::register_extension`); a managed buffer (`_NyMBuf`) holds one
+  export for every view made from it and gives it back when the last view
+  is released or collected. The whole 3.12 API: casts, N-dim shapes and
+  strides, every native format, slicing and slice assignment, ==/hash,
+  tolist/tobytes/hex/toreadonly, release and `with`, CPython's messages.
+- **Loaded on first need**: the class is in the startup prelude, its members
+  and the helpers are the mirror chunk `"buffer"`
+  (`src/NyPreludeBuffer.cpp`, `builtin_mirror_chunk`), loaded by the first
+  view or non-bytes buffer argument through `_ny_load_chunk` (parsing it at
+  every start cost 6 ms, 18%). A helper a library calls before a view exists
+  needs a stub in NyPrelude.hpp, as `_ny_bytes_like` has.
+- **Exporters**: bytes/bytearray natively (`_ny_buf_export`/`_unexport`/
+  `_exports`/`_addr`), everything else by `__buffer__` (PEP 688): array.array
+  (now native C values in a bytearray), mmap, ctypes (3.12's PEP 3118
+  formats), shared_memory, PickleBuffer, memoryview, a program's classes.
+- **An exported bytearray keeps its size and storage**: resizing raises
+  `BufferError: Existing exports of data: object cannot be re-sized`
+  (interpreter `nyheap::Bytes::exports`, VM `VMVal::ba_exports()`;
+  `nypy::ba_resize_check`/`ba_assign`); same-size writes go in place. The
+  same for array ("cannot resize an array that is exporting buffers"), mmap
+  close/resize, BytesIO with a live `getbuffer()`, SharedMemory.close.
+- **Every bytes-like argument takes a buffer**: the engines' bytes
+  constructors, operators and methods (`_ny_buffer_bytes`), struct, zlib,
+  bz2, lzma, gzip, binascii, base64, hashlib, hmac, io, files, sockets, os,
+  mmap, array, ctypes `from_buffer`/`from_buffer_copy`, pickle, sqlite3
+  (`Binary = memoryview`), wave/aifc/sunau; `readinto`/`recv_into` write
+  straight into the buffer's memory (`file_readinto`, `_net_recv_into`);
+  new `os.readv/writev/pread/pwrite/preadv/pwritev` (POSIX),
+  `socket.recvfrom_into`.
+- **`bytes % args` / `bytearray % args`** (PEP 461): `nypy::
+  bytes_percent_format` (NyBytes.hpp, numbers shared with str's `%`), both
+  engines, CPython's conversions and errors.
 
 ## Transcripts
 

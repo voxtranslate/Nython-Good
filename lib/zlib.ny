@@ -38,8 +38,8 @@
 #
 # Not here: the memLevel only sizes the hash table and the symbol buffer;
 # Z_TREES behaves as Z_BLOCK; bufsize is a hint (the output grows as
-# needed). Data is bytes, bytearray or anything with tobytes() (array.array)
-# - Nython has no memoryview.
+# needed). Data is any bytes-like object (round 84: bytes, bytearray,
+# memoryview, array.array, mmap ...).
 
 __all__ = ["compress", "decompress", "compressobj", "decompressobj", "crc32", "adler32", "error",
            "compress_optimal"]
@@ -81,14 +81,8 @@ def _reraise(e):
 
 
 def _data(d):
-    if isinstance(d, bytes) or isinstance(d, bytearray):
-        return d
-    if isinstance(d, str):
-        raise TypeError("a bytes-like object is required, not 'str'")
-    var tb = getattr(d, "tobytes", none)
-    if tb is not none:
-        return tb()
-    raise TypeError("a bytes-like object is required, not '" + type(d).__name__ + "'")
+    # any bytes-like object (round 84: memoryview, array, mmap ...)
+    return _ny_bytes_like(d)
 
 
 def _int(v, what):

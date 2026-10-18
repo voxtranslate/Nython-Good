@@ -19,6 +19,8 @@
 #include "NyStr.hpp"
 #include "NyBigInt.hpp"
 #include "NyCodecs.hpp"
+#include "NyFormat.hpp"   // round 84: bytes % args (PEP 461) shares the number formatting
+#include <functional>
 
 namespace nypy {
 
@@ -371,9 +373,38 @@ inline std::vector<std::string> bytes_split_sep(const std::string& s, const std:
     return rev;
 }
 
+// ── buffer exports (round 84) ────────────────────────────────────────────
+// A bytearray whose storage a memoryview (any buffer export) points into
+// must keep its size - CPython's BufferError - and its storage: a change of
+// the same size is written in place, never by swapping the string's buffer.
+inline void ba_resize_check(int64_t exports, size_t from, size_t to) {
+    if (exports > 0 && from != to) raise("BufferError", "Existing exports of data: object cannot be re-sized");
+}
+inline void ba_assign(std::string& dst, std::string&& src, int64_t exports) {
+    if (exports > 0) {
+        ba_resize_check(exports, dst.size(), src.size());
+        if (!src.empty()) std::memcpy(&dst[0], src.data(), src.size());
+        return;
+    }
+    dst = std::move(src);
+}
+inline bool ba_resizing_method(const std::string& m) {
+    return m == "append" || m == "extend" || m == "insert" || m == "pop" || m == "remove" || m == "clear";
+}
+
 // bytes / bytearray methods. `data` is the receiver's bytes; a bytearray
 // (mut) method may change it. Returns false when `m` is not a method.
-inline bool bytes_method(std::string& data, bool mut, const std::string& m, const std::vector<BArg>& a, BRes& out) {
+// `exports` (round 84): the bytearray's buffer exports - a method that would
+// change its size then raises BufferError (after its own argument errors,
+// as CPython's do).
+inline bool bytes_method(std::string& data, bool mut, const std::string& m, const std::vector<BArg>& a, BRes& out,
+                         int64_t exports = 0) {
+    if (mut && exports > 0 && ba_resizing_method(m)) {
+        std::string copy = data;
+        bool r = bytes_method(copy, mut, m, a, out, 0);
+        ba_assign(data, std::move(copy), exports);
+        return r;
+    }
     const size_t n = a.size();
     const std::string& s = data;
     const char* tn = mut ? "bytearray" : "bytes";
@@ -751,6 +782,144 @@ inline const char* bytes_methods_list() {
            "islower isspace istitle isupper join ljust lower lstrip partition removeprefix removesuffix replace "
            "rfind rindex rjust rpartition rsplit rstrip split splitlines startswith strip swapcase title "
            "translate upper zfill";
+}
+
+
+// ── bytes % args (PEP 461; round 84) ────────────────────────────────────
+// CPython's _PyBytes_FormatEx. get(index, key, conv): the argument at
+// `index`, or under the bytes `key` of a mapping (index -1); conv 'b' / 's':
+// its bytes (bytes and bytearray as they are, __bytes__, a buffer - the
+// engine raises CPython's TypeError for anything else), 'a' / 'r': its
+// ascii() text; any other conversion character ('d', 'x', 'f', 'c', '*'
+// ...): the value - an int, float, bool, or bytes/bytearray as STR with
+// that type_name; an object converted by the engine (its __index__,
+// __int__, __float__ as CPython's conversions take them) or left OTHER.
+using BytesPercentGetter = std::function<FmtVal(int64_t index, const std::string& key, char conv)>;
+inline std::string bytes_pad(const std::string& body, int64_t width, bool left) {
+    if (width <= (int64_t)body.size()) return body;
+    std::string fill((size_t)(width - (int64_t)body.size()), ' ');
+    return left ? body + fill : fill + body;
+}
+inline std::string bytes_percent_format(const std::string& fmt, int64_t nargs, bool is_mapping, const BytesPercentGetter& get) {
+    std::string out;
+    int64_t ai = 0;
+    size_t i = 0, n = fmt.size();
+    auto next_arg = [&](char conv) -> FmtVal {
+        if (ai >= nargs) raise("TypeError", "not enough arguments for format string");
+        return get(ai++, "", conv);
+    };
+    while (i < n) {
+        char c = fmt[i];
+        if (c != '%') { out += c; i++; continue; }
+        i++;
+        if (i >= n) raise("ValueError", "incomplete format");
+        std::string key; bool has_key = false;
+        if (fmt[i] == '(') {
+            int lvl = 1; size_t j = i + 1;
+            while (j < n && lvl) { if (fmt[j] == '(') lvl++; else if (fmt[j] == ')') lvl--; if (lvl) j++; }
+            if (j >= n) raise("ValueError", "incomplete format key");
+            if (!is_mapping) raise("TypeError", "format requires a mapping");
+            key = fmt.substr(i + 1, j - i - 1); has_key = true; i = j + 1;
+        }
+        Spec s; bool left = false, zero = false;
+        while (i < n && (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' || fmt[i] == '0')) {
+            char f = fmt[i++];
+            if (f == '-') left = true; else if (f == '+') s.sign = '+'; else if (f == ' ') { if (s.sign != '+') s.sign = ' '; }
+            else if (f == '#') s.alt = true; else zero = true;
+        }
+        auto star = [&]() -> int64_t {
+            FmtVal w = has_key ? get(-1, key, '*') : next_arg('*');
+            if (w.kind != FmtVal::INT && w.kind != FmtVal::BOOL) raise("TypeError", "* wants int");
+            if (w.kind == FmtVal::BOOL) return w.b ? 1 : 0;
+            if (w.is_big) raise("OverflowError", "Python int too large to convert to C ssize_t");
+            return w.i;
+        };
+        if (i < n && fmt[i] == '*') {
+            i++;
+            s.width = star();
+            if (s.width < 0) { left = true; s.width = -s.width; }
+        } else if (i < n && fmt[i] >= '0' && fmt[i] <= '9') {
+            s.width = 0; while (i < n && fmt[i] >= '0' && fmt[i] <= '9') s.width = s.width * 10 + (fmt[i++] - '0');
+        }
+        if (i < n && fmt[i] == '.') {
+            i++; s.prec = 0;
+            if (i < n && fmt[i] == '*') { i++; s.prec = star(); if (s.prec < 0) s.prec = 0; }
+            else while (i < n && fmt[i] >= '0' && fmt[i] <= '9') s.prec = s.prec * 10 + (fmt[i++] - '0');
+        }
+        while (i < n && (fmt[i] == 'h' || fmt[i] == 'l' || fmt[i] == 'L')) i++;
+        if (i >= n) raise("ValueError", "incomplete format");
+        char t = fmt[i++];
+        if (t == '%') { out += '%'; continue; }
+        if (left) s.align = '<';
+        else if (zero && t != 's' && t != 'b' && t != 'r' && t != 'a' && t != 'c') { s.fill = "0"; s.align = '='; }
+        else s.align = '>';
+        auto fetch = [&](char conv) { return has_key ? get(-1, key, conv) : next_arg(conv); };
+        switch (t) {
+            case 's': case 'b': case 'r': case 'a': {
+                FmtVal v = fetch(t == 's' ? 'b' : t == 'r' ? 'a' : t);
+                std::string body = v.s;
+                if (s.prec >= 0 && (int64_t)body.size() > s.prec) body.resize((size_t)s.prec);
+                out += bytes_pad(body, s.width, left);
+                break;
+            }
+            case 'c': {
+                FmtVal v = fetch('c');
+                char ch = 0;
+                if ((v.kind == FmtVal::STR || v.kind == FmtVal::OTHER) && (v.type_name == "bytes" || v.type_name == "bytearray")
+                    && v.s.size() == 1) ch = v.s[0];
+                else if (v.kind == FmtVal::INT || v.kind == FmtVal::BOOL) {
+                    int64_t x = v.kind == FmtVal::BOOL ? (v.b ? 1 : 0) : v.i;
+                    if (v.is_big || x < 0 || x > 255) raise("OverflowError", "%c arg not in range(256)");
+                    ch = (char)x;
+                } else raise("TypeError", "%c requires an integer in range(256) or a single byte");
+                out += bytes_pad(std::string(1, ch), s.width, left);
+                break;
+            }
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
+                FmtVal v = fetch(t);
+                bool integral = t == 'o' || t == 'x' || t == 'X';
+                if (!v.is_numeric() || (integral && v.kind == FmtVal::FLOAT)) {
+                    char tc = t == 'i' ? 'd' : t;
+                    raise("TypeError", std::string("%") + tc + " format: " + (integral ? "an integer" : "a real number")
+                                       + " is required, not " + v.type_name);
+                }
+                FmtVal iv = v;
+                if (v.kind == FmtVal::FLOAT) {
+                    if (std::isinf(v.d)) raise("OverflowError", "cannot convert float infinity to integer");
+                    if (std::isnan(v.d)) raise("ValueError", "cannot convert float NaN to integer");
+                    iv = FmtVal::of_big(BigInt::from_double(std::trunc(v.d)));
+                } else if (v.kind == FmtVal::BOOL) iv = FmtVal::of_int(v.b ? 1 : 0);
+                Spec s2 = s; s2.type = (t == 'i' || t == 'u') ? 'd' : t;
+                if (s2.prec >= 0) {
+                    // a precision on an integer is a minimum digit count
+                    Spec s3; s3.type = s2.type; s3.alt = false;
+                    std::string digits = format_int(iv, s3);
+                    bool ng = !digits.empty() && digits[0] == '-';
+                    if (ng) digits.erase(0, 1);
+                    while ((int64_t)digits.size() < s2.prec) digits.insert(digits.begin(), '0');
+                    std::string prefix = sign_str(ng, s2.sign);
+                    if (s2.alt && t != 'd' && t != 'i' && t != 'u') prefix += t == 'o' ? "0o" : t == 'x' ? "0x" : "0X";
+                    out += pad(prefix, digits, s2, '>');
+                } else out += format_int(iv, s2);
+                break;
+            }
+            case 'e': case 'E': case 'f': case 'F': case 'g': case 'G': {
+                FmtVal v = fetch(t);
+                if (!v.is_numeric()) raise("TypeError", "float argument required, not " + v.type_name);
+                Spec s2 = s; s2.type = t;
+                if (s2.prec < 0) s2.prec = 6;
+                out += format_float(v.as_double(), s2);
+                break;
+            }
+            default: {
+                char hb[128];
+                snprintf(hb, sizeof hb, "unsupported format character '%c' (0x%x) at index %zu", t, (unsigned)(unsigned char)t, i - 1);
+                raise("ValueError", hb);
+            }
+        }
+    }
+    if (!is_mapping && ai < nargs) raise("TypeError", "not all arguments converted during bytes formatting");
+    return out;
 }
 
 } // namespace nypy

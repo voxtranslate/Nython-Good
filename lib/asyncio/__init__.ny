@@ -2292,7 +2292,7 @@ class _FlowControlMixin(Transport):
         raise NotImplementedError
 
 def _check_data(data):
-    if not (isinstance(data, bytes) or isinstance(data, bytearray) or type(data).__name__ == "memoryview"):
+    if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("data argument must be a bytes-like object, not " + repr(type(data).__name__))
 
 class _SocketTransport(_FlowControlMixin):

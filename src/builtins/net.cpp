@@ -444,6 +444,20 @@ std::string recv_some(Sock& s, size_t n, int flags) {
         if (!await_ready(s, wait, c)) raise_timeout();
     }
 }
+// (round 84) recv_into: straight into the caller's buffer (a memoryview's
+// address - the export keeps it from moving while this waits): no bytes
+// object in between, as CPython's sock_recv_into
+size_t recv_into_raw(Sock& s, char* dst, size_t n, int flags) {
+    Clock c(s.timeout);
+    while (true) {
+        int wait = 0, err = 0;
+        long r = io_recv(s, dst, n, flags, &wait, &err);
+        if (r >= 0) return (size_t)r;
+        if (!wait) raise_io(s, err);
+        if (interrupted(err)) { run_signals(); continue; }
+        if (!await_ready(s, wait, c)) raise_timeout();
+    }
+}
 size_t send_some(Sock& s, const std::string& data, size_t off, int flags, const Clock* shared) {
     Clock own(s.timeout);
     const Clock& c = shared ? *shared : own;
@@ -502,6 +516,7 @@ static const std::vector<std::string>& net_names() {
         "_net_settimeout", "_net_gettimeout", "_net_setdefaulttimeout", "_net_getdefaulttimeout",
         "_net_bind", "_net_listen", "_net_accept", "_net_connect", "_net_connect_ex",
         "_net_send", "_net_sendall", "_net_recv", "_net_sendto", "_net_recvfrom", "_net_shutdown",
+        "_net_recv_into",   // round 84: recv_into without a copy (the buffer protocol)
         "_net_setsockopt", "_net_getsockopt", "_net_getsockname", "_net_getpeername",
         "_net_getaddrinfo", "_net_gethostname", "_net_gethostbyname", "_net_gethostbyaddr",
         "_net_getnameinfo", "_net_inet_pton", "_net_inet_ntop", "_net_select", "_net_constants",
@@ -688,6 +703,15 @@ Value dispatch_net(NythonExecutor& E, const std::string& name, std::vector<Value
         int flags = (int)int_arg(E, A, 2, "flags", 0);
         if (n == 0) return E.makeBytesValue("");
         return E.makeBytesValue(recv_some(*s, (size_t)std::min<int64_t>(n, 64 << 20), flags));
+    }
+    if (name == "_net_recv_into") {
+        // _net_recv_into(h, address, n, flags) -> bytes received at address
+        auto s = get(handle_of(E, A.get(0, nullptr)));
+        int64_t addr = int_arg(E, A, 1, "address", 0);
+        int64_t n = int_arg(E, A, 2, "nbytes", 0);
+        int flags = (int)int_arg(E, A, 3, "flags", 0);
+        if (n <= 0 || !addr) return intValue(0);
+        return intValue((int64_t)recv_into_raw(*s, (char*)(intptr_t)addr, (size_t)n, flags));
     }
     if (name == "_net_sendto") {
         auto s = get(handle_of(E, A.get(0, nullptr)));

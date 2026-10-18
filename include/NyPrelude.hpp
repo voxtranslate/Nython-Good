@@ -21,8 +21,77 @@
 
 namespace nyrt {
 
+// (round 84) The buffer protocol's part of the prelude - memoryview's
+// members, the managed buffers, the bytes-like helpers - is in
+// src/NyPreludeBuffer.cpp, a unit of its own (editing it does not rebuild
+// every file that includes this header), loaded on first need as the mirror
+// chunk "buffer" (builtin_mirror_chunk); the startup prelude below holds the
+// class memoryview and the stubs that load it.
+const char* prelude_buffer_source();
+
 inline const char* prelude_source() {
     return R"NYPRELUDE(
+# ── memoryview, loaded on first need (round 84) ───────────────────────────
+# The class is here, so isinstance(x, memoryview) and subclass checks cost
+# nothing; its members, the managed buffers and the helpers are the mirror
+# chunk "buffer" (src/NyPreludeBuffer.cpp), which the first view - or the
+# first bytes-like argument that is not bytes/bytearray - loads
+# (_ny_load_chunk). The helpers' stubs below call the real ones the chunk
+# binds in the prelude's scope.
+class memoryview:
+    """Create a new memoryview object which references the given object."""
+
+    def __new__(cls, *args, **kwargs):
+        # memoryview(object): CPython's argument messages
+        var n = len(args) + len(kwargs)
+        if n > 1:
+            if len(kwargs) > 1 and not args:
+                raise TypeError("memoryview() takes at most 1 keyword argument (" + str(n) + " given)")
+            raise TypeError("memoryview() takes at most 1 argument (" + str(n) + " given)")
+        if not args and "object" not in kwargs:
+            raise TypeError("memoryview() missing required argument 'object' (pos 1)")
+        _ny_load_chunk("buffer")
+        return _ny_mv_export(args[0] if args else kwargs["object"], "memoryview: ")
+
+def _ny_is_exporter(obj):
+    return (isinstance(obj, bytes) or isinstance(obj, bytearray) or isinstance(obj, memoryview)
+            or getattr(type(obj), "__buffer__", None) is not None)
+
+def _ny_bytes_like(obj, what=""):
+    if isinstance(obj, bytes) or isinstance(obj, bytearray):
+        return obj
+    _ny_load_chunk("buffer")
+    return _ny_bytes_like(obj, what)
+
+def _ny_buffer_bytes(obj):
+    _ny_load_chunk("buffer")
+    return _ny_buffer_bytes(obj)
+
+def _ny_writable_view(obj, where="argument"):
+    _ny_load_chunk("buffer")
+    return _ny_writable_view(obj, where)
+
+def _ny_memview_raw(obj, addr, nbytes, readonly, fmt="B", itemsize=1, shape=None, strides=None, release=None,
+                    owner=None):
+    _ny_load_chunk("buffer")
+    return _ny_memview_raw(obj, addr, nbytes, readonly, fmt, itemsize, shape, strides, release, owner)
+
+def _ny_pct_arg(v, c):
+    _ny_load_chunk("buffer")
+    return _ny_pct_arg(v, c)
+
+def _ny_mv_export(obj, what):
+    _ny_load_chunk("buffer")
+    return _ny_mv_export(obj, what)
+
+def _ny_mv_make(mb, addr, fmt, isz, shape, strides, ro):
+    _ny_load_chunk("buffer")
+    return _ny_mv_make(mb, addr, fmt, isz, shape, strides, ro)
+
+def _ny_mv_copy(m, ro):
+    _ny_load_chunk("buffer")
+    return _ny_mv_copy(m, ro)
+
 class NythonFile:
     def __init__(self, path, mode, handle, encoding="utf-8"):
         self.name = path
@@ -54,6 +123,19 @@ class NythonFile:
             return file_readline_bytes(self.handle, size)
         return file_readline(self.handle, true)
 
+    # (round 84) read into any writable buffer, in place: a bytearray, a
+    # memoryview's slice, an array, an mmap
+    def readinto(self, b):
+        self._check()
+        var view = _ny_writable_view(b, "readinto() argument")
+        try:
+            return file_readinto(self.handle, view._ny_a, len(view))   # in place, no copy
+        finally:
+            view.release()
+
+    def readinto1(self, b):
+        return self.readinto(b)
+
     def readlines(self, hint=-1):
         self._check()
         var out = []
@@ -67,7 +149,7 @@ class NythonFile:
         self._check()
         if self.binary:
             if not (isinstance(data, "bytes") or isinstance(data, "bytearray")):
-                raise TypeError("a bytes-like object is required, not '" + data.type_name() + "'")
+                data = _ny_bytes_like(data)     # round 84: any buffer (memoryview, array ...)
             return file_write(self.handle, data)
         if isinstance(data, "bytes") or isinstance(data, "bytearray"):
             raise TypeError("write() argument must be str, not " + data.type_name())
@@ -3799,6 +3881,7 @@ def _ny_os_environb():
     _ny_os_environ()
     return _ny_environ_obj[1]
 
+
 )NYPRELUDE";
 }
 
@@ -5003,9 +5086,73 @@ def _ny_os_read(fd, n):
 def _ny_os_write(fd, data):
     if isinstance(data, bytearray):
         data = bytes(data)
-    if not isinstance(data, bytes):
-        raise TypeError("a bytes-like object is required, not '" + type(data).__name__ + "'")
+    elif not isinstance(data, bytes):
+        data = _ny_bytes_like(data)      # round 84: any buffer
     return _ny_os_call("write", _ny_os_fd(fd), data)
+
+# (round 84) positioned and vectored I/O: pread/pwrite at an offset without
+# moving the file position (POSIX), readv/preadv scatter what one read gives
+# into the buffers in order (any writable buffers, filled in place),
+# writev/pwritev gather the buffers into one write
+def _ny_os_pread(fd, n, offset):
+    return _ny_os_call("pread", _ny_os_fd(fd), _ny_os_fd(n), _ny_os_fd(offset))
+
+def _ny_os_pwrite(fd, data, offset):
+    return _ny_os_call("pwrite", _ny_os_fd(fd), bytes(_ny_bytes_like(data)), _ny_os_fd(offset))
+
+def _ny_os_seq(buffers, what):
+    if isinstance(buffers, (str, bytes, bytearray, dict, set)) or not hasattr(type(buffers), "__getitem__"):
+        raise TypeError(what + "() arg 2 must be a sequence")
+    return list(buffers)
+
+def _ny_os_scatter(views, data):
+    var pos = 0
+    for v in views:
+        if pos >= len(data):
+            break
+        var k = min(len(v), len(data) - pos)
+        v[0:k] = data[pos:pos + k]
+        pos = pos + k
+    for v in views:
+        v.release()
+    return len(data)
+
+def _ny_os_views(buffers, what):
+    var views = []
+    try:
+        for b in _ny_os_seq(buffers, what):
+            views.append(_ny_writable_view(b, None))
+    except BaseException:
+        for v in views:
+            v.release()
+        raise
+    return views
+
+def _ny_os_gather(buffers, what):
+    var out = []
+    for b in _ny_os_seq(buffers, what):
+        out.append(bytes(_ny_bytes_like(b)))
+    return b"".join(out)
+
+def _ny_os_readv(fd, buffers):
+    var views = _ny_os_views(buffers, "readv")
+    var total = 0
+    for v in views:
+        total = total + len(v)
+    return _ny_os_scatter(views, _ny_os_call("read", _ny_os_fd(fd), total))
+
+def _ny_os_preadv(fd, buffers, offset, flags=0):
+    var views = _ny_os_views(buffers, "preadv")
+    var total = 0
+    for v in views:
+        total = total + len(v)
+    return _ny_os_scatter(views, _ny_os_call("pread", _ny_os_fd(fd), total, _ny_os_fd(offset)))
+
+def _ny_os_writev(fd, buffers):
+    return _ny_os_call("write", _ny_os_fd(fd), _ny_os_gather(buffers, "writev"))
+
+def _ny_os_pwritev(fd, buffers, offset, flags=0):
+    return _ny_os_call("pwrite", _ny_os_fd(fd), _ny_os_gather(buffers, "pwritev"), _ny_os_fd(offset))
 
 def _ny_os_close(fd):
     _ny_os_call("close", _ny_os_fd(fd))
@@ -5352,6 +5499,13 @@ def _ny_os_member_list():
     for c in _ny_os_call("constants"):
         m.append(c)
     if not _ny_os_nt:
+        # (round 84) POSIX's vectored and positioned I/O
+        m.append(("readv", _ny_os_readv))
+        m.append(("writev", _ny_os_writev))
+        m.append(("pread", _ny_os_pread))
+        m.append(("pwrite", _ny_os_pwrite))
+        m.append(("preadv", _ny_os_preadv))
+        m.append(("pwritev", _ny_os_pwritev))
         var ids = _ny_os_call("ids")
         def idf(i):
             def f():
@@ -5508,6 +5662,7 @@ _ny_os_members = _ny_os_member_list()
 }
 // The text of one chunk of builtin_mirrors_source() ("" if there is none).
 inline std::string builtin_mirror_chunk(const std::string& name) {
+    if (name == "buffer") return prelude_buffer_source();   // (round 84) its own unit
     static const std::string src = builtin_mirrors_source();
     const std::string mark = "#@ " + name + "\n";
     size_t b = src.find(mark);

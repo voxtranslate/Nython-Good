@@ -232,10 +232,8 @@ def _encode_input(data, text, encoding, errors):
         if encoding is none or encoding.lower().replace("-", "").replace("_", "") == "utf8":
             return data
         return data.encode(encoding, errors or "strict")
-    if isinstance(data, str):
-        raise TypeError("memoryview: a bytes-like object is required, not 'str'")
     if not (isinstance(data, bytes) or isinstance(data, bytearray)):
-        raise TypeError("memoryview: a bytes-like object is required, not '" + _tname(data) + "'")
+        data = memoryview(data)          # any buffer (round 84), CPython's message otherwise
     return bytes(data)
 
 

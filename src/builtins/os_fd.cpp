@@ -277,6 +277,41 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
         if (put < 0) raise_errno(err, "");
         return make_int(put);
     }
+#ifndef _WIN32
+    // (round 84) os.pread(fd, n, offset) / os.pwrite(fd, data, offset): at
+    // an offset, the file position left as it was (os.preadv/pwritev in the
+    // prelude's os chunk scatter and gather around them)
+    if (op == "pread") {
+        int fd = fd_arg(E, A(0));
+        long long n = I(1, 0), off = I(2, 0);
+        if (n < 0) raise("ValueError", "negative buffersize in pread");
+        std::string buf((size_t)n, '\0');
+        long long got;
+        int err = 0;
+        {
+            nyconc::GilRelease unlocked;
+            do got = ::pread(fd, n ? &buf[0] : nullptr, (size_t)n, (off_t)off); while (got < 0 && errno == EINTR);
+            if (got < 0) err = errno;
+        }
+        if (got < 0) raise_errno(err, "");
+        buf.resize((size_t)got);
+        return E.makeBytesValue(buf);
+    }
+    if (op == "pwrite") {
+        int fd = fd_arg(E, A(0));
+        std::string data = bytes_arg(E, A(1));
+        long long off = I(2, 0);
+        long long put;
+        int err = 0;
+        {
+            nyconc::GilRelease unlocked;
+            do put = ::pwrite(fd, data.data(), data.size(), (off_t)off); while (put < 0 && errno == EINTR);
+            if (put < 0) err = errno;
+        }
+        if (put < 0) raise_errno(err, "");
+        return make_int(put);
+    }
+#endif
     // os.sendfile(out_fd, in_fd, offset, count): the kernel copies from a file
     // to a socket (round 82; asyncio's sock_sendfile uses it). offset None
     // is the file's position (Linux, as CPython); POSIX only.
@@ -635,6 +670,11 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
     if (op == "shm_size") {
         std::lock_guard<std::mutex> lk(seg_mutex());
         return make_int((long long)segment_of(I(0, 0)).size);
+    }
+    if (op == "shm_addr") {
+        // (round 84) the segment's address: SharedMemory.buf is a memoryview of it
+        std::lock_guard<std::mutex> lk(seg_mutex());
+        return make_int((long long)(intptr_t)segment_of(I(0, 0)).base);
     }
     if (op == "shm_read") {
         // shm_read(id, offset, n) -> bytes

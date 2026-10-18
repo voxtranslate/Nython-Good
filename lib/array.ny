@@ -5,26 +5,34 @@
 #     from array import array
 #     a = array("i", [1, 2, 3]); a.append(4); a.tobytes()
 #     array("d", b"...8-byte doubles...")  array("u", "text")
+#     m = memoryview(a); m[0] = 10          # a[0] == 10: the same memory
 #
 # Typecodes (itemsize): b B (1) u (4, 2 on Windows: wchar_t) h H (2) i I (4)
 # l L (8, 4 on Windows and 32-bit builds: C long) q Q (8) f (4) d (8).
-# array(typecode[, initializer]) from a list or any iterable, bytes or
-# bytearray (frombytes), a str for "u", or another array; typecode,
+# array(typecode[, initializer]) from a list or any iterable, bytes or any
+# bytes-like object (frombytes), a str for "u", or another array; typecode,
 # itemsize; append, extend, insert, pop, remove, index(x, start, stop),
-# count, reverse, byteswap, buffer_info, frombytes, tobytes, fromlist,
-# tolist, fromunicode, tounicode, fromfile, tofile; len, indexing and
-# slicing (an array), item and slice assignment (from an array of the same
-# typecode, extended slices included), del, +, *, +=, *=, in, iteration,
-# comparisons (item by item, any two arrays), repr, bytes(a), copy/deepcopy,
-# pickling as CPython does it (array(typecode, list) below protocol 3,
-# _array_reconstructor with the machine format code from 3 on - the same
-# bytes), typecodes, ArrayType. Values are range checked with CPython's
-# OverflowError messages; "f" items are rounded to single precision.
+# count, reverse, byteswap, buffer_info (the items' real address),
+# frombytes, tobytes, fromlist, tolist, fromunicode, tounicode, fromfile,
+# tofile; len, indexing and slicing (an array), item and slice assignment
+# (from an array of the same typecode, extended slices included), del, +, *,
+# +=, *=, in, iteration, comparisons (item by item, any two arrays), repr,
+# bytes(a), copy/deepcopy, pickling as CPython does it (array(typecode,
+# list) below protocol 3, _array_reconstructor with the machine format code
+# from 3 on - the same bytes), typecodes, ArrayType. Values are range checked
+# with CPython's OverflowError messages; "f" items are rounded to single
+# precision.
 #
-# Not here: the buffer protocol (Nython has no memoryview; bytes(a) and
-# tobytes() give the data), the deprecated "u" typecode's wchar_t surrogate
-# handling on Windows (characters outside the BMP).
-import struct
+# Round 84: the items are native C values in a bytearray (the machine's own
+# layout and byte order), read and written in place by the buffer natives
+# (_mv_get/_mv_set at _ny_buf_addr), and an array exports them through the
+# buffer protocol (__buffer__, PEP 688): memoryview(a) shares the array's
+# memory (format the typecode, "w" for "u" as CPython 3.12's), and while a
+# view is exported the array cannot change size - "cannot resize an array
+# that is exporting buffers" (BufferError), as CPython's.
+#
+# Not here: the deprecated "u" typecode's wchar_t surrogate handling on
+# Windows (characters outside the BMP).
 import sys
 
 __all__ = ["array", "ArrayType", "typecodes"]
@@ -35,15 +43,16 @@ _WIN = sys.platform == "win32"
 _LONG = 4 if (_WIN or sys.maxsize <= 4294967296) else 8
 _SIZES = {"b": 1, "B": 1, "u": 2 if _WIN else 4, "h": 2, "H": 2, "i": 4, "I": 4, "l": _LONG, "L": _LONG,
           "q": 8, "Q": 8, "f": 4, "d": 8}
+# the buffer natives' item code for each typecode ("u": its wchar_t)
+_CODE = {"b": "b", "B": "B", "u": "H" if _WIN else "I", "h": "h", "H": "H", "i": "i", "I": "I", "l": "l",
+         "L": "L", "q": "q", "Q": "Q", "f": "f", "d": "d"}
 _SIGNED = {"b": true, "B": false, "h": true, "H": false, "i": true, "I": false, "l": true, "L": false,
            "q": true, "Q": false}
-# struct codes for little-endian standard sizes
-_STRUCT = {"b": "b", "B": "B", "h": "h", "H": "H", "i": "i", "I": "I", "l": "q" if _LONG == 8 else "i",
-           "L": "Q" if _LONG == 8 else "I", "q": "q", "Q": "Q", "f": "f", "d": "d"}
 # CPython's machine format codes (arraymodule.c), little-endian
 _MFORMAT = {"b": 1, "B": 0, "h": 4, "H": 2, "i": 8, "I": 6, "l": 12 if _LONG == 8 else 8,
             "L": 10 if _LONG == 8 else 6, "q": 12, "Q": 10, "f": 14, "d": 16, "u": 18 if _WIN else 20}
 _LMAX = (1 << (8 * _LONG - 1)) - 1
+_RESIZE = "cannot resize an array that is exporting buffers"
 
 
 def _range_error(tc, v):
@@ -94,22 +103,11 @@ def _range_error(tc, v):
     return none
 
 
-def _f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
-
-
 def _conv(tc, v):
     # an item as the array stores it (TypeError / OverflowError as CPython)
     if tc == "f" or tc == "d":
         if isinstance(v, bool) or isinstance(v, int) or isinstance(v, float):
-            var x = float(v)
-            if tc == "f":
-                if x != x or x in (float("inf"), float("-inf")):
-                    return x
-                if abs(x) > 3.4028234663852886e38:
-                    return float("inf") if x > 0 else float("-inf")
-                return _f32(x)
-            return x
+            return float(v)
         if hasattr(v, "__float__"):
             return float(v)
         raise TypeError("must be real number, not " + type(v).__name__)
@@ -131,6 +129,17 @@ def _conv(tc, v):
     return n
 
 
+def _raw(tc, v):
+    # an item (already converted) as the buffer natives store it
+    if tc == "u":
+        return ord(v)
+    if tc == "f" or tc == "d":
+        return v
+    if v > 0x7fffffffffffffff:
+        return v - 0x10000000000000000
+    return v
+
+
 def _check_typecode(tc):
     if not isinstance(tc, str) or len(tc) != 1:
         raise TypeError("array() argument 1 must be a unicode character, not " + type(tc).__name__)
@@ -139,22 +148,34 @@ def _check_typecode(tc):
 
 
 def _pack(tc, items):
-    if tc == "u":
-        var enc = "utf-16-le" if _WIN else "utf-32-le"
-        return "".join(items).encode(enc)
-    if not items:
-        return b""
-    return struct.pack("<" + str(len(items)) + _STRUCT[tc], *items)
+    # converted items as the bytes of an array
+    var sz = _SIZES[tc]
+    var tmp = bytearray(len(items) * sz)
+    if items:
+        var a = _ny_buf_addr(tmp)
+        var c = _CODE[tc]
+        var i = 0
+        for v in items:
+            _mv_set(a + i, c, _raw(tc, v))
+            i += sz
+    return tmp
 
 
-def _unpack(tc, data):
-    if tc == "u":
-        var enc = "utf-16-le" if _WIN else "utf-32-le"
-        return list(bytes(data).decode(enc))
-    var n = len(data) // _SIZES[tc]
-    if n == 0:
+def _unpack(tc, data, start=0, n=-1):
+    # the items in an array's bytes (a bytearray: its storage is read in place)
+    var sz = _SIZES[tc]
+    if n < 0:
+        n = (len(data) - start) // sz
+    if n <= 0:
         return []
-    return list(struct.unpack("<" + str(n) + _STRUCT[tc], bytes(data)))
+    var b = data if isinstance(data, bytearray) else bytearray(data)
+    var c = _CODE[tc]
+    var r = _mv_tolist(_ny_buf_addr(b) + start, c, [n], [sz])
+    if tc == "u":
+        return [chr(x) for x in r]
+    if tc == "Q" or tc == "L":
+        return [int(x) if isinstance(x, str) else x for x in r]
+    return r
 
 
 def _is_array(x):
@@ -169,21 +190,25 @@ class array:
     def __init__(self, typecode, initializer=none):
         _check_typecode(typecode)
         self._tc = typecode
-        self._a = []
+        self._b = bytearray()
+        self._exports = 0
         if initializer is none:
             return
         if isinstance(initializer, str):
             if typecode != "u":
                 raise TypeError("cannot use a str to initialize an array with typecode '" + typecode + "'")
-            self._a = list(initializer)
+            self._b = _pack("u", list(initializer))
         elif isinstance(initializer, bytes) or isinstance(initializer, bytearray):
             self.frombytes(initializer)
         elif _is_array(initializer):
             if initializer._tc == "u" and typecode != "u":
                 raise TypeError("cannot use a unicode array to initialize an array with typecode '" + typecode + "'")
-            self._a = [_conv(typecode, v) for v in initializer._a]
+            if initializer._tc == typecode:
+                self._b = bytearray(initializer._b)
+            else:
+                self._b = _pack(typecode, [_conv(typecode, v) for v in initializer._items()])
         else:
-            self._a = [_conv(typecode, v) for v in initializer]
+            self._b = _pack(typecode, [_conv(typecode, v) for v in initializer])
 
     @property
     def typecode(self):
@@ -195,121 +220,184 @@ class array:
 
     def _new(self, items):
         var r = array(self._tc)
-        r._a = items
+        r._b = _pack(self._tc, items)
         return r
+
+    def _from_bytes(self, data):
+        var r = array(self._tc)
+        r._b = bytearray(data)
+        return r
+
+    def _items(self):
+        return _unpack(self._tc, self._b)
+
+    def _get(self, k):
+        var v = _mv_get(_ny_buf_addr(self._b) + k * _SIZES[self._tc], _CODE[self._tc])
+        if self._tc == "u":
+            return chr(v)
+        if isinstance(v, str):
+            return int(v)
+        return v
+
+    def _put(self, k, v):
+        # v already converted
+        _mv_set(_ny_buf_addr(self._b) + k * _SIZES[self._tc], _CODE[self._tc], _raw(self._tc, v))
+
+    def _resizing(self):
+        if self._exports > 0:
+            raise BufferError(_RESIZE)
+
+    # ── the buffer protocol (PEP 688; round 84) ─────────────────────────
+    def __buffer__(self, flags):
+        var e = _ny_buf_export(self._b)     # the storage cannot move while viewed
+        self._exports += 1
+        var tc = self._tc
+        var sz = _SIZES[tc]
+        var fmt = ("w" if tc == "u" else tc) if (flags & 4) else "B"
+        var arr = self
+        var store = self._b
+        def gone():
+            arr._exports -= 1
+            _ny_buf_unexport(store)
+        return _ny_memview_raw(self, e[0], e[1], false, fmt, sz, (e[1] // sz,), (sz,), gone, store)
+
+    def __release_buffer__(self, view):
+        view.release()
 
     # ── list-like methods ───────────────────────────────────────────────
     def append(self, v):
-        self._a.append(_conv(self._tc, v))
+        var x = _conv(self._tc, v)
+        self._resizing()
+        self._b.extend(_pack(self._tc, [x]))
 
     def extend(self, it):
         if _is_array(it):
             if it._tc != self._tc:
                 raise TypeError("can only extend with array of same kind")
-            self._a.extend(list(it._a))
+            var data = bytes(it._b)
+            if data:
+                self._resizing()
+            self._b.extend(data)
             return
         var conv = [_conv(self._tc, v) for v in it]
-        self._a.extend(conv)
+        if conv:
+            self._resizing()
+        self._b.extend(_pack(self._tc, conv))
 
     def insert(self, i, v):
-        self._a.insert(i, _conv(self._tc, v))
+        var x = _conv(self._tc, v)
+        var n = len(self)
+        if i < 0:
+            i = max(0, i + n)
+        if i > n:
+            i = n
+        self._resizing()
+        var sz = _SIZES[self._tc]
+        self._b[i * sz:i * sz] = _pack(self._tc, [x])
 
     def pop(self, i=-1):
-        if len(self._a) == 0:
+        var n = len(self)
+        if n == 0:
             raise IndexError("pop from empty array")
-        var n = len(self._a)
         var k = i + n if i < 0 else i
         if k < 0 or k >= n:
             raise IndexError("pop index out of range")
-        return self._a.pop(k)
+        var v = self._get(k)
+        self._resizing()
+        var sz = _SIZES[self._tc]
+        del self._b[k * sz:(k + 1) * sz]
+        return v
 
     def remove(self, v):
-        for i in range(len(self._a)):
-            if self._a[i] == v:
-                del self._a[i]
+        var items = self._items()
+        for i in range(len(items)):
+            if items[i] == v:
+                self._resizing()
+                var sz = _SIZES[self._tc]
+                del self._b[i * sz:(i + 1) * sz]
                 return
         raise ValueError("array.remove(x): x not in array")
 
     def index(self, v, start=0, stop=sys.maxsize):
-        var n = len(self._a)
+        var items = self._items()
+        var n = len(items)
         if start < 0:
             start = max(0, start + n)
         if stop < 0:
             stop = max(0, stop + n)
         var i = start
         while i < min(stop, n):
-            if self._a[i] == v:
+            if items[i] == v:
                 return i
             i = i + 1
         raise ValueError("array.index(x): x not in array")
 
     def count(self, v):
         var c = 0
-        for x in self._a:
+        for x in self._items():
             if x == v:
                 c = c + 1
         return c
 
     def reverse(self):
-        self._a.reverse()
+        var items = self._items()
+        items.reverse()
+        self._b[:] = _pack(self._tc, items)
 
     def byteswap(self):
-        if self._tc == "u":
-            var size = _SIZES["u"]
-            var raw = bytearray(_pack("u", self._a))
-            var out = bytearray()
-            var i = 0
-            while i < len(raw):
-                out.extend(bytes(reversed(raw[i:i + size])))
-                i = i + size
-            self._a = _unpack("u", out)
-            return
         var size = _SIZES[self._tc]
         if size == 1:
             return
-        var raw = _pack(self._tc, self._a)
+        var raw = bytes(self._b)
         var out = bytearray()
         var i = 0
         while i < len(raw):
-            out.extend(bytes(reversed(raw[i:i + size])))
+            out.extend(raw[i:i + size][::-1])
             i = i + size
-        self._a = _unpack(self._tc, out)
+        self._b[:] = out
 
     def buffer_info(self):
-        return (id(self), len(self._a))
+        var a = _ny_buf_addr(self._b)
+        return (a, len(self))
 
     # ── conversions ─────────────────────────────────────────────────────
     def frombytes(self, data):
         if isinstance(data, str):
             raise TypeError("a bytes-like object is required, not 'str'")
-        var b = bytes(data)
+        var b = _ny_bytes_like(data)
         if len(b) % _SIZES[self._tc] != 0:
             raise ValueError("bytes length not a multiple of item size")
-        self._a.extend(_unpack(self._tc, b))
+        if len(b):
+            self._resizing()
+        self._b.extend(b)
 
     def tobytes(self):
-        return _pack(self._tc, self._a)
+        return bytes(self._b)
 
     def fromlist(self, lst):
         if not isinstance(lst, list):
             raise TypeError("arg must be list")
         var conv = [_conv(self._tc, v) for v in lst]
-        self._a.extend(conv)
+        if conv:
+            self._resizing()
+        self._b.extend(_pack(self._tc, conv))
 
     def tolist(self):
-        return list(self._a)
+        return self._items()
 
     def fromunicode(self, s):
         if self._tc != "u":
             raise ValueError("fromunicode() may only be called on unicode type arrays")
         if not isinstance(s, str):
             raise TypeError("fromunicode() argument must be str, not " + type(s).__name__)
-        self._a.extend(list(s))
+        if s:
+            self._resizing()
+        self._b.extend(_pack("u", list(s)))
 
     def tounicode(self):
         if self._tc != "u":
             raise ValueError("tounicode() may only be called on unicode type arrays")
-        return "".join(self._a)
+        return "".join(self._items())
 
     def fromfile(self, f, n):
         if n < 0:
@@ -328,29 +416,34 @@ class array:
 
     # ── the sequence protocol ───────────────────────────────────────────
     def __len__(self):
-        return len(self._a)
+        return len(self._b) // _SIZES[self._tc]
 
     def __iter__(self):
-        return iter(list(self._a))
+        return iter(self._items())
 
     def __contains__(self, v):
-        for x in self._a:
+        for x in self._items():
             if x == v:
                 return true
         return false
 
     def __getitem__(self, i):
         if isinstance(i, slice):
-            return self._new(self._a[i])
+            var n = len(self)
+            var r = i.indices(n)
+            var sz = _SIZES[self._tc]
+            if r[2] == 1:
+                return self._from_bytes(self._b[r[0] * sz:max(r[0], r[1]) * sz])
+            return self._new(self._items()[i])
         if not (isinstance(i, int) or hasattr(i, "__index__")):
             raise TypeError("array indices must be integers")
-        var n = len(self._a)
-        var k = int(i)
+        var n = len(self)
+        var k = int(i) if isinstance(i, int) else i.__index__()
         if k < 0:
             k = k + n
         if k < 0 or k >= n:
             raise IndexError("array index out of range")
-        return self._a[k]
+        return self._get(k)
 
     def __setitem__(self, i, v):
         if isinstance(i, slice):
@@ -358,66 +451,95 @@ class array:
                 raise TypeError("can only assign array (not \"" + type(v).__name__ + "\") to array slice")
             if v._tc != self._tc:
                 raise TypeError("bad argument type for built-in operation")
-            var items = list(v._a)
-            var r = i.indices(len(self._a))
-            if r[2] != 1:
-                var count = len(range(r[0], r[1], r[2]))
-                if count != len(items):
-                    raise ValueError("attempt to assign array of size " + str(len(items))
-                                     + " to extended slice of size " + str(count))
-            self._a[i] = items
+            var n = len(self)
+            var r = i.indices(n)
+            var sz = _SIZES[self._tc]
+            var src = bytes(v._b)
+            if r[2] == 1:
+                var stop = max(r[0], r[1])
+                if len(src) != (stop - r[0]) * sz:
+                    self._resizing()
+                self._b[r[0] * sz:stop * sz] = src
+                return
+            var count = len(range(r[0], r[1], r[2]))
+            var items = v._items()
+            if count != len(items):
+                raise ValueError("attempt to assign array of size " + str(len(items))
+                                 + " to extended slice of size " + str(count))
+            var k = 0
+            for j in range(r[0], r[1], r[2]):
+                self._put(j, items[k])
+                k += 1
             return
-        var n = len(self._a)
-        var k = int(i)
+        var n = len(self)
+        var k = int(i) if isinstance(i, int) else i.__index__()
         if k < 0:
             k = k + n
         if k < 0 or k >= n:
             raise IndexError("array assignment index out of range")
-        self._a[k] = _conv(self._tc, v)
+        self._put(k, _conv(self._tc, v))
 
     def __delitem__(self, i):
+        var n = len(self)
+        var sz = _SIZES[self._tc]
         if isinstance(i, slice):
-            del self._a[i]
+            var r = i.indices(n)
+            var gone = len(range(r[0], r[1], r[2]))
+            if gone == 0:
+                return
+            self._resizing()
+            if r[2] == 1:
+                del self._b[r[0] * sz:r[1] * sz]
+                return
+            var items = self._items()
+            del items[i]
+            self._b[:] = _pack(self._tc, items)
             return
-        var n = len(self._a)
-        var k = int(i)
+        var k = int(i) if isinstance(i, int) else i.__index__()
         if k < 0:
             k = k + n
         if k < 0 or k >= n:
             raise IndexError("array assignment index out of range")
-        del self._a[k]
+        self._resizing()
+        del self._b[k * sz:(k + 1) * sz]
 
     def __add__(self, other):
         if not _is_array(other):
             raise TypeError("can only append array (not \"" + type(other).__name__ + "\") to array")
         if other._tc != self._tc:
             raise TypeError("bad argument type for built-in operation")
-        return self._new(self._a + other._a)
+        return self._from_bytes(bytes(self._b) + bytes(other._b))
 
     def __iadd__(self, other):
         if not _is_array(other):
             raise TypeError("can only extend array with array (not \"" + type(other).__name__ + "\")")
         if other._tc != self._tc:
             raise TypeError("can only extend with array of same kind")
-        self._a.extend(list(other._a))
+        var data = bytes(other._b)
+        if data:
+            self._resizing()
+        self._b.extend(data)
         return self
 
     def __mul__(self, n):
         if not (isinstance(n, int) or isinstance(n, bool)):
             raise TypeError("can't multiply sequence by non-int of type '" + type(n).__name__ + "'")
-        return self._new(self._a * n if n > 0 else [])
+        return self._from_bytes(bytes(self._b) * n if n > 0 else b"")
 
     def __rmul__(self, n):
         return self.__mul__(n)
 
     def __imul__(self, n):
-        self._a = self._a * n if n > 0 else []
+        var data = bytes(self._b) * n if n > 0 else b""
+        if len(data) != len(self._b):
+            self._resizing()
+            self._b[:] = data
         return self
 
     # comparisons item by item (any two arrays, as CPython)
     def _cmp(self, other):
-        var a = self._a
-        var b = other._a
+        var a = self._items()
+        var b = other._items()
         var i = 0
         while i < len(a) and i < len(b):
             if a[i] != b[i]:
@@ -428,7 +550,7 @@ class array:
     def __eq__(self, other):
         if not _is_array(other):
             return NotImplemented
-        return len(self._a) == len(other._a) and self._cmp(other) == 0
+        return len(self) == len(other) and self._cmp(other) == 0
 
     def __ne__(self, other):
         if not _is_array(other):
@@ -458,23 +580,20 @@ class array:
     __hash__ = none
 
     def __repr__(self):
-        if len(self._a) == 0:
+        if len(self) == 0:
             return "array('" + self._tc + "')"
         if self._tc == "u":
-            return "array('u', " + repr("".join(self._a)) + ")"
-        return "array('" + self._tc + "', " + repr(list(self._a)) + ")"
+            return "array('u', " + repr(self.tounicode()) + ")"
+        return "array('" + self._tc + "', " + repr(self._items()) + ")"
 
     def __str__(self):
         return self.__repr__()
 
-    def __bytes__(self):
-        return self.tobytes()
-
     def __copy__(self):
-        return self._new(list(self._a))
+        return self._from_bytes(self._b)
 
     def __deepcopy__(self, memo):
-        return self._new(list(self._a))
+        return self._from_bytes(self._b)
 
     def __reduce_ex__(self, protocol):
         if protocol < 3:
@@ -491,6 +610,7 @@ def _array_reconstructor(arraytype, typecode, mformat_code, items):
         a.frombytes(items)
         return a
     # another machine's layout: decode by the format code
+    import struct
     var fmts = {0: "<B", 1: "<b", 2: "<H", 3: ">H", 4: "<h", 5: ">h", 6: "<I", 7: ">I", 8: "<i", 9: ">i",
                 10: "<Q", 11: ">Q", 12: "<q", 13: ">q", 14: "<f", 15: ">f", 16: "<d", 17: ">d"}
     if mformat_code in (18, 19, 20, 21):

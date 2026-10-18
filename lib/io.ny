@@ -11,8 +11,11 @@
 #               truncate, iteration, close/closed, with, readable/writable/
 #               seekable, newline=None/""/"\n"/"\r"/"\r\n" as Python
 #               translates and splits lines
-# BytesIO       bytes in memory: the same, plus read1, readinto, getbuffer
-#               (a copy here), and writes past the end padded with zeros
+# BytesIO       bytes in memory: the same, plus read1, readinto (into any
+#               writable buffer: a memoryview's slice is filled in place),
+#               getbuffer (a live memoryview of the contents: while one is
+#               exported write/truncate/close raise BufferError, as
+#               CPython's), and writes past the end padded with zeros
 # TextIOWrapper text over a binary stream (encoding, errors, newline=None
 #               reading universal newlines)
 # IOBase, RawIOBase, BufferedIOBase, TextIOBase  base classes to subclass:
@@ -26,7 +29,8 @@
 # calls is linear, not quadratic.
 #
 # Not here: FileIO, BufferedReader/Writer/Random/RWPair (open() returns the
-# runtime's file objects), getbuffer() as a live memoryview.
+# runtime's file objects - their write takes any bytes-like object and
+# readinto fills any writable buffer, round 84).
 # Note: print() writes to a StringIO given as file=; assigning sys.stdout
 # does not redirect the print statement (the engines write to the process's
 # standard output directly).
@@ -221,10 +225,15 @@ class BufferedIOBase(IOBase):
         self._unsupported("read1")
 
     def readinto(self, b):
-        var data = self.read(len(b))
-        var n = len(data)
-        b[0:n] = data
-        return n
+        # any writable buffer, filled in place (round 84)
+        var view = _ny_writable_view(b, "readinto() argument")
+        try:
+            var data = self.read(len(view))
+            var n = len(data)
+            view[0:n] = data
+            return n
+        finally:
+            view.release()
 
     def readinto1(self, b):
         return self.readinto(b)
@@ -534,13 +543,14 @@ class StringIO(TextIOBase):
 
 # ── BytesIO ──────────────────────────────────────────────────────────────────
 def _as_bytes(b):
-    if isinstance(b, bytes) or isinstance(b, bytearray):
-        return b
-    if isinstance(b, str):
-        raise TypeError("a bytes-like object is required, not 'str'")
-    if hasattr(b, "tobytes"):
-        return b.tobytes()
-    raise TypeError("a bytes-like object is required, not '" + type(b).__name__ + "'")
+    # any bytes-like object (round 84: memoryview, array.array, mmap ...)
+    return _ny_bytes_like(b)
+
+
+def _check_exports(buf):
+    # CPython's CHECK_EXPORTS: no resize while getbuffer()'s view lives
+    if _ny_buf_exports(buf) > 0:
+        raise BufferError("Existing exports of data: object cannot be re-sized")
 
 
 class BytesIO(BufferedIOBase):
@@ -562,6 +572,7 @@ class BytesIO(BufferedIOBase):
         return self._closed_flag
 
     def close(self):
+        _check_exports(self._buf)
         self._closed_flag = true
         return none
 
@@ -587,13 +598,14 @@ class BytesIO(BufferedIOBase):
         return bytes(self._buf)
 
     def getbuffer(self):
-        """A copy of the contents (Python gives a live memoryview)."""
+        """Get a read-write view over the contents of the BytesIO object."""
         self._check()
-        return bytearray(self._buf)
+        return memoryview(self._buf)
 
     def write(self, b):
         """Write bytes to file. Return the number of bytes written."""
         self._check()
+        _check_exports(self._buf)
         var data = _as_bytes(b)
         var n = len(data)
         if n == 0:
@@ -627,10 +639,14 @@ class BytesIO(BufferedIOBase):
 
     def readinto(self, b):
         self._check()
-        var data = self.read(len(b))
-        var n = len(data)
-        b[0:n] = data
-        return n
+        var view = _ny_writable_view(b, "readinto() argument")
+        try:
+            var data = self.read(len(view))
+            var n = len(data)
+            view[0:n] = data
+            return n
+        finally:
+            view.release()
 
     def readline(self, size=-1):
         """Next line from the file, as a bytes object."""
@@ -674,6 +690,7 @@ class BytesIO(BufferedIOBase):
 
     def writelines(self, lines):
         self._check()
+        _check_exports(self._buf)
         for line in lines:
             self.write(line)
         return none
@@ -706,6 +723,7 @@ class BytesIO(BufferedIOBase):
             size = self._pos
         if size < 0:
             raise ValueError("negative size value " + str(size))
+        _check_exports(self._buf)
         if size < len(self._buf):
             self._buf = self._buf[0:size]
         return size

@@ -429,7 +429,7 @@ class Au_write:
 
     def writeframesraw(self, data):
         if not isinstance(data, (bytes, bytearray)):
-            data = data.tobytes() if hasattr(data, 'tobytes') else bytes(data)   # (Nython has no memoryview)
+            data = memoryview(data).cast('B')
         self._ensure_header_written()
         if self._comptype == 'ULAW':
             with warnings.catch_warnings():

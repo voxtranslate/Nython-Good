@@ -19,16 +19,17 @@
 # size() (the file's size), tell, write(data) -> count, write_byte(int),
 # len(), m[i] (an int), m[a:b:c] (bytes), m[i] = int, m[a:b] = bytes,
 # iteration (1-byte bytes, as CPython's sequence protocol gives), with,
-# bytes(m) / bytearray(m) (the mapped bytes, through __bytes__), and the
+# the buffer protocol (round 84: __buffer__, PEP 688 - memoryview(m) is a
+# view of the mapped memory itself, readonly for ACCESS_READ; bytes(m),
+# bytearray(m), f.readinto(m), m.write(memoryview) ... through it; close()
+# and resize() raise BufferError while a view is exported), and the
 # constants: ACCESS_DEFAULT/READ/WRITE/COPY, PAGESIZE, ALLOCATIONGRANULARITY,
 # MAP_SHARED/PRIVATE/ANONYMOUS/..., PROT_READ/WRITE/EXEC, MADV_* (the
 # platform's own, natively); error (OSError). CPython's argument checks and
 # messages ("mmap closed or invalid", "mmap can't modify a readonly memory
 # map.", "data out of range", "mmap index out of range", ...).
 #
-# Not here: the buffer protocol proper - memoryview(m) and writing into the
-# map through another object's buffer (readinto(m)) - the engines have no
-# shared views of memory; bytes(m) copies. trackfd (3.13).
+# Not here: trackfd (3.13).
 import sys as _sys
 
 error = OSError
@@ -67,11 +68,8 @@ def _index(v, what="an integer"):
 
 
 def _buffer(data):
-    if isinstance(data, bytes):
-        return data
-    if isinstance(data, (bytearray, memoryview)):
-        return bytes(data)
-    raise TypeError("a bytes-like object is required, not '" + type(data).__name__ + "'")
+    # any bytes-like object (round 84: memoryview, array, another mmap ...)
+    return _ny_bytes_like(data)
 
 
 class mmap:
@@ -126,6 +124,7 @@ class mmap:
             self._pos = 0
             self._closed = False
             self._fileno = fileno
+            self._exports = 0
     else:
         def __init__(self, fileno, length, tagname=None, access=ACCESS_DEFAULT, offset=0):
             self._h = None
@@ -146,6 +145,7 @@ class mmap:
             self._pos = 0
             self._closed = False
             self._fileno = fileno
+            self._exports = 0
 
     # ── state ────────────────────────────────────────────────────────────
     def _check(self):
@@ -161,9 +161,26 @@ class mmap:
         return self._closed
 
     def close(self):
+        if getattr(self, "_exports", 0) > 0:
+            raise BufferError("cannot close exported pointers exist")
         if not self._closed and self._h is not None:
             _mmap_close(self._h)
         self._closed = True
+
+    # ── the buffer protocol (PEP 688; round 84) ──────────────────────────
+    def __buffer__(self, flags):
+        self._check()
+        var ro = self._access == ACCESS_READ
+        if (flags & 1) and ro:
+            raise BufferError("Object is not writable.")
+        self._exports += 1
+        var me = self
+        def gone():
+            me._exports -= 1
+        return _ny_memview_raw(self, _mmap_addr(self._h), self._size, ro, release=gone)
+
+    def __release_buffer__(self, view):
+        view.release()
 
     def __del__(self):
         try:
@@ -334,6 +351,8 @@ class mmap:
 
     def resize(self, newsize, /):
         self._check()
+        if self._exports > 0:
+            raise BufferError("mmap can't resize with extant buffers exported.")
         if self._access != ACCESS_WRITE and self._access != ACCESS_DEFAULT:
             raise TypeError("mmap can't resize a readonly or copy-on-write memory map.")
         newsize = _index(newsize)
@@ -414,10 +433,6 @@ class mmap:
             if b == item:
                 return True
         return False
-
-    def __bytes__(self):
-        self._check()
-        return _mmap_read(self._h, 0, self._size, 1)
 
     def __reduce__(self):
         raise TypeError("cannot pickle 'mmap.mmap' object")

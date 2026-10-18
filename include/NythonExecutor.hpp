@@ -557,7 +557,7 @@ struct NythonExecutor {
     void ensureMirror(const std::string& chunk) {
         if (mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if (chunk != "base" && chunk != "os") ensureMirror("base");   // (round 80: "os" needs no mirror base)
+        if (chunk != "base" && chunk != "os" && chunk != "buffer") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer")
         if (chunk == "dictview") ensureMirror("dict");
         try {
             auto source = SourceCode(nyrt::builtin_mirror_chunk(chunk));
@@ -659,6 +659,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_main_globals","_ny_exc_current","_ny_stack",
             "_ny_exc_init","_ny_exc_str","_ny_exc_repr",        // BaseException's members as values (round 84)
             "_ny_audit_enable",                                  // sys.addaudithook (round 84)
+            "_ny_buf_export","_ny_buf_unexport","_ny_buf_exports","_ny_buf_addr","_ny_load_chunk",   // the buffer protocol: memoryview (round 84)
             "_ny_main_set","_ny_main_del","_ny_globals_view",   // globals() as a live view (round 81)
             "_ny_getrefcount","_ny_frame_jump",                 // sys.getrefcount, frame.f_lineno = n (round 81)
             "_ny_modules","_ny_module_new","_ny_module_exec","_ny_find_module",   // sys.modules, importlib (round 80)
@@ -709,6 +710,7 @@ public:   // NythonExecutor is a struct: members default to public
             "embedding","embedding_lookup","env_get","eprint","exec_cmd","exp","fclose","fft_magnitude",
             "file_append","file_close","file_copy","file_delete","file_open","file_read","file_readline","file_readlines",
             "file_read_bytes","file_readline_bytes","file_truncate","file_fileno",
+            "file_readinto",   // round 84: readinto into a buffer's memory
             "stream_write","stream_flush","stream_isatty","stream_readline","stream_read",
             "file_rename","file_size","file_mtime","fuzzy_score","fuzzy_positions","fuzzy_rank","file_write","file_writelines","flush","fprint","fread","freadline",
             "fs_mkdirs","fs_stat","fs_walk","function","fwrite","gelu","getcwd","getenv",
@@ -2640,11 +2642,14 @@ public:   // NythonExecutor is a struct: members default to public
     // to the general code (identity, `b in a_list`, and/or, ...).
     bool bytesBinary(int opc, const Value& lv, const Value& rv, nyheap::Bytes* lb, nyheap::Bytes* rb, Value& out, Context* ctx) {
         switch (opc) {
-        case OP_ADD:
+        case OP_ADD: {
             if (lb && rb) { out = makeBytesValue(lb->s + rb->s, lb->mut); return true; }
+            std::string rbuf;   // round 84: bytes + any buffer (memoryview, array ...), as CPython's
+            if (lb && bufferBytes(rv, rbuf, ctx)) { out = makeBytesValue(lb->s + rbuf, lb->mut); return true; }
             if (lb) pyRaise("TypeError", "can't concat " + typeNameOf(rv) + " to " + typeNameOf(lv));
             pyRaise("TypeError", isStringValue(lv) ? "can only concatenate str (not \"" + typeNameOf(rv) + "\") to str"
                                                    : "unsupported operand type(s) for +: '" + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
+        }
         case OP_MUL: {
             nyheap::Bytes* b = lb ? lb : rb;
             const Value& other = lb ? rv : lv;
@@ -2681,7 +2686,7 @@ public:   // NythonExecutor is a struct: members default to public
             return true;
         }
         case OP_MOD:
-            if (lb) pyRaise("TypeError", "%-formatting of bytes is not supported; use b''.join or .format on str and encode()");
+            if (lb) { out = bytesPercent(lb, rv, ctx); return true; }   // round 84: PEP 461
             return false;
         case OP_SUB: case OP_DIV: case OP_FLOORDIV: case OP_POW: case OP_BAND: case OP_BOR: case OP_BXOR:
         case OP_LSHIFT: case OP_RSHIFT:
@@ -2689,6 +2694,19 @@ public:   // NythonExecutor is a struct: members default to public
         default:
             return false;
         }
+    }
+    // (round 84) An object exporting a buffer that is not bytes or bytearray
+    // (a memoryview, array.array, mmap, ctypes data, any class with
+    // __buffer__ - PEP 688): the bytes it holds, in C order, through the
+    // prelude's _ny_buffer_bytes. False for anything else.
+    bool bufferBytes(const Value& v, std::string& out, Context* ctx) {
+        if (!isInstanceVal(v) || !instanceHasMethod(v, "__buffer__")) return false;
+        std::vector<Value> a{v};
+        Value r = callFunctionValue(global_ctx->getByName("_ny_buffer_bytes"), a, ctx ? ctx : global_ctx);
+        nyheap::Bytes* bo = bytesOf(r);
+        if (!bo) return false;
+        out = bo->s;
+        return true;
     }
     // A value as an argument of a bytes method (NyBytes.hpp: BArg).
     nypy::BArg toBArg(const Value& v_in, Context* ctx, int depth = 0) {
@@ -2710,6 +2728,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (auto* bo = bytesOf(v)) { a.k = nypy::BArg::BYTES; a.s = bo->s; return a; }
         if (isStringValue(v)) { a.k = nypy::BArg::STR; a.s = *(std::string*)v.value.p; return a; }
+        if (bufferBytes(v, a.s, ctx)) { a.k = nypy::BArg::BYTES; return a; }   // round 84: any buffer exporter
         if (depth == 0 && (contOf(v) || isInstanceVal(v) || nygen::is_gen(v))) {
             a.k = nypy::BArg::SEQ;
             for (auto& it : iterItems(v, ctx)) a.items.push_back(toBArg(it, ctx, 1));
@@ -2825,12 +2844,13 @@ public:   // NythonExecutor is a struct: members default to public
             if (opc == OP_ADD) {
                 nypy::BArg ra = toBArg(new_val, ctx);
                 if (ra.k != nypy::BArg::BYTES) pyRaise("TypeError", "can't concat " + typeNameOf(new_val) + " to bytearray");
+                nyCall([&] { nypy::ba_resize_check(bo->exports, 0, ra.s.size()); return 0; });   // round 84: exported
                 bo->s += ra.s;
             } else {
                 Num cnt;
                 if (!asNum(new_val, cnt) || cnt.k == 3) pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(new_val) + "'");
                 int64_t times = cnt.k == 1 ? cnt.i : (numIsNeg(cnt) ? 0 : 1);
-                bo->s = nypy::repeat_str(bo->s, times);
+                nyCall([&] { nypy::ba_assign(bo->s, nypy::repeat_str(bo->s, times), bo->exports); return 0; });   // round 84
             }
             result = old_val;
         } else if (oc && seqLen(oc) >= 0 && !isTupleCont(oc) && !isSetCont(oc) && (opc == OP_ADD || opc == OP_MUL)) {
@@ -3883,6 +3903,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (step == 1) {
                 if (cnt < 0) cnt = 0;
                 if (st > len) st = len;
+                nyCall([&] { nypy::ba_resize_check(bo->exports, (size_t)cnt, repl.size()); return 0; });   // round 84
                 d.replace((size_t)st, (size_t)cnt, repl);
             } else {
                 if ((int64_t)repl.size() != cnt)
@@ -4610,6 +4631,55 @@ public:   // NythonExecutor is a struct: members default to public
                 });
         });
         return makeStringValue(out);
+    }
+
+    // b"fmt" % args / bytearray % args (PEP 461; round 84): NyBytes.hpp's
+    // bytes_percent_format. A tuple gives the arguments, a mapping (a dict,
+    // a list, an object with __getitem__ - CPython's mp_subscript test) the
+    // %(key)s values under bytes keys; anything else is one argument.
+    nypy::FmtVal pctBytesArg(const Value& v_in, char conv, Context* ctx) {
+        Value v = unwrapPayload(v_in);
+        nyheap::Bytes* bo = bytesOf(v);
+        if (conv == 'b' && bo) return nypy::FmtVal::of_str(bo->s);
+        if (conv == 'a') return toFmtVal(v, 'a', ctx);
+        if (bo) { nypy::FmtVal f = nypy::FmtVal::of_str(bo->s); f.type_name = bo->mut ? "bytearray" : "bytes"; return f; }
+        if (conv == 'b' || isInstanceVal(v)) {
+            // the prelude's conversions: __bytes__ / a buffer for %b and %s,
+            // __index__ / __int__ / __float__ for the numbers, CPython's errors
+            std::vector<Value> a{v, makeStringValue(std::string(1, conv))};
+            Value r = callFunctionValue(global_ctx->getByName("_ny_pct_arg"), a, ctx ? ctx : global_ctx);
+            if (nyheap::Bytes* rb = bytesOf(r)) {
+                nypy::FmtVal f = nypy::FmtVal::of_str(rb->s);
+                f.type_name = rb->mut ? "bytearray" : "bytes";
+                return f;
+            }
+            return toFmtVal(r, 0, ctx);
+        }
+        return toFmtVal(v, 0, ctx);
+    }
+    Value bytesPercent(nyheap::Bytes* lb, const Value& rv_in, Context* ctx) {
+        Value rv = rv_in, pv;
+        if (any_payload_ && payloadOf(rv_in, pv) && contOf(pv)) rv = pv;   // a tuple / dict subclass's value
+        std::vector<Value> args;
+        bool mapping = false;
+        Container* rc = contOf(rv);
+        if (rc && seqLen(rc) >= 0 && isTupleCont(rc)) args = seqItems(rc);
+        else {
+            args.push_back(rv);
+            mapping = (rc && !nygen::is_gen(rv)) || (isInstanceVal(rv) && instanceHasMethod(rv, "__getitem__"));
+        }
+        std::string fmt = lb->s;
+        std::string out = nyCall([&] {
+            return nypy::bytes_percent_format(fmt, (int64_t)args.size(), mapping,
+                [&](int64_t i, const std::string& key, char conv) -> nypy::FmtVal {
+                    if (i < 0) {
+                        Value k = makeBytesValue(key, false);
+                        return pctBytesArg(getItem(rv, k, ctx), conv, ctx);
+                    }
+                    return pctBytesArg(args[(size_t)i], conv, ctx);
+                });
+        });
+        return makeBytesValue(std::move(out), lb->mut);
     }
 
     // `pend` (round 82): the evaluator asking checks the pending flag right
@@ -5883,7 +5953,7 @@ public:   // NythonExecutor is a struct: members default to public
         ba.reserve(args.size());
         for (auto& a : args) ba.push_back(toBArg(a, ctx));
         nypy::BRes r;
-        if (nyCall([&] { return nypy::bytes_method(bo->s, bo->mut, m, ba, r); })) return fromBRes(r);
+        if (nyCall([&] { return nypy::bytes_method(bo->s, bo->mut, m, ba, r, bo->exports); })) return fromBRes(r);   // round 84: exports
         Value pm;
         if (primitiveMember(obj, m, args, ctx, pm)) return pm;
         pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + m + "'");
@@ -14445,6 +14515,7 @@ public:
                 int64_t n = (int64_t)bo->s.size(), i = k.k == 1 ? k.i : INT64_MAX;
                 if (i < 0) i += n;
                 if (i < 0 || i >= n) pyRaise("IndexError", "bytearray index out of range");
+                nyCall([&] { nypy::ba_resize_check(bo->exports, 1, 0); return 0; });   // round 84: exported
                 bo->s.erase((size_t)i, 1);
                 return NONE_VALUE;
             }
@@ -14503,7 +14574,7 @@ public:
                 for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
                 std::string kept;
                 for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) kept += bo->s[(size_t)k];
-                bo->s = std::move(kept);
+                nyCall([&] { nypy::ba_assign(bo->s, std::move(kept), bo->exports); return 0; });   // round 84: exported
             }
             return;
         }

@@ -148,11 +148,10 @@ def _chain(filters):
 
 
 def _bytes_like(data):
+    # any bytes-like object (round 84: memoryview, array, mmap ...)
     if isinstance(data, bytes):
         return data
-    if isinstance(data, bytearray):
-        return bytes(data)
-    raise TypeError("a bytes-like object is required, not '" + type(data).__name__ + "'")
+    return bytes(_ny_bytes_like(data))
 
 
 class LZMACompressor:
@@ -511,10 +510,9 @@ class LZMAFile(_compression.BaseStream):
         if isinstance(data, (bytes, bytearray)):
             length = len(data)
         else:
-            # accept any data that supports the buffer protocol (here:
-            # anything bytes() takes - Nython has no memoryview)
-            data = bytes(data)
-            length = len(data)
+            # accept any data that supports the buffer protocol
+            data = memoryview(data)
+            length = data.nbytes
 
         compressed = self._compressor.compress(data)
         self._fp.write(compressed)

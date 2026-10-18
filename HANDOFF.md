@@ -3,8 +3,9 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 84, part 0 — **§0w** (the semantic gaps rounds 82-83 found: module attribute messages, BaseException's members and builtins' docstrings as values, a finally body seeing its exception, strict and starred comprehension targets, sys.audit, True/None spelled by the program's language)
+Last updated: round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
 Round 84, ctypes and Windows — **§0w1** (ctypes structures passed and returned by value on every ABI without libffi - SysV eightbyte classification, AAPCS64, Win64, i686; Windows callback trampolines per float mask and stdcall; the Windows gaps round 83 left: zipapp path-hook recursion, liblzma's header errors, faulthandler's SIGSEGV, mmap's messages, AF_UNIX)
+Round 84, part 0 — **§0w** (the semantic gaps rounds 82-83 found: module attribute messages, BaseException's members and builtins' docstrings as values, a finally body seeing its exception, strict and starred comprehension targets, sys.audit, True/None spelled by the program's language)
 Round 83, ctypes — **§0v4** (ctypes over libffi loaded at run time, or Nython's own caller built on the calling conventions' register files; type's own members; a metaclass's operators on its classes)
 Round 83, part B — **§0v** (Python's system and command-line modules: errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched, cmath, colorsys, readline, rlcompleter, site, sysconfig, webbrowser, zipimport, zipapp, encodings, stringprep, bz2, lzma; module.__dict__ and hashable modules on both engines; VM comprehension results freed; vm_audit109).
 Round 83, part C — **§0v3** (sqlite3 over libsqlite3 loaded at run time, its callbacks run by suspending a coroutine; dbm/shelve; the email package and the mail modules; smtplib/poplib/imaplib/ftplib/telnetlib/xmlrpc/wsgiref/cgi/netrc; plistlib; audioop and the audio-file modules; vm_audit110).
@@ -91,6 +92,212 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0x. Round 84, part A — memoryview and the buffer protocol, bytes % args (vm_audit112)
+
+`examples/vm_audit112.ny` (135 checks) passes on both engines and under
+python3.12 (132 under python3.11: the PEP 688 checks need 3.12; where
+3.12 changed an answer - ctypes structure formats with their padding, `len()`
+of a 0-dim view, the half-float format - both are carried, Nython giving
+3.12's). Every expected value is CPython's. Sweep 451 runs, 0 not ok in a copy of the tree outside the main checkout (in this worktree vm_audit110 on the VM fails on a main-checkout file, see "Found, not fixed"); tools/ide_e2e.py 463 passed, 0 failed; ide_lint, the class check and the cbp check clean.
+
+### The model (CPython's memoryobject.c)
+- **A buffer is native memory**: the address of its first item, a format
+  and item size, a shape and strides in bytes. A view's state is plain
+  fields (`_ny_a` address, `_ny_f` format, `_ny_i` itemsize, `_ny_sh`/`_ny_st`
+  shape and strides, `_ny_ro`, `_ny_fl` contiguity, `_ny_x` exports, `_ny_mb`
+  its managed buffer); items are read and written at their addresses by
+  `src/builtins/nybuffer.cpp`'s `_mv_*` natives (served by the concurrency
+  runtime's dispatcher, `nyconc::register_extension`, so both engines run
+  them natively, no bridge): `_mv_fmt`, `_mv_get`/`_mv_set` (every native
+  format, `@` optional, and the struct byte orders for comparisons; half
+  floats by CPython's `PyFloat_Pack2`/`Unpack2`), `_mv_read`/`_mv_write`/
+  `_mv_move`, `_mv_tolist`, `_mv_tobytes` (C or Fortran order), `_mv_store`
+  (C-ordered bytes into a strided layout), `_mv_cmp` (== item by item,
+  format-aware).
+- **Loaded on first need.** The class `memoryview` is in the startup prelude
+  (NyPrelude.hpp: its `__new__`, `_ny_is_exporter`, and stubs of the helpers
+  below); its members, the managed buffers and the helpers are the mirror
+  chunk `"buffer"` - `src/NyPreludeBuffer.cpp`, a unit of its own
+  (`builtin_mirror_chunk("buffer")` returns `prelude_buffer_source()`, so
+  editing it rebuilds one file, not every file that includes NyPrelude.hpp).
+  The first view, or the first bytes-like argument that is not
+  bytes/bytearray, loads it through the new native `_ny_load_chunk(name)`
+  (interpreter `ensureMirror`, VM `load_mirror`); the chunk defines its
+  members on `_NyMemoryview` and puts them on `memoryview` (`_ny_mv_attach`,
+  `__qualname__` `memoryview.x`). Parsed at every start it cost 6 ms of CPU
+  (18%: `-c pass` 33.5 -> 39.6 ms on the interpreter, 38.8 -> 45.5 on the
+  VM); now a start costs what it did before the round (side by side with the base binary on the same loaded machine: 39.0 vs 39.0 ms on the interpreter, 47.7 vs 47.8 on the VM), and the first view pays about 5 ms once. A stub calls the real function by its name, which the
+  chunk rebinds in the prelude's scope (interpreter) / the VM's globals.
+  **A new helper a library calls must be stubbed the same way** if a program
+  can reach it before a view exists.
+- **A `_NyMBuf` is CPython's managed buffer**: one export of an object,
+  shared by every view made from it (slices, casts, `memoryview(m)`,
+  `toreadonly()`); `views` counts the registered views. The export is given
+  back when the last view is released (`release()`, a `with` block) or when
+  the managed buffer is collected (`__del__`): CPython's rule that a slice
+  keeps the export after its parent is released, and that a dropped view
+  gives it back.
+- **Exporters**: bytes and bytearray through the engines' new natives
+  `_ny_buf_export(obj)` -> `[address, length, readonly, owner]`,
+  `_ny_buf_unexport`, `_ny_buf_exports`, `_ny_buf_addr` (interpreter
+  `src/builtins/core.cpp`, VM `globals_[...]`); everything else through
+  `__buffer__(flags)` (PEP 688): array.array, mmap, ctypes data,
+  multiprocessing.shared_memory, pickle.PickleBuffer, memoryview itself (its
+  exports counted: `release()` refused while one lives, "memoryview has 1
+  exported buffer") and any class of a program; `__release_buffer__(view)`
+  is called when that export is given back. Nython's own exporters build
+  their views with `_ny_memview_raw(obj, address, nbytes, readonly, fmt,
+  itemsize, shape, strides, release, owner)`.
+- **A bytearray's storage does not move while exported**: the export count
+  lives in `nyheap::Bytes::exports` (interpreter) and in the shared
+  element's `i` of a VM bytearray (`VMVal::ba_exports()`); every operation
+  that would change the size raises CPython's `BufferError: Existing exports
+  of data: object cannot be re-sized` (append, extend, insert, pop, remove,
+  clear, `+=`, `*=`, `del`, slice assignment of another length - after
+  their own argument errors, as CPython's), and a change of the same size
+  is written in place, never by swapping the string's buffer
+  (`nypy::ba_assign`, `ba_resize_check` in NyBytes.hpp; the builtin bridge's
+  copy-back too). VM bytes are values: a view of them holds a bytearray copy
+  made once at export (the interpreter's views of bytes are zero-copy).
+
+### memoryview
+Everything CPython 3.12 has: `tobytes(order)`, `tolist` (N-dim nested),
+`hex(sep, bytes_per_sep)`, `toreadonly`, `release` and the context manager,
+`cast(format, shape)` with CPython's rules and messages (C-contiguous only,
+one side a byte format, the product of the shape, 1D <-> ND, zeros in the
+shape), `obj`, `nbytes`, `readonly`, `itemsize`, `format`, `ndim`, `shape`,
+`strides`, `suboffsets`, `c_contiguous`/`f_contiguous`/`contiguous`;
+indexing in every native format (`bBhHiIlLqQnNfdeP?c`), `m[i, j, k]`,
+first-dimension slicing with steps (a view of a view keeps the base),
+slice assignment of the same structure (overlap-safe), item assignment with
+CPython's range checks and messages, `==` by value (format-aware, struct's
+unpacking for other formats, NaN unequal to itself), `hash` (read-only byte
+formats only, cached), `len`, iteration, `bytes(m)`, `bytearray(m)`,
+`list(m)`, `<memory at 0x...>` / `<released memory at 0x...>`, pickling
+refused, read-only attributes, `__buffer__`/`__release_buffer__`,
+CPython's argument messages; `collections.abc.Sequence` and `Buffer`
+include it.
+
+### Everything that takes a bytes-like object takes a buffer
+- **Engines** (both): a bytes-like argument that is an exporter becomes its
+  bytes through the prelude's `_ny_buffer_bytes` (interpreter `bufferBytes`
+  in `toBArg`, VM `buffer_bytes` in `to_barg`): `bytes()`/`bytearray()`,
+  every bytes method's arguments (`join`'s items, `find`, `startswith`,
+  `replace`, `split` ...), `in`, `bytes + buffer`, `bytearray += buffer`,
+  slice assignment, `int.from_bytes`.
+- **Libraries**: struct (`pack_into`/`unpack_from`/`iter_unpack` into and
+  from any buffer, written in place), zlib, bz2, lzma, gzip, binascii,
+  base64, hashlib, hmac, io (`BytesIO.getbuffer()` a live view - write,
+  writelines, truncate and close raise BufferError while it is exported;
+  `readinto` into any writable buffer, filled in place; `write` of any
+  buffer), files (`write` of any buffer; `readinto`/`readinto1` read
+  straight into the buffer's memory - the new native `file_readinto(h,
+  address, n)`, no bytes object in between), sockets (`send`/`sendall`/
+  `sendto` of buffers, `recv_into` straight into the buffer's memory -
+  `_net_recv_into`, no bytes object in between -, `recvfrom_into`, new), os
+  (`write` of buffers; new `readv`, `writev`, `pread`, `pwrite`, `preadv`,
+  `pwritev` - POSIX only, as CPython's; natives `pread`/`pwrite` in
+  `src/builtins/os_fd.cpp`), mmap (slices, `write`, `find` take buffers;
+  `__buffer__` - the mapped memory itself, read-only for ACCESS_READ; close
+  and resize raise BufferError while exported, CPython's messages;
+  `_mmap_addr`), array.array (now native C values in a bytearray, read and
+  written in place - `buffer_info()` is the real address; `__buffer__` with
+  the typecode as format, "w" for "u" as 3.12; "cannot resize an array that
+  is exporting buffers"), ctypes (`__buffer__` with CPython 3.12's PEP 3118
+  formats: `<i`, `<q` for an 8-byte long, `&<i`, `(3)<i` for array fields,
+  `T{<i:x:4x<d:y:}` with the padding, `B` for unions; `from_buffer` of any
+  writable buffer - bytearray, mmap, array, memoryview - sharing the memory
+  and keeping the export in `_objects`; `from_buffer_copy` of any
+  bytes-like object), multiprocessing.shared_memory (`buf` a memoryview of
+  the block; `shm_addr`; close refused while it is exported), pickle.
+  PickleBuffer (a view; `raw()` a flat memoryview; READONLY_BUFFER gives a
+  read-only view, as CPython's), sqlite3 (`Binary = memoryview`; Blob
+  writes take buffers), wave/aifc/sunau (`memoryview(data).cast('B')`,
+  CPython's code), `_compression`, pathlib's `write_bytes`, subprocess's
+  input. The round-83 workarounds are gone.
+
+### bytes % args (PEP 461)
+`nypy::bytes_percent_format` (NyBytes.hpp, the number formatting shared with
+str's `%` in NyFormat.hpp), both engines (`bytesPercent` / `bytes_percent`):
+`%b`/`%s` (bytes, bytearray, `__bytes__`, any buffer), `%a`/`%r` (ascii()),
+`%c` (an int in range(256) or one byte), the numeric codes with every flag,
+width and precision, `*` widths, `%(key)s` with bytes keys from a mapping
+(a dict, or anything with `__getitem__`), bytearray % args giving a
+bytearray, and CPython's errors ("%b requires a bytes-like object, or an
+object that implements __bytes__, not 'str'", "%x format: an integer is
+required, not float", "float argument required, not str", "%c arg not in
+range(256)", "not all arguments converted during bytes formatting" ...).
+An object's conversions go through the prelude's `_ny_pct_arg` (`%d`:
+`__int__` then `__index__`; `%x`/`%o`/`%c`: `__index__`; `%f`: `__float__`
+then `__index__`), so they do not depend on the engines' `int()`/`float()`.
+
+### Engine changes (all marked "round 84")
+- NyBytes.hpp: `ba_resize_check`, `ba_assign`, `ba_resizing_method`,
+  `bytes_method(..., exports)` (a resizing method on an exported bytearray
+  runs on a copy, then `ba_assign`), `bytes_pad`, `bytes_percent_format`.
+  NyHeap.hpp: `Bytes::exports`. NyExcTypes.hpp: `BufferError` (both tables).
+  NyRuntime.hpp: `memoryview` is a prelude builtin class.
+- Interpreter (NythonExecutor.hpp): `bufferBytes`; `toBArg` takes any
+  exporter; `bytesBinary` `+` with a buffer and `%` (`bytesPercent`,
+  `pctBytesArg`); `+=`/`*=`, slice assignment, `del` of items and slices
+  checked against exports and written in place; `ensureMirror("buffer")`
+  needs no mirror base; natives registered: `_ny_buf_*`, `_ny_load_chunk`,
+  `file_readinto` (core.cpp / io.cpp).
+- VM (VirtualMachine.hpp): `VMVal::ba_exports`; `buffer_bytes`, `to_barg`,
+  `bytes_binop` `+`/`%` (`bytes_percent`, `pct_bytes_arg`),
+  `binop_inplace`, `DELETE_SUBSCR`, slice stores and `call_bytes_method`
+  checked against exports; `load_mirror("buffer")` needs no base; natives
+  `_ny_buf_export/_unexport/_exports/_addr`, `_ny_load_chunk`.
+- main.cpp: the builtin bridge's copy-back of a bytearray writes an exported
+  one in place (same size) or raises BufferError.
+- Natives: `src/builtins/nybuffer.cpp` (new), `_mmap_addr` (nymmap.cpp),
+  `pread`/`pwrite`/`shm_addr` (os_fd.cpp), `_net_recv_into` (net.cpp),
+  `file_readinto` (io.cpp).
+
+### Not done
+- Reading memoryview's members from the class before any view exists
+  (`memoryview.cast`, `dir(memoryview)`, `hasattr(memoryview, "tobytes")`)
+  finds only the stub: the chunk is loaded by the first view or the first
+  non-bytes buffer argument (`_ny_load_chunk("buffer")` loads it by hand).
+- `memoryview(o).obj` for a class with `__buffer__` is `o` itself (CPython
+  3.12: an internal `_buffer_wrapper` around it); bytes and bytearray have
+  no `__buffer__` attribute of their own (CPython 3.12 has them; the engines
+  export them natively, and `collections.abc.Buffer` counts them).
+- `inspect.BufferFlags` (3.12) is not there: it is an `enum.IntFlag`, and
+  importing enum would cost inspect's every import 25-45 ms; a module
+  `__getattr__` (PEP 562) would make it on first read, but neither engine
+  calls one (below).
+- `class M(memoryview)` is accepted (CPython: "type 'memoryview' is not an
+  acceptable base type").
+- `suboffsets` (PIL-style indirect buffers) are always `()`: no exporter
+  makes them. Formats beyond one native item (`"2i"`, struct strings other
+  than ctypes' own `T{...}`) can be made by a `__buffer__` but not indexed
+  ("memoryview: format ... not supported", as CPython's).
+- VM views of a bytes value read a copy made at export (VM bytes are
+  values); a bytearray's are zero-copy on both engines.
+- The ctypes formats are 3.12's (`<q` for long, padding in `T{}`); 3.11's
+  differ and are not given.
+
+### Found, not fixed (engine gaps outside this round's scope)
+- `int(x)` ignores `__index__` (CPython 3.8+ falls back to it after
+  `__int__`); `float(2**1100)` gives `inf` (CPython: OverflowError "int too
+  large to convert to float") - `_ny_pct_arg` and `_ny_mv_pack` do their
+  own conversions to stay correct.
+- `"s" + memoryview(b"x")` concatenates the repr (str's `+` is lenient
+  with a non-str right operand; CPython: TypeError).
+- `b"abc".partition(memoryview(b"b"))` returns the separator as bytes
+  (CPython returns the separator object as given).
+- A module's `__getattr__` (PEP 562) is never called, on either engine:
+  `mod.missing` raises AttributeError at once (lib/sqlite3's deprecated
+  names rely on one).
+- The VM's module search climbs four directories above the script's
+  (`VirtualMachine::module_dirs`, the interpreter climbs from the importing
+  file's): run from a worktree under `/home/user/Nython-Good/.claude/
+  worktrees/`, `examples/x.ny` reaches `/home/user/Nython-Good/lib/`, so a
+  module this tree lacks is taken from the main checkout - vm_audit110 on
+  the VM imported its `lib/ast.ny` (dbm.dumb's optional `import ast`) and
+  failed on `_ny_ast`. The same tree copied elsewhere passes.
 
 ## 0w. Round 84 (main session) — the semantic gaps rounds 82-83 found (vm_audit116)
 
@@ -511,7 +718,7 @@ in UTF-8 mode) were added to lib/io.ny for site.
   `vars()`/`__dict__`: `exec(code, vars(m))` fills a copy. zipimport makes
   a `types.ModuleType`, which is.
 - No memoryview, so mmap has no buffer protocol (`bytes(m)` copies;
-  `readinto(m)` cannot write into it); no `sys.audit` (pty and webbrowser
+  `readinto(m)` cannot write into it) - **done in round 84, §0x**; no `sys.audit` (pty and webbrowser
   skip their audit events).
 - encodings: no CJK codecs (big5, gb2312/gbk/gb18030, shift_jis, euc_jp/kr,
   iso2022_*, hz, johab, cp932/949/950), utf_7, mbcs/oem.
@@ -3210,7 +3417,8 @@ and reads what Nython wrote.
 - `dataclass(slots=True)` sets `__slots__` without rebuilding the class.
 - pickle memoizes str/bytes by value (valid, different only for equal
   strings built at run time); sets are written in insertion order; no
-  `pickletools`; no memoryview (`PickleBuffer` wraps bytes/bytearray).
+  `pickletools`; no memoryview (`PickleBuffer` wraps bytes/bytearray) -
+  **done in round 84, §0x** (a PickleBuffer holds a view).
 - zipfile: no bzip2/lzma (RuntimeError as CPython without them), no writing
   of encrypted members, AES, multi-disk; tarfile: no bz2/xz, no chown,
   device/FIFO members not created.

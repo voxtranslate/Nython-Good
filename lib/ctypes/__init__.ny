@@ -19,7 +19,7 @@
 # arrays (T * n, cached), pointers (POINTER, pointer, contents, indexing,
 # slicing, cast); byref, addressof, sizeof, alignment, resize,
 # create_string_buffer, create_unicode_buffer, string_at, wstring_at,
-# memmove, memset; from_buffer (of ctypes objects), from_buffer_copy,
+# memmove, memset; from_buffer (any writable buffer), from_buffer_copy,
 # from_address, in_dll; bytes(obj); CDLL/PyDLL (WinDLL/OleDLL on Windows),
 # cdll/pydll loaders, LibraryLoader, attribute and ordinal lookup;
 # function pointers with restype/argtypes/errcheck, from_param, the
@@ -32,10 +32,13 @@
 # without it a built-in caller handles scalar arguments and results on
 # x86-64, AArch64 (Linux) and 32/64-bit Windows - _ffi_backend() says which.
 #
+# The buffer protocol (round 84): memoryview(obj) is a view of the object's
+# memory with CPython 3.12's PEP 3118 format; from_buffer takes any writable
+# buffer (bytearray, mmap, array.array, memoryview, ctypes objects) and
+# shares its memory, from_buffer_copy any bytes-like object.
+#
 # Not provided, honestly: ctypes.pythonapi as CPython's C API (Nython has
-# none - it is the process's own symbols); from_buffer of a bytearray (its
-# storage is not fixed native memory: use from_buffer_copy, or a
-# create_string_buffer); memoryview of a ctypes object; paramflags
+# none - it is the process's own symbols); paramflags
 # (output parameters of prototypes); callbacks returning structures, or
 # called on threads Nython did not start; COM (OleDLL's HRESULT check is
 # done, COM interfaces are not); pickling of ctypes instances.
@@ -157,6 +160,9 @@ class _CData:
             root = root._b_base_
         if root._objects is None:
             object.__setattr__(root, "_objects", {})
+        elif not isinstance(root._objects, dict):
+            # (round 84) from_buffer's memoryview, kept with the rest
+            object.__setattr__(root, "_objects", {"-1": root._objects})
         root._objects[str(id(self)) + ":" + str(key)] = obj
 
     def __del__(self):
@@ -165,8 +171,17 @@ class _CData:
             object.__setattr__(self, "_b_needsfree_", False)
             _ffi_free(a)
 
-    def __bytes__(self):
-        return _ffi_read(self._b_addr, type(self)._size_)
+    # the buffer protocol (PEP 3118, PEP 688; round 84): the object's own
+    # memory, writable, with the format CPython's ctypes gives (PEP 3118
+    # strings: "<i", "T{<i:x:4x<d:y:}", "&<i"), arrays shaped by their
+    # lengths, the innermost element's size as itemsize
+    def __buffer__(self, flags):
+        var t = type(self)
+        var info = _pep3118(t)
+        return _ny_memview_raw(self, self._b_addr, t._size_, False, info[0], info[1], info[2])
+
+    def __release_buffer__(self, view):
+        view.release()
 
     def __reduce__(self):
         raise ValueError("ctypes objects containing pointers cannot be pickled")
@@ -182,21 +197,35 @@ class _CData:
 
     @classmethod
     def from_buffer(cls, source, offset=0):
-        if not isinstance(source, _CData):
-            raise TypeError("from_buffer() needs a ctypes object here (a bytearray's storage is not "
-                            "fixed native memory in Nython: use from_buffer_copy)")
+        # (round 84) any writable buffer - a bytearray, an mmap, an array, a
+        # ctypes object, a memoryview: the object is a view of that memory,
+        # keeping the export alive (the bytearray cannot be resized while it
+        # lives), as CPython's
+        var mv = memoryview(source)
+        if mv.readonly:
+            mv.release()
+            raise TypeError("underlying buffer is not writable")
+        if not mv.c_contiguous:
+            mv.release()
+            raise TypeError("underlying buffer is not C contiguous")
         if offset < 0:
+            mv.release()
             raise ValueError("offset cannot be negative")
-        if type(source)._size_ < offset + cls._size_:
-            raise ValueError("Buffer size too small (" + str(type(source)._size_) + " instead of at least " +
+        if cls._size_ > mv.nbytes - offset:
+            var n = mv.nbytes
+            mv.release()
+            raise ValueError("Buffer size too small (" + str(n) + " instead of at least " +
                              str(offset + cls._size_) + " bytes)")
+        if hasattr(_sys, "audit"):
+            _sys.audit("ctypes.cdata/buffer", mv._ny_a, mv.nbytes, offset)
         var o = cls.__new__(cls)
-        o._ny_view(source._b_addr + offset, source)
+        o._ny_view(mv._ny_a + offset, None)
+        object.__setattr__(o, "_objects", mv)
         return o
 
     @classmethod
     def from_buffer_copy(cls, source, offset=0):
-        var data = bytes(source)
+        var data = _ny_bytes_like(source)
         if offset < 0:
             raise ValueError("offset cannot be negative")
         if len(data) < offset + cls._size_:
@@ -213,6 +242,67 @@ class _CData:
         if a is None:
             raise ValueError("symbol '" + name + "' not found")
         return cls.from_address(a)
+
+# PEP 3118 formats (round 84), as CPython 3.12's ctypes makes them: a simple
+# type's code with its byte order ("<i"; int and long by size: "<q" for an
+# 8-byte long), a pointer "&" and its target's, a structure "T{...}" of its
+# fields ("<fmt>:<name>:", arrays "(n)", padding "Nx" - trailing padding too),
+# a union "B".
+def _simple_fmt(code, big):
+    var pep = code
+    if code == "l":
+        pep = "q" if _SIZES["l"] == 8 else "l"
+    elif code == "L":
+        pep = "Q" if _SIZES["L"] == 8 else "L"
+    elif code == "i":
+        pep = {2: "h", 4: "i", 8: "q"}.get(_SIZES["i"], "i")
+    elif code == "I":
+        pep = {2: "H", 4: "I", 8: "Q"}.get(_SIZES["I"], "I")
+    return (">" if big else "<") + pep
+
+def _fmt_of(t, big=None):
+    if big is None:
+        big = _BIG
+    if issubclass(t, Array):
+        var dims = []
+        var e = t
+        while issubclass(e, Array):
+            dims.append(str(e._length_))
+            e = e._type_
+        return "(" + ",".join(dims) + ")" + _fmt_of(e, big)
+    if issubclass(t, _Pointer):
+        return "&" + (_fmt_of(t._type_, big) if isinstance(t._type_, type) else "B")
+    if issubclass(t, _SimpleCData):
+        return _simple_fmt(t._type_, big)
+    if issubclass(t, Union):
+        return "B"
+    if issubclass(t, Structure):
+        var sw = getattr(t, "_ny_swapped_", False)
+        var fbig = (not _BIG) if sw else _BIG
+        var out = "T{"
+        var end = 0
+        for f in getattr(t, "_ny_fields_all_", []):
+            var pad = f.offset - end
+            if pad > 0:
+                out = out + ("x" if pad == 1 else str(pad) + "x")
+            out = out + _fmt_of(f.type, fbig) + ":" + f.name + ":"
+            end = max(end, f.offset + f.type._size_)
+        var tail = t._size_ - end
+        if tail > 0:
+            out = out + ("x" if tail == 1 else str(tail) + "x")
+        return out + "}"
+    return "B"
+
+def _pep3118(t):
+    # (format, itemsize, shape) of a type's buffer
+    if issubclass(t, Array):
+        var shape = []
+        var e = t
+        while issubclass(e, Array):
+            shape.append(e._length_)
+            e = e._type_
+        return (_fmt_of(e), e._size_, tuple(shape))
+    return (_fmt_of(t), t._size_, ())
 
 # A Python value of type `typ` read at `addr`: simple types give their value
 # (subclasses of them an instance), others a view owned by `base`.

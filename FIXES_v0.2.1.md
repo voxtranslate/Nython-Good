@@ -5845,6 +5845,19 @@ Full detail in `HANDOFF.md` §0w. New test: `vm_audit116` (34 checks; both engin
 | No `sys.audit` / `sys.addaudithook` | - | PEP 578 hooks; exec/compile/import/open/builtins.input events |
 | VM: a comprehension's targets (`__cN_x`) stayed bound - the last item alive, class attributes in a class body | kept for lambdas made in the element | deleted unless the comprehension made a function or class |
 | `print(True)` printed `true` in a `.py` program | one spelling for every program | Python's spelling for Python source (`nypy::python_spelling`) |
+## Round 84, part A — memoryview and the buffer protocol, bytes % args
+
+Full detail in `HANDOFF.md` §0x. New test: `vm_audit112` (135 checks; both engines; python3.12, 132 under 3.11 which has no PEP 688).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `memoryview` did not exist (both engines); libraries worked around it with copies | - | CPython's memoryobject.c in Nython over native memory (`_mv_*` natives, `src/builtins/nybuffer.cpp`): casts, N-dim shapes and strides, every native format, slicing and slice assignment, ==/hash, release/`with`, CPython's messages; loaded on first use (the prelude chunk `"buffer"`) |
+| No buffer protocol: array, mmap, ctypes, shared memory, PickleBuffer and a program's classes could not be viewed | - | `__buffer__` / `__release_buffer__` (PEP 688); bytes/bytearray export natively |
+| An exported bytearray could be resized under its views | no export count | `BufferError: Existing exports of data: object cannot be re-sized` (both engines; array, mmap, BytesIO.getbuffer, SharedMemory alike); same-size writes go in place |
+| struct/zlib/hashlib/io/sockets/os ... refused a memoryview or array | bytes-like meant bytes/bytearray | every bytes-like argument takes a buffer; `readinto`/`recv_into` write into the buffer's memory |
+| `b"%d" % 5` raised TypeError (both engines) | no PEP 461 | `bytes % args` / `bytearray % args` with CPython's conversions and errors |
+| array.array stored Nython values | - | native C values in a bytearray (its buffer) |
+
 ## Round 84 — ctypes structures by value everywhere, and the Windows gaps round 83 left
 
 Full detail in `HANDOFF.md` §0w1. `vm_audit111` has 55 checks (both engines; python3; under Wine 64-bit without libffi).

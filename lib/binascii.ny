@@ -24,14 +24,8 @@ class Incomplete(Exception):
 
 
 def _bin(data):
-    if isinstance(data, bytes) or isinstance(data, bytearray):
-        return data
-    if isinstance(data, str):
-        raise TypeError("a bytes-like object is required, not 'str'")
-    var tb = getattr(data, "tobytes", none)
-    if tb is not none:
-        return tb()
-    raise TypeError("a bytes-like object is required, not '" + type(data).__name__ + "'")
+    # any bytes-like object (round 84: memoryview, array, mmap ...)
+    return _ny_bytes_like(data)
 
 
 # a2b_* input: bytes, or a str of ASCII characters
@@ -43,9 +37,8 @@ def _ascii(data):
         return data.encode("ascii")
     if isinstance(data, bytes) or isinstance(data, bytearray):
         return data
-    var tb = getattr(data, "tobytes", none)
-    if tb is not none:
-        return tb()
+    if _ny_is_exporter(data):
+        return _ny_bytes_like(data)
     raise TypeError("argument should be bytes, buffer or ASCII string, not '" + type(data).__name__ + "'")
 
 

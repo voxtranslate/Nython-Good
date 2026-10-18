@@ -525,7 +525,8 @@ inline bool is_builtin_type_name(const std::string& n) {
 inline bool is_prelude_builtin_class(const std::string& n) {
     return n == "property" || n == "staticmethod" || n == "classmethod" || n == "ellipsis"
         // round 78: the dict views and mappingproxy are the prelude's too
-        || n == "dict_keys" || n == "dict_values" || n == "dict_items" || n == "mappingproxy";
+        || n == "dict_keys" || n == "dict_values" || n == "dict_items" || n == "mappingproxy"
+        || n == "memoryview";   // round 84
 }
 // round 84: a builtin class of Python's that Nython defines as a class
 // (object, the exceptions, range, property ... - the prelude's): its
