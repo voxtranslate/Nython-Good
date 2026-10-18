@@ -588,6 +588,7 @@ check("sys.__breakpointhook__ is the original", sys.__breakpointhook__ is old_ho
 
 # ── 8. bdb ───────────────────────────────────────────────────────────────────
 import bdb
+import gc
 import pdb
 
 def dbg_target(n):   # @dbg_target
@@ -700,6 +701,10 @@ def _norm(text):
 
 def run_pdb(cmds, func, *args):
     bdb.Breakpoint.clearBreakpoints()
+    # (round 83) earlier sections' garbage collected now, not inside the
+    # traced call: a cycle collection there runs weakref callbacks (asyncio's
+    # WeakSets), which the debugger steps into - in CPython too
+    gc.collect()
     out = io.StringIO()
     p = pdb.Pdb(stdin=io.StringIO("\n".join(cmds) + "\n"), stdout=out, readrc=False)
     r = p.runcall(func, *args)
