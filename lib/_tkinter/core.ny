@@ -644,7 +644,7 @@ class App:
         except TclError:
             self.destroy_window(w)
             raise
-        if w.IS_TOPLEVEL:
+        if w.IS_TOPLEVEL and not getattr(w, "IS_MENU", False):
             self.toplevels.append(w)
         self.relayout()
         return path
