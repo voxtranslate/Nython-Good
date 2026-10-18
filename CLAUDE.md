@@ -1691,9 +1691,9 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   a name before a local binding of it ("1": files outside the library).
 - Not done: CPython's "cannot access free variable" message (a closure read
   of an enclosing local not yet bound falls back to the module's name or a
-  NameError); `exec("global x ...")` from a Python-language function binds
-  the module's x through the snippet's scope chain as CPython does, but a
-  name exec'd code binds is not visible to a later `locals()` there.
+  NameError); what exec'd code binds in a function is not in a later
+  `locals()` there (3.13's PEP 667 behaviour, not 3.12's). See `HANDOFF.md`
+  §0yF.
 
 ## Transcripts
 

@@ -97,6 +97,97 @@ collisions.
 
 ---
 
+## 0yF. Round 85, part F — Python's binding rule for Python-language source (vm_audit119)
+
+**The rule.** Nython's ruling (round 75) stays for `.ny` code: inside a
+function a plain assignment rebinds the nearest existing binding.
+Python-language source binds as CPython does: a name a function binds
+anywhere (assignment, augmented assignment, for/with/except-as targets,
+`del`, import, def/class, a walrus - in a comprehension it binds in the
+function around it -, match captures) is a local of the whole function
+unless declared global/nonlocal, and reading it unbound is
+UnboundLocalError ("cannot access local variable 'x' where it is not
+associated with a value"). Python-language source is: a `.py` file; a file
+whose leading comment block says `# nython: python`; code compile() /
+exec() / eval() compile when called from such a file (compile() records
+the rule in the code object, `_NyCode._ny_pyrule`; code *named* after a
+source file - `compile(src, "prog.ny", "exec")`, as runpy/pdb/cProfile/
+importlib run a program - is that file's language: `nython::scope::
+code_rule`); and ast trees (lib/ast.ny's `_ny_compile` is Python-language).
+A Nython function opts in with `# nython: python` on its def line (its
+nested functions too) - the per-function hybrid.
+
+**One implementation, in the static pass** (`src/NyScope.cpp`, run by
+`Parser::parse`, which now passes the file name and source): for a
+function under Python's rule, the set of names it binds minus its
+global/nonlocal names (`py_locals`) is its locals; every read, assignment
+target and del target of one is marked `VariableNode::py_bind = 1`
+(`include/ASTNodes.hpp`). The engines only follow the marks:
+- interpreter: `evalVariable` -> `readPyLocal` (the function's own scope,
+  the node's NameCache slot at depth 0; UnboundLocalError), `assignName`
+  (defineByName in the scope), `evalDelete` (own scope only);
+- VM: `LOAD_LOCAL` / `DELETE_LOCAL` (new generic ops after FIN_EXC_OF; the
+  frame's own env then locals; not quickened), stores as `DEFINE_NAME`;
+  lib/dis.ny and lib/opcode.ny know the two ops (`haslocal`).
+`self`/`this` are never marked (STORE_SELF/LOAD_SELF stay).
+
+**exec in a Python-language function without namespaces** (CPython: it
+cannot create or change the function's locals): the snippet is parsed
+with `RuleScope(python, top_locals)` and its top-level writes are marked
+`py_bind = 2`; the interpreter runs it in a child scope of the function's
+(reads see the locals, writes are dropped with it), the VM skips the
+write-back of `run_code_with_locals`. `global x` inside it reaches the
+module. (As 3.13's PEP 667: `locals()` afterwards does not show them.)
+
+**Census** (`python3 tools/ny_scopecheck.py`, over `nython --scope-report
+files...`, a hidden flag whose lines are NyScope's `differences()`): every
+function assignment / augmentation / del of a name an enclosing function
+or the module binds with no declaration (and every read before a local
+binding), classified (a) rebinding meant (it uses the outer value: needs
+global/nonlocal - `--fix` inserts them), (b) clobber (write-first over a
+def/class/import: a bug under Nython's rule - `--fix-locals` writes `var`),
+(c) unclear. lib/**/*.ny + the IDE's .ny files: 527 files, **68 cases: (a)
+0, (b) 4, (c) 64**, every one in a CPython-ported module where CPython's
+code means a local (imaplib's `dat`, smtplib's `msg`, poplib, aifc: names
+the module's `__main__` test code binds; difflib's `_mdiff` generators,
+ElementTree, pydoc, dataclasses: inner functions' locals named as the
+enclosing function's). One was a live bug: `email/_parseaddr.ny`'s
+`getdelimited` had `quote = False`, which replaced the module's quote(), so
+`email.utils.parseaddr('"a b"@example.com')` raised "'bool' object is not
+callable"; also timeit's main() (`repeat`), mailcap's findmatch (`test`),
+mimetypes on Windows (`add_type`). Nython's own libraries (gui, ide_*,
+nytorch, aiagent, nyxai, _tkinter, ...) have none.
+
+**Marked**: the 435 CPython-ported `# nython: module` files got a second
+line `# nython: python` (marking them fixes all 68). Left Nython-language:
+`lib/_tkinter/` (Nython's Tk), `lib/nyxai/`, `_nyvt`, `ide_debugserver`,
+`websocket` (Nython's own), the generated `_nydocs` and `html/entities`
+(their generators write the header), and every non-module library. What
+the marker controls now: Python's binding rule; `${...}` stays text (as
+`module` already did); True/None are spelled `True`/`None` when such a file
+is the main program (`nython -m <module>`).
+
+**Warnings**: `-W nython-scope[:filter]` / `NY_SCOPE_WARN=1|all|<substr>`
+print each such case of a Nython-language file as it is parsed ("1": files
+outside the library directories), e.g. `f.ny:4:5: warning: function 'add'
+augments 'total', rebinding the module's 'total' (line 1) without a
+declaration - Python's rule makes it a local of the function: declare
+'global total' to keep rebinding it, or 'var total' for a local
+[nython-scope]`.
+
+**Cost**: `-c pass` 184.93M -> 185.07M instructions (interpreter), 209.17M
+-> 209.30M (VM) - the pass now walks raw pointers instead of copying
+shared_ptrs, which paid for the new bookkeeping; benchmarks within
++0.05% instructions.
+
+**Not done**: CPython's "cannot access free variable 'x' where it is not
+associated with a value in enclosing scope" (a closure reading an
+enclosing local not yet bound reads a same-named module variable or raises
+NameError); a class body in a function reading a name the body binds
+later finds the enclosing function's variable (CPython reads the module's).
+
+---
+
 ## 0x. Round 84, part A — memoryview and the buffer protocol, bytes % args (vm_audit112)
 
 `examples/vm_audit112.ny` (135 checks) passes on both engines and under
