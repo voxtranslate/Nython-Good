@@ -402,12 +402,13 @@ These were aligned to match how the IDE calls them:
 | vm_audit116 | 34 | round 84 (part 0): module AttributeError text, `{}.append` on the interpreter, BaseException's members as values, instance `__module__`/`__weakref__`, builtins' docstrings, a finally body seeing its exception, strict and starred comprehension targets, `sys.audit`/`addaudithook` events, VM comprehension targets freed, True/None spelled by the program's language (passes under python3) |
 | vm_audit117 | 33 | round 84: the functions CPython implements in C are builtins (types, reprs, no binding through a class, `__self__`, natives' module names), PEP 562 module `__getattr__`/`__dir__` and from-imports, int() via `__index__`/`__trunc__`, float() overflow, an unbound name with a method of that name, PEP 701 f-strings (passes under python3.12; 32 under 3.11) |
 | vm_audit108 | 224 | round 83: ast (the real parser's tree: dump of a corpus with positions, f-string parts, unparse round trips, literal_eval, visitors/transformers, compile of a tree, SyntaxErrors), tokenize/token (3.12 f-string tokens, detect_encoding, untokenize), symtable, dis/opcode (Nython's VM bytecode, the adaptive view on the VM), marshal bytes, pickletools.dis/optimize text, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, multi-line string lines; generated from CPython 3.12's values (`tools/gen_vm_audit108.py`; 206 under python3.12, 191 under 3.11) |
-| vm_audit112 | 135 | round 84 (part A): memoryview and the buffer protocol (PEP 3118/688) - views of bytes/bytearray/array/mmap/ctypes/memoryview/`__buffer__` classes, attributes, casts, N-dim shapes and strides, every native format, slicing and slice assignment, ==/hash, CPython's messages, exports blocking resizes (BufferError), bytes-like arguments everywhere (struct/zlib/bz2/lzma/binascii/hashlib/io/files/sockets/os/wave/sqlite3/pickle), readinto into views, ctypes from_buffer, bytes % args (PEP 461) (passes under python3.12; 132 under 3.11) |
+| vm_audit112 | 136 | round 84 (part A): memoryview and the buffer protocol (PEP 3118/688) - views of bytes/bytearray/array/mmap/ctypes/memoryview/`__buffer__` classes, attributes, casts, N-dim shapes and strides, every native format, slicing and slice assignment, ==/hash, CPython's messages, exports blocking resizes (BufferError), bytes-like arguments everywhere (struct/zlib/bz2/lzma/binascii/hashlib/io/files/sockets/os/wave/sqlite3/pickle), readinto into views, ctypes from_buffer, bytes % args (PEP 461) (passes under python3.12; 132 under 3.11) |
 | vm_audit113 | 389 | round 84 (part B): unicodedata (every property over a sample, NormalizationTest-14.0.0, ucd_3_2_0, aliases and named sequences), str by the database (full case mapping, final sigma, casefold, title, the is* predicates, Unicode whitespace and line breaks, int/float/complex/Decimal of Unicode digits), PEP 3131 identifiers, re's Unicode classes, the CJK codecs (every one, every error handler, incremental, streams), utf-7, the single-byte code pages, idna's nameprep, email charsets, mbcs/oem/code_page_* on Windows (392 there, run under Wine); generated from python3.11's values (`tools/vm_audit113_spec.py`; the 380 shared checks pass under python3.11) |
 | vm_audit114 | 215 | round 84 (part C): tkinter/ttk/turtle over Nython's own Tk (the Tcl subset, widgets, geometry managers, events and bindings, variables, images, fonts, ttk styles, dialogs, turtle) driven through the scripted-input harness (python3: skipped without tkinter) |
 | vm_audit115 | 611 | round 84 (part D): curses without ncurses - ten programs under a pty on xterm-256color and vt100 compared cell for cell with CPython+ncurses through the VT emulator, terminfo against infocmp, tparm, byte counts (585 under python3.11 with ncurses) |
 | vm_audit118 | 155 | round 85, part E: the rest of posix (statvfs, sysconf/pathconf/confstr, ids, the scheduler, eventfd/memfd/pidfd, splice, copy_file_range, xattrs, posix_spawn, wait3/wait4/waitid, register_at_fork, popen, spawn*, fwalk, a posix module), time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data/send_fds/interfaces/constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt (RFC 7914), locale's catalogs - values asked of the host's python3 (passes under python3) |
-| vm_audit119 | 82 | round 85 (part F): Python's binding rule in a Python-language file - every binding form, UnboundLocalError, closures/nonlocal, class bodies, comprehensions, generators, decorators, exec/eval/compile/ast from the file; Nython-only: a `.ny` file keeps Nython's rule, the def-line opt-in, `-W nython-scope` / `NY_SCOPE_WARN`, `--scope-report` (63 pass under python3) |
+| vm_audit119 | 85 | round 85 (part F): Python's binding rule in a Python-language file - every binding form, UnboundLocalError, closures/nonlocal, class bodies, comprehensions, generators, decorators, exec/eval/compile/ast from the file; Nython-only: a `.ny` file keeps Nython's rule, the def-line opt-in, `-W nython-scope` / `NY_SCOPE_WARN`, `--scope-report` (63 pass under python3) |
+| vm_audit120 | 19 | round 85 (main session): exceptions the runtime catches and carries on from are freed (for loops, list()/sorted()/unpacking, `__getitem__` iteration, hasattr/getattr/next defaults, `__getattribute__` -> `__getattr__`, yield from, a generator closed inside an except clause), weak references to generators and WeakSets of them (passes under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1649,6 +1650,24 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   of the same name (tkinter's `W` became a widget path); write `var` for
   locals in ported modules. (Round 85: the ported modules are now
   Python-language and bind as CPython does - see below.)
+
+## Round 85 (main session): what native code catches, generators, Windows (see `HANDOFF.md` §0y3)
+
+- **An exception native code catches and carries on from is forgotten**
+  (interpreter): `excSwallowed(flow, type)` / `forgetRaised(flow, false)` at
+  every site that swallows one (loops and consumers ending an iterator,
+  hasattr/getattr/next defaults, `__getattribute__` -> `__getattr__`,
+  yield from, close()). **New code in the interpreter that catches a
+  Python exception and does not re-raise it must forget it** the same way,
+  or the ring keeps it (and every frame its traceback holds) until 256 more
+  exceptions are raised. Generators' own exceptions go through
+  `rememberRaised` (never `exc_instance_map_[...] = v` directly).
+- Generators can be weakly referenced (both engines) and are hashable by
+  identity (interpreter; the VM was).
+- `bytes.partition`/`rpartition` return the separator object passed in.
+- The scripted-input harness seeks back to its offset after EOF: the
+  Windows C runtime does not read lines appended to a file that was empty
+  at EOF (`_ny_drive` delivered nothing under Wine).
 
 ## Round 85, part F: Python's binding rule for Python-language source
 

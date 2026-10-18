@@ -5826,6 +5826,25 @@ both engines and under python3).
 | ctypes: `strtod(b"3.25xyz", byref(end))` left `end` pointing at freed memory | a `bytes` argument was copied into a temporary C string freed after the call (CPython passes the bytes object's own buffer, which lives as long as the object) | C strings made from bytes are kept in a 512-entry cache keyed by their contents (`_cstr_cached`) |
 | ctypes: a `BigEndianStructure` subclass was laid out little-endian | its byte order was read from the class's own attributes only | read through the MRO |
 
+## Round 85 — CPython's API measured and filled, Python's binding rule, what native code catches
+
+Full detail in `HANDOFF.md` §0y (part E), §0y2 (part F) and §0y3 (main session). New tests: `vm_audit118` (155), `vm_audit119` (85), `vm_audit120` (19); `tools/api_diff.py --check tools/api_baseline.json` in the sweep.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| 1695 of CPython's 9676 public names missing from Nython's modules (os 170/378, socket 79/432, signal 45/69, select 9/32 ...) | never measured | `tools/api_diff.py` (python3.11/3.12 against both engines, a baseline the sweep checks); posix/nt modules, the rest of posixmodule.c (`src/builtins/os_posix.cpp`, prelude chunk "posix"), time's clocks, signal's masks/waits/`set_wakeup_fd`, socket's ancillary data/fd passing/constants, select.epoll, sys's int digit limit and `unraisablehook`, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt (RFC 7914), locale's gettext: 94.1% (part E) |
+| `subprocess.run(["true"])` took 24.9 ms with 300k objects alive | fork() copies the page tables of a large parent | posix_spawnp where the semantics allow (1.6 ms; `NY_SPAWN_FORK=1` for the old path) |
+| `os.pipe()` returned a list; every `namedtuple` class was named `_NT` | native "tuples" were lists; the class name was not set | tuples; the given name |
+| `int("1" * 5000)` / `str(10 ** 5000)` worked | no digit limit | CPython 3.11's limit (4300, `sys.set_int_max_str_digits`, `-X int_max_str_digits`, `PYTHONINTMAXSTRDIGITS`) |
+| A function in a `.py` file assigning a name the module binds changed the module's variable; `email.utils.parseaddr('"a b"@example.com')` raised "'bool' object is not callable" | Nython's binding rule (a plain assignment rebinds the nearest binding) applied to Python source; `quote = False` in `getdelimited` replaced the module's `quote()` | Python's rule for Python-language source (`.py`, `# nython: python`, code compiled from them, ast trees): a name a function binds is its local, UnboundLocalError; 435 ported library modules marked Python-language (part F) |
+| The interpreter kept every exception native code caught and carried on from (a for loop's StopIteration, hasattr's AttributeError, next()'s default ...) alive until 256 more were raised | only a completed except clause forgot its exception (round 84) | `excSwallowed`/`forgetRaised` at each such site |
+| A generator closed while paused in an except clause kept that clause's exception alive | the GeneratorExit raised there held it for its `__context__` (`pending_ctx_`) until the next exception was caught | forgetting a flow clears it |
+| The StopIteration a generator raises, and an instance thrown into a generator, were never freed (interpreter) | stored in `exc_instance_map_` by address, outside the ring | `rememberRaised` |
+| `weakref.ref(gen)`: "cannot create weak reference to 'generator' object" (both engines); `{gen: 1}`: "unhashable type: 'generator'" (interpreter) | not handled | a weak cell kind for generators (VM), GenObject as a target (interpreter); identity keys for generators and lazy iterators |
+| `b"a-b".partition(mv)[1]` was a bytes copy | the native result rebuilt every part | the separator object itself (bytes); bytearray copies for bytearray |
+| tkinter's `_ny_drive` delivered no input under Wine (vm_audit114) | the Windows CRT never read lines appended to a file that was empty when the stream met EOF | the reader seeks back to its offset after EOF (real-SDL harness and the stub) |
+| vm_audit112 failed on Windows | it called `os.writev` (POSIX-only) and expected `<i` for c_int | Windows branches: os.write; `<l` where c_int is c_long (CPython's ctypes) |
+
 ## Round 84, part 0 — the semantic gaps rounds 82-83 found
 
 Full detail in `HANDOFF.md` §0w. New test: `vm_audit116` (34 checks; both engines and python3).

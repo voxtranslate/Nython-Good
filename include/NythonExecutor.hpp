@@ -3497,7 +3497,11 @@ public:   // NythonExecutor is a struct: members default to public
             if (isSetCont(c)) return setKey(k);       // a frozenset; a set raises
             // a module is hashed by identity, as in Python (round 83: site's
             // set(sys.modules.values()) raised)
-            if (!isInstanceVal(k) && !isModuleNamespace(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
+            // round 85: so are generators and the lazy iterators (CPython:
+            // every iterator object hashes by identity; weakref.WeakSet of
+            // generators raised)
+            if (!isInstanceVal(k) && !isModuleNamespace(k) && !nygen::is_gen(k))
+                pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
         }
         {
             Value p;   // MyStr("k") is the key "k" (round 77)

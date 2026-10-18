@@ -3,8 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
+Last updated: round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
+Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
 Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
+Round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
 Round 84, part B — **§0x2** (the Unicode database - unicodedata complete from compact generated tables; str's case mappings and predicates by it on both engines; PEP 3131 identifiers; the CJK codecs ported from CPython's cjkcodecs; utf-7; mbcs/oem on Windows; idna's nameprep; Unicode-aware fuzzy matching; vm_audit113)
 Round 84, part C — **§0x3** (tkinter, ttk and turtle over Nython's own GUI backend: a Tcl subset, Tk's core, pack/grid/place, the classic and ttk widgets, photo images, dialogs; CPython's tkinter package and turtle.py; vm_audit114)
 Round 84, part D — **§0x4** (curses without ncurses: terminfo, tparm, ncurses' screen model and update algorithm, input and mouse, panels; a VT/xterm emulator the test compares with CPython+ncurses through; vm_audit115)
@@ -95,6 +97,86 @@ round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
+
+---
+
+## 0y3. Round 85 (main session) — exceptions native code swallows, generators as weak references and keys, the harness under Wine, the round 84 suites on Windows (vm_audit120)
+
+Verified with all of round 85 merged (parts E and F and this): sweep 468
+runs, 0 not ok; `tools/ide_e2e.py` 463 passed; memory probe, lint, class
+check, cbp (78 units) and the API baseline clean.
+
+`examples/vm_audit120.ny` (19 checks) passes on both engines and under
+python3; on the round 84 binary the interpreter fails it (the swallowed
+exceptions stay alive) and both engines raise at the first weak reference
+to a generator.
+
+- **Exceptions that native code catches and carries on from are let go**
+  (interpreter). The exception ring (`rememberRaised`, `kExcRing` = 256)
+  keeps a raised instance alive for the string that carries it; round 84
+  made a completed except clause and a suppressing `with` forget theirs.
+  Everything else that catches one - a for loop, list()/sorted()/unpacking
+  ending an iterator on StopIteration, iteration by `__getitem__` ending on
+  IndexError, hasattr and getattr's default, next()'s default,
+  `__getattribute__` falling back to `__getattr__`, a module's
+  `__getattr__` in a from-import, `yield from` and the send/throw of a
+  delegate, close() catching GeneratorExit - kept it until 256 more
+  exceptions had been raised: `excSwallowed(flow, type)` matches and
+  forgets (`forgetRaised(flow, false)`: an enclosing clause handling the
+  same exception keeps it), at each of those sites in NythonExecutor.hpp
+  and src/NyGen.cpp.
+- **A runtime error leaving an except clause** (no object yet) holds the
+  exception the clause handled for its `__context__` (`pending_ctx_`,
+  `tbHandlerExit`) until its object is made - which happened only when the
+  next exception was caught. A generator closed (or dropped) while paused
+  inside an except clause raised GeneratorExit there, close() swallowed
+  it, and the clause's exception stayed alive. Forgetting a flow clears
+  `pending_ctx_` when it is that flow.
+- **src/NyGen.cpp**: the StopIteration a generator raises (`raise_stop`)
+  and an instance thrown into a generator (`exc_string_for`) were stored in
+  `exc_instance_map_` by address, outside the ring, and never removed; they
+  go through `rememberRaised` (a serial, the ring) as `raise` does.
+- **Weak references to generators** (both engines; CPython allows them -
+  asyncio's WeakSets of tasks, weakref.finalize on a generator): the
+  interpreter's `makeWeakRef` takes a `GenObject` as it takes a set; the
+  VM's `WeakCell` has a kind 5 holding a `weak_ptr` to the `GenState`.
+  **Generators and the lazy iterators hash by identity** on the
+  interpreter (`dictKey`: "unhashable type: 'generator'"); the VM already
+  did.
+- **`bytes.partition` / `rpartition`** give the separator object they were
+  passed when it is found (CPython's `stringlib_partition` keeps `sep_obj`:
+  `b"a-b".partition(mv)[1] is mv`); a bytearray's result holds bytearray
+  copies, as CPython's.
+- **The scripted-input harness under Wine** (`src/builtins/gui_harness.cpp`
+  for real SDL3, `thirdparty/sdl3-stub/src/sdl3_stub.cpp`): the event
+  script is appended to while it is read; at EOF the reader called
+  `clearerr` and tried again later. The Windows C runtime never returns
+  lines appended to a file that was *empty* when the stream met its end, so
+  tkinter's `_ny_drive` (which starts from an empty script) delivered
+  nothing and vm_audit114 failed under Wine. The reader keeps the offset of
+  the next unread line and `fseek`s there before reading again after EOF
+  (binary mode: offsets are bytes).
+- **The round 84 suites on Windows** (`tools/cross_windows.sh build`,
+  `build-win/nywin`, both engines): 111 (55), 112, 113 (392), 114 (215),
+  115 (82 - the pty programs are POSIX-only), 116 (34), 117 (33), 120.
+  vm_audit112 needed two Windows branches, both CPython's behaviour there:
+  no `os.readv`/`os.writev` (os.write is checked instead), and `ctypes.c_int`
+  is `c_long` where int and long have one size (CPython's ctypes/__init__.py),
+  so its PEP 3118 format is `<l` (`<L` for c_uint).
+- WINE_LINE
+
+### Not done
+- AArch64 (qemu) and 32-bit Windows runs of rounds 84-85: not run this
+  round.
+- In a Python-language file, valid Python still meets Nython's
+  conveniences: `"a" + 1` concatenates, `for x in 5` is a range, `1 is int`
+  is a type test, `{"a": 1}.a` reads the key, `true`/`none`/`undefined`/
+  `null`/`elseif` are not names; and in every file `sorted([1, "a"])` /
+  `max("a", 1)` compare leniently, the interpreter's `[1, 2]["0"]` is 1,
+  `list(5)`/`iter(5)` disagree between the engines (round 86, part J).
+- From part E's report: `import encodings.undefined` is a SyntaxError
+  (`undefined` is a hard keyword in a dotted import name); `builtins.super`
+  is there on the interpreter only.
 
 ---
 
