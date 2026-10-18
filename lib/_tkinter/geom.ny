@@ -542,8 +542,10 @@ def grid_configure(app, items, args):
             continue
         slave = app.window(it)
         info = slave.minfo if slave.manager == "grid" else None
+        # a slave `grid remove` took out keeps its slot (tkGrid.c leaves its row/column set)
+        restored = info is None and getattr(slave, "grid_saved", None) is not None
         if info is None:
-            info = slave.grid_saved if getattr(slave, "grid_saved", None) is not None else GridInfo()
+            info = slave.grid_saved if restored else GridInfo()
         slave.grid_saved = None
         for key in opts:
             v = opts[key]
@@ -569,9 +571,9 @@ def grid_configure(app, items, args):
                 info.ipadx = _ipad(v, "x")
             elif key == "-ipady":
                 info.ipady = _ipad(v, "y")
-        if "-column" in opts or info.column < 0 or k > 0 or slave.manager != "grid":
+        if "-column" in opts or info.column < 0 or ((k > 0 or slave.manager != "grid") and not restored):
             info.column = c
-        if "-row" in opts or info.row < 0 or slave.manager != "grid":
+        if "-row" in opts or info.row < 0 or (slave.manager != "grid" and not restored):
             info.row = row
         c = info.column + info.columnspan
         check_master(app, slave, master, "grid")

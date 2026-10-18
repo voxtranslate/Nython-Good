@@ -1267,7 +1267,17 @@ class TkListbox(TkWin):
         n = len(self.items)
         if n == 0:
             return 0
-        k = (y - self.inset) // max(1, self.line_h) + self.top_index
+        # NearestListboxElement: C's truncating division, clamped to the lines shown
+        lh = max(1, self.line_h)
+        d = y - self.inset
+        k = d // lh if d >= 0 else -((-d) // lh)
+        avail = self.height - 2 * self.inset
+        shown = avail // lh + (1 if avail % lh else 0)
+        if k >= shown:
+            k = shown - 1
+        if k < 0:
+            k = 0
+        k += self.top_index
         return max(0, min(n - 1, k))
 
     def w_insert(self, args):

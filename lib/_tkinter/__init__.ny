@@ -17,8 +17,19 @@
 # bind.ny (sequences, matching, %-substitution), geom.ny (pack, grid,
 # place), win.ny (the window record and option tables), util.ny (units,
 # colours, fonts, drawing), widgets.ny, entry.ny, text.ny, canvas.ny,
-# menu.ny, image.ny, ttk.ny (the widgets), colors.ny / keysyms.ny (tables
-# generated from X11's rgb.txt and keysymdef.h).
+# menu.ny, image.ny (photo and bitmap images, PNG/GIF/PPM codecs) - the
+# classic widgets; ttk.ny (ttk's style engine: themes, elements, layouts,
+# state maps, and the simple ttk widgets), ttk2.ny (ttk's entry, combobox,
+# spinbox, scrollbar, scale, progressbar, notebook, panedwindow,
+# treeview), dialogs.ny (tk_messageBox, tk_dialog, tk_getOpenFile/
+# tk_getSaveFile/tk_chooseDirectory over the native file dialogs,
+# tk_chooseColor); colors.ny / keysyms.ny (tables generated from X11's
+# rgb.txt and keysymdef.h).
+#
+# Several Tk applications (a second Tk(), turtle's Screen beside a
+# program's root) share one event loop, as Tcl's notifier is the thread's:
+# whichever application's loop runs serves every application's window
+# events, timers and idle handlers.
 #
 # Not provided: a real Tcl (only the subset tcl.ny lists), file handlers
 # (createfilehandler raises TclError), `send`, threads calling into Tk from

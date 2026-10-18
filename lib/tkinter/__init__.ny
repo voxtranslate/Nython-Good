@@ -32,7 +32,10 @@
 # Nython additions: Misc._ny_drive(commands) drives the real event loop
 # with the SDL stub's scripted input (click/key/type/move/drag/wheel/resize,
 # see thirdparty/sdl3-stub) and returns once all of it was delivered;
-# Misc._ny_snapshot() returns the last frame drawn as a display list;
+# Misc._ny_queue(commands) appends scripted input without waiting (for a
+# modal dialog's own loop to read: queue it from an after() callback);
+# Misc._ny_snapshot() returns the last frame drawn as a display list
+# (images included);
 # Misc._ny_accessibility() an accessibility tree (role, name, state, bounds
 # for every viewable widget); Misc._ny_frames() how many frames were drawn
 # (Tk redraws only damaged toplevels, at idle).
@@ -2056,6 +2059,10 @@ class Misc:
                 ln = ln.strip()
                 if ln:
                     ops.append(json.loads(ln))
+        try:
+            os.remove(snap)
+        except OSError:
+            pass
         # the images drawn (the backend's display list does not show them)
         ops.extend(self.tk.image_ops(self._w))
         return ops

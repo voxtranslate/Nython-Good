@@ -727,6 +727,8 @@ class App:
             for name in list(self.interp.commands.keys()):
                 if name.startswith("."):
                     del self.interp.commands[name]
+            if self in _APPS:
+                _APPS.remove(self)
 
     def destroy_native(self, top):
         if top.native is not None:
@@ -1072,47 +1074,91 @@ class App:
         while i < n:
             e = evs[i]
             nxt = evs[i + 1] if i + 1 < n else None
-            consumed = self.native_event(e, nxt)
+            consumed = self.owner_of(e).native_event(e, nxt)
             i += 2 if consumed else 1
         return True
+
+    def owner_of(self, e):
+        # every Tk application of the thread shares one event source, as
+        # Tcl_DoOneEvent dispatches to any interpreter's windows: an event
+        # for another application's window goes to that application
+        wid = e.get("window", 0)
+        if wid and wid not in self.natives:
+            for a in _APPS:
+                if a is not self and wid in a.natives:
+                    return a
+        return self
 
     def do_one_event(self, flags=0):
         if flags & ~DONT_WAIT == 0:
             flags |= WINDOW_EVENTS | TIMER_EVENTS | IDLE_EVENTS | FILE_EVENTS
+        apps = self.event_apps()
         if flags & WINDOW_EVENTS:
-            if self.event_queue:
-                ev = self.event_queue.pop(0)
-                if not ev.window.destroyed:
-                    self.handle_event(ev)
-                return True
+            for a in apps:
+                if a.event_queue:
+                    ev = a.event_queue.pop(0)
+                    if not ev.window.destroyed:
+                        a.handle_event(ev)
+                    return True
             if self.pump_native(0):
                 return True
         if flags & TIMER_EVENTS:
-            if self.run_timers():
-                return True
+            for a in apps:
+                if a.run_timers():
+                    return True
         if flags & IDLE_EVENTS:
-            if self.run_idle():
-                return True
+            for a in apps:
+                if a.run_idle():
+                    return True
         if flags & DONT_WAIT:
             return False
-        wait = self.next_timer_ms()
+        wait = None
+        for a in apps:
+            w = a.next_timer_ms()
+            if w is not None and (wait is None or w < wait):
+                wait = w
         if wait is None or wait > 30:
             wait = 30
         if wait <= 0:
-            return self.run_timers()
+            return self.run_any_timers(apps)
         if flags & WINDOW_EVENTS:
             if self.pump_native(wait):
                 return True
-            return self.run_timers()
+            return self.run_any_timers(apps)
         time.sleep(wait / 1000.0)
-        return self.run_timers()
+        return self.run_any_timers(apps)
+
+    def event_apps(self):
+        # Tcl's notifier, timers and idle handlers belong to the thread, not
+        # to one interpreter: every Tk application's events, timers and idle
+        # work are served whichever application's loop runs (a second Tk(),
+        # as turtle's Screen makes beside a program's own root)
+        if len(_APPS) < 2:
+            return (self,)
+        out = [self]
+        for a in _APPS:
+            if a is not self and not a.dead:
+                out.append(a)
+        return out
+
+    def run_any_timers(self, apps):
+        for a in apps:
+            if a.run_timers():
+                return True
+        return False
 
     def update(self, idletasks=False):
         if idletasks:
             guard = 0
-            while self.idle_q and guard < 100:
+            apps = self.event_apps()
+            busy = True
+            while busy and guard < 100:
                 guard += 1
-                self.run_idle()
+                busy = False
+                for a in apps:
+                    if a.idle_q:
+                        busy = True
+                        a.run_idle()
             return
         guard = 0
         while guard < 10000:
@@ -1173,7 +1219,10 @@ class App:
         if t == "textedit":
             txt = e.get("text", "")
             if txt.startswith("__nysync_"):
+                # whichever application asked for it waits on its own set
                 self.sync_seen.add(txt)
+                for a in _APPS:
+                    a.sync_seen.add(txt)
             return False
         if t == "quit":
             self.last_input = _now_ms()
