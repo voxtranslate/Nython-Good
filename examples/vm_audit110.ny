@@ -14,7 +14,10 @@
 # chunk, sndhdr, imghdr; wsgiref and xmlrpc over real HTTP servers;
 # smtplib, poplib, imaplib, ftplib (passive and active), telnetlib and LMTP
 # (a Unix socket, SMTPUTF8) against servers written here, on localhost, and
-# STARTTLS/SMTP_SSL/POP3_SSL/IMAP4_SSL/FTP_TLS with a throwaway CA.
+# STARTTLS/SMTP_SSL/POP3_SSL/IMAP4_SSL/FTP_TLS with a throwaway CA; the
+# engine fixes these modules needed (a failed import retried, float(bytes),
+# `init` with a __new__, builtin subclasses' stores, copy and __reduce__).
+# Python 3.13 removed several of these modules: 3.11 and 3.12 run it all.
 # Every expected value is CPython's (computed by python3; the 3.12-only
 # checks carry CPython 3.12's values on 3.11 too). Skipped with a notice
 # (not counted): the sqlite3 checks where SQLite is not installed, the TLS

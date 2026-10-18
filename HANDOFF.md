@@ -3,6 +3,7 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
+Round 83, part C — **§0v3** (sqlite3 over libsqlite3 loaded at run time, its callbacks run by suspending a coroutine; dbm/shelve; the email package and the mail modules; smtplib/poplib/imaplib/ftplib/telnetlib/xmlrpc/wsgiref/cgi/netrc; plistlib; audioop and the audio-file modules; vm_audit110).
 Last updated: round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` modules and packages, `.ny` first; quoted imports from anywhere; `threading.Lock` is Python's ownerless lock; tasks see their loop's thread in threading; `_thread`; vm_audit107).
 Round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
 Round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
@@ -81,6 +82,185 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0v3. Round 83, part C — sqlite3, the email package, mail/network protocols, data formats (vm_audit110)
+
+`examples/vm_audit110.ny` (264 checks) passes on both engines and under
+python3.11 and python3.12 (3.13 removed uu, mailcap, audioop, cgi, telnetlib
+... and checks X.509 key usage, so it fails those sections). Every expected
+value is CPython's (computed by python3); the 3.12-only checks
+(`autocommit=`) carry CPython's values on 3.11 too. The sqlite3 checks are
+skipped with a notice where libsqlite3 is not installed, the TLS checks
+where there is no `openssl` command, the LMTP check where there are no Unix
+sockets.
+
+### sqlite3 over libsqlite3 loaded at run time
+- **`src/builtins/nysqlite.cpp`** (natives `_sql_*`, reached by the VM through
+  the builtin bridge): libsqlite3 is `dlopen`ed / `LoadLibrary`d on first use
+  (`NY_LIBSQLITE3` names a library to try first; `libsqlite3.so.0`,
+  `libsqlite3.dylib`, `sqlite3.dll`/`winsqlite3.dll`), as tls.cpp does with
+  OpenSSL; without it `import sqlite3` raises ImportError naming the library.
+  Optional entry points (window functions, backup, blob I/O, serialize,
+  load_extension, db_config, trace_v2) are looked up separately and their
+  absence reported when used.
+- **Callbacks without calling back into an engine**: SQLite calls user
+  functions, aggregates, window functions, collations, the authorizer, the
+  progress handler and the trace callback from inside `sqlite3_prepare/step/
+  exec`. Every such SQLite call of a connection that has callbacks runs on a
+  **NyCoro coroutine of its own**; a callback *suspends* it and the native
+  returns `[1, op, kind, fid, key, args]` to `lib/_sqlite3.ny`, which calls the
+  program's function as ordinary Nython code and resumes the operation with
+  `_sql_resume(op, status, value)`. So callbacks run identically on both
+  engines (no VM value crosses into the interpreter's call path), raise and
+  trace as ordinary code, may use the connection themselves (a nested
+  operation is a coroutine of its own) and see threads normally; a
+  connection without callbacks runs SQLite directly. The GIL is released
+  while SQLite works (`nyconc::GilRelease` around each resume / call).
+- **Rule: every SQLite call that can take a connection's mutex runs with the
+  GIL released** (`nogil(...)` in nysqlite.cpp - reset, finalize, bind,
+  column reads, errinfo, changes, create_function ...). A thread whose
+  statement is paused in a callback holds that (recursive) mutex while it
+  runs the callback's Nython code; another thread waiting for it with the GIL
+  held deadlocked them both (8 threads sharing a `check_same_thread=False`
+  connection with a user function). Values are made only after the GIL is
+  back.
+- **A cursor takes its statement out of the connection's cache** and gives
+  it back once reset (`Connection._statement` / `_give_back`, one dict
+  operation each way): CPython holds the GIL from the cache lookup to
+  `sqlite3_step`, Nython's GIL may change hands in between, and two threads
+  then bound and stepped the same statement (SQLITE_MISUSE, rows lost).
+- `_sql_row` is given the columns to read as bytes as flags, never the
+  converter functions: a VM function reaches the interpreter's natives
+  through the bridge as no value (converters got str on the VM).
+- Nython-only: `Connection.set_profile_callback(cb)` (`cb(sql, ns)` for each
+  finished statement, SQLite's SQLITE_TRACE_PROFILE), `iterdump(filter=)`
+  (3.13's), an LRU statement cache of `cached_statements` entries.
+- **`lib/_sqlite3.ny`** is CPython 3.12's C module `_sqlite3` written in
+  Nython: connect (paths/bytes/PathLike, `:memory:`, uri=, timeout=,
+  detect_types=, isolation_level=, autocommit= with
+  LEGACY_TRANSACTION_CONTROL, check_same_thread=, factory=,
+  cached_statements=), CPython's transaction rules (the implicit
+  `BEGIN ` before DML in legacy mode, COMMIT/ROLLBACK/BEGIN in autocommit=False
+  mode, rollback on close), Connection/Cursor/Row/Blob/PrepareProtocol,
+  adapters and converters (PARSE_DECLTYPES / PARSE_COLNAMES, `__conform__`),
+  the statement checks (`lstrip_sql`, is_dml, "You can only execute one
+  statement at a time.", the SQL length limit), the exception classes with
+  `sqlite_errorcode`/`sqlite_errorname`, every SQLITE_* constant, and
+  CPython's messages. `lib/sqlite3/` is CPython's package (dbapi2, dump,
+  `__main__`).
+- `dbm` is CPython **3.13**'s (dbm.sqlite3 first, then dbm.gnu/dbm.ndbm -
+  ImportError on Nython - then dbm.dumb), `shelve` 3.12's.
+
+### The email package and the mail modules
+- `lib/email/` is CPython 3.12's package file for file (message, parser,
+  feedparser, generator, policy, headerregistry, header, utils, mime/*,
+  charset, encoders, contentmanager, iterators, errors, base64mime,
+  quoprimime, _header_value_parser, _encoded_words, _parseaddr,
+  _policybase). A corpus of 25 messages through every policy (parse,
+  items, walk, decoded payloads, Generator at 40 columns, BytesGenerator),
+  decode_header/getaddresses, the header registry over 14 addresses,
+  parsedate over 7 dates and Header encoding: 974 results byte-identical to
+  CPython 3.12's on both engines.
+- `quopri`, `uu`, `mailbox` (mbox, Maildir, MH, Babyl, MMDF), `mailcap`.
+
+### Protocols, data formats, audio
+- `smtplib` (SMTP, SMTP_SSL, LMTP over TCP or a Unix socket, starttls,
+  CRAM-MD5/PLAIN/LOGIN, send_message with Bcc and SMTPUTF8), `poplib`,
+  `imaplib` (with literals and continuation requests), `ftplib` (active and
+  passive, FTP_TLS with a protected data channel), `telnetlib`,
+  `xmlrpc.client`/`xmlrpc.server`, `wsgiref`, `cgi`/`cgitb`, `netrc` -
+  CPython 3.12's code over lib/socket.ny and lib/ssl.ny, tested against
+  servers the test runs on localhost (and over TLS with a throwaway CA).
+- `plistlib` (XML and binary): 60 random property lists dump to the bytes
+  CPython 3.12 gives, both formats, sorted and not.
+- `audioop` is CPython's C module written in Nython: 1,948 results of a
+  fuzz (every 16-bit value through u-law/A-law, every function at widths
+  1-4, ratecv, ADPCM with states) identical to CPython 3.12's on both
+  engines. `wave`, `aifc`, `sunau`, `chunk`, `sndhdr`, `imghdr` are CPython's.
+  The modules 3.12 deprecated warn at import as CPython's do
+  (`warnings._deprecated`, new in lib/warnings.ny).
+
+### Engine changes (both engines)
+- **No `def init` constructor alias for a class with a `__new__` of its
+  own** (`NythonExecutor::runConstructor` with `own_new`;
+  `VirtualMachine::find_ctor(..., alias=false)` on the `__new__` path of
+  `instantiate`). email.headerregistry's header classes define `init` as an
+  ordinary method that `BaseHeader.__new__` calls with keyword arguments;
+  Nython's legacy alias ran it a second time as the constructor with the
+  constructor's arguments (KeyError: 'params'). Classes without `__new__`
+  keep the alias.
+- **VM: a builtin subclass instance stored by a builtin method keeps its
+  class** (`VirtualMachine::unwrap_native_args`): `list.append`, `set.add`
+  store their argument as given, and `list.insert`, `dict.setdefault`/`get`/
+  `pop` unwrap only their first argument. A `str` subclass instance (an email
+  header) appended to a `list` subclass came back as a plain str on the VM.
+- **`float(b"1.5")` / `float(bytearray(...))`** parse the bytes, with
+  CPython's ValueError (`could not convert string to float: b'x'`) -
+  `pycore.cpp` `B_FLOAT`, the VM's `def("float")`. sqlite3 converters
+  receive bytes.
+- **A module that is not found is not marked imported** (interpreter
+  `evalImport`: `imported_modules_.erase`; VM `vm_import`:
+  `globals_.erase(guard_key)`): a second `try: import pydoc` "succeeded"
+  without binding the name - a NameError at the first use (xmlrpc.server
+  after cgitb had looked for pydoc).
+- `src/builtins/nysqlite.cpp` registered in `registerBuiltins()` and the
+  `callBuiltin` chain (`dispatch_sqlite` for `_sql_*`), `_sql_` in
+  `isKwmapBuiltin`'s prefixes; `include/builtins/nysqlite.hpp`; the unit in
+  `nython.cbp`.
+
+### Library changes outside the new modules
+- `lib/socket.ny`: `_GLOBAL_DEFAULT_TIMEOUT` (create_connection's default),
+  `getservbyname`/`getservbyport` (/etc/services, else the well-known ports).
+- `lib/urllib/parse.ny`: `unwrap` and the private `_split*` helpers.
+- `lib/warnings.ny`: `_deprecated` (CPython's).
+- `lib/copy.ny`: `copy()`/`deepcopy()` of a builtin-subclass instance whose
+  class defines `__reduce_ex__`/`__reduce__` use it (the fast path for
+  builtin values skipped it; email's headers are str subclasses with a
+  `__reduce__`); `copy()` uses it before its atomic/container shortcuts.
+
+### Adapted in the ports (each marked "(Nython: ...)")
+- `sys.audit` is called only where the runtime has it (smtplib, poplib,
+  imaplib, ftplib, telnetlib).
+- `errno`, `locale`, `tokenize`, `ast` and `pydoc` are used when present
+  (round 83's other parts add them): xmlrpc.client/poplib/imaplib/mailbox
+  carry the errno values they need; cgi falls back to UTF-8 for the query
+  string; cgitb's variable dump needs tokenize and carries pydoc's
+  HTMLRepr/TextRepr; dbm.dumb reads its index with a small literal parser
+  without ast; xmlrpc.server's DocXMLRPCServer needs a pydoc with HTMLDoc.
+- memoryview (Nython has none): wave/aifc/sunau take `tobytes()`/`bytes()`,
+  `sqlite3.Binary` is `bytes`, email's raw_data_manager registers bytes and
+  bytearray.
+- `True.__doc__` (email._policybase's docstring merging reads `__doc__` of
+  every class attribute) - read with getattr.
+
+### Found, not fixed
+- `(True).__doc__` and other builtin values' `__doc__` raise AttributeError.
+- `getattr(e, n)` fails for some names `dir(e)` lists: an exception's
+  `__init__`, `__repr__`, `__str__`, `__module__`, `__weakref__`; an
+  instance's `__module__`, `__weakref__` (cgitb's report reads them all).
+- No `sys.audit`/`sys.addaudithook`.
+- `bytes % args` (PEP 461) raises TypeError on both engines (round 77's
+  deliberate message); the test's IMAP server encodes a str instead.
+- Interpreter: `{}.append(x)` turns the dict into a list (`[, x]`) instead
+  of raising AttributeError (the VM raises). Found through Nython's scope
+  rule - a function's `results = {}` rebinds a module's `results` list.
+
+### Not done
+- `dbm.gnu`/`dbm.ndbm` raise ImportError (no `_gdbm`/`_dbm` native); `dbm`
+  uses dbm.sqlite3 or dbm.dumb.
+- The CJK codecs (iso-2022-jp, euc-jp, shift_jis, gb2312, big5 ...) are not
+  in Nython's codec table, so email charsets that need them fail (the
+  default-policy fuzz differs from CPython only there).
+- `mailbox` locks with dot-locking only (there is no `fcntl` module);
+  cgitb's variable dump needs `tokenize`, DocXMLRPCServer a `pydoc` with
+  HTMLDoc, cgi's locale-dependent decoding `locale` (round 83's other parts
+  provide them; until then the fallbacks above apply).
+- `Connection.load_extension` is wired up but not tested (no extension
+  library in the container); `telnetlib.Telnet.interact` needs a terminal
+  and is not tested.
+- Windows: `sqlite3.dll` / (64-bit) `winsqlite3.dll` are looked for, but
+  the MinGW cross build and Wine were not run this round.
+- bytes %-formatting (PEP 461), see above.
 
 ## 0u5. Round 82, follow-ups (2) — Python source modules, quoted imports from anywhere, Python's lock (vm_audit107)
 
