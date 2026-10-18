@@ -653,7 +653,17 @@ Value dispatch_fault(NythonExecutor& E, const std::string& name, std::vector<Val
         std::string k = E.strOf(a[0]);
         std::fflush(stdout);
         std::fflush(stderr);
-        if (k == "segv") std::raise(SIGSEGV);
+        if (k == "segv") {
+#ifdef _WIN32
+            // as CPython's faulthandler._sigsegv: the handler gives the flow
+            // back for SIGSEGV (a real fault faults again), so a raised one
+            // is raised until the previous handler ends the process (it
+            // returned, and the process exited 0)
+            for (;;) std::raise(SIGSEGV);
+#else
+            std::raise(SIGSEGV);
+#endif
+        }
         else if (k == "abrt") std::abort();
         else if (k == "fpe") std::raise(SIGFPE);
 #ifdef SIGBUS

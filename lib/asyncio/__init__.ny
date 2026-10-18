@@ -182,7 +182,7 @@ _DEFAULT_LIMIT = 65536
 _LIMIT = _DEFAULT_LIMIT
 _LOG_THRESHOLD_FOR_CONNLOST_WRITES = 5
 _SSL_HANDSHAKE_TIMEOUT = 60.0
-_HAS_UNIX = socket.AF_UNIX is not none
+_HAS_UNIX = getattr(socket, "AF_UNIX", None) is not none
 _WINDOWS = os_platform() == "windows"
 
 def _now():
@@ -2335,7 +2335,7 @@ class _SocketTransport(_FlowControlMixin):
         if self._server is not none:
             self._server._attach()
         try:
-            if sock.family != socket.AF_UNIX:
+            if sock.family != getattr(socket, "AF_UNIX", None):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except BaseException:
             pass
@@ -3986,7 +3986,7 @@ class BaseEventLoop(AbstractEventLoop):
             if not (local_addr or remote_addr):
                 if family == 0:
                     raise ValueError("unexpected address family")
-            if family == socket.AF_UNIX or (_HAS_UNIX and ((isinstance(local_addr, str) or isinstance(local_addr, bytes)) or (isinstance(remote_addr, str) or isinstance(remote_addr, bytes)))):
+            if (_HAS_UNIX and family == socket.AF_UNIX) or (_HAS_UNIX and ((isinstance(local_addr, str) or isinstance(local_addr, bytes)) or (isinstance(remote_addr, str) or isinstance(remote_addr, bytes)))):
                 if not _HAS_UNIX:
                     raise NotImplementedError("Unix domain sockets are not supported on this platform")
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM, proto)
@@ -4068,7 +4068,7 @@ class BaseEventLoop(AbstractEventLoop):
         else:
             if sock is none:
                 raise ValueError("no path and sock were specified")
-            if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+            if sock.family != getattr(socket, "AF_UNIX", None) or sock.type != socket.SOCK_STREAM:
                 raise ValueError("A UNIX Domain Stream Socket was expected, got " + repr(sock))
         return await self._create_connection_transport(sock, protocol_factory, ssl, server_hostname,
                                                        ssl_handshake_timeout=ssl_handshake_timeout)
@@ -4108,7 +4108,7 @@ class BaseEventLoop(AbstractEventLoop):
         else:
             if sock is none:
                 raise ValueError("path was not specified, and no sock specified")
-            if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+            if sock.family != getattr(socket, "AF_UNIX", None) or sock.type != socket.SOCK_STREAM:
                 raise ValueError("A UNIX Domain Stream Socket was expected, got " + repr(sock))
         sock.setblocking(false)
         var server = Server(self, [sock], protocol_factory, ssl, backlog, ssl_handshake_timeout, ssl_shutdown_timeout)

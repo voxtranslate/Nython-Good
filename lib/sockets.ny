@@ -393,7 +393,7 @@ class UnixSocket:
         self.binary = binary
 
     def connect(self):
-        if socket.AF_UNIX == none:
+        if getattr(socket, "AF_UNIX", None) == none:
             return false
         try:
             self.fd = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -409,7 +409,7 @@ class UnixSocket:
 
     def listen(self, backlog=16):
         # serve on the path (a stale socket file is replaced): accept() then
-        if socket.AF_UNIX == none:
+        if getattr(socket, "AF_UNIX", None) == none:
             return false
         if os_exists(self.path):
             os_remove(self.path)

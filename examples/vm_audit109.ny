@@ -320,8 +320,11 @@ write_bytes(tpath("empty.bin"), b"")
 with open(tpath("empty.bin"), "rb") as f:
     check("empty file", raises(mmap.mmap, f.fileno(), 0), ["ValueError", "cannot mmap an empty file"])
 with open(p, "rb") as f:
-    check("too long", raises(mmap.mmap, f.fileno(), 1000, access=mmap.ACCESS_READ),
-          ["ValueError", "mmap length is greater than file size"])
+    # Windows: CreateFileMapping refuses a read-only map larger than the file
+    # (CPython's OSError [WinError 8] there)
+    tl = raises(mmap.mmap, f.fileno(), 1000, access=mmap.ACCESS_READ)
+    check("too long", tl if posix else [tl[0], tl[1].startswith("[WinError 8] ")],
+          ["ValueError", "mmap length is greater than file size"] if posix else ["OSError", True])
 check("constants", [mmap.PAGESIZE > 0, mmap.ALLOCATIONGRANULARITY >= mmap.PAGESIZE, mmap.ACCESS_READ, mmap.ACCESS_WRITE,
                     mmap.ACCESS_COPY, mmap.ACCESS_DEFAULT], [True, True, 1, 2, 3, 0])
 check("negative length", raises(mmap.mmap, -1, -1)[0], "OverflowError")
@@ -346,7 +349,7 @@ import math
 check("cmath basics", [cmath.sqrt(-1), cmath.sqrt(4), cmath.exp(0), cmath.log(1), cmath.log10(100), cmath.log(8, 2)],
       [1j, (2 + 0j), (1 + 0j), 0j, (2 + 0j), (3 + 0j)])
 check("exact results", [cmath.exp(1j * math.pi), cmath.sqrt(2j), cmath.cos(1 + 1j), cmath.tan(0.5 - 0.25j)],
-      [(-1 + 1.2246467991473532e-16j), (1 + 1j), (0.8337300251311491 - 0.9888977057628651j),
+      [complex(-1.0, math.sin(math.pi)), (1 + 1j), (0.8337300251311491 - 0.9888977057628651j),   # exp(i*pi): the C library's sin(pi)
        (0.504500702698564 - 0.31242069250258875j)])
 check("inverse functions", [cmath.acos(2), cmath.asin(0.5), cmath.atan(1j / 2), cmath.acosh(0.5), cmath.asinh(1j),
                             cmath.atanh(0.5)],
@@ -541,9 +544,9 @@ sys.stdout = out
 dc.report_full_closure()
 sys.stdout = saved
 check("dircmp report", out.getvalue().replace(TMP, "T"),
-      "diff T/d1 T/d2\nOnly in T/d1 : ['only1.txt']\nOnly in T/d2 : ['only2.txt']\nIdentical files : ['same.txt']\n"
-      "Differing files : ['diff.txt']\nCommon subdirectories : ['sub']\n\ndiff T/d1/sub T/d2/sub\n"
-      "Differing files : ['s.txt']\n")
+      ("diff T/d1 T/d2\nOnly in T/d1 : ['only1.txt']\nOnly in T/d2 : ['only2.txt']\nIdentical files : ['same.txt']\n"
+       "Differing files : ['diff.txt']\nCommon subdirectories : ['sub']\n\ndiff T/d1/sub T/d2/sub\n"
+       "Differing files : ['s.txt']\n").replace("/", os.sep))
 filecmp.clear_cache()
 check("DEFAULT_IGNORES", ".git" in filecmp.DEFAULT_IGNORES and "__pycache__" in filecmp.DEFAULT_IGNORES, True)
 
@@ -838,33 +841,48 @@ check("lzma errors", [raises(lzma.decompress, b"garbage data here"), raises(lzma
        ["ValueError", "Must specify filters for FORMAT_RAW"], ["ValueError", "Integrity checks are only supported by FORMAT_XZ"],
        ["ValueError", "Cannot specify both preset and filter chain"], ["ValueError", "Invalid filter ID: 99"],
        ["ValueError", "Invalid filter specifier for LZMA filter"]])
-check("filter properties", [lzma._encode_filter_properties({"id": lzma.FILTER_LZMA2, "preset": 6}),
-                            lzma._decode_filter_properties(lzma.FILTER_LZMA2, b"\x16"),
+# compression needs liblzma (Nython reads .xz/.lzma natively without it):
+# where the system has none (Windows), those checks are skipped, named
+LZC = True
+try:
+    lzma.compress(b"x")
+except lzma.LZMAError:
+    LZC = False
+def skip_lz(*names):
+    for n in names:
+        results.append([n + " (skipped: no liblzma)", True, None, None])
+check("filter properties", [lzma._decode_filter_properties(lzma.FILTER_LZMA2, b"\x16"),
                             lzma._decode_filter_properties(lzma.FILTER_DELTA, b"\x03")],
-      [b"\x16", {"id": 33, "dict_size": 8388608}, {"id": 3, "dist": 4}])
+      [{"id": 33, "dict_size": 8388608}, {"id": 3, "dist": 4}])
+if LZC:
+    check("encoded filter properties", lzma._encode_filter_properties({"id": lzma.FILTER_LZMA2, "preset": 6}), b"\x16")
 check("is_check_supported", [lzma.is_check_supported(lzma.CHECK_NONE), lzma.is_check_supported(lzma.CHECK_CRC64),
                              lzma.is_check_supported(lzma.CHECK_SHA256)], [True, True, True])
-payload = b"The quick brown fox jumps over the lazy dog. " * 200
-check("lzma round trips", [lzma.decompress(lzma.compress(payload)) == payload,
-                           lzma.decompress(lzma.compress(payload, check=lzma.CHECK_SHA256)) == payload,
-                           lzma.decompress(lzma.compress(payload, format=lzma.FORMAT_ALONE)) == payload,
-                           lzma.decompress(lzma.compress(payload, preset=9 | lzma.PRESET_EXTREME)) == payload],
-      [True, True, True, True])
-filters = [{"id": lzma.FILTER_DELTA, "dist": 4}, {"id": lzma.FILTER_LZMA2, "preset": 1}]
-raw = lzma.compress(payload, format=lzma.FORMAT_RAW, filters=filters)
-check("FORMAT_RAW with a filter chain", lzma.decompress(raw, format=lzma.FORMAT_RAW, filters=filters) == payload, True)
-c = lzma.LZMACompressor(check=lzma.CHECK_CRC32)
-stream = c.compress(b"part one, ") + c.compress(b"part two") + c.flush()
-dz = lzma.LZMADecompressor()
-check("incremental, CHECK_CRC32", [dz.decompress(stream), dz.check], [b"part one, part two", lzma.CHECK_CRC32])
-lp = tpath("t.xz")
-with lzma.open(lp, "wt", encoding="utf-8") as f:
-    f.write("xz line\nsecond\n")
-with lzma.open(lp, "rt", encoding="utf-8") as f:
-    check("lzma.open text", f.readlines(), ["xz line\n", "second\n"])
-with lzma.LZMAFile(lp) as f:
-    check("LZMAFile", [f.read(2), f.tell(), f.seekable()], [b"xz", 2, True])
-check("concatenated streams", lzma.decompress(lzma.compress(b"a") + lzma.compress(b"b")), b"ab")
+if LZC:
+    payload = b"The quick brown fox jumps over the lazy dog. " * 200
+    check("lzma round trips", [lzma.decompress(lzma.compress(payload)) == payload,
+                               lzma.decompress(lzma.compress(payload, check=lzma.CHECK_SHA256)) == payload,
+                               lzma.decompress(lzma.compress(payload, format=lzma.FORMAT_ALONE)) == payload,
+                               lzma.decompress(lzma.compress(payload, preset=9 | lzma.PRESET_EXTREME)) == payload],
+          [True, True, True, True])
+    filters = [{"id": lzma.FILTER_DELTA, "dist": 4}, {"id": lzma.FILTER_LZMA2, "preset": 1}]
+    raw = lzma.compress(payload, format=lzma.FORMAT_RAW, filters=filters)
+    check("FORMAT_RAW with a filter chain", lzma.decompress(raw, format=lzma.FORMAT_RAW, filters=filters) == payload, True)
+    c = lzma.LZMACompressor(check=lzma.CHECK_CRC32)
+    stream = c.compress(b"part one, ") + c.compress(b"part two") + c.flush()
+    dz = lzma.LZMADecompressor()
+    check("incremental, CHECK_CRC32", [dz.decompress(stream), dz.check], [b"part one, part two", lzma.CHECK_CRC32])
+    lp = tpath("t.xz")
+    with lzma.open(lp, "wt", encoding="utf-8") as f:
+        f.write("xz line\nsecond\n")
+    with lzma.open(lp, "rt", encoding="utf-8") as f:
+        check("lzma.open text", f.readlines(), ["xz line\n", "second\n"])
+    with lzma.LZMAFile(lp) as f:
+        check("LZMAFile", [f.read(2), f.tell(), f.seekable()], [b"xz", 2, True])
+    check("concatenated streams", lzma.decompress(lzma.compress(b"a") + lzma.compress(b"b")), b"ab")
+else:
+    skip_lz("encoded filter properties", "lzma round trips", "FORMAT_RAW with a filter chain",
+            "incremental, CHECK_CRC32", "lzma.open text", "LZMAFile", "concatenated streams")
 if nython:
     # without liblzma (NY_NO_LIBLZMA=1 pretends it is absent) the native
     # decoder still reads .xz and .lzma; a compressor names the library
@@ -894,7 +912,7 @@ with open(fp, "w") as f:
     faulthandler.dump_traceback(f.fileno(), all_threads=True)
 text = open(fp).read().splitlines()
 check("dump_traceback: all threads", [text[0], text[1].endswith(" in <module>")],
-      ["Current thread 0x%016x (most recent call first):" % threading.get_ident(), True])
+      ["Current thread 0x%0*x (most recent call first):" % (struct.calcsize("L") * 2, threading.get_ident()), True])   # unsigned long's width, as CPython
 check("argument errors", [raises(faulthandler.dump_traceback_later, 0), raises(faulthandler.dump_traceback_later, -1)],
       [["ValueError", "timeout must be greater than 0"], ["ValueError", "timeout must be greater than 0"]])
 faulthandler.cancel_dump_traceback_later()

@@ -764,9 +764,27 @@ struct Fallback {
         }
         case A_HDR: {
             need(13);
-            set_lzma_props((uint8_t)in[ip], false);
             uint32_t ds = (uint32_t)le(in, ip + 1, 4);
             a_size = le(in, ip + 5, 8);
+            {
+                // round 84: what liblzma's .lzma decoder refuses as no .lzma
+                // header (LZMA_FORMAT_ERROR) - invalid properties and, read
+                // through FORMAT_AUTO ("picky"), a dictionary size not 2^n or
+                // 2^n + 2^(n-1) or an implausible size (garbage given to
+                // lzma.decompress said "Corrupt input data")
+                uint8_t pb = (uint8_t)in[ip];
+                bool bad = pb > (4 * 5 + 4) * 9 + 8 || (pb % 9) + ((pb / 9) % 5) > 4;
+                if (!bad && format == FORMAT_AUTO) {
+                    if (ds != UINT32_MAX) {
+                        uint32_t d = ds - 1;
+                        d |= d >> 2; d |= d >> 3; d |= d >> 4; d |= d >> 8; d |= d >> 16; ++d;
+                        bad = d != ds;
+                    }
+                    if (a_size != UINT64_MAX && a_size >= (1ULL << 38)) bad = true;
+                }
+                if (bad) throw Corrupt{"Input format not supported by decoder"};
+            }
+            set_lzma_props((uint8_t)in[ip], false);
             w.dict_size = std::max<uint32_t>(ds, 4096);
             if ((uint64_t)w.dict_size > memlimit) throw Corrupt{"Memory usage limit exceeded"};
             ip += 13;

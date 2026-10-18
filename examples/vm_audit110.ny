@@ -1082,7 +1082,7 @@ def netrc_mailcap_cgi_checks():
           [["application/pdf", "image/*", "text/plain"], "cat %s", '"PDF"'])
     check("mailcap.findmatch", [mailcap.findmatch(caps, "text/plain", filename="/tmp/a.txt")[0],
                                 mailcap.findmatch(caps, "image/png", filename="x.png")[0], mailcap.findmatch(caps, "video/mp4")],
-          ["cat /tmp/a.txt", "display x.png", (None, None)])
+          ["cat /tmp/a.txt", "display x.png" if sys.platform != "win32" else None, (None, None)])   # `test=true`: no true command on Windows
     check("mailcap.subst", mailcap.subst("view %s %t %{charset}", "text/plain", "f.txt", ["charset=utf-8"]), 'view f.txt text/plain utf-8')
     import io
     body = "a=1&b=two+words&b=x%26y&empty="

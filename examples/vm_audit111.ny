@@ -13,6 +13,8 @@ from ctypes import *
 
 NYTHON = sys.implementation.name == "nython"
 WIN = sys.platform == "win32"
+# (c_int is c_long where they have one size - Windows; CPython names it so)
+CI = c_int.__name__
 results = []
 
 def check(name, got, want):
@@ -65,7 +67,7 @@ check("char, bool, pointers", [c_char(b"a").value, c_char(66).value, c_bool(5).v
       c_char_p().value, c_wchar(" ").value], [b"a", b"B", True, False, b"hi", "hé", None, 1234, None, " "])
 check("reprs", [repr(c_int(5)), repr(c_bool(2)), repr(c_char(b"a")), repr(c_double(1.5)), repr(c_void_p()),
       repr(c_wchar_p(None)), repr(c_char_p(b"x")) == "c_char_p(%d)" % cast(c_char_p(b"x"), c_void_p).value or True],
-      ["c_int(5)", "c_bool(True)", "c_char(b'a')", "c_double(1.5)", "c_void_p(None)", "c_wchar_p(None)", True])
+      [CI + "(5)", "c_bool(True)", "c_char(b'a')", "c_double(1.5)", "c_void_p(None)", "c_wchar_p(None)", True])
 check("sizes are the platform's", [sizeof(c_int), sizeof(c_long), sizeof(c_longlong), sizeof(c_void_p),
       sizeof(c_size_t), sizeof(c_double), sizeof(c_short), sizeof(c_char)],
       [struct.calcsize("i"), struct.calcsize("l"), struct.calcsize("q"), struct.calcsize("P"),
@@ -91,7 +93,7 @@ class P(Structure):
     _fields_ = [("x", c_int), ("y", c_short)]
 p = P(1, 2)
 check("a structure", [repr(P.x), repr(P.y), sizeof(P), p.x, p.y, P.x.offset, P.y.offset, P.y.size],
-      ["<Field type=c_int, ofs=0, size=4>", "<Field type=c_short, ofs=4, size=2>", 8, 1, 2, 0, 4, 2])
+      ["<Field type=" + CI + ", ofs=0, size=4>", "<Field type=c_short, ofs=4, size=2>", 8, 1, 2, 0, 4, 2])
 p.y = 300
 check("fields write its memory", bytes(p), struct.pack("ih", 1, 300) + b"\x00\x00")
 class Mixed(Structure):
@@ -146,7 +148,7 @@ class B(Structure):
     _fields_ = [("a", c_int, 3), ("b", c_int, 5), ("c", c_uint, 10)]
 bb = B(5, 17, 1000)
 check("bit fields (signed fields sign-extend)", [bb.a, bb.b, bb.c, sizeof(B), repr(B.a), repr(B.b)],
-      [-3, -15, 1000, 4, "<Field type=c_int, ofs=0:0, bits=3>", "<Field type=c_int, ofs=0:3, bits=5>"])
+      [-3, -15, 1000, 4, "<Field type=" + CI + ", ofs=0:0, bits=3>", "<Field type=" + CI + ", ofs=0:3, bits=5>"])
 class BE(BigEndianStructure):
     _fields_ = [("v", c_uint32), ("w", c_uint16)]
 be = BE(0x01020304, 0x0506)
@@ -161,7 +163,7 @@ A = c_int * 3
 a = A(1, 2, 3)
 a[-1] = 30
 check("arrays", [len(a), a[1], list(a), a[0:2], A is c_int * 3, A.__name__, A._length_, A._type_ is c_int, a[2]],
-      [3, 2, [1, 2, 30], [1, 2], True, "c_int_Array_3", 3, True, 30])
+      [3, 2, [1, 2, 30], [1, 2], True, CI + "_Array_3", 3, True, 30])
 check("array errors", [err(lambda: a[3]), err(lambda: A(1, 2, 3, 4))], ["IndexError: invalid index", "IndexError: invalid index"])
 a[0:2] = [10, 20]
 check("slice assignment", list(a), [10, 20, 30])
@@ -181,7 +183,7 @@ ip = pointer(i)
 ip.contents.value = 8
 ip[0] = ip[0] + 1
 check("pointers", [i.value, ip.contents.value, bool(POINTER(c_int)()), POINTER(c_int) is POINTER(c_int),
-      POINTER(c_int).__name__, type(ip).__name__], [9, 9, False, True, "LP_c_int", "LP_c_int"])
+      POINTER(c_int).__name__, type(ip).__name__], [9, 9, False, True, "LP_" + CI, "LP_" + CI])
 check("NULL pointer access", err(lambda: POINTER(c_int)().contents), "ValueError: NULL pointer access")
 arr = (c_int * 4)(1, 2, 3, 4)
 pa = cast(arr, POINTER(c_int))
@@ -204,7 +206,7 @@ libc.strtod.restype = c_double
 libc.strtod.argtypes = [c_char_p, POINTER(c_char_p)]
 end = c_char_p()
 check("restype/argtypes, an out parameter by reference", [libc.labs(-(2**40)), libc.strtod(b"3.25xyz", byref(end)), end.value],
-      [2**40, 3.25, b"xyz"])
+      [2**40 if sizeof(c_long) == 8 else 0, 3.25, b"xyz"])   # a 32-bit long truncates (Windows)
 libc.strchr.restype = c_char_p
 libc.getenv.restype = c_char_p
 os.environ["NY_CTYPES_PROBE"] = "found"
@@ -261,9 +263,46 @@ else:
 import ctypes.util, ctypes.wintypes
 fl = ctypes.util.find_library("c")
 check("ctypes.util.find_library", [fl is not None, fl is None or "c" in fl, ctypes.util.find_library("no_such_lib_ny")],
-      [True, True, None])
+      [not WIN, True, None])   # CPython's is None on Windows too (the UCRT)
 check("ctypes.wintypes", [sizeof(ctypes.wintypes.DWORD) == sizeof(c_ulong), ctypes.wintypes.RECT(1, 2, 3, 4).right,
       ctypes.wintypes.RGB(1, 2, 3)], [True, 3, 197121])
+
+# ── structures by value through calls and callbacks (round 84) ───────────
+# every register class: INTEGER (P), SSE+INTEGER (Q), SSE+SSE (R), in memory
+# (B, 40 bytes), an odd size (S3); 16- and 8-byte results (ldiv, div)
+sprog = """from ctypes import *
+import sys
+class P(Structure): _fields_ = [("x", c_int), ("y", c_int)]
+class Q(Structure): _fields_ = [("d", c_double), ("n", c_longlong)]
+class R(Structure): _fields_ = [("a", c_float), ("b", c_float), ("c", c_double)]
+class B(Structure): _fields_ = [("v", c_longlong * 5)]
+class S3(Structure): _fields_ = [("a", c_ubyte), ("b", c_ubyte), ("c", c_ubyte)]
+def f(p, q, r, b, s, z):
+    return p.x + p.y * 10 + int(q.d) * 100 + q.n * 1000 + int(r.a + r.b + r.c) * 10000 + sum(b.v) * 100000 + (s.a + s.b + s.c) * 10000000 + int(z) * 1000000000
+cb = CFUNCTYPE(c_longlong, P, Q, R, B, S3, c_double)(f)
+r1 = cb(P(1, 2), Q(3.0, 4), R(1.5, 2.5, 3.0), B((c_longlong * 5)(1, 2, 3, 4, 5)), S3(1, 2, 3), 7.0)
+g = CFUNCTYPE(c_double, Q, c_int, R)(lambda q, i, r: q.d * i + r.c)
+r2 = g(Q(2.5, 9), 4, R(0.0, 0.0, 0.25))
+libc = CDLL(None) if sys.platform != "win32" else cdll.msvcrt
+class LD(Structure): _fields_ = [("quot", c_long), ("rem", c_long)]
+libc.ldiv.restype = LD
+libc.ldiv.argtypes = [c_long, c_long]
+d = libc.ldiv(10**9 + 7, 10)
+class DV(Structure): _fields_ = [("quot", c_int), ("rem", c_int)]
+libc.div.restype = DV
+dv = libc.div(-17, 5)
+OUT = [r1, r2, d.quot, d.rem, dv.quot, dv.rem]
+"""
+want_s = [7061574321, 10.25, 100000000, 7, -3, -2]
+ns = {}
+exec(sprog, ns)
+check("structures by value: calls and callbacks", ns["OUT"], want_s)
+if NYTHON:
+    out = subprocess.run([sys.executable, "-c", sprog + "print(OUT)\n"], capture_output=True, text=True,
+                         env=dict(os.environ, NY_FFI_NO_LIBFFI="1"))
+    check("... on Nython's built-in caller (no libffi)", out.stdout.strip(), repr(want_s))
+else:
+    results.append(["... on Nython's built-in caller (no libffi)", True, None, None])
 
 # ── Nython: the built-in caller (no libffi) ──────────────────────────────
 if NYTHON and not WIN and _ffi_backend() == "libffi":

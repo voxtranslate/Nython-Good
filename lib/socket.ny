@@ -20,7 +20,11 @@ _C = _consts()
 AF_INET = _C["AF_INET"]
 AF_INET6 = _C["AF_INET6"]
 AF_UNSPEC = _C["AF_UNSPEC"]
-AF_UNIX = _C.get("AF_UNIX")
+# round 84: absent where the platform has no Unix sockets (Windows), as in
+# CPython - code tests hasattr(socket, "AF_UNIX"); it was None there
+_AF_UNIX = _C.get("AF_UNIX")
+if _AF_UNIX is not None:
+    AF_UNIX = _AF_UNIX
 SOCK_STREAM = _C["SOCK_STREAM"]
 SOCK_DGRAM = _C["SOCK_DGRAM"]
 SOCK_RAW = _C["SOCK_RAW"]
@@ -350,7 +354,7 @@ def _from_handle(h, family, type):
 def socketpair(family=none, type=SOCK_STREAM, proto=0):
     var fam = family
     if fam is none:
-        fam = AF_UNIX if AF_UNIX is not none else AF_INET
+        fam = _AF_UNIX if _AF_UNIX is not none else AF_INET
     var hs = _net_socketpair(fam, type)
     return (_from_handle(hs[0], fam, type), _from_handle(hs[1], fam, type))
 

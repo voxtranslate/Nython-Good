@@ -3212,12 +3212,22 @@ def _ny_path_hooks_spec(sysm, name, path, hooks):
         if entry in cache:
             finder = cache[entry]
         else:
-            for hook in list(hooks):
-                try:
-                    finder = hook(entry)
-                    break
-                except ImportError:
-                    continue
+            # round 84: provisionally no finder while the hooks run - a hook
+            # that imports (zipimporter's os.path calls import lazily on
+            # Windows) has the entry searched natively instead of entering
+            # the hook again without end (a RecursionError for `nython
+            # app.pyz` there); a hook's own error leaves no entry
+            cache[entry] = None
+            try:
+                for hook in list(hooks):
+                    try:
+                        finder = hook(entry)
+                        break
+                    except ImportError:
+                        continue
+            except BaseException:
+                cache.pop(entry, None)
+                raise
             cache[entry] = finder
         if finder is None:
             # no hook takes it: the engines' own search of that directory

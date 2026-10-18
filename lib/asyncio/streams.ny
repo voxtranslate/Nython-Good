@@ -3,5 +3,5 @@
 # (the names live in lib/asyncio/__init__.ny; round 82).
 from asyncio import (StreamReader, StreamWriter, StreamReaderProtocol, open_connection, start_server, IncompleteReadError, LimitOverrunError, FlowControlMixin, _DEFAULT_LIMIT)
 import socket as _socket
-if _socket.AF_UNIX is not None:
+if getattr(_socket, "AF_UNIX", None) is not None:
     from asyncio import open_unix_connection, start_unix_server

@@ -409,19 +409,31 @@ const int N_FREG = 8, N_STACK = 8;
 // Integer-class and float-class arguments fill their own registers in
 // order; the excess goes on the stack in argument order (SysV x86-64 §3.2.3,
 // AAPCS64 §6.8). A variadic prototype makes x86-64 set %al.
+// round 84: 16 stack words for calls (structures passed in memory take
+// several); the callback trampolines still read N_STACK
+const int N_STACK_CALL = 16;
 template <class R>
 R split_call(void* fn, const W* ir, const double* fr, const W* st) {
 #  if defined(__x86_64__)
     using F = R (*)(...);
     return ((F)fn)(ir[0], ir[1], ir[2], ir[3], ir[4], ir[5], fr[0], fr[1], fr[2], fr[3], fr[4], fr[5], fr[6], fr[7],
-                   st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
+                   st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15]);
 #  else
     using F = R (*)(W, W, W, W, W, W, W, W, double, double, double, double, double, double, double, double,
-                    W, W, W, W, W, W, W, W);
+                    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W);
     return ((F)fn)(ir[0], ir[1], ir[2], ir[3], ir[4], ir[5], ir[6], ir[7], fr[0], fr[1], fr[2], fr[3], fr[4], fr[5], fr[6], fr[7],
-                   st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
+                   st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15]);
 #  endif
 }
+// Result types the compiler returns as the ABIs return small structures:
+// two eightbytes in RAX:RDX / XMM0:XMM1 / mixed (SysV), x0:x1 (AAPCS64), and
+// blobs larger than 16 bytes, which every ABI returns through a hidden
+// pointer the compiler passes itself (x8 on AArch64).
+struct RII { W a, b; };
+struct RDD { double a, b; };
+struct RID { W a; double b; };
+struct RDI { double a; W b; };
+template <int N> struct RBlob { W w[N]; };
 #elif defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
 #  define NY_FFI_WIN64 1
 const int N_POS = 16;
@@ -586,16 +598,97 @@ Ret call_libffi(void* fn, int flags, unsigned nfixed, const std::string& rtype, 
     return result_of(rtype, ret.data(), true);
 }
 
+// round 84: a structure's scalar leaves (offset, code), as spec_layout lays
+// them out - what the ABIs classify a structure passed by value by.
+void spec_leaves(const std::string& s, size_t& i, size_t base, std::vector<std::pair<size_t, char>>& out,
+                 size_t& size, size_t& align) {
+    char c = s[i++];
+    if (c != '{') {
+        const TI* t = type_of(c);
+        if (!t) raise("TypeError", std::string("ctypes: unknown type code '") + c + "'");
+        out.push_back({base, c});
+        size = t->size; align = t->align;
+        return;
+    }
+    size_t off = 0, al = 1;
+    while (i < s.size() && s[i] != '}') {
+        size_t n = 1;
+        bool arr = false;
+        if (s[i] == '[') {
+            arr = true; i++; n = 0;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') n = n * 10 + (size_t)(s[i++] - '0');
+        }
+        size_t start = i, es, ea;
+        std::vector<std::pair<size_t, char>> one;
+        spec_leaves(s, i, 0, one, es, ea);
+        if (arr && i < s.size() && s[i] == ']') i++;
+        off = (off + ea - 1) / ea * ea;
+        for (size_t k = 0; k < n; k++)
+            for (auto& l : one) out.push_back({base + off + k * es + l.first, l.second});
+        off += es * n;
+        if (ea > al) al = ea;
+        (void)start;
+    }
+    if (i < s.size()) i++;
+    size = (off + al - 1) / al * al;
+    align = al;
+}
+struct SLayout { size_t size = 0, align = 1; std::vector<std::pair<size_t, char>> leaves; };
+SLayout struct_layout(const std::string& spec) {
+    SLayout L; size_t i = 0;
+    spec_leaves(spec, i, 0, L.leaves, L.size, L.align);
+    return L;
+}
+[[noreturn]] void need_libffi(const char* what) {
+    raise("TypeError", std::string("ctypes: ") + what + " needs libffi (" + ffi().why + ")");
+}
+#if defined(NY_FFI_SPLIT_REGS) && defined(__x86_64__)
+// SysV x86-64 (§3.2.3): each eightbyte of a structure of at most 16 bytes is
+// INTEGER when any integer leaf touches it, else SSE; larger ones, and any
+// holding a long double, are MEMORY.
+enum { C_NONE = 0, C_INT = 1, C_SSE = 2, C_MEM = 3 };
+void sysv_classify(const SLayout& L, int cls[2]) {
+    cls[0] = cls[1] = C_NONE;
+    if (L.size > 16 || L.size == 0) { cls[0] = cls[1] = C_MEM; return; }
+    for (auto& l : L.leaves) {
+        if (l.second == 'g') { cls[0] = cls[1] = C_MEM; return; }
+        const TI* t = type_of(l.second);
+        for (size_t e = l.first / 8; e <= (l.first + t->size - 1) / 8 && e < 2; e++) {
+            if (l.first % t->align) { cls[0] = cls[1] = C_MEM; return; }   // unaligned (packed)
+            int want = is_float(l.second) ? C_SSE : C_INT;
+            if (cls[e] == C_NONE || (cls[e] == C_SSE && want == C_INT)) cls[e] = want;
+        }
+    }
+    if (L.size <= 8) cls[1] = C_NONE;
+}
+#endif
+#if defined(NY_FFI_SPLIT_REGS) && defined(__aarch64__)
+// AAPCS64: a homogeneous floating-point aggregate goes in SIMD registers;
+// the built-in caller leaves those to libffi
+bool aapcs_hfa(const SLayout& L) {
+    if (L.leaves.empty() || L.leaves.size() > 4) return false;
+    char c = L.leaves[0].second;
+    if (!is_float(c)) return false;
+    for (auto& l : L.leaves) if (l.second != c) return false;
+    return true;
+}
+#endif
+
 Ret call_builtin(void* fn, int flags, unsigned nfixed, const std::string& rtype, const std::vector<std::string>& atypes,
                  const Args& av) {
     (void)nfixed;
-    for (auto& s : atypes)
-        if (s[0] == '{' || s[0] == 'g')
-            raise("TypeError", "ctypes: structures by value and long double need libffi (" + ffi().why + ")");
-    if (rtype[0] == '{' || rtype[0] == 'g')
-        raise("TypeError", "ctypes: structures by value and long double need libffi (" + ffi().why + ")");
+    // round 84: structures by value (it raised for every one): passed and
+    // returned as each ABI does, from their layout (spec_leaves); long double
+    // and what an ABI needs that the C++ calls below cannot express still
+    // need libffi
+    for (auto& s : atypes) if (s[0] == 'g') need_libffi("a long double argument");
+    if (rtype[0] == 'g') need_libffi("a long double result");
+    const bool rstruct = rtype[0] == '{';
+    SLayout RL;
+    if (rstruct) { RL = struct_layout(rtype); if (RL.size > 128) need_libffi("a structure result of more than 128 bytes"); }
     char rc = rtype[0];
-    unsigned char rbuf[16] = {0};
+    alignas(16) unsigned char rbuf[144] = {0};
+    std::deque<std::vector<unsigned char>> copies;   // structures passed through a pointer to a copy
     auto word_of = [&](size_t k, bool& isf) -> W {
         char c = atypes[k][0];
         unsigned char tmp[16] = {0};
@@ -606,49 +699,166 @@ Ret call_builtin(void* fn, int flags, unsigned nfixed, const std::string& rtype,
         const TI* t = type_of(c);
         return (W)load_int(tmp, t->size, is_signed_int(c) || c == 'c');
     };
+    auto struct_mem = [&](size_t k) -> const unsigned char* {
+        const unsigned char* p = (const unsigned char*)addr_arg(av, k);
+        if (!p) raise("ValueError", "ctypes: NULL struct argument");
+        return p;
+    };
+    auto words_of = [&](const unsigned char* p, size_t size, W* out, size_t n) {
+        std::memset(out, 0, n * sizeof(W));
+        std::memcpy(out, p, size < n * sizeof(W) ? size : n * sizeof(W));
+    };
 #if defined(NY_FFI_SPLIT_REGS)
 #  if defined(__aarch64__) && defined(__APPLE__)
     if (flags & F_VARIADIC) raise("TypeError", "ctypes: variadic calls need libffi on this platform");
 #  endif
-    W ir[N_IREG > 8 ? N_IREG : 8] = {0}; double fr[N_FREG] = {0}; W stk[N_STACK] = {0};
+    W ir[N_IREG > 8 ? N_IREG : 8] = {0}; double fr[N_FREG] = {0}; W stk[N_STACK_CALL] = {0};
     int ni = 0, nf = 0, ns = 0;
+    auto push_stack = [&](W w) {
+        if (ns >= N_STACK_CALL) raise("TypeError", "ctypes: too many arguments for the built-in caller (libffi: " + ffi().why + ")");
+        stk[ns++] = w;
+    };
+#  if defined(__x86_64__)
+    int rcls[2] = {C_NONE, C_NONE};
+    if (rstruct) {
+        sysv_classify(RL, rcls);
+        if (rcls[0] == C_MEM) ir[ni++] = (W)(uintptr_t)rbuf;   // the hidden result pointer, in %rdi
+    }
+#  endif
     for (size_t k = 0; k < atypes.size(); k++) {
+        if (atypes[k][0] == '{') {
+            SLayout L = struct_layout(atypes[k]);
+            const unsigned char* p = struct_mem(k);
+            size_t nw = (L.size + 7) / 8;
+            W wv[16];
+            if (nw > 16) need_libffi("a structure argument of more than 128 bytes");
+            words_of(p, L.size, wv, nw);
+#  if defined(__x86_64__)
+            int cls[2];
+            sysv_classify(L, cls);
+            if (cls[0] != C_MEM) {
+                int need_i = (cls[0] == C_INT) + (cls[1] == C_INT), need_f = (cls[0] == C_SSE) + (cls[1] == C_SSE);
+                if (ni + need_i <= N_IREG && nf + need_f <= N_FREG) {   // all of it in registers, else all on the stack
+                    for (size_t e = 0; e < nw; e++) {
+                        if (cls[e] == C_INT) ir[ni++] = wv[e];
+                        else std::memcpy(&fr[nf++], &wv[e], 8);
+                    }
+                    continue;
+                }
+            }
+            for (size_t e = 0; e < nw; e++) push_stack(wv[e]);
+#  else
+            if (aapcs_hfa(L)) need_libffi("a structure of floating-point members by value on AArch64");
+            if (L.size > 16) {
+                // a copy in memory, its address in the next integer register
+                copies.emplace_back(p, p + L.size);
+                W a = (W)(uintptr_t)copies.back().data();
+                if (ni < N_IREG) ir[ni++] = a; else push_stack(a);
+                continue;
+            }
+            if (ni + (int)nw <= N_IREG) { for (size_t e = 0; e < nw; e++) ir[ni++] = wv[e]; continue; }
+            ni = N_IREG;   // C.13: no more integer registers once one did not fit
+            for (size_t e = 0; e < nw; e++) push_stack(wv[e]);
+#  endif
+            continue;
+        }
         bool isf;
         W w = word_of(k, isf);
         if (isf && nf < N_FREG) { std::memcpy(&fr[nf++], &w, 8); continue; }
         if (!isf && ni < N_IREG) { ir[ni++] = w; continue; }
-        if (ns >= N_STACK) raise("TypeError", "ctypes: too many arguments for the built-in caller (libffi: " + ffi().why + ")");
-        stk[ns++] = w;
+        push_stack(w);
     }
     ErrnoSwap es(flags);
     std::unique_ptr<GilRelease> rel;
     if (!(flags & F_KEEPGIL)) rel.reset(new GilRelease());
-    if (rc == 'd') { double d = split_call<double>(fn, ir, fr, stk); std::memcpy(rbuf, &d, 8); }
+    if (rstruct) {
+#  if defined(__x86_64__)
+        if (rcls[0] == C_MEM) (void)split_call<W>(fn, ir, fr, stk);
+        else if (RL.size <= 8) {
+            if (rcls[0] == C_SSE) { double d = split_call<double>(fn, ir, fr, stk); std::memcpy(rbuf, &d, 8); }
+            else { W w = split_call<W>(fn, ir, fr, stk); std::memcpy(rbuf, &w, 8); }
+        } else if (rcls[0] == C_INT && rcls[1] == C_INT) { RII r = split_call<RII>(fn, ir, fr, stk); std::memcpy(rbuf, &r, 16); }
+        else if (rcls[0] == C_SSE && rcls[1] == C_SSE) { RDD r = split_call<RDD>(fn, ir, fr, stk); std::memcpy(rbuf, &r, 16); }
+        else if (rcls[0] == C_INT) { RID r = split_call<RID>(fn, ir, fr, stk); std::memcpy(rbuf, &r.a, 8); std::memcpy(rbuf + 8, &r.b, 8); }
+        else { RDI r = split_call<RDI>(fn, ir, fr, stk); std::memcpy(rbuf, &r.a, 8); std::memcpy(rbuf + 8, &r.b, 8); }
+#  else
+        if (aapcs_hfa(RL)) { rel.reset(); need_libffi("a structure result of floating-point members on AArch64"); }
+        size_t nw = (RL.size + 7) / 8;
+        switch (nw) {
+            case 0: case 1: { W w = split_call<W>(fn, ir, fr, stk); std::memcpy(rbuf, &w, 8); break; }
+            case 2: { RII r = split_call<RII>(fn, ir, fr, stk); std::memcpy(rbuf, &r, 16); break; }
+#    define NY_BLOB(N) case N: { RBlob<N> r = split_call<RBlob<N>>(fn, ir, fr, stk); std::memcpy(rbuf, &r, sizeof r); break; }
+            NY_BLOB(3) NY_BLOB(4) NY_BLOB(5) NY_BLOB(6) NY_BLOB(7) NY_BLOB(8) NY_BLOB(9) NY_BLOB(10) NY_BLOB(11)
+            NY_BLOB(12) NY_BLOB(13) NY_BLOB(14) NY_BLOB(15) NY_BLOB(16)
+#    undef NY_BLOB
+            default: rel.reset(); need_libffi("a structure result of more than 128 bytes");
+        }
+#  endif
+    }
+    else if (rc == 'd') { double d = split_call<double>(fn, ir, fr, stk); std::memcpy(rbuf, &d, 8); }
     else if (rc == 'f') { float x = split_call<float>(fn, ir, fr, stk); std::memcpy(rbuf, &x, 4); }
     else { W w = split_call<W>(fn, ir, fr, stk); std::memcpy(rbuf, &w, 8); }
     rel.reset();
 #elif defined(NY_FFI_WIN64)
-    if (atypes.size() > (size_t)N_POS) raise("TypeError", "ctypes: more than 16 arguments need libffi");
-    W w[N_POS] = {0};
-    int mask = 0;
+    // Windows x64: a structure of 1, 2, 4 or 8 bytes travels as an integer of
+    // that size; any other is passed by reference to a copy, and returned
+    // through a hidden pointer that comes first (RCX)
+    W w[N_POS + 1] = {0};
+    int mask = 0, n = 0;
+    const bool rhidden = rstruct && !(RL.size == 1 || RL.size == 2 || RL.size == 4 || RL.size == 8);
+    if (rhidden) w[n++] = (W)(uintptr_t)rbuf;
     for (size_t k = 0; k < atypes.size(); k++) {
+        if (n >= N_POS) raise("TypeError", "ctypes: more than 16 arguments need libffi");
+        if (atypes[k][0] == '{') {
+            SLayout L = struct_layout(atypes[k]);
+            const unsigned char* p = struct_mem(k);
+            if (L.size == 1 || L.size == 2 || L.size == 4 || L.size == 8) { words_of(p, L.size, &w[n++], 1); continue; }
+            copies.emplace_back(p, p + L.size);
+            w[n++] = (W)(uintptr_t)copies.back().data();
+            continue;
+        }
         bool isf;
-        w[k] = word_of(k, isf);
+        w[n] = word_of(k, isf);
         // a float stays a float: its bits in the low half of the XMM register
-        if (isf && k < 4) mask |= 1 << k;
+        if (isf && n < 4) mask |= 1 << n;
+        n++;
     }
     ErrnoSwap es(flags);
     std::unique_ptr<GilRelease> rel;
     if (!(flags & F_KEEPGIL)) rel.reset(new GilRelease());
-    if (rc == 'd') { double d = win64_dispatch<double>(fn, mask, w); std::memcpy(rbuf, &d, 8); }
+    if (rstruct) {
+        W r = win64_dispatch<W>(fn, mask, w);
+        if (!rhidden) std::memcpy(rbuf, &r, 8);
+    }
+    else if (rc == 'd') { double d = win64_dispatch<double>(fn, mask, w); std::memcpy(rbuf, &d, 8); }
     else if (rc == 'f') { float x = win64_dispatch<float>(fn, mask, w); std::memcpy(rbuf, &x, 4); }
     else { W r = win64_dispatch<W>(fn, mask, w); std::memcpy(rbuf, &r, 8); }
     rel.reset();
 #elif defined(NY_FFI_X86)
-    (void)word_of;
+    (void)word_of; (void)words_of;
     W32 w[N_WORDS] = {0};
     int n = 0;
+#  if defined(_WIN32)
+    // structures of 1, 2, 4 or 8 bytes come back in EAX/EDX:EAX; the rest
+    // through a hidden pointer the caller pushes first and pops itself (the
+    // Microsoft convention, which DLLs follow)
+    const bool rhidden = rstruct && !(RL.size == 1 || RL.size == 2 || RL.size == 4 || RL.size == 8);
+    if (rhidden) w[n++] = (W32)(uintptr_t)rbuf;
+#  else
+    if (rstruct) need_libffi("a structure result on 32-bit x86");   // the callee pops the hidden pointer (SysV i386)
+    const bool rhidden = false;
+#  endif
     for (size_t k = 0; k < atypes.size(); k++) {
+        if (atypes[k][0] == '{') {
+            // copied onto the stack, in words of 4 bytes
+            SLayout L = struct_layout(atypes[k]);
+            const unsigned char* p = struct_mem(k);
+            size_t words = (L.size + 3) / 4;
+            if (n + (int)words > N_WORDS) raise("TypeError", "ctypes: too many arguments for the built-in caller");
+            std::memcpy(&w[n], p, L.size);
+            n += (int)words;
+            continue;
+        }
         char c = atypes[k][0];
         unsigned char tmp[16] = {0};
         store(tmp, c, av, k);
@@ -664,21 +874,22 @@ Ret call_builtin(void* fn, int flags, unsigned nfixed, const std::string& rtype,
     if (!(flags & F_KEEPGIL)) rel.reset(new GilRelease());
 #  if defined(_WIN32)
     if (flags & F_STDCALL) {
-        if (rc == 'd') { double d = x86_stdcall<double>(fn, n, w); std::memcpy(rbuf, &d, 8); }
-        else if (rc == 'f') { float x = x86_stdcall<float>(fn, n, w); std::memcpy(rbuf, &x, 4); }
-        else { uint64_t r = x86_stdcall<uint64_t>(fn, n, w); std::memcpy(rbuf, &r, 8); }
+        if (rc == 'd' && !rstruct) { double d = x86_stdcall<double>(fn, n, w); std::memcpy(rbuf, &d, 8); }
+        else if (rc == 'f' && !rstruct) { float x = x86_stdcall<float>(fn, n, w); std::memcpy(rbuf, &x, 4); }
+        else { uint64_t r = x86_stdcall<uint64_t>(fn, n, w); if (!rhidden) std::memcpy(rbuf, &r, 8); }
     } else
 #  endif
     {
-        if (rc == 'd') { double d = x86_cdecl<double>(fn, w); std::memcpy(rbuf, &d, 8); }
-        else if (rc == 'f') { float x = x86_cdecl<float>(fn, w); std::memcpy(rbuf, &x, 4); }
-        else { uint64_t r = x86_cdecl<uint64_t>(fn, w); std::memcpy(rbuf, &r, 8); }
+        if (rc == 'd' && !rstruct) { double d = x86_cdecl<double>(fn, w); std::memcpy(rbuf, &d, 8); }
+        else if (rc == 'f' && !rstruct) { float x = x86_cdecl<float>(fn, w); std::memcpy(rbuf, &x, 4); }
+        else { uint64_t r = x86_cdecl<uint64_t>(fn, w); if (!rhidden) std::memcpy(rbuf, &r, 8); }
     }
     rel.reset();
 #else
-    (void)word_of; (void)flags;
+    (void)word_of; (void)flags; (void)struct_mem; (void)words_of; (void)copies;
     raise("TypeError", "ctypes: foreign calls need libffi on this platform (" + ffi().why + ")");
 #endif
+    if (rstruct) return Ret::bytes(std::string((const char*)rbuf, RL.size));
     if (rc == 'v') return Ret::none();
     if (rc == 'd' || rc == 'f') return load(rbuf, rc);
     // an integer result: the low bytes of the word, extended by the type
@@ -769,12 +980,41 @@ W pool_dispatch(int kind, int slot, const W* ir, const double* fr, const W* st, 
     std::vector<std::vector<unsigned char>> store_(cb->atypes.size(), std::vector<unsigned char>(16, 0));
     std::vector<void*> argp(cb->atypes.size());
     int ni = 0, nf = 0, ns = 0;
+    auto next_stack = [&]() -> W { return ns < N_STACK ? st[ns++] : 0; };
     for (size_t k = 0; k < cb->atypes.size(); k++) {
         char c = cb->atypes[k][0];
+        if (c == '{') {
+            // round 84: a structure by value, from where call_builtin puts one
+            SLayout L = struct_layout(cb->atypes[k]);
+            size_t nw = (L.size + 7) / 8;
+            store_[k].assign(nw * 8 + 8, 0);
+            W* out = (W*)store_[k].data();
+#  if defined(__x86_64__)
+            int cls[2];
+            sysv_classify(L, cls);
+            int need_i = cls[0] == C_MEM ? 99 : (cls[0] == C_INT) + (cls[1] == C_INT);
+            int need_f = cls[0] == C_MEM ? 99 : (cls[0] == C_SSE) + (cls[1] == C_SSE);
+            if (ni + need_i <= N_IREG && nf + need_f <= N_FREG) {
+                for (size_t e = 0; e < nw; e++) {
+                    if (cls[e] == C_INT) out[e] = ir[ni++];
+                    else std::memcpy(&out[e], &fr[nf++], 8);
+                }
+            } else for (size_t e = 0; e < nw; e++) out[e] = next_stack();
+#  else
+            if (L.size > 16) {
+                W a = ni < N_IREG ? ir[ni++] : next_stack();
+                store_[k].assign(L.size + 8, 0);
+                if (a) std::memcpy(store_[k].data(), (const void*)(uintptr_t)a, L.size);
+            } else if (ni + (int)nw <= N_IREG) { for (size_t e = 0; e < nw; e++) out[e] = ir[ni++]; }
+            else { ni = N_IREG; for (size_t e = 0; e < nw; e++) out[e] = next_stack(); }
+#  endif
+            argp[k] = store_[k].data();
+            continue;
+        }
         W w;
         if (is_float(c) && nf < N_FREG) std::memcpy(&w, &fr[nf++], 8);
         else if (!is_float(c) && ni < N_IREG) w = ir[ni++];
-        else w = ns < N_STACK ? st[ns++] : 0;
+        else w = next_stack();
         std::memcpy(store_[k].data(), &w, 8);
         argp[k] = store_[k].data();
     }
@@ -816,6 +1056,167 @@ template <int... S> struct TrampTable {
 };
 using Pool = TrampTable<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
                         26, 27, 28, 29, 30, 31>;
+#elif defined(NY_FFI_WIN64)
+// round 84: callbacks without libffi on Windows x64. Its first four
+// arguments are positional - RCX/RDX/R8/R9 or XMM0-3 by their type - so a
+// trampoline is one per float mask of those four (M): each parameter has
+// the type of the register the caller put the argument in. The rest are
+// stack words. A structure of 1, 2, 4 or 8 bytes arrives as such a word,
+// any other as a pointer to the caller's copy.
+const int POOL = 16;
+Callback* g_pool[3][16][POOL];   // [int, double, float result][mask][slot]
+W pool_dispatch(int kind, int mask, int slot, const W* w, double* dret) {
+    Callback* cb = g_pool[kind][mask][slot];
+    std::vector<std::vector<unsigned char>> store_(cb->atypes.size(), std::vector<unsigned char>(16, 0));
+    std::vector<void*> argp(cb->atypes.size());
+    for (size_t k = 0; k < cb->atypes.size() && k < 16; k++) {
+        const std::string& s = cb->atypes[k];
+        if (s[0] == '{') {
+            size_t size = spec_size(s);
+            store_[k].assign(size + 8, 0);
+            if (size == 1 || size == 2 || size == 4 || size == 8) std::memcpy(store_[k].data(), &w[k], size);
+            else if (w[k]) std::memcpy(store_[k].data(), (const void*)(uintptr_t)w[k], size);
+        } else std::memcpy(store_[k].data(), &w[k], 8);
+        argp[k] = store_[k].data();
+    }
+    unsigned char ret[16] = {0};
+    run_callback(cb, argp.data(), ret, false);
+    char rc = cb->rtype[0];
+    if (rc == 'd') { std::memcpy(dret, ret, 8); return 0; }
+    if (rc == 'f') { float f; std::memcpy(&f, ret, 4); *dret = f; return 0; }
+    if (rc == 'v') return 0;
+    const TI* t = type_of(rc);
+    return (W)load_int(ret, t->size, is_signed_int(rc));
+}
+template <int M, int K> using P64 = std::conditional_t<((M >> K) & 1) != 0, double, W>;
+template <class T> W bits64(T v) { W w = 0; std::memcpy(&w, &v, sizeof v); return w; }
+#  define NY_T64_PARAMS P64<M, 0> a0, P64<M, 1> a1, P64<M, 2> a2, P64<M, 3> a3, W s4, W s5, W s6, W s7, W s8, W s9, W s10, W s11, W s12, W s13, W s14, W s15
+#  define NY_T64_WORDS W w[16] = {bits64(a0), bits64(a1), bits64(a2), bits64(a3), s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15}
+template <int M, int S> W tramp_i(NY_T64_PARAMS) { NY_T64_WORDS; double d; return pool_dispatch(0, M, S, w, &d); }
+template <int M, int S> double tramp_d(NY_T64_PARAMS) { NY_T64_WORDS; double d = 0; pool_dispatch(1, M, S, w, &d); return d; }
+template <int M, int S> float tramp_f(NY_T64_PARAMS) { NY_T64_WORDS; double d = 0; pool_dispatch(2, M, S, w, &d); return (float)d; }
+#  undef NY_T64_PARAMS
+#  undef NY_T64_WORDS
+template <int M, int... S> struct TrampRow {
+    static void* get(int kind, int s) {
+        static void* ti[] = {(void*)&tramp_i<M, S>...};
+        static void* td[] = {(void*)&tramp_d<M, S>...};
+        static void* tf[] = {(void*)&tramp_f<M, S>...};
+        return kind == 0 ? ti[s] : kind == 1 ? td[s] : tf[s];
+    }
+};
+template <int M> using Row = TrampRow<M, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>;
+void* pool_code(int kind, int mask, int s) {
+    switch (mask & 15) {
+        case 0: return Row<0>::get(kind, s);   case 1: return Row<1>::get(kind, s);
+        case 2: return Row<2>::get(kind, s);   case 3: return Row<3>::get(kind, s);
+        case 4: return Row<4>::get(kind, s);   case 5: return Row<5>::get(kind, s);
+        case 6: return Row<6>::get(kind, s);   case 7: return Row<7>::get(kind, s);
+        case 8: return Row<8>::get(kind, s);   case 9: return Row<9>::get(kind, s);
+        case 10: return Row<10>::get(kind, s); case 11: return Row<11>::get(kind, s);
+        case 12: return Row<12>::get(kind, s); case 13: return Row<13>::get(kind, s);
+        case 14: return Row<14>::get(kind, s); default: return Row<15>::get(kind, s);
+    }
+}
+#elif defined(NY_FFI_X86)
+// round 84: callbacks without libffi on 32-bit x86: every argument is a
+// stack word (or two), read from the trampoline's 16 word parameters; a
+// cdecl caller pops them itself, a stdcall trampoline pops exactly its
+// signature's words (one instantiation per word count, 0-12). A structure
+// argument is its words copied onto the stack.
+const int POOL = 8;
+const int N_CBW = 16;
+Callback* g_pool[3][14][POOL];   // [int, double, float result][0 cdecl, 1 + words: stdcall][slot]
+uint64_t pool_dispatch(int kind, int conv, int slot, const W32* w, double* dret) {
+    Callback* cb = g_pool[kind][conv][slot];
+    std::vector<std::vector<unsigned char>> store_(cb->atypes.size(), std::vector<unsigned char>(16, 0));
+    std::vector<void*> argp(cb->atypes.size());
+    int n = 0;
+    for (size_t k = 0; k < cb->atypes.size(); k++) {
+        const std::string& s = cb->atypes[k];
+        size_t size = s[0] == '{' ? spec_size(s) : type_of(s[0])->size;
+        size_t words = s[0] == '{' ? (size + 3) / 4 : (size > 4 ? 2 : 1);
+        store_[k].assign(words * 4 + 8, 0);
+        for (size_t q = 0; q < words && n < N_CBW; q++, n++) std::memcpy(store_[k].data() + q * 4, &w[n], 4);
+        argp[k] = store_[k].data();
+    }
+    unsigned char ret[16] = {0};
+    run_callback(cb, argp.data(), ret, false);
+    char rc = cb->rtype[0];
+    if (rc == 'd') { std::memcpy(dret, ret, 8); return 0; }
+    if (rc == 'f') { float f; std::memcpy(&f, ret, 4); *dret = f; return 0; }
+    if (rc == 'v') return 0;
+    const TI* t = type_of(rc);
+    return (uint64_t)load_int(ret, t->size, is_signed_int(rc));
+}
+#  define NY_T32_PARAMS W32 w0, W32 w1, W32 w2, W32 w3, W32 w4, W32 w5, W32 w6, W32 w7, W32 w8, W32 w9, W32 w10, W32 w11, W32 w12, W32 w13, W32 w14, W32 w15
+#  define NY_T32_WORDS W32 w[N_CBW] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15}
+template <int S> uint64_t tramp_i(NY_T32_PARAMS) { NY_T32_WORDS; double d; return pool_dispatch(0, 0, S, w, &d); }
+template <int S> double tramp_d(NY_T32_PARAMS) { NY_T32_WORDS; double d = 0; pool_dispatch(1, 0, S, w, &d); return d; }
+template <int S> float tramp_f(NY_T32_PARAMS) { NY_T32_WORDS; double d = 0; pool_dispatch(2, 0, S, w, &d); return (float)d; }
+#  undef NY_T32_PARAMS
+#  undef NY_T32_WORDS
+template <int... S> struct TrampTable {
+    static void* get(int kind, int s) {
+        static void* ti[] = {(void*)&tramp_i<S>...};
+        static void* td[] = {(void*)&tramp_d<S>...};
+        static void* tf[] = {(void*)&tramp_f<S>...};
+        return kind == 0 ? ti[s] : kind == 1 ? td[s] : tf[s];
+    }
+};
+using Pool = TrampTable<0, 1, 2, 3, 4, 5, 6, 7>;
+#  if defined(_WIN32)
+// stdcall: the words the signature takes, popped by the trampoline
+template <class R, int N, int S> struct StdTramp;
+#    define NY_STDT(N, ...) template <class R, int S> struct StdTramp<R, N, S> { \
+        static R __stdcall run(__VA_ARGS__) { W32 w[N_CBW] = {0}; NY_STDT_FILL_##N; double d = 0; \
+            uint64_t r = pool_dispatch(std::is_same<R, double>::value ? 1 : std::is_same<R, float>::value ? 2 : 0, N + 1, S, w, &d); \
+            if constexpr (std::is_same<R, double>::value || std::is_same<R, float>::value) return (R)d; else return (R)r; } };
+#    define NY_STDT_FILL_0 (void)0
+#    define NY_STDT_FILL_1 w[0] = a0
+#    define NY_STDT_FILL_2 NY_STDT_FILL_1; w[1] = a1
+#    define NY_STDT_FILL_3 NY_STDT_FILL_2; w[2] = a2
+#    define NY_STDT_FILL_4 NY_STDT_FILL_3; w[3] = a3
+#    define NY_STDT_FILL_5 NY_STDT_FILL_4; w[4] = a4
+#    define NY_STDT_FILL_6 NY_STDT_FILL_5; w[5] = a5
+#    define NY_STDT_FILL_7 NY_STDT_FILL_6; w[6] = a6
+#    define NY_STDT_FILL_8 NY_STDT_FILL_7; w[7] = a7
+#    define NY_STDT_FILL_9 NY_STDT_FILL_8; w[8] = a8
+#    define NY_STDT_FILL_10 NY_STDT_FILL_9; w[9] = a9
+#    define NY_STDT_FILL_11 NY_STDT_FILL_10; w[10] = a10
+#    define NY_STDT_FILL_12 NY_STDT_FILL_11; w[11] = a11
+NY_STDT(0, void)
+NY_STDT(1, W32 a0)
+NY_STDT(2, W32 a0, W32 a1)
+NY_STDT(3, W32 a0, W32 a1, W32 a2)
+NY_STDT(4, W32 a0, W32 a1, W32 a2, W32 a3)
+NY_STDT(5, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4)
+NY_STDT(6, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5)
+NY_STDT(7, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5, W32 a6)
+NY_STDT(8, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5, W32 a6, W32 a7)
+NY_STDT(9, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5, W32 a6, W32 a7, W32 a8)
+NY_STDT(10, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5, W32 a6, W32 a7, W32 a8, W32 a9)
+NY_STDT(11, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5, W32 a6, W32 a7, W32 a8, W32 a9, W32 a10)
+NY_STDT(12, W32 a0, W32 a1, W32 a2, W32 a3, W32 a4, W32 a5, W32 a6, W32 a7, W32 a8, W32 a9, W32 a10, W32 a11)
+#    undef NY_STDT
+template <class R, int N, int... S> void* std_get(int s) { static void* t[] = {(void*)&StdTramp<R, N, S>::run...}; return t[s]; }
+template <int N> void* std_code(int kind, int s) {
+    if (kind == 1) return std_get<double, N, 0, 1, 2, 3, 4, 5, 6, 7>(s);
+    if (kind == 2) return std_get<float, N, 0, 1, 2, 3, 4, 5, 6, 7>(s);
+    return std_get<uint64_t, N, 0, 1, 2, 3, 4, 5, 6, 7>(s);
+}
+void* stdcall_code(int kind, int words, int s) {
+    switch (words) {
+        case 0: return std_code<0>(kind, s);   case 1: return std_code<1>(kind, s);
+        case 2: return std_code<2>(kind, s);   case 3: return std_code<3>(kind, s);
+        case 4: return std_code<4>(kind, s);   case 5: return std_code<5>(kind, s);
+        case 6: return std_code<6>(kind, s);   case 7: return std_code<7>(kind, s);
+        case 8: return std_code<8>(kind, s);   case 9: return std_code<9>(kind, s);
+        case 10: return std_code<10>(kind, s); case 11: return std_code<11>(kind, s);
+        default: return std_code<12>(kind, s);
+    }
+}
+#  endif
 #endif
 
 // ── the builtins ────────────────────────────────────────────────────────────
@@ -988,19 +1389,58 @@ Ret b_callback(Engine& e, const Args& a) {
             raise("TypeError", "ctypes: ffi_prep_closure_loc failed");
         }
     } else {
-#if defined(NY_FFI_SPLIT_REGS)
-        for (auto& s : cb->atypes)
-            if (s[0] == '{' || s[0] == 'g') raise("TypeError", "ctypes: callbacks taking structures or long double need libffi");
+#if defined(NY_FFI_SPLIT_REGS) || defined(NY_FFI_WIN64) || defined(NY_FFI_X86)
+        // round 84: structures as arguments (classified as call_builtin
+        // passes them); a structure result and long double need libffi
+        for (auto& s : cb->atypes) {
+            if (s[0] == 'g') raise("TypeError", "ctypes: callbacks taking long double need libffi");
+#  if defined(NY_FFI_SPLIT_REGS) && defined(__aarch64__)
+            if (s[0] == '{' && aapcs_hfa(struct_layout(s))) raise("TypeError", "ctypes: callbacks taking structures of floating-point members need libffi on AArch64");
+#  endif
+        }
         char rc = cb->rtype[0];
         if (rc == '{' || rc == 'g') raise("TypeError", "ctypes: callbacks returning structures or long double need libffi");
         int kind = rc == 'd' ? 1 : rc == 'f' ? 2 : 0;
         std::lock_guard<std::mutex> l(g_cb_mu);
         int slot = -1;
+#  if defined(NY_FFI_SPLIT_REGS)
         for (int k = 0; k < POOL; k++) if (!g_pool[kind][k]) { slot = k; break; }
         if (slot < 0) raise("MemoryError", "ctypes: all " + std::to_string(POOL) + " callback trampolines are in use (libffi: " + f.why + ")");
         g_pool[kind][slot] = cb.get();
         cb->slot = kind * POOL + slot;
         cb->code = Pool::get(kind, slot);
+#  elif defined(NY_FFI_WIN64)
+        if (cb->atypes.size() > 16) raise("TypeError", "ctypes: callbacks of more than 16 arguments need libffi");
+        int mask = 0;
+        for (size_t k = 0; k < cb->atypes.size() && k < 4; k++) if (is_float(cb->atypes[k][0])) mask |= 1 << k;
+        for (int k = 0; k < POOL; k++) if (!g_pool[kind][mask][k]) { slot = k; break; }
+        if (slot < 0) raise("MemoryError", "ctypes: all " + std::to_string(POOL) + " callback trampolines of this shape are in use (libffi: " + f.why + ")");
+        g_pool[kind][mask][slot] = cb.get();
+        cb->slot = (kind * 16 + mask) * POOL + slot;
+        cb->code = pool_code(kind, mask, slot);
+#  else
+        int words = 0;
+        for (auto& s : cb->atypes) words += s[0] == '{' ? (int)((spec_size(s) + 3) / 4) : (type_of(s[0])->size > 4 ? 2 : 1);
+        if (words > N_CBW) raise("TypeError", "ctypes: callbacks of more than 16 argument words need libffi");
+        int conv = 0;
+        if (flags & F_STDCALL) {
+#    if defined(_WIN32)
+            if (words > 12) raise("TypeError", "ctypes: a stdcall callback of more than 12 argument words needs libffi");
+            conv = 1 + words;
+#    else
+            raise("TypeError", "ctypes: stdcall callbacks are a Windows convention");
+#    endif
+        }
+        for (int k = 0; k < POOL; k++) if (!g_pool[kind][conv][k]) { slot = k; break; }
+        if (slot < 0) raise("MemoryError", "ctypes: all " + std::to_string(POOL) + " callback trampolines of this shape are in use (libffi: " + f.why + ")");
+        g_pool[kind][conv][slot] = cb.get();
+        cb->slot = (kind * 14 + conv) * POOL + slot;
+#    if defined(_WIN32)
+        cb->code = conv ? stdcall_code(kind, conv - 1, slot) : Pool::get(kind, slot);
+#    else
+        cb->code = Pool::get(kind, slot);
+#    endif
+#  endif
 #else
         raise("TypeError", "ctypes: callbacks need libffi on this platform (" + f.why + ")");
 #endif
@@ -1020,6 +1460,10 @@ Ret b_callback_free(Engine&, const Args& a) {
         cb = std::move(g_callbacks[(size_t)id - 1]);
 #if defined(NY_FFI_SPLIT_REGS)
         if (cb->slot >= 0) g_pool[cb->slot / POOL][cb->slot % POOL] = nullptr;
+#elif defined(NY_FFI_WIN64)
+        if (cb->slot >= 0) g_pool[cb->slot / POOL / 16][cb->slot / POOL % 16][cb->slot % POOL] = nullptr;
+#elif defined(NY_FFI_X86)
+        if (cb->slot >= 0) g_pool[cb->slot / POOL / 14][cb->slot / POOL % 14][cb->slot % POOL] = nullptr;
 #endif
     }
     if (cb->closure) ffi().closure_free(cb->closure);

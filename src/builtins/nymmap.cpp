@@ -40,6 +40,19 @@ namespace {
 
 [[noreturn]] void fail(const std::string& type, const std::string& msg) { nyos::raise(type, msg); }
 [[noreturn]] void fail_errno(int err) { nyos::raise_errno(err, ""); }
+#ifdef _WIN32
+// round 84: an OSError as CPython's PyErr_SetFromWindowsErr words it -
+// "[WinError 8] Not enough memory resources are available ..." (the
+// system's message; it said "CreateFileMapping failed")
+[[noreturn]] void fail_win(DWORD e) {
+    char buf[512] = {0};
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, e, 0, buf, sizeof buf, nullptr);
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ' || buf[n - 1] == '.')) buf[--n] = 0;
+    std::string text = n ? std::string(buf, n) : std::string("Windows error ") + std::to_string(e);
+    if (n && text.back() != '.') text += '.';
+    nyos::raise("OSError", "[WinError " + std::to_string(e) + "] " + text);
+}
+#endif
 
 struct MMap {
     char* data = nullptr;
@@ -220,9 +233,9 @@ Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Valu
             HANDLE fh = (HANDLE)_get_osfhandle((int)fileno);
             if (fh == INVALID_HANDLE_VALUE) fail_errno(EBADF);
             if (!DuplicateHandle(GetCurrentProcess(), fh, GetCurrentProcess(), &m->file, 0, 0, DUPLICATE_SAME_ACCESS))
-                fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] DuplicateHandle failed");
+                fail_win(GetLastError());
             LARGE_INTEGER fs;
-            if (!GetFileSizeEx(m->file, &fs)) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] cannot get the file size");
+            if (!GetFileSizeEx(m->file, &fs)) fail_win(GetLastError());
             if (length == 0) {
                 if (fs.QuadPart == 0) fail("ValueError", "cannot mmap an empty file");
                 if (offset >= fs.QuadPart) fail("ValueError", "mmap offset is greater than file size");
@@ -234,9 +247,9 @@ Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Valu
         int64_t end = offset + length;
         m->mapping = CreateFileMappingA(m->file, nullptr, fl_protect, (DWORD)(end >> 32), (DWORD)(end & 0xFFFFFFFF),
                                         tag.empty() ? nullptr : tag.c_str());
-        if (!m->mapping) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] CreateFileMapping failed");
+        if (!m->mapping) fail_win(GetLastError());
         m->data = (char*)MapViewOfFile(m->mapping, dw_access, (DWORD)(offset >> 32), (DWORD)(offset & 0xFFFFFFFF), (SIZE_T)length);
-        if (!m->data) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] MapViewOfFile failed");
+        if (!m->data) fail_win(GetLastError());
         m->size = length;
 #else
         if (fileno != -1) {
@@ -347,7 +360,7 @@ Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Valu
         int64_t off = iarg(a, 1), size = iarg(a, 2);
         if (size == 0) return NONE_VALUE;
 #ifdef _WIN32
-        if (!FlushViewOfFile(m->data + off, (SIZE_T)size)) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] FlushViewOfFile failed");
+        if (!FlushViewOfFile(m->data + off, (SIZE_T)size)) fail_win(GetLastError());
 #else
         if (msync(m->data + off, (size_t)size, MS_SYNC) < 0) fail_errno(errno);
 #endif
@@ -378,13 +391,13 @@ Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Valu
         if (m->file != INVALID_HANDLE_VALUE) {
             LARGE_INTEGER li; li.QuadPart = end;
             if (!SetFilePointerEx(m->file, li, nullptr, FILE_BEGIN) || !SetEndOfFile(m->file))
-                fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] cannot resize the file");
+                fail_win(GetLastError());
         }
         m->mapping = CreateFileMappingA(m->file, nullptr, PAGE_READWRITE, (DWORD)(end >> 32), (DWORD)(end & 0xFFFFFFFF),
                                         m->tagname.empty() ? nullptr : m->tagname.c_str());
-        if (!m->mapping) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] CreateFileMapping failed");
+        if (!m->mapping) fail_win(GetLastError());
         m->data = (char*)MapViewOfFile(m->mapping, FILE_MAP_WRITE, (DWORD)(m->offset >> 32), (DWORD)(m->offset & 0xFFFFFFFF), (SIZE_T)newsize);
-        if (!m->data) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] MapViewOfFile failed");
+        if (!m->data) fail_win(GetLastError());
         m->size = newsize;
 #else
         if (m->fd >= 0 && ftruncate(m->fd, (off_t)(m->offset + newsize)) < 0) fail_errno(errno);
