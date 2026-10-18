@@ -396,6 +396,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit106 | 27 | round 82 follow-ups: TaskGroup exception groups (children's errors then the body's), wait() refusing coroutines, CancelledError() with empty args, the ThreadPoolExecutor default executor, create_server(None) on every family it can open, sock_sendfile/sendfile/os.sendfile, connect_read_pipe/connect_write_pipe, sys.set_asyncgen_hooks and shutdown_asyncgens, the `gc` module, unretrieved task/future exceptions reported, native objects freed (passes under python3) |
 | vm_audit107 | 22 | round 82 follow-ups (2): `import name` finds `.py` modules, `__init__.py` packages and `.py` namespace packages (`.ny` first, so a `.py` never shadows a library module), `-m name.py`, quoted imports from any directory, `threading.Lock` released by another thread (Python's ownerless lock) and its errors, threading seen from asyncio tasks (get_ident/current_thread/local), `_thread` (passes under python3) |
 | vm_audit105 | 118 | round 82: lib/aiagent.ny's NyxAgent on a fixture workspace - `ny_facts`, call/import graphs, BM25F rankings (definitions over uses, call-graph neighbours, incremental, JSON round trip), the rule engine (closure, stratified negation, why), explain/doc/review/fix at exact lines, generated tests that run and pass (doctests, boundaries, a shrunk counterexample, a hang, a .py module under python3), completion MRR before/after training, GitHubLearner over a local http.server (Nython-only) |
+| vm_audit109 | 255 | round 83 (part B): errno, fcntl, termios/tty/pty (os.fork/forkpty/openpty/waitpid/exec*), resource, syslog, mmap, cmath (CPython's special values), colorsys, sched, getopt, optparse (help text identical), fileinput, filecmp, gettext (.mo files, plurals), readline/rlcompleter, site/sysconfig, webbrowser, zipimport/zipapp (`nython app.pyz`), encodings, stringprep, bz2 (byte-identical to libbz2), lzma (liblzma at run time, a native decoder without it), faulthandler (both engines' stacks, a real SIGSEGV), tracemalloc, locale; module.__dict__, comprehension lists freed on the VM (passes under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1389,6 +1390,30 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   builtin bridge share one parse of the prelude
   (`VirtualMachine::shared_prelude_ast`): `-c pass` 2.5x (interpreter) and
   4x (VM) fewer instructions.
+
+## Round 83, part B: system and command-line modules (see `HANDOFF.md` §0v)
+
+- `lib/`: errno, fcntl, termios, tty, pty, resource, syslog, mmap,
+  faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput,
+  filecmp, sched, cmath, colorsys, readline, rlcompleter, site,
+  sysconfig, webbrowser, zipimport, zipapp, encodings (a package),
+  stringprep, bz2, lzma. POSIX-only ones raise ModuleNotFoundError on
+  Windows. `os.fork/forkpty/openpty/login_tty/waitpid/W*/exec*/_exit`.
+- Natives behind one entry point (`include/builtins/sysmods.hpp`):
+  `nysysmods.cpp` (errno table, constants, fcntl/termios/pty/resource/
+  syslog/locale calls), `nymmap.cpp`, `nybz2.cpp` (bzip2 byte-identical to
+  libbz2), `nylzma.cpp` (liblzma by dlopen, else a native .xz/.lzma
+  decoder; `NY_NO_LIBLZMA=1`), `nycmath.cpp`, `nyfault.cpp`
+  (faulthandler's async-signal-safe dumps over `nyconc::Engine::
+  walk_frames`; tracemalloc via replaced `operator new/delete`, one byte
+  test when off), `nyreadline.cpp` (readline over the prompt's editor).
+- **The process keeps LC_NUMERIC "C"** whatever a program's setlocale says
+  (the engines format floats with the C library).
+- `nython app.pyz` / `nython dir` runs its `__main__` (zipimport's
+  `_run_main`); `module.__dict__` is the live `vars(module)` (both engines).
+- Gotcha: both engines are built in either mode (the interpreter's host
+  object is a VirtualMachine), so "which engine runs" is told by which one
+  has frames (`nyfault.cpp`), not by the runner pointer.
 
 ## Transcripts
 

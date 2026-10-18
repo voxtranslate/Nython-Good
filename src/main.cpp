@@ -148,7 +148,40 @@ struct Program {
     std::string path, text, name;
     std::string display() const { return is_file ? path : name; }
 };
+// (round 83) `nython app.pyz` / `nython dir`: a zip archive (zipapp's, a
+// shebang line before it allowed) or a directory with a __main__.ny/.py runs
+// its __main__, as CPython runs them - lib/zipimport.ny's _run_main puts
+// the archive first on sys.path and runs __main__ in the main module.
+static std::string main_bootstrap(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return "";
+    if ((st.st_mode & S_IFMT) == S_IFDIR) {
+        struct stat m;
+        if (stat((path + "/__main__.ny").c_str(), &m) != 0 && stat((path + "/__main__.py").c_str(), &m) != 0) return "";
+    } else {
+        std::ifstream f(path, std::ios::binary);
+        char b[4] = {0, 0, 0, 0};
+        f.read(b, 4);
+        bool zip = f.gcount() == 4 && std::memcmp(b, "PK\x03\x04", 4) == 0;
+        if (!zip && b[0] == '#' && b[1] == '!') {
+            f.clear();
+            f.seekg(0);
+            std::string first;
+            std::getline(f, first);
+            char c[4] = {0, 0, 0, 0};
+            f.read(c, 4);
+            zip = f.gcount() == 4 && std::memcmp(c, "PK\x03\x04", 4) == 0;
+        }
+        if (!zip) return "";
+    }
+    return "__import__(\"zipimport\")._run_main(" + nypy::str_repr(path) + ")\n";
+}
+
 static SourceCode source_of(const Program& p) {
+    if (p.is_file) {
+        std::string boot = main_bootstrap(p.path);
+        if (!boot.empty()) return SourceCode::from_text(boot, p.path);
+    }
     return p.is_file ? SourceCode(p.path) : SourceCode::from_text(p.text, p.name);
 }
 // -i: the interactive prompt after the program, in its scope.
@@ -641,8 +674,27 @@ static void interp_chunk(NythonExecutor& exec, Runnable* runner, const std::stri
     }
 }
 
+// (round 83) readline's completer at the prompt: Tab asks the readline
+// module, when a program imported it, for the candidates - a chunk run in
+// the session's globals that leaves them in _ny_rl_out (NythonREPL.hpp's
+// ReadlineState::complete; lib/readline.ny's _ny_complete).
+static std::string rl_complete_code(const std::string& text, const std::string& line, int beg, int end) {
+    return "_ny_rl_out = __import__('sys').modules['readline']._ny_complete(" + nypy::str_repr(text) + ", " +
+           nypy::str_repr(line) + ", " + std::to_string(beg) + ", " + std::to_string(end) +
+           ") if 'readline' in __import__('sys').modules else None\n";
+}
+
 static void interactive_interp(NythonExecutor& exec, Runnable* runner, bool banner) {
+    nython::repl_engine::readline_state().complete = [&exec, runner](const std::string& t, const std::string& l, int b, int e) {
+        std::vector<std::string> out;
+        interp_chunk(exec, runner, rl_complete_code(t, l, b, e), false);
+        Value v = exec.global_ctx->getByName("_ny_rl_out");
+        if (exec.contOf(v)) for (auto& x : exec.listItems(v)) out.push_back(exec.strOf(x));
+        exec.global_ctx->defineByName("_ny_rl_out", NONE_VALUE);
+        return out;
+    };
     interactive_loop([&](const std::string& code) { interp_chunk(exec, runner, code, true); }, banner, "interpreter");
+    nython::repl_engine::readline_state().complete = nullptr;
 }
 
 void repl() {
@@ -1061,7 +1113,20 @@ static void vm_chunk(nython::vm::VirtualMachine& vm, VMMap& session, const std::
 }
 
 static void interactive_vm(nython::vm::VirtualMachine& vm, VMMap& session, bool banner) {
+    // (round 83) readline's completer, as interactive_interp's
+    nython::repl_engine::readline_state().complete = [&vm, &session](const std::string& t, const std::string& l, int b, int e) {
+        std::vector<std::string> out;
+        vm_chunk(vm, session, rl_complete_code(t, l, b, e), false);
+        auto it = session.find("_ny_rl_out");
+        if (it != session.end()) {
+            if (it->second.type == VMType::LIST && it->second.list)
+                for (auto& x : *it->second.list) if (x.type == VMType::STRING) out.push_back(x.s);
+            session.erase(it);
+        }
+        return out;
+    };
     interactive_loop([&](const std::string& code) { vm_chunk(vm, session, code, true); }, banner, "bytecode VM");
+    nython::repl_engine::readline_state().complete = nullptr;
 }
 
 static int run_program_vm(const Program& prog, bool inspect) {

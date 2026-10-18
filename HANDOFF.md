@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` modules and packages, `.ny` first; quoted imports from anywhere; `threading.Lock` is Python's ownerless lock; tasks see their loop's thread in threading; `_thread`; vm_audit107).
+Last updated: round 83, part B — **§0v** (Python's system and command-line modules: errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched, cmath, colorsys, readline, rlcompleter, site, sysconfig, webbrowser, zipimport, zipapp, encodings, stringprep, bz2, lzma; module.__dict__ and hashable modules on both engines; VM comprehension results freed; vm_audit109).
+Round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` modules and packages, `.ny` first; quoted imports from anywhere; `threading.Lock` is Python's ownerless lock; tasks see their loop's thread in threading; `_thread`; vm_audit107).
 Round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
 Round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
 Round 82, part B — **§0u2** (asyncio's missing half: the event-loop API over a persistent native loop, transports and protocols over TCP/UDP/Unix with flow control, streams rebuilt on StreamReaderProtocol, subprocesses waited for on the reactor, add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation rules, eager tasks, structured-concurrency reports; a GC heap-sampling fix that made many tasks quadratic, a VM break/continue-out-of-except leak; vm_audit104).
@@ -85,6 +86,183 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0v. Round 83, part B — Python's system and command-line modules (vm_audit109)
+
+`examples/vm_audit109.ny` (255 checks on Linux) passes on both engines
+and under python3 (3.11: 253 checks - the Nython-only lzma fallback check and
+the 3.12-only tty.cfmakeraw check are skipped there). Every expected value is
+CPython's; bz2 streams are compared byte for byte with libbz2's.
+`import errno` / `mmap` / `locale` / `optparse` ... all failed before.
+Sweep 441 runs, 0 not ok; `tools/ide_e2e.py` 463 passed, 0 failed.
+
+### Native parts (one entry point: `include/builtins/sysmods.hpp`)
+- **`src/builtins/nysysmods.cpp`** (`_sys_*`): the errno table (an `#ifdef`
+  per name in CPython's errnomodule order, so `errorcode` picks CPython's
+  name for a shared number: EAGAIN, EDEADLOCK, ENOTSUP; WSAE* on Windows),
+  the fcntl/termios/resource/syslog/locale constants from the C headers,
+  fcntl/ioctl/flock/lockf (the blocking ones release the GIL), tcgetattr/
+  tcsetattr/tcsendbreak/tcdrain/tcflush/tcflow/tcgetwinsize/tcsetwinsize,
+  openpty/forkpty/fork/login_tty/waitpid (EINTR retried, signal handlers
+  run)/the wait-status macros/execv/execve/_exit/ttyname, getrlimit/
+  setrlimit/prlimit/getrusage/getpagesize, openlog/syslog/closelog/
+  setlogmask, setlocale/localeconv/nl_langinfo/strcoll/strxfrm. **The
+  process keeps LC_NUMERIC "C"** under a program's setlocale - the engines
+  format floats with the C library - and the program's numeric locale is put
+  in place only while localeconv/nl_langinfo/setlocale(cat, None) read it.
+- **`src/builtins/nymmap.cpp`** (`_mmap_*`): mmap(2)/mremap, or
+  CreateFileMapping/MapViewOfFile with `tagname` on Windows.
+- **`src/builtins/nybz2.cpp`** (`_bz2_*`): bzip2 written here. Compression
+  is libbz2's algorithm step for step (the initial RLE, fallbackSort's BWT
+  with its exact tie-breaking, MTF/RUNA/RUNB, 2-6 Huffman tables with 4
+  refinement passes, 17-bit length limiting by weight halving, the lazy bit
+  writer), so the output is **byte-identical to libbz2's** at every level -
+  checked on 34 inputs (periodic blocks, 1.2 MB of zeros, several blocks)
+  against CPython's bz2. Decompression is resumable at block boundaries and
+  reads every stream except the obsolete randomised blocks.
+- **`src/builtins/nylzma.cpp`** (`_lzma_*`): liblzma loaded at run time
+  (dlopen/LoadLibrary as tls.cpp loads OpenSSL; `NY_LIBLZMA` names one to
+  try first, `NY_NO_LIBLZMA=1` pretends it is absent) for everything
+  CPython's `_lzma` does. **Without it, a native decoder** (range coder,
+  LZMA1, LZMA2 chunks, the .xz container with its index and CRC32/CRC64/
+  SHA-256 checks, .lzma, raw, the delta filter), resumable at any input
+  boundary - 425 cases against CPython's output, fed in 1-byte, 7-byte and
+  whole pieces - so reading .xz works everywhere; a compressor then raises
+  LZMAError naming the library.
+- **`src/builtins/nycmath.cpp`** (`_cmath_*`): cmathmodule.c's algorithms
+  and errno rules; the special-value tables (`nycmath_tables.inc`) were
+  made by asking CPython for each entry.
+- **`src/builtins/nyfault.cpp`** (`_fault_*`, `_tm_*`): faulthandler's dumps
+  with write(2) only, reading each engine's frame records through the new
+  `nyconc::Engine::walk_frames` (the live frames, or a parked thread's from
+  its saved state); which engine runs the program is told by its frames
+  (both engines exist in either mode - the interpreter's host object is a
+  VirtualMachine - and only the running one has frames). Fatal handlers on
+  an alternate signal stack, user signals, the watchdog thread.
+  tracemalloc's records come from **replaced global operator new/delete**
+  (one atomic byte test while tracing is off), with the allocating
+  thread's Python stack.
+- **`src/builtins/nyreadline.cpp`** (`_rl_*`): readline over the prompt's
+  own line editor (`NythonREPL.hpp`'s MultilineEditor), not libreadline.
+
+### Modules (`lib/`)
+errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler,
+tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched,
+cmath, colorsys, readline, rlcompleter, site (+ `_sitebuiltins`),
+sysconfig, webbrowser, zipimport, zipapp, encodings (a package: 70
+single-byte code pages and the Unicode codecs from CPython; `codecs.lookup`
+imports it on a miss), stringprep (Unicode 3.2 tables generated from
+CPython's ucd_3_2_0, and CPython's str.lower as a table), `_compression`,
+bz2, lzma. Each file's header says what is not there. POSIX-only modules
+(fcntl, termios, tty, pty, resource, syslog) raise ModuleNotFoundError on
+Windows. `io.open_code` and `encoding="locale"` (UTF-8: Nython is always
+in UTF-8 mode) were added to lib/io.ny for site.
+
+### Engine changes (all marked "round 83")
+- **`include/builtins/sysmods.hpp`** (new): `dispatch_sysmods` /
+  `sysmods_builtin_names` and the per-file dispatchers; declares
+  `nyfault_set_vm_engine`.
+- **`include/NythonExecutor.hpp`**: includes sysmods.hpp; `registerBuiltins`
+  registers `sysmods_builtin_names()`; `callBuiltin`'s `_`-prefixed block
+  calls `dispatch_sysmods` after `_re_`. The round-81 `__spec__`/
+  `__loader__` hook in the container attribute read also answers
+  `__dict__` for a module namespace (`module.__dict__` raised
+  AttributeError; it is the live `vars(module)` now). `dictKey`: a module
+  namespace is hashed by identity (`hash(sys)`, `set(sys.modules.values())`
+  raised "unhashable type: 'dict'").
+- **`include/VirtualMachine.hpp`**: the same `__dict__` hook and
+  module-identity hashing (`vkey`); `vm_call_method` makes
+  `self.__class__(...)` before asking `__getattr__` (a class with
+  `__getattr__` was asked for `__class__` - filecmp.dircmp); a list/dict/set
+  comprehension's hidden accumulator `__compN__` is deleted (DELETE_NAME)
+  once its result is on the stack - it kept the result alive until the
+  comprehension ran again (`del` freed nothing, tracemalloc saw no memory
+  go) and was a class attribute in a class body.
+- **`include/NyPrelude.hpp`**: the `#@ os` chunk gets fork, forkpty,
+  openpty, login_tty, waitpid, ttyname, the W* macros,
+  waitstatus_to_exitcode, execv/execve/execl/execle/execlp/execlpe/execvp/
+  execvpe (`_execvpe` searches `get_exec_path` with the Python-semantics
+  `_ny_osp_dirname`/`_ny_osp_join` - the legacy `os_path_dirname("sh")` is
+  "."), WNOHANG/WUNTRACED/WCONTINUED (POSIX) and `_exit` (all platforms);
+  `_ny_module_spec_attr` answers `__dict__` with `vars(module)`;
+  `_ny_load_spec` sets a submodule loaded through a path hook as its
+  package's attribute (`import pkg.sub` then `pkg.sub`), as CPython's
+  `_find_and_load_unlocked` does.
+- **`include/NyConc.hpp`, `src/NyConc.cpp`**: `after_fork_child()` (the
+  child of a fork: GIL off and fresh, this thread the main thread);
+  `ThreadSnap` + `thread_snapshot()` (try_lock, no allocation; a task stands
+  for its loop thread); `Engine::FrameEmit` and the virtual
+  `walk_frames(estate, emit, sink)` (default: nothing).
+- **`src/builtins/threading.cpp`**: `ny_interp_walk()` (an interpreter
+  thread's frames without allocating; prelude frames left out);
+  `InterpEngine` notes the live frames in `swap_in` and overrides
+  `walk_frames`.
+- **`src/VMConc.cpp`**: `VMConcEngine::walk_frames` (the live
+  `call_stack_` or a parked thread's `VMThreadState::calls`);
+  `VMConc::install` registers the engine with nyfault (the first VM made).
+- **`include/NythonREPL.hpp`**: `ReadlineState` / `readline_state()` (the
+  history, auto_history, completer delimiters, the line being completed,
+  insert_text, the completion hook); `MultilineEditor` shares the history,
+  completes on Tab through the hook (a second Tab lists), respects
+  auto_history and starts a line with insert_text.
+- **`src/main.cpp`**: `main_bootstrap`/`source_of` - a zip archive (PK
+  magic, a shebang line allowed before it) or a directory with
+  `__main__.ny`/`.py` runs `zipimport._run_main(path)`; `rl_complete_code`
+  and the completion hooks in `interactive_interp` / `interactive_vm`.
+- **`nython.cbp`**: the seven new units.
+- **The process's global `operator new`/`delete` are replaced**
+  (`nyfault.cpp`) for tracemalloc: one relaxed atomic load while tracing is
+  off.
+
+### Found on the way, fixed
+- `codecs.charmap_encode`'s parameter is named `str` (CPython's name), so
+  its `isinstance(rep, str)` asked about the argument, not the type: an
+  error handler's replacement was never encoded through the map
+  (`"a\u4e00b".encode("cp1251", "replace")` raised).
+- lib/gettext.ny was taken from Debian's patched gettext.py (a langpack
+  lookup, tab-indented comments): CPython's `find()` now.
+- lib/io.ny: `open_code()`; `encoding="locale"` is UTF-8 (Nython is always
+  in UTF-8 mode, `sys.flags.utf8_mode == 1`).
+- examples/vm_audit91.ny: its pdb sessions start with `gc.collect()`; a cycle
+  collection inside the traced call ran weakref callbacks (asyncio's
+  WeakSets) that the debugger stepped into - GC timing, which any change in
+  allocation patterns moves (this round's did).
+
+### Not done
+- **Nython's `str.lower`/`upper` cover Latin-1, Latin Extended-A, Greek
+  and Cyrillic only** (`NyStr.hpp`'s `cp_lower`/`cp_upper`): Roman numerals
+  (U+2160), circled letters, titlecase digraphs (U+01C5), Armenian,
+  Georgian... are left as they are. stringprep carries CPython's lowercase
+  map as a table instead.
+- The VM's comprehension targets (`__cN_x`) stay bound after the
+  comprehension (the last item stays alive; in a class body they are class
+  attributes): a lambda made in the element may read them later, so they
+  are not deleted as the accumulator now is.
+- `frame.f_lineno`/`f_lasti` of a running module-level frame
+  (`_ny_frame_sync`) copy the module's variables into the frame object,
+  which keeps them alive until the next read (vm_audit109 orders its
+  tracemalloc checks around it).
+- A module the import statement makes for a hook loader whose
+  `create_module` returns None (`_ny_module_new`) is not live through
+  `vars()`/`__dict__`: `exec(code, vars(m))` fills a copy. zipimport makes
+  a `types.ModuleType`, which is.
+- No memoryview, so mmap has no buffer protocol (`bytes(m)` copies;
+  `readinto(m)` cannot write into it); no `sys.audit` (pty and webbrowser
+  skip their audit events).
+- encodings: no CJK codecs (big5, gb2312/gbk/gb18030, shift_jis, euc_jp/kr,
+  iso2022_*, hz, johab, cp932/949/950), utf_7, mbcs/oem.
+- readline: `set_startup_hook`/`set_pre_input_hook` are kept but the editor
+  does not call them; the display-matches hook is not used; no vi mode or
+  inputrc bindings.
+- faulthandler: no C stack, no Windows structured exceptions; frames of
+  Nython-written stdlib functions (time.sleep is lib/time.ny) appear in
+  dumps where CPython's C functions do not.
+- tracemalloc: sizes are the C++ allocations' (not CPython's object sizes);
+  domain 0 only.
+- lzma without liblzma: no BCJ filters, no compression. bz2: the obsolete
+  randomised blocks are refused.
+- Not run under Wine this round (the native files pass a MinGW
+  `-fsyntax-only` check, Windows branches included).
 
 ## 0u5. Round 82, follow-ups (2) — Python source modules, quoted imports from anywhere, Python's lock (vm_audit107)
 

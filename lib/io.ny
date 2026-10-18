@@ -19,7 +19,7 @@
 #               iteration, readlines, writelines, context management and the
 #               closed checks come from IOBase as in Python
 # UnsupportedOperation (OSError and ValueError), SEEK_SET/SEEK_CUR/SEEK_END,
-# DEFAULT_BUFFER_SIZE, open (the builtin open), text_encoding
+# DEFAULT_BUFFER_SIZE, open (the builtin open), open_code, text_encoding
 #
 # StringIO keeps appended text as a list of pieces and joins it only when
 # something needs the whole text, so building a string with many write()
@@ -48,6 +48,13 @@ def text_encoding(encoding, stacklevel=2):
     if encoding is not none:
         return encoding
     return "utf-8"
+
+
+def open_code(path):
+    """Opens the provided file with the intent to import the contents (round 83)."""
+    if not isinstance(path, str):
+        raise TypeError("open_code() argument 'path' must be str, not " + type(path).__name__)
+    return open(path, "rb")
 
 
 def _closed_error():
@@ -730,6 +737,10 @@ class TextIOWrapper(TextIOBase):
     def __init__(self, buffer, encoding=none, errors=none, newline=none, line_buffering=false, write_through=false):
         self.buffer = buffer
         self.encoding = text_encoding(encoding)
+        if self.encoding == "locale":
+            # (round 83) PEP 597's "locale": the locale encoding, which is
+            # UTF-8 in UTF-8 mode - Nython's only mode (sys.flags.utf8_mode)
+            self.encoding = "utf-8"
         self.errors = "strict" if errors is none else errors
         if not (newline is none or newline == "" or newline == "\n" or newline == "\r" or newline == "\r\n"):
             raise ValueError("illegal newline value: " + repr(newline))

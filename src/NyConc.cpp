@@ -223,6 +223,17 @@ static thread_local bool t_async_token = false;   // run the next async body
 
 bool active() { return g_active.load(std::memory_order_acquire); }
 bool holds_gil() { return !g_active.load(std::memory_order_acquire) || t_holds; }
+// (round 83) os.fork()/pty.fork(): in the child only the forking thread is
+// left. The GIL goes back to "no second thread" (its mutex may have been
+// held by a thread that is gone: a fresh one), and that thread is the main
+// thread now, as CPython's PyOS_AfterFork_Child makes it.
+void after_fork_child() {
+    g_active.store(false, std::memory_order_release);
+    g_gil_waiters.store(0, std::memory_order_relaxed);
+    new (&G()) Gil();
+    t_holds = false;
+    main_tid() = std::this_thread::get_id();
+}
 
 static void gil_acquire() {
     auto& g = G();
@@ -738,6 +749,27 @@ struct LoopObj : Obj {
     std::shared_ptr<Loop> L;
     bool running = false, closed = false;
 };
+
+// (round 83) faulthandler's view of the threads (NyConc.hpp): try_lock, no
+// allocation. A task stands for the thread running its loop.
+size_t thread_snapshot(ThreadSnap* out, size_t max) {
+    auto& rt = RT();
+    if (!rt.m.try_lock()) return 0;
+    auto os_thread = [](ThreadRec* r) -> ThreadRec* {
+        if (r && r->task && r->task->loop && r->task->loop->thread) return r->task->loop->thread;
+        return r;
+    };
+    ThreadRec* owner = os_thread(G().owner);
+    ThreadRec* self = os_thread(t_self);
+    size_t n = 0;
+    for (ThreadRec* r : rt.live) {
+        if (n >= max) break;
+        if (!r || r->task || r->done || !r->started) continue;
+        out[n++] = ThreadSnap{r->id, r->estate, r->engine, r == owner, r == self};
+    }
+    rt.m.unlock();
+    return n;
+}
 
 static void loop_wake_poll(Loop* L) {
 #ifndef _WIN32
