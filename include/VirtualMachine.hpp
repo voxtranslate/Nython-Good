@@ -758,6 +758,9 @@ struct VMCode {
     bool                     bind_first    = false;
     bool                     is_static     = false;
     bool                     is_classmethod= false;
+    // round 84: a function CPython implements in C (the prelude's
+    // _ny_seal_cmodule): static, builtin_function_or_method, <built-in function f>
+    bool                     nybuiltin     = false;
     std::string              self_name     = "self";   // the receiver's parameter: self or this (round 79)
     bool                     is_generator  = false;
     // For inspect / __code__ / __qualname__ (round 77): the parser's
@@ -1009,6 +1012,7 @@ inline std::string VMVal::to_string() const {
         // round 81: as CPython, <function Qualname at 0x...> with the
         // address id() gives (it was <function name>)
         if(!code) return "<function ?>";
+        if(code->nybuiltin) return "<built-in function "+(code->qualname.empty()?code->name:code->qualname)+">";   // round 84
         uintptr_t raw=(uintptr_t)code.get()^((uintptr_t)closure_env.get()*31)^((uintptr_t)list.get()*17);
         char buf[40];
         std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)(raw & 0x7fffffffffffffffULL));
@@ -1040,14 +1044,14 @@ inline std::string VMVal::to_string() const {
         if(class_name.rfind("__builtin__:",0)==0){
             std::string bn=class_name.substr(12);
             if(nyrt::is_builtin_type_name(bn)) return "<class '"+bn+"'>";
-            return "<built-in function "+bn+">";
+            return "<built-in function "+nyrt::builtin_public(bn)+">";   // round 84: math_sqrt is sqrt
         }
         if(nyrt::is_builtin_type_name(class_name)) return "<class '"+class_name+"'>";
         if(class_name.rfind("__native__:",0)==0){
             std::string bn=class_name.substr(11);
             if(bn=="map") bn="dict";
             if(nyrt::is_builtin_type_name(bn)) return "<class '"+bn+"'>";
-            return "<built-in function "+bn+">";
+            return "<built-in function "+nyrt::builtin_public(bn)+">";
         }
         if(class_name=="map") return "<class 'dict'>";
         return "<native>";
@@ -4341,6 +4345,7 @@ public:
         note_module("os",ns);
         note_module("os.path",path);   // sys.modules["os.path"] (round 80)
         os_ns_=ns;
+        seal_cmodule("os",ns);   // round 84: os.fspath, os.scandir ... are builtins
         if(bind) define_var(as_name,ns);
         return ns;
     }
@@ -6918,6 +6923,12 @@ private:
             } else if(o.type==VMType::CLASS){
                 class_member_names(class_key(o),names);
             } else if(is_module_ns(o)){
+                // round 84: PEP 562 - a module's own __dir__ lists it
+                auto dd=o.map->find("__dir__");
+                if(dd!=o.map->end()&&dd->second.type==VMType::FUNCTION){
+                    std::vector<VMVal> none;
+                    for(auto& n:iter_items(vm_call(dd->second,none,std::nullopt))) names.insert(n.type==VMType::STRING?n.s:n.to_string());
+                } else
                 for(auto& kv:*o.map) if(!reflect_hidden(kv.first)) names.insert(kv.first);
             } else {
                 nypy::MemberKind k=vm_member_kind(o);
@@ -7301,7 +7312,7 @@ private:
     // A class namespace's static / class method as the object Python's
     // C.__dict__ holds (round 77); anything else as it is.
     VMVal method_object_of(const VMVal& v, const std::string* name=nullptr) {
-        if(v.type!=VMType::FUNCTION||!v.code) return v;
+        if(v.type!=VMType::FUNCTION||!v.code||v.code->nybuiltin) return v;   // round 84: a builtin function, as CPython's
         const char* kind=v.code->is_static?"staticmethod":v.code->is_classmethod?"classmethod":nullptr;
         // __new__ is a static method without the decorator (round 78)
         if(!kind&&name) kind=nyrt::implicit_method_kind(*name);
@@ -7572,7 +7583,7 @@ private:
         auto bt=[&](const char* n)->VMVal{ auto it=builtin_types_.find(n); return it==builtin_types_.end()?VMVal::make_none():it->second; };
         switch(v.type){
         case VMType::NONE: return runtime_type_value("NoneType");   // round 77
-        case VMType::FUNCTION: return runtime_type_value("function");
+        case VMType::FUNCTION: return runtime_type_value(v.code&&v.code->nybuiltin?"builtin_function_or_method":"function");   // round 84
         case VMType::GENERATOR: return runtime_type_value(v.gen&&v.gen->native?v.gen->name:std::string("generator"));
         case VMType::ITERATOR: return runtime_type_value(v.s.empty()?std::string("iterator"):v.s);
         case VMType::BOOL: return bt("bool");
@@ -10962,7 +10973,7 @@ private:
             case VMType::STRING: return "str";
             case VMType::LIST: return v.is_set()?(v.is_frozenset()?"frozenset":"set"):v.b?"tuple":"list";
             case VMType::MAP: return v.class_name=="__bound_method__"?"method":"dict";
-            case VMType::FUNCTION: return "function";
+            case VMType::FUNCTION: return v.code&&v.code->nybuiltin?"builtin_function_or_method":"function";   // round 84
             case VMType::NATIVE:
                 if(v.class_name.rfind("__rtype__:",0)==0||!v.builtin_type_name().empty()) return "type";
                 return "builtin_function_or_method";
@@ -11998,6 +12009,17 @@ private:
                 out=vm_call(load_var("_ny_module_spec_attr"),a,std::nullopt);
                 return true;
             }
+            // round 84: PEP 562 - a module's own __getattr__ supplies a name it
+            // lacks (what it raises propagates; try_get_attr takes an
+            // AttributeError for a miss)
+            if(obj.type==VMType::MAP&&attr!="__getattr__"&&is_module_ns(obj)&&!is_property_desc(obj)&&obj.class_name.rfind("__",0)!=0){
+                auto ga=obj.map->find("__getattr__");
+                if(ga!=obj.map->end()&&ga->second.type==VMType::FUNCTION){
+                    std::vector<VMVal> a{VMVal::make_str(attr)};
+                    out=vm_call(ga->second,a,std::nullopt);
+                    return true;
+                }
+            }
         }
         // super().attr / super(C, obj).attr read without a call (round 77):
         // the member after the owner in the MRO, bound as a read binds it - a
@@ -12078,6 +12100,12 @@ private:
             }
             if(attr=="__name__"){ out=VMVal::make_str(obj.code?nyrt::unmangled_name(obj.code->name, obj.code->qualname):""); return true; }   // def __m: __m (round 78)
             if(attr=="__call__"){ out=obj; return true; }   // f.__call__ (round 78)
+            // round 84: a builtin function's __self__ is the module it was sealed in
+            if(attr=="__self__"&&obj.code&&obj.code->nybuiltin){
+                VMVal m;
+                out=lookup_attr(obj,"__module__",m)&&m.type==VMType::STRING?module_value_by_name(m.s):VMVal::make_none();
+                return true;
+            }
             if(attr=="__qualname__"){ out=VMVal::make_str(obj.code?(obj.code->qualname.empty()?obj.code->name:obj.code->qualname):""); return true; }
             if(attr=="__doc__"){ out=obj.code&&obj.code->has_doc?VMVal::make_str(obj.code->doc):VMVal::make_none(); return true; }
             // __defaults__, __kwdefaults__, __code__, __qualname__, __module__,
@@ -12224,14 +12252,33 @@ private:
                 if(attr=="__mro__"||b!="bool"){ VMVal o=class_value("object"); if(o.type!=VMType::NONE) r.push_back(o); }
                 out=VMVal::make_tuple(std::move(r)); return true;
             }
+            // round 84: a native's __self__ is its module (builtins' for len,
+            // math's for math.sqrt), as CPython's builtin functions'
+            if(attr=="__self__"){
+                const std::string& c=obj.class_name;
+                size_t colon=c.find(':');
+                bool tagged=colon!=std::string::npos&&(c.rfind("__builtin__:",0)==0||c.rfind("__native__:",0)==0);
+                std::string nm=tagged?c.substr(colon+1):colon==std::string::npos?c:std::string();
+                if(!nm.empty()&&!nyrt::is_builtin_type_name(nm)&&nm!="map"){
+                    std::string mod; nyrt::builtin_public(nm,&mod);
+                    out=module_value_by_name(mod); return true;
+                }
+            }
             // len.__name__, int.__name__: the name the builtin is tagged with
             if(attr=="__name__"||attr=="__qualname__"||attr=="__module__"){
                 const std::string& c=obj.class_name;
                 size_t colon=c.find(':');
                 bool tagged=colon!=std::string::npos&&(c.rfind("__builtin__:",0)==0||c.rfind("__native__:",0)==0);
                 if(tagged||(!c.empty()&&colon==std::string::npos)){
-                    if(attr=="__module__"){ out=VMVal::make_str("builtins"); return true; }
                     std::string nm=tagged?c.substr(colon+1):c;
+                    // round 84: a native as the module that has it shows it
+                    // (math_sqrt is math's sqrt, _ny_getrefcount sys's getrefcount)
+                    if(!nyrt::is_builtin_type_name(nm)&&nm!="map"){
+                        std::string mod, pub=nyrt::builtin_public(nm,&mod);
+                        out=VMVal::make_str(attr=="__module__"?mod:pub);
+                        return true;
+                    }
+                    if(attr=="__module__"){ out=VMVal::make_str("builtins"); return true; }
                     if(nm=="map") nm="dict";   // the dict builtin is tagged with Nython's name for it
                     size_t dot=nm.rfind('.');
                     out=VMVal::make_str(dot==std::string::npos?nm:nm.substr(dot+1));
@@ -13333,6 +13380,16 @@ private:
                         if(class_lookup(member.class_name,"__call__",cm)) return vm_call(member,args,std::nullopt,kwargs);
                     }
                 }
+                // round 84: PEP 562 - m.f(...) of a name module m supplies
+                // through its own __getattr__
+                else if(method!="__getattr__"&&is_module_ns(obj)&&!is_property_desc(obj)&&obj.class_name.rfind("__",0)!=0){
+                    auto ga=obj.map->find("__getattr__");
+                    if(ga!=obj.map->end()&&ga->second.type==VMType::FUNCTION){
+                        std::vector<VMVal> a{VMVal::make_str(method)};
+                        VMVal target=vm_call(ga->second,a,std::nullopt);
+                        return vm_call(target,args,std::nullopt,kwargs);
+                    }
+                }
             }
             return call_map_method(obj,method,with_kw());
         }
@@ -13664,6 +13721,34 @@ private:
         for(auto& n:names) d[nypy::key_of_str(n)]=module_ns_[n];
         return sys_modules_;
     }
+    // round 84: the functions CPython implements in C (include/NyBuiltinFns.hpp)
+    // are builtins here too once the module binding them has run - the
+    // prelude's _ny_seal_cmodule, as the interpreter's sealCModule
+    void seal_cmodule(const std::string& name, const VMVal& nsv) {
+        const char* names=nyrt::cpython_builtin_fns(name);
+        if(!names) return;
+        VMVal fn=load_var("_ny_seal_cmodule");
+        if(fn.type!=VMType::FUNCTION) return;
+        std::vector<VMVal> a{nsv, VMVal::make_str(names)};
+        vm_call(fn,a,std::nullopt);
+    }
+    // A loaded module by name (sys.modules', the engine's own, builtins);
+    // None when it is not loaded
+    VMVal module_value_by_name(const std::string& mod) {
+        if(mod=="sys"&&sys_ns_.type==VMType::MAP) return sys_ns_;
+        if(sys_modules_.type==VMType::MAP&&sys_modules_.map){
+            auto it=sys_modules_.map->find(nypy::key_of_str(mod));
+            if(it!=sys_modules_.map->end()) return it->second;
+        }
+        auto mi=module_ns_.find(mod);
+        if(mi!=module_ns_.end()) return mi->second;
+        if(mod=="builtins"){
+            std::vector<VMVal> none;
+            VMVal bm=load_var("_ny_builtins_module");
+            if(bm.type==VMType::FUNCTION) return vm_call(bm,none,std::nullopt);
+        }
+        return VMVal::make_none();
+    }
     void note_module(const std::string& name, const VMVal& v) {
         module_ns_[name]=v;
         if(sys_modules_.type==VMType::MAP&&sys_modules_.map) (*sys_modules_.map)[nypy::key_of_str(name)]=v;
@@ -13697,6 +13782,15 @@ private:
         for(auto& s:c->sub_codes) tag_module_code(s, env);
         for(auto& k:c->constants) if(k.code) tag_module_code(k.code, env);
     }
+    // round 84: what CPython's "cannot import name" adds: " (its file)", or
+    // " (unknown location)" (the interpreter's importWhere)
+    static std::string import_where(const VMVal& nsv) {
+        if(nsv.type==VMType::MAP&&nsv.map&&is_module_ns(nsv)){
+            auto f=nsv.map->find("__file__");
+            if(f!=nsv.map->end()&&f->second.type==VMType::STRING) return " ("+f->second.s+")";
+        }
+        return " (unknown location)";
+    }
     // `from m import a, b` / `*` (see the interpreter's bindFromNamespace).
     void bind_from_namespace(const VMVal& nsv, const std::vector<std::string>& names, const std::string& module_name) {
         if((nsv.type!=VMType::MAP || !nsv.map) && nsv.type!=VMType::NONE && !(names.size()==1&&names[0]=="*")){
@@ -13705,7 +13799,7 @@ private:
                 auto [n, bound]=nyrt::import_name_alias(entry);
                 VMVal v;
                 if(!try_get_attr(nsv,n,v))
-                    throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'")}));
+                    throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'"+import_where(nsv))}));
                 define_var(bound,v);
             }
             return;
@@ -13720,8 +13814,13 @@ private:
                 for(auto& nm:items){
                     std::string k=nm.type==VMType::STRING?nm.s:nm.to_string();
                     auto hit=ns.find(k);
-                    if(hit==ns.end())
-                        throw_exception(make_exception("AttributeError",{VMVal::make_str("module '"+module_name+"' has no attribute '"+k+"'")}));
+                    if(hit==ns.end()){
+                        VMVal got;   // round 84: PEP 562 (its AttributeError propagates)
+                        if(!ns.count("__getattr__")||!lookup_attr(nsv,k,got))
+                            throw_exception(make_exception("AttributeError",{VMVal::make_str("module '"+module_name+"' has no attribute '"+k+"'")}));
+                        define_var(k, got);
+                        continue;
+                    }
                     define_var(k, hit->second);
                 }
                 return;
@@ -13732,8 +13831,13 @@ private:
         for(auto& entry:names){
             auto [n, bound]=nyrt::import_name_alias(entry);
             auto hit=ns.find(n);
-            if(hit==ns.end())
-                throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'")}));
+            if(hit==ns.end()){
+                VMVal got;   // round 84: PEP 562 (an AttributeError is "cannot import name")
+                if(!ns.count("__getattr__")||!try_get_attr(nsv,n,got))
+                    throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'"+import_where(nsv))}));
+                define_var(bound, got);
+                continue;
+            }
             define_var(bound, hit->second);
         }
     }
@@ -13766,6 +13870,9 @@ private:
         for(auto& d:sys_path_dirs()) dirs.push_back(d);   // round 80
         for(const char* d:{"","./","lib/","./lib/"}) dirs.push_back(d);
         dirs.push_back(cwd_+"/"); dirs.push_back(cwd_+"/lib/");
+        // round 84: the installation's own library before the script's
+        // ancestors (the interpreter's moduleDirs)
+        for(auto& ld:nyrt::library_dirs()) dirs.push_back(ld);
         std::string d=script_dir_;
 #ifndef _WIN32
         char rb[4096];
@@ -13778,7 +13885,6 @@ private:
             d=d.substr(0,cut+1);
             dirs.push_back(d); dirs.push_back(d+"lib/");
         }
-        for(auto& ld:nyrt::library_dirs()) dirs.push_back(ld);
         return dirs;
     }
     // Whether a directory can be a namespace package: it holds a .ny file or
@@ -13920,6 +14026,7 @@ private:
         catch(VMReturn&){}
         catch(...){ if(!into) forget_module(name); throw; }
         for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
+        seal_cmodule(name,nsv);   // round 84
         return nsv;
     }
     // A relative import's module (round 80: `from .m import x`, `from ..
@@ -14847,6 +14954,19 @@ private:
         // references this call holds itself, plus one for the argument, as
         // CPython counts; a value with no count of its own (int, float, bool,
         // None, str) is immortal there: 2**32 - 1, as 3.12 reports it
+        // _ny_mark_builtin(f) (round 84; the prelude's _ny_seal_cmodule): a
+        // def's function becomes a builtin function - static (not bound
+        // through a class or an instance), builtin_function_or_method,
+        // <built-in function f>, held as it is by C.__dict__
+        globals_["_ny_mark_builtin"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_none();
+            VMVal& f=a[0];
+            if(f.type==VMType::FUNCTION&&f.code&&!f.code->nybuiltin&&!f.code->is_classmethod&&!f.code->is_method){
+                f.code->is_static=true; f.code->nybuiltin=true;
+                vm_types_changed();   // a cached method read may change kind
+            }
+            return f;
+        });
         globals_["_ny_getrefcount"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()!=1) raise_native_exception("TypeError","sys.getrefcount() takes exactly one argument ("+std::to_string(a.size())+" given)");
             const VMVal& v=a[0];
@@ -15199,13 +15319,15 @@ private:
             VMVal inner=it->second;
             std::string dunder=std::string("__")+nm+"__";
             VirtualMachine* vm=this;
-            (*ns.map)[nm]=VMVal::make_native([vm,inner,dunder](std::vector<VMVal>& a)->VMVal{
+            VMVal w=VMVal::make_native([vm,inner,dunder](std::vector<VMVal>& a)->VMVal{
                 if(a.size()==1&&a[0].type==VMType::INSTANCE){
                     bool f=false; VMVal r=vm->call_dunder_f(a[0],dunder,{},f);
                     if(f) return r;
                 }
                 return vm->vm_call(inner,a,std::nullopt);
             });
+            w.class_name=inner.class_name;   // round 84: named as the native it wraps (it read <native>)
+            (*ns.map)[nm]=w;
         }
         (*ns.map)["pi"]=VMVal::make_float(3.14159265358979323846);
         (*ns.map)["e"]=VMVal::make_float(2.71828182845904523536);
@@ -15834,7 +15956,18 @@ private:
                         vm->raise_native_exception("ValueError","invalid literal for int() with base 10: "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                     return VMVal::make_bigint(out);
                 }
-                case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__int__",{}); if(r.type!=VMType::NONE) return r; break; }
+                case VMType::INSTANCE: {
+                    VMVal r=vm->call_dunder(v,"__int__",{}); if(r.type!=VMType::NONE) return r;
+                    // round 84: then __index__, then __trunc__ (CPython's order; it ignored both)
+                    for(const char* m:{"__index__","__trunc__"}){
+                        bool f=false; VMVal x=vm->call_dunder_f(v,m,{},f);
+                        if(!f) continue;
+                        if(x.type==VMType::BOOL) return VMVal::make_int(x.b?1:0);
+                        if(x.type!=VMType::INT) vm->raise_native_exception("TypeError",std::string(m)+" returned non-int (type "+vm_type_name(x)+")");
+                        return x;
+                    }
+                    break;
+                }
                 default: break;
             }
             vm->raise_native_exception("TypeError","int() argument must be a string, a bytes-like object or a real number, not '"+vm_type_name(v)+"'");
@@ -15843,7 +15976,12 @@ private:
             if(a.empty()) return VMVal::make_float(0.0);
             const VMVal& v=a[0];
             nypy::NumV n;
-            if(v.to_numv(n)) return VMVal::make_float(n.dbl());
+            if(v.to_numv(n)){
+                double d=n.dbl();
+                // round 84: an int too large is an error, not inf (CPython's)
+                if(n.k!=3&&std::isinf(d)) vm->raise_native_exception("OverflowError","int too large to convert to float");
+                return VMVal::make_float(d);
+            }
             if(v.type==VMType::STRING){
                 double d;
                 if(!nypy::parse_float_str(nypy::uni_to_ascii(v.s),d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::str_repr(v.s));
@@ -15854,7 +15992,15 @@ private:
                 if(!nypy::parse_float_str(v.bdata(),d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::bytes_repr(v.bdata(),v.b));
                 return VMVal::make_float(d);
             }
-            if(v.type==VMType::INSTANCE){ VMVal r=vm->call_dunder(v,"__float__",{}); if(r.type!=VMType::NONE) return r; }
+            if(v.type==VMType::INSTANCE){
+                VMVal r=vm->call_dunder(v,"__float__",{}); if(r.type!=VMType::NONE) return r;
+                bool f=false; VMVal x=vm->call_dunder_f(v,"__index__",{},f);   // round 84: CPython's fallback
+                if(f&&x.to_numv(n)){
+                    double d=n.dbl();
+                    if(std::isinf(d)) vm->raise_native_exception("OverflowError","int too large to convert to float");
+                    return VMVal::make_float(d);
+                }
+            }
             vm->raise_native_exception("TypeError","float() argument must be a string or a real number, not '"+vm_type_name(v)+"'");
         });
         def("abs",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{

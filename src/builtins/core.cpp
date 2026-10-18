@@ -617,6 +617,7 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
         // a function's parameters, flags and place (inspect; round 77)
         if (name == "_ny_fn_info") return E.fnInfo(args.empty() ? NONE_VALUE : args[0]);
+        if (name == "_ny_mark_builtin") return E.markBuiltinFn(args.empty() ? NONE_VALUE : args[0]);   // round 84
         if (name == "_ny_vm_code") return E.vmCodeInfo(args);   // round 83: lib/dis.ny
         if (name == "_ny_fn_globals") return E.fnGlobals(args.empty() ? NONE_VALUE : args[0]);
         // the lexer's keyword spellings (lib/keyword.ny's nykwlist; the VM

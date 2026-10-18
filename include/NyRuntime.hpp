@@ -21,6 +21,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include "NyBuiltinFns.hpp"   // round 84: the functions CPython implements in C
 
 namespace nyrt {
 
@@ -553,9 +554,33 @@ inline std::string builtin_doc_key(const std::string& tag) {
                                           {"_ny_intern", "sys.intern"}, {"_ny_exc_info", "sys.exc_info"},
                                           {"_ny_getframe", "sys._getframe"}, {"_ny_settrace", "sys.settrace"},
                                           {"_ny_setprofile", "sys.setprofile"}, {"_ny_gettrace", "sys.gettrace"},
-                                          {"_ny_getprofile", "sys.getprofile"}};
+                                          {"_ny_getprofile", "sys.getprofile"}, {"_ny_exc_current", "sys.exception"}};
     for (auto& p : sysn) if (tag == p[0]) return p[1];
     return tag;
+}
+// A native as the module exposing it shows it (round 84): its __name__ (the
+// result), __qualname__, __module__ (*module), repr and __self__ -
+// math_sqrt is math's sqrt, _ny_getrefcount sys's getrefcount, os_getcwd
+// os's getcwd (CPython: posix's); every other native is builtins'.
+inline std::string builtin_public(const std::string& tag, std::string* module = nullptr) {
+    std::string k = builtin_doc_key(tag);
+    if (k == tag && tag.rfind("os_", 0) == 0) {
+        // the os_* natives os binds as they are (the others it wraps)
+        static const char* const osn[] = {"chdir", "chmod", "cpu_count", "getcwd", "getpid", "getppid", "readlink",
+                                          "unlink", "rmdir", "symlink", "system", "unsetenv", "urandom", "utime", "wait"};
+        for (const char* n : osn) if (tag.compare(3, std::string::npos, n) == 0) { k = "os." + tag.substr(3); break; }
+    }
+    size_t d = k.find('.');
+    if (d == std::string::npos || k == "map") {
+        if (module) *module = "builtins";
+        return k;
+    }
+    if (is_builtin_type_name(k.substr(0, d))) {   // str.upper: a builtin type's method
+        if (module) *module = "builtins";
+        return k.substr(d + 1);
+    }
+    if (module) *module = k.substr(0, d);
+    return k.substr(d + 1);
 }
 inline std::string class_repr(const std::string& full) {
     std::string n = shown_class_name(full);

@@ -1354,6 +1354,29 @@ def _ny_sys_addaudithook(hook):
     _ny_audit_hooks.append(hook)
     _ny_audit_enable()
 
+def _ny_builtins_module():
+    # round 84: the builtins module (lib/builtins.ny) - sys.modules["builtins"],
+    # a builtin function's __self__
+    import builtins
+    return builtins
+
+def _ny_seal_cmodule(mod, names):
+    # round 84: the functions CPython implements in C are builtins here too.
+    # The engines call this when a module named in include/NyBuiltinFns.hpp
+    # has run, with that module's names: a plain function the module binds
+    # under one is marked (_ny_mark_builtin: not bound through a class, of
+    # type builtin_function_or_method, <built-in function name>) and, when
+    # it was written under a private name (_ny_os_fspath), takes the public one
+    var ft = type(_ny_seal_cmodule)
+    for n in names.split(" "):
+        var f = getattr(mod, n, None)
+        if type(f) is not ft:
+            continue
+        if f.__name__ != n and f.__name__.startswith("_"):
+            f.__name__ = n
+            f.__qualname__ = n
+        _ny_mark_builtin(f)
+
 _ny_docs_mod = [None, False]
 def _ny_builtin_doc(key):
     # round 84: a builtin's docstring - CPython's, from lib/_nydocs.ny

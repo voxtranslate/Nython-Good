@@ -120,6 +120,13 @@ public:
     void consume_cplx();
     void consume_regex(char first);
     void consume_string(char first);
+    // round 84: PEP 701 - the string after an `f` prefix is read with its
+    // replacement fields copied as they are written (nested strings of any
+    // quote, nested f-strings, brackets, a format spec), so a field may use
+    // the f-string's own quote: f"{", ".join(xs)}"
+    bool fstring_next_ = false;
+    void read_fstring_field(std::stringstream& out, char first);
+    void read_nested_string(std::stringstream& out, char q, bool fstr);
     void consume_raw_string(char quote);
     void consume_bytes(char quote, bool raw);
     void consume_comment();

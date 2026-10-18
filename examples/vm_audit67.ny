@@ -111,7 +111,8 @@ def star_import():
 check("from m import * honours __all__", star_import(), [63, false, true])
 def from_missing():
     from audit67_mod import nothing
-check("from m import a missing name", err(lambda: from_missing()), "ImportError: cannot import name 'nothing' from 'audit67_mod'")
+import audit67_mod
+check("from m import a missing name", err(lambda: from_missing()), "ImportError: cannot import name 'nothing' from 'audit67_mod' (" + audit67_mod.__file__ + ")")
 import audit67_mod2
 check("a module importing a module", audit67_mod2.twice(1), [21, 21])
 

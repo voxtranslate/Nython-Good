@@ -853,23 +853,6 @@ def strptime(string, format="%a %b %d %H:%M:%S %Y"):
 
 # CPython's time functions are builtins, which a class does not bind: a
 # class attribute `converter = time.gmtime` (logging.Formatter) is called
-# with the seconds alone. Ours are Nython functions, so they are wrapped as
-# staticmethods - callable as they are, never bound to an instance.
-time = staticmethod(time)
-time_ns = staticmethod(time_ns)
-sleep = staticmethod(sleep)
-monotonic = staticmethod(monotonic)
-monotonic_ns = staticmethod(monotonic_ns)
-perf_counter = staticmethod(perf_counter)
-perf_counter_ns = staticmethod(perf_counter_ns)
-process_time = staticmethod(process_time)
-process_time_ns = staticmethod(process_time_ns)
-thread_time = staticmethod(thread_time)
-thread_time_ns = staticmethod(thread_time_ns)
-gmtime = staticmethod(gmtime)
-localtime = staticmethod(localtime)
-mktime = staticmethod(mktime)
-strftime = staticmethod(strftime)
-strptime = staticmethod(strptime)
-asctime = staticmethod(asctime)
-ctime = staticmethod(ctime)
+# with the seconds alone. Ours are Nython functions that the engines make
+# builtin functions once this module has run (round 84: the prelude's
+# _ny_seal_cmodule over include/NyBuiltinFns.hpp's names for time).

@@ -1268,6 +1268,10 @@ _BUILTIN_OBJS = [abs, all, any, ascii, bin, callable, chr, compile, delattr, div
 
 
 def _builtin_signature(cls, obj):
+    # round 84: a builtin written in Nython (a function CPython implements in
+    # C - time.sleep, operator.add) has its def's signature
+    if _ny_fn_info(obj) is not None:
+        return _signature_from_function(cls, obj)
     var name = getattr(obj, "__name__", None)
     if isinstance(name, str) and name in _BUILTIN_SIGS:
         for b in _BUILTIN_OBJS:

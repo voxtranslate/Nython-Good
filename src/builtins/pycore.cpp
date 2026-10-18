@@ -249,13 +249,28 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             Value r = E.callMethod(v, "__int__", no, ctx);
             if (r.type != ValueType::NONE) return r;
         }
+        // round 84: then __index__, then __trunc__ (CPython's order; it
+        // ignored both)
+        for (const char* m : {"__index__", "__trunc__"})
+            if (E.isInstanceVal(v) && E.instanceHasMethod(v, m)) {
+                std::vector<Value> no;
+                Value r = E.callMethod(v, m, no, ctx);
+                if (r.type != ValueType::INTEGER && r.type != ValueType::BOOLEAN)
+                    E.pyRaise("TypeError", std::string(m) + " returned non-int (type " + E.typeNameOf(r) + ")");
+                return r.type == ValueType::BOOLEAN ? intValue(r.value.b ? 1 : 0) : r;
+            }
         E.pyRaise("TypeError", "int() argument must be a string, a bytes-like object or a real number, not '" + E.typeNameOf(v) + "'");
     }
     case B_FLOAT: {
         if (args.empty()) return Value(0.0);
         const Value& v = args[0];
         NythonExecutor::Num n;
-        if (NythonExecutor::asNum(v, n)) return Value(NythonExecutor::numD(n));
+        if (NythonExecutor::asNum(v, n)) {
+            double d = NythonExecutor::numD(n);
+            // round 84: an int too large is an error, not inf (CPython's)
+            if (n.k != 3 && std::isinf(d)) E.pyRaise("OverflowError", "int too large to convert to float");
+            return Value(d);
+        }
         if (E.isStringValue(v)) {
             const std::string& s = *(std::string*)v.value.p;
             double d;
@@ -271,6 +286,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             std::vector<Value> no;
             Value r = E.callMethod(v, "__float__", no, ctx);
             if (r.type != ValueType::NONE) return r;
+        }
+        if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__index__")) {   // round 84: CPython's fallback
+            std::vector<Value> no, one;
+            one.push_back(E.callMethod(v, "__index__", no, ctx));
+            return dispatch_pycore(E, "float", one, ctx);
         }
         E.pyRaise("TypeError", "float() argument must be a string or a real number, not '" + E.typeNameOf(v) + "'");
     }

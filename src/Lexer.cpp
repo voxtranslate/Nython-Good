@@ -1955,7 +1955,7 @@ void Lexer::consume_ident() {
             consume_string(q);
             return;
         }
-        if (lo == "f") ident = "f";
+        if (lo == "f") { ident = "f"; fstring_next_ = true; }   // round 84: PEP 701
         if (lo == "rf" || lo == "fr") {
             this->token.value = "f";
             make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
@@ -2156,9 +2156,95 @@ void Lexer::consume_regex(char first) {
 	}
 }
 
+// round 84: PEP 701 - a replacement field of an f-string, its `{` just read:
+// copied as written up to its closing `}` (the parser parses it), with the
+// strings inside it read whole whatever their quotes, brackets counted, a
+// format spec's own fields followed, comments dropped.
+void Lexer::read_fstring_field(std::stringstream& out, char first) {
+    out << '{';
+    int depth = 0;
+    bool spec = false;
+    std::string prev;   // the identifier characters just before a quote: a string prefix
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { source.put_char(); return; }   // unterminated: the caller reports it
+        if (spec) {
+            if (c == '{') { read_fstring_field(out, first); continue; }
+            if (c == '}') { out << '}'; return; }
+            if (c == first) { source.put_char(); return; }
+            out << c;
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            std::string lo;
+            for (char p : prev) lo += (char)((p >= 'A' && p <= 'Z') ? p + 32 : p);
+            bool nested_f = !lo.empty() && lo.size() <= 2 && lo.find('f') != std::string::npos
+                            && lo.find_first_not_of("rf") == std::string::npos;   // f, rf, fr
+            out << c;
+            read_nested_string(out, c, nested_f);
+            prev.clear();
+            continue;
+        }
+        if (is_ident_part(c)) prev += c; else prev.clear();
+        if (c == '#') {   // a comment, to the end of its line
+            while (source.peek_char() != '\n' && source.peek_char() != '\0' && source.peek_char() != (char)-1) source.read_char();
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']') { if (depth > 0) depth--; }
+        else if (c == '}') {
+            if (depth == 0) { out << '}'; return; }
+            depth--;
+        } else if (c == ':' && depth == 0) spec = true;
+        out << c;
+    }
+}
+
+// The rest of a string literal inside a replacement field, its opening quote
+// already copied: copied as written, escapes and all (a nested f-string's
+// fields followed in turn).
+void Lexer::read_nested_string(std::stringstream& out, char q, bool fstr) {
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        out << q;
+        if (source.peek_char() != q) return;   // ''
+        source.read_char();
+        out << q;
+        n = 3;
+    }
+    int ends = 0;
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { source.put_char(); return; }
+        if (c == '\\') {
+            out << c;
+            char d = source.read_char();
+            if (d == '\0' || d == (char)-1) { source.put_char(); return; }
+            out << d;
+            ends = 0;
+            continue;
+        }
+        if (fstr && c == '{') {
+            if (source.peek_char() == '{') { source.read_char(); out << "{{"; ends = 0; continue; }
+            read_fstring_field(out, q);
+            ends = 0;
+            continue;
+        }
+        if (c == '\n' && n == 1) { source.put_char(); return; }   // unterminated: the parser reports it
+        out << c;
+        if (c == q) {
+            if (++ends == n) return;
+        } else ends = 0;
+    }
+}
+
 void Lexer::consume_string(char first) {
     std::stringstream strbuff;
     char cur = first;
+    // round 84: PEP 701 - an f-string's fields are read whole
+    const bool fstr = fstring_next_;
+    fstring_next_ = false;
 	int quote_count     = 0;
 	int end_quote_count = 0;
 	while(cur == first && quote_count < 3) {
@@ -2187,6 +2273,13 @@ void Lexer::consume_string(char first) {
 			// lost them) - round 77.
 			if(quote_count == 3 && cur != first && end_quote_count > 0)
 				for(int q = 0; q < end_quote_count; q++) strbuff << first;
+			// round 84: PEP 701 - a replacement field, copied whole ({{ is a brace)
+			if(fstr && cur == '{') {
+				end_quote_count = 0;
+				if(source.peek_char() == '{') { source.read_char(); strbuff << "{{"; continue; }
+				read_fstring_field(strbuff, first);
+				continue;
+			}
 			if(cur != '\\' && cur != '\x0c' && cur != '\r') {
 				// For triple-quoted strings (quote_count==3), preserve literal newlines
 				if(cur == '\n') {

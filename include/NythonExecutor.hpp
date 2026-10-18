@@ -429,6 +429,11 @@ struct NythonExecutor {
     // A class statement run again makes a new class, registered as
     // "Name#n" (evalClassDecl); what is shown is Name.
     static std::string shownClassName(const std::string& n) { return nyrt::shown_class_name(n); }
+    // round 84: a function CPython implements in C, marked when the module
+    // binding it had run (sealCModule): static, and "__nybuiltin__"
+    static bool isNyBuiltinTag(const std::string& t) {
+        return t.size() > 13 && t.rfind("__func__:", 0) == 0 && t.find("__nybuiltin__") != std::string::npos;
+    }
     static std::string funcDisplayName(const std::string& fn) {
         if (fn.rfind("__class__:", 0) == 0) return nyrt::class_repr(fn.substr(10));
         std::string n = fn;
@@ -668,6 +673,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_settrace","_ny_setprofile","_ny_gettrace","_ny_getprofile","_ny_frame_local_set",   // sys.settrace ... (round 79)
             "sys.settrace","sys.setprofile","sys.gettrace","sys.getprofile",   // the same, named as sys's (__name__ "settrace")
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
+            "_ny_mark_builtin",                                  // a function CPython implements in C (round 84)
             "_ny_unicode_lookup","_ny_unicode_name",          // unicodedata (round 77)
             "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
             "_ny_getfield","_ny_mark_slots","_ny_slot_flags","_ny_switch_class",   // __slots__, __class__ assignment (round 79)
@@ -1423,11 +1429,28 @@ public:   // NythonExecutor is a struct: members default to public
         if (builtin_set.count(called)) return true;
         for (auto& kv : func_names) {
             if (!module_owned_.empty() && module_owned_.count(kv.first)) continue;
+            // round 84: a bound method, a method and a nested function are no
+            // global names - an unbound `result` read as undefined (no
+            // NameError) once any `def result` method existed (asyncio's
+            // Future.result), depending on which function values were alive
+            if (!bound_self_.empty() && bound_self_.count(kv.first)) continue;
             const std::string& n = kv.second;
-            if (n == called
-                || (n.rfind("__func__:", 0) == 0  && n.compare(9, std::string::npos, called) == 0)
-                || (n.rfind("__class__:", 0) == 0 && n.compare(10, std::string::npos, called) == 0)
-                || (n.rfind("__builtin__:", 0) == 0 && n.compare(12, std::string::npos, called) == 0))
+            bool fn = n.rfind("__func__:", 0) == 0 && n.compare(9, std::string::npos, called) == 0;
+            bool cls = n.rfind("__class__:", 0) == 0 && n.compare(10, std::string::npos, called) == 0;
+            if (fn || cls) {
+                auto ai = func_ast_nodes.find(kv.first);
+                Node* an = ai != func_ast_nodes.end() ? (Node*)ai->second : nullptr;
+                if (fn && an && an->type() == NodeType::FUNCTION) {
+                    auto* f = static_cast<FunctionNode*>(an);
+                    if (f->is_method || f->qualname.find('.') != std::string::npos) continue;
+                }
+                if (cls && an && an->type() == NodeType::CLASS) {
+                    auto* c = static_cast<ClassNode*>(an);
+                    if (c->qualname.find('.') != std::string::npos) continue;
+                }
+                return true;
+            }
+            if (n == called || (n.rfind("__builtin__:", 0) == 0 && n.compare(12, std::string::npos, called) == 0))
                 return true;
         }
         return false;
@@ -1610,6 +1633,7 @@ public:   // NythonExecutor is a struct: members default to public
         noteModule("os", nsv);
         noteModule("os.path", Value((Collectable*)path));   // sys.modules["os.path"] (round 80)
         os_ns_cache_ = nsv;
+        sealCModule("os", nsv);   // round 84: os.fspath, os.scandir ... are builtins
         return nsv;
     }
 
@@ -3316,8 +3340,11 @@ public:   // NythonExecutor is a struct: members default to public
             auto fit = func_names.find(v.value.p);
             if (fit != func_names.end()) {
                 // functions, bound methods, builtins: their type objects (round 77)
-                if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0)
-                    return runtimeTypeValue(bound_self_.count(v.value.p) ? "method" : "function");
+                if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0) {
+                    if (bound_self_.count(v.value.p)) return runtimeTypeValue("method");
+                    // round 84: a function CPython implements in C (sealCModule)
+                    return runtimeTypeValue(isNyBuiltinTag(fit->second) ? "builtin_function_or_method" : "function");
+                }
                 if (fit->second.find("__rtype__:") == 0) return builtin("type");
                 if (fit->second.find("__class__:") == 0) {
                     // a class: its metaclass, else type
@@ -4293,7 +4320,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (fit->second.rfind("__rtype__:", 0) == 0) return "type";
                 if (fit->second.rfind("__builtin__:", 0) == 0 || fit->second.rfind("__bmethod__:", 0) == 0) return "builtin_function_or_method";
                 if (bound_self_.count(v.value.p)) return "method";
-                return "function";
+                return isNyBuiltinTag(fit->second) ? "builtin_function_or_method" : "function";   // round 84
             }
         }
         return "object";
@@ -4381,7 +4408,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (fit->second.rfind("__builtin__:", 0) == 0) {
                     std::string bn = fit->second.substr(12);
                     if (nyrt::is_builtin_type_name(bn)) return "<class '" + bn + "'>";
-                    return "<built-in function " + bn + ">";
+                    return "<built-in function " + nyrt::builtin_public(bn) + ">";   // round 84: math_sqrt is sqrt
                 }
                 // the runtime's type objects, bound methods and builtin
                 // methods as Python shows them (round 77)
@@ -4407,9 +4434,12 @@ public:   // NythonExecutor is a struct: members default to public
                 if (fit->second.rfind("__class__:", 0) != 0) {
                     Value q;
                     std::string qn;
+                    // round 84: a function CPython implements in C, as CPython shows it
+                    const bool nyb = isNyBuiltinTag(fit->second);
                     try {
-                        if (specialAttribute(v, "__qualname__", ctx ? ctx : global_ctx, q) && isStringValue(q)) qn = getStringValue(q);
+                        if (specialAttribute(v, nyb ? "__name__" : "__qualname__", ctx ? ctx : global_ctx, q) && isStringValue(q)) qn = getStringValue(q);
                     } catch (std::string&) {}
+                    if (nyb && !qn.empty()) return "<built-in function " + qn + ">";
                     if (!qn.empty()) return "<function " + qn + " at " + idHex(v, ctx ? ctx : global_ctx) + ">";
                 }
                 return funcDisplayName(fit->second);
@@ -6967,6 +6997,13 @@ public:   // NythonExecutor is a struct: members default to public
             Value target;
             if (specialAttribute(obj, method_name, ctx, target)) return callFunctionValue(target, args, ctx, kw_in);
         }
+        // round 84: PEP 562 - m.f(...) of a name module m supplies through
+        // its own __getattr__
+        if (obj.isCollectable() && obj.value.gc) {
+            Value target;
+            if (moduleGetattr(obj, dynamic_cast<Container*>(obj.value.gc), method_name, ctx, target))
+                return callFunctionValue(target, args, ctx, kw_in);
+        }
         // Any other value without such a method raises too: `none.m()` and
         // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
         // spelling.
@@ -7511,6 +7548,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value methodObjectOf(const Value& v, Context* ctx, const std::string* name = nullptr) {
         if (!isPlainFunction(v) || bound_self_.count(v.value.p)) return v;
         const std::string tag = fnTag(func_names, v.value.p);
+        if (isNyBuiltinTag(tag)) return v;   // round 84: a builtin function, as CPython's
         const char* kind = tag.find("__static__") != std::string::npos ? "staticmethod"
                          : tag.find("__classmethod__") != std::string::npos ? "classmethod" : nullptr;
         // __new__ is a static method, __init_subclass__ and
@@ -9479,7 +9517,9 @@ public:
         size_t best = std::string::npos;
         std::string bestName;
         auto consider = [&](const std::string& cand) {
-            if (cand.empty() || cand.find("__") == 0) return;
+            // round 84: never the name itself (a method of that name is no
+            // global name: "did you mean 'total'?" for total)
+            if (cand.empty() || cand.find("__") == 0 || cand == want) return;
             size_t la = want.size(), lb = cand.size();
             if (la > lb + 3 || lb > la + 3) return;
             std::vector<size_t> prev(lb + 1), cur(lb + 1);
@@ -10056,6 +10096,9 @@ public:
                     out = callFunctionValue(global_ctx->getByName("_ny_module_spec_attr"), a, ctx ? ctx : global_ctx);
                     return true;
                 }
+                // round 84: PEP 562 - a module's own __getattr__ supplies a
+                // name it lacks (what it raises propagates)
+                if (moduleGetattr(obj, cont, attr, ctx, out)) return true;
                 // A dict / list / tuple / set method read as a value.
                 if (bind && builtinValueDunder(obj, attr, out)) return true;   // [1].__getitem__ (round 78)
                 if (bind && nypy::kind_has_method(memberKindOf(obj), attr)) { out = boundMember(obj, attr); return true; }
@@ -10084,6 +10127,15 @@ public:
                 std::string target = nyrt::builtin_member(base, attr,
                     [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
                 if (!target.empty()) { out = builtinValue(target); return true; }
+                // round 84: a native as the module that has it shows it
+                // (math_sqrt is math's sqrt), and its __self__ is that module
+                if (!nyrt::is_builtin_type_name(base) && base != "map"
+                    && (attr == "__name__" || attr == "__qualname__" || attr == "__module__" || attr == "__self__")) {
+                    std::string mod, pub = nyrt::builtin_public(base, &mod);
+                    if (attr == "__self__") out = moduleValueByName(mod, ctx);
+                    else out = makeStringValue(attr == "__module__" ? mod : pub);
+                    return true;
+                }
                 // len.__name__, int.__name__ (argparse's "invalid int value")
                 if (attr == "__name__" || attr == "__qualname__") {
                     size_t dot = base.rfind('.');
@@ -10497,6 +10549,19 @@ public:
                 if (ft.rfind("__func__:", 0) == 0 || ft.rfind("__lambda__", 0) == 0 || ft.rfind("__builtin__:", 0) == 0
                     || ft.rfind("__bmethod__:", 0) == 0) { out = obj; return true; }
             }
+            // round 84: a builtin function's __self__ is its module - a
+            // native's (nyrt::builtin_public) or a function CPython implements
+            // in C (sealCModule): the module it was sealed in
+            if (attr == "__self__" && !bound_self_.count(obj.value.p)) {
+                const std::string ft = fnTag(func_names, obj.value.p);
+                std::string mod;
+                if (ft.rfind("__builtin__:", 0) == 0 && !nyrt::is_builtin_type_name(ft.substr(12))) nyrt::builtin_public(ft.substr(12), &mod);
+                else if (isNyBuiltinTag(ft)) {
+                    Value m;
+                    if (getAttrValue(obj, "__module__", ctx, m) && isStringValue(m)) mod = getStringValue(m);
+                }
+                if (!mod.empty()) { out = moduleValueByName(mod, ctx); return true; }
+            }
             // A builtin method ([].append): __self__ and its qualified name
             // (round 77)
             if (!bound_members_.empty() && (attr == "__self__" || attr == "__qualname__")) {
@@ -10684,13 +10749,20 @@ public:
             if (attr == "__name__" || attr == "__qualname__" || attr == "__module__") {
                 if (fit != func_names.end()) {
                     const std::string& t = fit->second;
+                    // round 84: a native as the module that has it shows it
+                    // (math_sqrt is math's sqrt, _ny_getrefcount sys's getrefcount)
+                    if (t.rfind("__builtin__:", 0) == 0 && !nyrt::is_builtin_type_name(t.substr(12))) {
+                        std::string mod, nm = nyrt::builtin_public(t.substr(12), &mod);
+                        out = makeStringValue(attr == "__module__" ? mod : nm);
+                        return true;
+                    }
                     size_t c = t.find(':');
                     std::string nm = c == std::string::npos ? t : t.substr(c + 1);
                     // name__static__ etc: the decorator tags (round 78: any
                     // "__" was cut, so a mangled _C__m read "_C")
                     for (bool cut = true; cut; ) {
                         cut = false;
-                        for (const char* sfx : {"__static__", "__classmethod__", "__property__"}) {
+                        for (const char* sfx : {"__static__", "__classmethod__", "__property__", "__nybuiltin__"}) {
                             size_t sl = std::strlen(sfx);
                             if (nm.size() > sl && nm.compare(nm.size() - sl, sl, sfx) == 0) { nm.resize(nm.size() - sl); cut = true; }
                         }
@@ -10813,6 +10885,53 @@ public:
         if (memberKindOf(obj) == nypy::MemberKind::Other) return std::string();
         std::string t = typeNameOf(obj);
         return t == "map" ? std::string("dict") : t;
+    }
+    // round 84: the functions CPython implements in C (include/NyBuiltinFns.hpp)
+    // are builtins here too, once the module that binds them has run: the
+    // prelude's _ny_seal_cmodule marks each plain function the module binds
+    // under one of those names (markBuiltinFn). Nothing for other modules.
+    void sealCModule(const std::string& module_name, const Value& nsv) {
+        const char* names = nyrt::cpython_builtin_fns(module_name);
+        if (!names) return;
+        Value fn = global_ctx->getByName("_ny_seal_cmodule");
+        if (fn.type == ValueType::NONE || fn.type == ValueType::UNDEFINED) return;
+        std::vector<Value> a{nsv, makeStringValue(names)};
+        callFunctionValue(fn, a, global_ctx);
+    }
+    // _ny_mark_builtin(f): a def's function becomes a builtin function -
+    // not bound when read through a class or an instance (static), of type
+    // builtin_function_or_method, <built-in function name>, C.__dict__ holds
+    // it as it is, its __self__ is its module
+    Value markBuiltinFn(const Value& f) {
+        if (!isPlainFunction(f) || bound_self_.count(f.value.p)) return f;
+        auto it = func_names.find(f.value.p);
+        if (it == func_names.end()) return f;
+        std::string& t = it->second;
+        if (t.rfind("__func__:", 0) != 0 || isNyBuiltinTag(t)
+            || t.find("__classmethod__") != std::string::npos || t.find("__property__") != std::string::npos) return f;
+        if (t.find("__static__") == std::string::npos) t += "__static__";
+        t += "__nybuiltin__";
+        specInvalidate();
+        return f;
+    }
+    // A loaded module by name: sys.modules', the engine's own, builtins (the
+    // prelude's); None when it is not loaded
+    Value moduleValueByName(const std::string& mod, Context* ctx) {
+        if (mod == "sys" && sys_ns_.type != ValueType::UNDEFINED) return sys_ns_;
+        if (Container* c = sysModulesCont()) {
+            auto it = c->container->find(nypy::key_of_str(mod));
+            if (it != c->container->end()) return it->second;
+        }
+        auto mi = module_ns_.find(mod);
+        if (mi != module_ns_.end()) return mi->second;
+        if (mod == "builtins") {
+            Value bm = global_ctx->getByName("_ny_builtins_module");
+            if (bm.type != ValueType::UNDEFINED && bm.type != ValueType::NONE) {
+                std::vector<Value> none;
+                return callFunctionValue(bm, none, ctx ? ctx : global_ctx);
+            }
+        }
+        return NONE_VALUE;
     }
     Value builtinDoc(const std::string& key, Context* ctx) {
         Value fn = global_ctx->getByName("_ny_builtin_doc");
@@ -13240,6 +13359,34 @@ public:
     // as long as the program, so its scope is never released.
     std::vector<Context*> module_ctxs_;
 
+    // round 84: what CPython's "cannot import name" adds: " (its file)", or
+    // " (unknown location)"
+    std::string importWhere(const Value& nsv) {
+        if (Container* c = contOf(nsv); c && c->container && isModuleNamespace(nsv)) {
+            auto f = c->container->find("__file__");
+            if (f != c->container->end() && isStringValue(f->second)) return " (" + getStringValue(f->second) + ")";
+        }
+        return " (unknown location)";
+    }
+    // round 84: PEP 562 - module m's own __getattr__(name), for a name m's
+    // namespace lacks (false when it defines none)
+    bool moduleGetattr(const Value& obj, Container* cont, const std::string& name, Context* ctx, Value& out) {
+        if (name == "__getattr__" || !cont || !cont->container || !isModuleNamespace(obj)) return false;
+        auto ga = cont->container->find("__getattr__");
+        if (ga == cont->container->end() || !isPlainFunction(ga->second)) return false;
+        std::vector<Value> a{makeStringValue(name)};
+        out = callFunctionValue(ga->second, a, ctx ? ctx : global_ctx);
+        return true;
+    }
+    // ... and in `from m import x`: an AttributeError it raises is "cannot
+    // import name" (CPython's)
+    bool moduleGetattrForImport(const Value& obj, Container* cont, const std::string& name, Context* ctx, Value& out) {
+        try { return moduleGetattr(obj, cont, name, ctx, out); }
+        catch (std::string& flow) {
+            if (excTypeMatches(flow, "AttributeError")) return false;
+            throw;
+        }
+    }
     // `from m import a, b` / `from m import *`: binds names of module m's
     // namespace in ctx (ImportError for a name m does not define). `*` binds
     // the names in m's __all__, or every name not starting with "_".
@@ -13253,7 +13400,7 @@ public:
                 auto [n, bound] = nyrt::import_name_alias(entry);
                 Value v;
                 if (!getAttrValue(nsv, n, ctx, v))
-                    throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'");
+                    throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'" + importWhere(nsv));
                 ctx->defineByName(bound, v);
             }
             return;
@@ -13265,8 +13412,13 @@ public:
                 for (const Value& nm : iterItems(all->second, ctx)) {
                     std::string k = isStringValue(nm) ? getStringValue(nm) : nm.toString();
                     auto it = ns->container->find(k);
-                    if (it == ns->container->end())
-                        throw std::string("__exc__:AttributeError:module '" + module_name + "' has no attribute '" + k + "'");
+                    Value got;
+                    if (it == ns->container->end()) {
+                        if (!moduleGetattr(nsv, ns, k, ctx, got))   // round 84: PEP 562
+                            throw std::string("__exc__:AttributeError:module '" + module_name + "' has no attribute '" + k + "'");
+                        ctx->defineByName(k, got);
+                        continue;
+                    }
                     ctx->defineByName(k, it->second);
                 }
                 return;
@@ -13278,8 +13430,13 @@ public:
         for (const auto& entry : names) {
             auto [n, bound] = nyrt::import_name_alias(entry);
             auto it = ns->container->find(n);
-            if (it == ns->container->end())
-                throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'");
+            if (it == ns->container->end()) {
+                Value got;
+                if (!moduleGetattrForImport(nsv, ns, n, ctx, got))   // round 84: PEP 562
+                    throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'" + importWhere(nsv));
+                ctx->defineByName(bound, got);
+                continue;
+            }
             ctx->defineByName(bound, it->second);
         }
     }
@@ -13312,6 +13469,10 @@ public:
         if (!here.empty() && !in_package) { dirs.push_back(here); dirs.push_back(here + "lib/"); }
         for (auto& d : sysPathDirs()) dirs.push_back(d);   // round 80
         for (const char* d : {"", "./", "lib/", "./lib/"}) dirs.push_back(d);
+        // round 84: the installation's own library before the importer's
+        // ancestors - a program run from inside another checkout found that
+        // checkout's lib/ (a library module the running build does not match)
+        for (auto& d : nyrt::library_dirs()) dirs.push_back(d);
         std::string anc = parentDirOf(here);
         for (int up = 0; up < 4 && !anc.empty(); ++up) {
             dirs.push_back(anc); dirs.push_back(anc + "lib/");
@@ -13319,7 +13480,6 @@ public:
             if (next == anc) break;
             anc = next;
         }
-        for (auto& d : nyrt::library_dirs()) dirs.push_back(d);
         return dirs;
     }
     // round 80: sys.path's entries (a program's sys.path.insert(0, d) is
@@ -13503,6 +13663,7 @@ public:
             catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); if (into.type == ValueType::UNDEFINED) forgetModule(module_name); throw; }
         }
         for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
+        sealCModule(module_name, nsv);   // round 84
         return nsv;
     }
     Value importModule(const std::string& filepath, const std::string& module_name,
@@ -15555,6 +15716,13 @@ public:
             } else if (Node* cn = classNodeOfValue(o)) {
                 classMemberNames(cn, names);
             } else if (isModuleNamespace(o)) {
+                // round 84: PEP 562 - a module's own __dir__ lists it
+                auto dd = contOf(o)->container->find("__dir__");
+                if (dd != contOf(o)->container->end() && isPlainFunction(dd->second)) {
+                    std::vector<Value> none;
+                    for (const Value& n : iterItems(callFunctionValue(dd->second, none, ctx ? ctx : global_ctx), ctx))
+                        names.insert(isStringValue(n) ? getStringValue(n) : n.toString());
+                } else
                 for (auto& kv : *contOf(o)->container) if (!reflectHidden(kv.first)) names.insert(kv.first);
             } else {
                 nypy::MemberKind k = memberKindOf(o);
