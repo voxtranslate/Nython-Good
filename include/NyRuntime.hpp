@@ -84,6 +84,22 @@ inline std::vector<std::string> library_dirs() {
     return out;
 }
 
+// round 83: type's own members read from the builtin type (type.__new__(mcs,
+// name, bases, ns), type.__setattr__(cls, name, value) past a metaclass's
+// __setattr__, ...): the prelude function standing for each, or nullptr.
+inline const char* type_own_member(const std::string& a) {
+    static const char* const m[][2] = {
+        {"__new__", "_ny_type_m_new"}, {"__init__", "_ny_type_m_init"}, {"__call__", "_ny_type_m_call"},
+        {"__setattr__", "_ny_type_m_setattr"}, {"__delattr__", "_ny_type_m_delattr"},
+        {"__getattribute__", "_ny_type_m_getattribute"}, {"__prepare__", "_ny_type_m_prepare"},
+        {"mro", "_ny_type_m_mro"}, {"__subclasses__", "_ny_type_m_subclasses"},
+        {"__instancecheck__", "_ny_type_m_instancecheck"}, {"__subclasscheck__", "_ny_type_m_subclasscheck"},
+    };
+    if (a.size() < 3) return nullptr;
+    for (auto& x : m) if (a == x[0]) return x[1];
+    return nullptr;
+}
+
 // round 82: a package's __init__ file (Nython's __init__.ny or Python's
 // __init__.py), and the module source extensions in the order a search
 // takes them: every directory is searched for a .ny module before any is

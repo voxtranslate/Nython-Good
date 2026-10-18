@@ -44,6 +44,7 @@ VMVal ret_to_vm(const nyconc::Ret& r) {
         case nyconc::Ret::INT:  return VMVal::make_int(r.i);
         case nyconc::Ret::NUM:  return VMVal::make_float(r.d);
         case nyconc::Ret::STR:  return VMVal::make_str(r.s);
+        case nyconc::Ret::BYTES: return VMVal::make_bytes(r.s);   // round 83
         case nyconc::Ret::BOX:  return unbox(r.box);
         case nyconc::Ret::LIST: {
             std::vector<VMVal> out;
@@ -94,6 +95,8 @@ struct VMArgs : nyconc::Args {
     }
     std::string as_str(size_t i) const override { return v[i].type == VMType::STRING ? v[i].s : v[i].to_string(); }
     bool truthy(size_t i) const override { return v[i].is_truthy(); }
+    bool is_bytes(size_t i) const override { return v[i].type == VMType::BYTES; }   // round 83
+    std::string as_bytes(size_t i) const override { return v[i].type == VMType::BYTES ? v[i].bdata() : as_str(i); }
     nyconc::BoxPtr box(size_t i) const override { return std::make_shared<VMBox>(v[i]); }
     std::unique_ptr<nyconc::Args> list(size_t i) const override {
         std::vector<VMVal> out;
@@ -191,6 +194,13 @@ struct VMConcEngine : nyconc::Engine {
         if (v.type != VMType::INT) return false;
         out = v.i;
         return true;
+    }
+    bool unbox_num(const nyconc::BoxPtr& b, double& out) override {   // round 83
+        VMVal v = unbox(b);
+        if (v.type == VMType::FLOAT) { out = v.d; return true; }
+        if (v.type == VMType::INT) { out = (double)v.i; return true; }
+        if (v.type == VMType::BOOL) { out = v.b ? 1 : 0; return true; }
+        return false;
     }
     nyconc::BoxPtr from_ret(const nyconc::Ret& r) override { return box(ret_to_vm(r)); }
     bool is_callable(const nyconc::BoxPtr& b) override {

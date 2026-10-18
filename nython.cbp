@@ -161,6 +161,7 @@
         <Unit filename="src/builtins/threading.cpp" />
         <Unit filename="src/builtins/nysqlite.cpp" />
         <Unit filename="src/builtins/tls.cpp" />
+        <Unit filename="src/builtins/ffi.cpp" />
         <Unit filename="src/builtins/hashing.cpp" />
         <Unit filename="src/builtins/pymath.cpp" />
         <Unit filename="src/builtins/pyjson.cpp" />

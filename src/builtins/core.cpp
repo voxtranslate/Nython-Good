@@ -643,6 +643,25 @@ Value dispatch_core(NythonExecutor& E,
             uint32_t cp = nypy::u8_decode(s, i);
             return E.makeStringValue(::nyuni::name(cp));
         }
+        // type.__new__ / type.__call__ read from the builtin (round 83): the
+        // prelude's _ny_type_m_new / _ny_type_m_call pass the positional
+        // arguments, then the keywords as a dict
+        if (name == "_ny_type_new" || name == "_ny_type_call") {
+            nyrt::OrderedKw<Value> kw;
+            std::vector<Value> a = args;
+            if (!a.empty()) {
+                if (Container* c = E.contOf(a.back()))
+                    for (auto& kv : *c->container)
+                        if (!NythonExecutor::isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+                a.pop_back();
+            }
+            if (name == "_ny_type_new") return E.typeNew(a, kw, ctx);
+            if (a.empty()) E.pyRaise("TypeError", "descriptor '__call__' of 'type' object needs an argument");
+            Value cls = a[0];
+            std::vector<Value> rest(a.begin() + 1, a.end());
+            E.type_call_skip_ = true;
+            return E.instantiateClass(cls, rest, kw, ctx);
+        }
         if (name == "_ny_setattr_raw" && args.size() >= 3) {
             NythonExecutor::RawAttr raw;
             E.setAttr(args[0], E.getStringValue(args[1]), args[2]);

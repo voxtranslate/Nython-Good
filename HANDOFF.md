@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 83, part B — **§0v** (Python's system and command-line modules: errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched, cmath, colorsys, readline, rlcompleter, site, sysconfig, webbrowser, zipimport, zipapp, encodings, stringprep, bz2, lzma; module.__dict__ and hashable modules on both engines; VM comprehension results freed; vm_audit109).
+Last updated: round 83, ctypes — **§0v4** (ctypes over libffi loaded at run time, or Nython's own caller built on the calling conventions' register files; type's own members; a metaclass's operators on its classes)
+Round 83, part B — **§0v** (Python's system and command-line modules: errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched, cmath, colorsys, readline, rlcompleter, site, sysconfig, webbrowser, zipimport, zipapp, encodings, stringprep, bz2, lzma; module.__dict__ and hashable modules on both engines; VM comprehension results freed; vm_audit109).
 Round 83, part C — **§0v3** (sqlite3 over libsqlite3 loaded at run time, its callbacks run by suspending a coroutine; dbm/shelve; the email package and the mail modules; smtplib/poplib/imaplib/ftplib/telnetlib/xmlrpc/wsgiref/cgi/netrc; plistlib; audioop and the audio-file modules; vm_audit110).
 Round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` modules and packages, `.ny` first; quoted imports from anywhere; `threading.Lock` is Python's ownerless lock; tasks see their loop's thread in threading; `_thread`; vm_audit107).
 Round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
@@ -87,6 +88,84 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0v4. Round 83, ctypes — ctypes, and type's own members (vm_audit111)
+
+`examples/vm_audit111.ny` (53 checks) passes on both engines and under python3
+(Linux; CPython's values throughout).
+Sweep 447 runs, 0 not ok; `tools/ide_e2e.py` 463 passed, 0 failed; the
+memory probe, class check and cbp check clean.
+
+- **`ctypes`** (`lib/ctypes/__init__.ny`, `util.ny`, `wintypes.ny`; native
+  `src/builtins/ffi.cpp`). CPython's object model: every instance is a view
+  of native memory (`_b_addr`, `_b_base_`, `_b_needsfree_`, `_objects`
+  keeping what its pointers point into alive); fields, array elements and
+  pointer contents share their parent's memory. The simple types with
+  CPython's platform aliases (`c_int is c_long` where they have one size),
+  Structure/Union with `_fields_` in the body or assigned once later
+  (recursive structures), bit fields laid out as the C compiler does
+  (GCC/Clang's rule; MSVC's on Windows - CPython 3.12's own layout differs
+  for some mixed-type runs), `_pack_`, `_anonymous_`, inheritance,
+  BigEndian/LittleEndian structures; arrays (`T * n`, cached, through a
+  metaclass `__mul__`), pointers, `cast`, `byref`, `memmove`/`memset`,
+  `string_at`/`wstring_at`, string and unicode buffers, `from_buffer` (of
+  ctypes objects), `from_buffer_copy`, `from_address`, `in_dll`; `CDLL`/
+  `PyDLL` (`WinDLL`/`OleDLL` on Windows), function pointers with
+  `restype`/`argtypes`/`errcheck`, CPython's ArgumentError messages and arity
+  rules (cdecl takes extra arguments: a variadic call), structures returned
+  and passed by value, `CFUNCTYPE` callbacks (qsort with a Python
+  comparator), function pointers from an address, `use_errno`.
+- **The native side is served by the concurrency runtime's dispatcher**
+  (`nyconc::register_extension`, new): both engines get the `_ffi_*`
+  builtins and a callback calls back into either engine through
+  `Engine::call`, re-taking the GIL the call released (`nyconc::GilReacquire`,
+  new). The dispatcher's argument/result interfaces carry bytes now
+  (`Args::is_bytes/as_bytes`, `Ret::BYTES`) and `Engine::unbox_num` gives a
+  callback's float result.
+- **Calls go through libffi, loaded at run time** (libffi.so.8/7, .dylib,
+  libffi-8.dll), as tls.cpp loads OpenSSL: any signature, structs by value,
+  variadic functions (`ffi_prep_cif_var`), closures. **Without libffi a
+  built-in caller** (Nython's own, `NY_FFI_NO_LIBFFI=1` forces it) relies on
+  the calling conventions' register files: on x86-64 System V and AArch64
+  (Linux) integer and float arguments fill separate registers in order and
+  the excess goes on the stack in order, so one fixed prototype (8 integer
+  words, 8 doubles, 8 stack words; variadic on x86-64 so %al is set) calls
+  any function of scalar arguments, variadic ones included, and a pool of 32
+  trampolines per result class reads every register for callbacks; Windows
+  x64 gets one prototype per int/float mask of the first four arguments
+  (positional registers); 32-bit x86 passes stack words (cdecl; stdcall by
+  word count). Structures by value and long double need libffi (the error
+  says so). `_ffi_backend()` says which is in use.
+- **type's own members read from the builtin type**: `type.__new__(mcs,
+  name, bases, ns)` written explicitly in a metaclass, `type.__init__`,
+  `type.__call__(cls, ...)` (the instance without the metaclass's
+  `__call__`), `type.__setattr__`/`__delattr__` (past a metaclass's hooks),
+  `type.__getattribute__`, `type.__prepare__`, `type.mro`,
+  `type.__subclasses__`, `type.__instancecheck__`/`__subclasscheck__` raised
+  AttributeError on both engines (only `super().__new__` worked). The
+  engines route them (`nyrt::type_own_member`) to the prelude's
+  `_ny_type_m_*`, over natives that were registered but never written on
+  the interpreter and absent on the VM (`_ny_type_new`, `_ny_type_call`).
+- **A metaclass's operators apply to its classes** (`C * 3`, `2 * C`,
+  `C | D`... with `__mul__`/`__rmul__`/`__or__` on the metaclass): both
+  engines raised "unsupported operand type(s) for *: 'type' and 'int'" -
+  the operator protocol looked at instances only. Arithmetic and bitwise
+  operators, then the reflected form on the right operand's metaclass
+  (interpreter `binaryOp` when any metaclass exists, VM `binop` for CLASS
+  operands). ctypes builds its array types this way (`c_int * 4`).
+- **The parser rewrote every `sizeof(x)` call to `len(x)`** (both engines),
+  so a program's own `sizeof` - ctypes' - was never called. The builtin
+  `sizeof` stays an alias of `len` for old code.
+
+### Not done
+- ctypes: memoryview of a ctypes object; `from_buffer` of a bytearray (its
+  storage is not fixed native memory); paramflags (output parameters of
+  prototypes); callbacks returning structures or called on threads Nython
+  did not start; `pythonapi` is the process's symbols (Nython has no C API);
+  COM; pickling ctypes instances. Bit-field structures and packed ones are
+  passed by value to libffi as words of their alignment (right for integer
+  members).
+- `type.__dict__` is still missing.
 
 ## 0v. Round 83, part B — Python's system and command-line modules (vm_audit109)
 

@@ -202,6 +202,13 @@ struct InterpEngine : nyconc::Engine {
         out = bigint_to_i64(v.value.i);
         return true;
     }
+    bool unbox_num(const nyconc::BoxPtr& b, double& out) override {   // round 83
+        Value v = unbox_value(b);
+        if (v.type == ValueType::DOUBLE) { out = (double)v.value.d; return true; }
+        if (v.type == ValueType::INTEGER) { out = (double)bigint_to_i64(v.value.i); return true; }
+        if (v.type == ValueType::BOOLEAN) { out = v.value.b ? 1 : 0; return true; }
+        return false;
+    }
     Value to_value(const nyconc::Ret& r) {
         switch (r.k) {
             case nyconc::Ret::NONE: return NONE_VALUE;
@@ -209,6 +216,7 @@ struct InterpEngine : nyconc::Engine {
             case nyconc::Ret::INT:  return Value((int64_t)r.i);
             case nyconc::Ret::NUM:  return Value(r.d);
             case nyconc::Ret::STR:  return E.makeStringValue(r.s);
+            case nyconc::Ret::BYTES: return E.makeBytesValue(r.s);   // round 83
             case nyconc::Ret::BOX:  return unbox_value(r.box);
             case nyconc::Ret::LIST: {
                 auto* lst = new Object((Runnable*)E.runner, "list", Type::LIST);
@@ -318,6 +326,11 @@ struct InterpArgs : nyconc::Args {
         return E.isStringValue(v[i]) ? E.getStringValue(v[i]) : v[i].toString();
     }
     bool truthy(size_t i) const override { return E.isTruthy(v[i]); }
+    bool is_bytes(size_t i) const override { return E.isBytesValue(v[i]); }   // round 83
+    std::string as_bytes(size_t i) const override {
+        if (nyheap::Bytes* b = E.bytesOf(v[i])) return b->s;
+        return as_str(i);
+    }
     nyconc::BoxPtr box(size_t i) const override { return std::make_shared<InterpBox>(v[i]); }
     std::unique_ptr<nyconc::Args> list(size_t i) const override {
         std::vector<Value> out;

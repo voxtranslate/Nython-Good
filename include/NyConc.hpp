@@ -65,6 +65,13 @@ struct Engine {
     virtual BoxPtr box_int(int64_t v) = 0;
     virtual BoxPtr box_none() = 0;
     virtual bool   unbox_int(const BoxPtr& b, int64_t& out) = 0;
+    // round 83: a float (or int, or bool) as a double; false for anything else
+    virtual bool   unbox_num(const BoxPtr& b, double& out) {
+        int64_t i;
+        if (!unbox_int(b, i)) return false;
+        out = (double)i;
+        return true;
+    }
     virtual BoxPtr from_ret(const struct Ret& r) = 0;
     virtual bool   is_callable(const BoxPtr& b) = 0;
     // Human-readable text of a boxed value (task/thread names, errors).
@@ -117,10 +124,13 @@ struct Args {
     virtual BoxPtr box(size_t i) const = 0;
     // Elements of a list argument, as another Args.
     virtual std::unique_ptr<Args> list(size_t i) const = 0;
+    // round 83: bytes / bytearray arguments (their data)
+    virtual bool is_bytes(size_t) const { return false; }
+    virtual std::string as_bytes(size_t i) const { return as_str(i); }
 };
 
 struct Ret {
-    enum Kind { NONE, BOOL, INT, NUM, STR, BOX, LIST } k = NONE;
+    enum Kind { NONE, BOOL, INT, NUM, STR, BOX, LIST, BYTES } k = NONE;
     bool b = false; int64_t i = 0; double d = 0; std::string s; BoxPtr box;
     std::vector<Ret> list;
     static Ret none() { return Ret(); }
@@ -130,6 +140,7 @@ struct Ret {
     static Ret str(const std::string& v) { Ret r; r.k = STR; r.s = v; return r; }
     static Ret boxed(const BoxPtr& v) { Ret r; if (v) { r.k = BOX; r.box = v; } return r; }
     static Ret lst(std::vector<Ret> v) { Ret r; r.k = LIST; r.list = std::move(v); return r; }
+    static Ret bytes(const std::string& v) { Ret r; r.k = BYTES; r.s = v; return r; }   // round 83
 };
 
 // Dispatch a concurrency builtin. Returns false if `name` is not one of ours.
@@ -138,6 +149,11 @@ bool dispatch(Engine& e, const std::string& name, const Args& a, Ret& out);
 
 // Every builtin name handled by dispatch(), for registration by the engines.
 const std::vector<std::string>& builtin_names();
+// round 83: another native module's builtins served through this dispatcher
+// (both engines, with Engine::call for callbacks): registered by a static
+// initializer, before the engines read builtin_names().
+using ExtHandler = Ret (*)(Engine&, const Args&);
+bool register_extension(const std::string& name, ExtHandler h);
 // Exception type names the runtime raises (registered as constructors).
 const std::vector<std::string>& exception_names();
 
@@ -173,6 +189,15 @@ struct GilRelease {
     ~GilRelease();
     GilRelease(const GilRelease&) = delete;
     GilRelease& operator=(const GilRelease&) = delete;
+};
+// round 83: take the GIL back for a while on a thread that gave it up in a
+// GilRelease (a C function calling a ctypes callback); no-op if held.
+struct GilReacquire {
+    bool taken = false;
+    GilReacquire();
+    ~GilReacquire();
+    GilReacquire(const GilReacquire&) = delete;
+    GilReacquire& operator=(const GilReacquire&) = delete;
 };
 
 // ── Async tasks inside generators ───────────────────────────────────────────

@@ -2346,6 +2346,19 @@ public:   // NythonExecutor is a struct: members default to public
                 pyRaise("TypeError", std::string("'") + opSymbol(opc) + "' not supported between instances of '"
                         + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
         }
+        // A class operand's metaclass operators (round 83): type(C).__mul__(C,
+        // x), then the other operand's reflected one - ctypes' c_int * 5
+        // (arithmetic and bitwise operators; comparisons of classes keep
+        // their identity semantics)
+        if (!class_meta_.empty() && opc != OP_EQ && opc != OP_NE && opc != OP_LT && opc != OP_LE
+            && opc != OP_GT && opc != OP_GE) {
+            const char* d; const char* rd;
+            if (opDunders(opSymbol(opc), d, rd)) {
+                Value res;
+                if (classNodeOfValue(lv) && metaCall(lv, d, {rv}, ctx, res) && !isNotImplemented(res)) return res;
+                if (classNodeOfValue(rv) && metaCall(rv, rd, {lv}, ctx, res) && !isNotImplemented(res)) return res;
+            }
+        }
         {
             nyheap::Bytes* lb = bytesOf(lv); nyheap::Bytes* rb = bytesOf(rv);
             Value res;
@@ -9970,6 +9983,9 @@ public:
             auto bit = func_names.find(obj.value.p);
             if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
                 const std::string base = bit->second.substr(12);
+                // type's own members (round 83): the prelude's _ny_type_m_*
+                if (base == "type")
+                    if (const char* pm = nyrt::type_own_member(attr)) { out = global_ctx->getByName(pm); return true; }
                 // str.upper, bytes.fromhex, int.from_bytes ... (round 77)
                 if (nypy::type_has_member(base, attr)) {
                     std::string full = base + "." + attr;

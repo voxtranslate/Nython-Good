@@ -398,6 +398,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit110 | 264 | round 83, part C: sqlite3 over libsqlite3 loaded at run time (every DB-API path, transactions incl. `autocommit=`, user functions/aggregates/window functions/collations, authorizer/progress/trace, Row, blobs, backup, iterdump text, adapters/converters, callbacks from several threads, one connection shared by threads), dbm (dumb, sqlite3)/shelve, the email package (CPython's exact strings: parse/generate round trips, the default policy's EmailMessage/MIMEPart API, MIME classes, utils, headers), quopri/uu/mailbox/mailcap/netrc/cgi/cgitb, plistlib and audioop/wave/aifc/sunau byte-identical to CPython's, wsgiref and xmlrpc over HTTP, smtplib/poplib/imaplib/ftplib/telnetlib/LMTP against servers on localhost, and over TLS; the engine fixes they needed (passes under python3.11/3.12) |
 | vm_audit105 | 118 | round 82: lib/aiagent.ny's NyxAgent on a fixture workspace - `ny_facts`, call/import graphs, BM25F rankings (definitions over uses, call-graph neighbours, incremental, JSON round trip), the rule engine (closure, stratified negation, why), explain/doc/review/fix at exact lines, generated tests that run and pass (doctests, boundaries, a shrunk counterexample, a hang, a .py module under python3), completion MRR before/after training, GitHubLearner over a local http.server (Nython-only) |
 | vm_audit109 | 255 | round 83 (part B): errno, fcntl, termios/tty/pty (os.fork/forkpty/openpty/waitpid/exec*), resource, syslog, mmap, cmath (CPython's special values), colorsys, sched, getopt, optparse (help text identical), fileinput, filecmp, gettext (.mo files, plurals), readline/rlcompleter, site/sysconfig, webbrowser, zipimport/zipapp (`nython app.pyz`), encodings, stringprep, bz2 (byte-identical to libbz2), lzma (liblzma at run time, a native decoder without it), faulthandler (both engines' stacks, a real SIGSEGV), tracemalloc, locale; module.__dict__, comprehension lists freed on the VM (passes under python3) |
+| vm_audit111 | 53 | round 83: ctypes - type's own members (`type.__new__/__call__/__setattr__` in metaclasses), simple types, structures (bit fields, packing, anonymous, byte order), unions, arrays, pointers, libc calls (strlen/labs/strtod/sprintf/div, errcheck), callbacks (qsort, a double callback, a struct by value), errno, util/wintypes, the built-in caller without libffi (passes under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1445,6 +1446,35 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   list/set/dict subclasses store a builtin-subclass argument as given.
 - Ported CPython modules that use `errno`/`locale`/`tokenize`/`ast`/`pydoc`
   do so when present; `sys.audit` is called only where the runtime has it.
+
+## Round 83: ctypes, type's own members (see `HANDOFF.md` §0v4)
+
+- **`ctypes`** (`lib/ctypes/` + `util`, `wintypes`; natives `_ffi_*` in
+  `src/builtins/ffi.cpp`): CPython's object model - every instance is a view
+  of native memory (`_b_addr`, `_b_base_`, `_objects`); simple types with
+  CPython's aliases, Structure/Union (bit fields as GCC lays them out, MSVC's
+  rule on Windows; `_pack_`, `_anonymous_`, byte order), arrays (`T * n`),
+  pointers, `cast`/`byref`/`memmove`/`string_at`, CDLL/PyDLL (WinDLL/OleDLL),
+  function pointers with `restype`/`argtypes`/`errcheck`, structures by
+  value, `CFUNCTYPE` callbacks, `use_errno`.
+- **Calls go through libffi loaded at run time**; without it a built-in
+  caller relies on the calling conventions' separate integer/float register
+  files (SysV x86-64/AArch64: one prototype for every scalar signature,
+  variadic too; Win64: one per int/float mask of four arguments; i686 stack
+  words) and pools of callback trampolines. `NY_FFI_NO_LIBFFI=1` forces it;
+  `_ffi_backend()` says which runs.
+- **`nyconc::register_extension(name, handler)`** adds a native to both
+  engines through the concurrency runtime's dispatcher (`Args::is_bytes/
+  as_bytes`, `Ret::bytes()`, `Engine::unbox_num`); a native that calls back
+  into an engine from a thread that released the GIL re-takes it with
+  `nyconc::GilReacquire`.
+- `type.__new__/__init__/__call__/__setattr__/__delattr__/__getattribute__/
+  __prepare__/mro/__subclasses__/__instancecheck__/__subclasscheck__` read
+  from the builtin type (`nyrt::type_own_member` → the prelude's
+  `_ny_type_m_*`). On the VM `type` is a NATIVE value (`__native__:type`).
+- A metaclass's arithmetic/bitwise operators apply to its classes (`C * 3`).
+- The parser no longer rewrites `sizeof(x)` to `len(x)`: the builtin
+  `sizeof` is an alias of `len`, a program's own `sizeof` is called.
 
 ## Transcripts
 

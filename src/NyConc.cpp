@@ -290,6 +290,10 @@ GilRelease::GilRelease() {
     if (g_active.load(std::memory_order_acquire) && t_holds) { gil_release(); released = true; }
 }
 GilRelease::~GilRelease() { if (released) gil_acquire(); }
+GilReacquire::GilReacquire() {
+    if (g_active.load(std::memory_order_acquire) && !t_holds && t_self) { gil_acquire(); taken = true; }
+}
+GilReacquire::~GilReacquire() { if (taken) gil_release(); }
 
 // ════════════════════════════════════════════════════════════════════════════
 // 3. Threads
@@ -2129,10 +2133,23 @@ static Ret sleep_ms(Engine& e, double ms) {
 
 static std::unordered_map<std::string, Handler>& table();
 
+static std::unordered_map<std::string, ExtHandler>& extensions() {
+    static auto* m = new std::unordered_map<std::string, ExtHandler>();
+    return *m;
+}
+bool register_extension(const std::string& name, ExtHandler h) { extensions()[name] = h; return true; }
+
 bool dispatch(Engine& e, const std::string& name, const Args& a, Ret& out) {
     auto& t = table();
     auto it = t.find(name);
-    if (it == t.end()) return false;
+    if (it == t.end()) {
+        // round 83: another module's builtins (no signal-restart loop: they
+        // do not wait on the runtime's queues)
+        auto x = extensions().find(name);
+        if (x == extensions().end()) return false;
+        out = x->second(e, a);
+        return true;
+    }
     // A wait a signal interrupts (main thread): run the handlers, then the
     // call again with its original deadline; a handler that raises ends it.
     DeadlineMemo saved = t_dl;
@@ -2150,6 +2167,7 @@ const std::vector<std::string>& builtin_names() {
     static std::vector<std::string> names = [] {
         std::vector<std::string> v;
         for (auto& kv : table()) v.push_back(kv.first);
+        for (auto& kv : extensions()) v.push_back(kv.first);   // round 83
         std::sort(v.begin(), v.end());
         return v;
     }();

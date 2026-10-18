@@ -527,8 +527,11 @@ node_ptr Parser::statement(){
     if((see(TokenType::Typeof)||see(TokenType::Sizeof)) && peek().type() == TokenType::ParenOpen) {
         Token tok = token();
         // typeof(x) is Nython's name of x's type ("int", "string"); type(x)
-        // is Python's type object (round 77)
-        std::string fn_name = tok.value == "typeof" ? "typeof" : "len";
+        // is Python's type object (round 77). sizeof(x) calls whatever
+        // `sizeof` names - the builtin (len) unless the program binds it
+        // (round 83: it was rewritten to len(x), so a program's own sizeof,
+        // ctypes', was never called and its own len was)
+        std::string fn_name = tok.value;
         next(); // consume keyword
         mustBe(TokenType::ParenOpen);
         auto arg = expression();
@@ -1893,7 +1896,6 @@ node_ptr Parser::primary(){
     // rebound len)
     if((see(TokenType::Typeof)||see(TokenType::Sizeof)) && peek().type() == TokenType::ParenOpen) {
         Token tok = token();
-        tok.value = (tok.value == "typeof") ? "typeof" : "len";
         next();
         return make_node<VariableNode>(tok);
     }

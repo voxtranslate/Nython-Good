@@ -2767,6 +2767,53 @@ def _ny_exc_match(e, t):
             return True
     return False
 
+# type's own members read from the builtin type (round 83; the engines
+# route type.__new__ ... here, nyrt::type_own_member): explicit
+# type.__new__(mcs, name, bases, ns) in a metaclass, type.__setattr__(cls,
+# name, value) past a metaclass's __setattr__, type.__call__(cls, ...) without
+# the metaclass's __call__, ...
+def _ny_type_m_new(mcs, *args, **kw):
+    if len(args) != 3:
+        raise TypeError("type.__new__() takes exactly 3 arguments (" + str(len(args)) + " given)")
+    return _ny_type_new(mcs, args[0], args[1], args[2], kw)
+
+def _ny_type_m_init(cls, *args, **kw):
+    return None
+
+def _ny_type_m_call(cls, *args, **kw):
+    return _ny_type_call(cls, *args, kw)
+
+def _ny_type_m_setattr(cls, name, value):
+    if not isinstance(name, str):
+        raise TypeError("attribute name must be string, not '" + type(name).__name__ + "'")
+    _ny_setattr_raw(cls, name, value)
+
+def _ny_type_m_delattr(cls, name):
+    if not isinstance(name, str):
+        raise TypeError("attribute name must be string, not '" + type(name).__name__ + "'")
+    if not hasattr(cls, name):
+        raise AttributeError("type object '" + cls.__name__ + "' has no attribute '" + name + "'")
+    _ny_delattr_raw(cls, name)
+
+def _ny_type_m_getattribute(cls, name):
+    return object.__getattribute__(cls, name)
+
+def _ny_type_m_prepare(*args, **kw):
+    return {}
+
+def _ny_type_m_mro(cls):
+    return list(cls.__mro__)
+
+def _ny_type_m_subclasses(cls):
+    return cls.__subclasses__()
+
+def _ny_type_m_instancecheck(cls, obj):
+    # the default check, without a metaclass's __instancecheck__
+    return cls in type(obj).__mro__
+
+def _ny_type_m_subclasscheck(cls, sub):
+    return cls in sub.__mro__
+
 def _ny_str_maketrans(*args):
     # str.maketrans (round 80): CPython's three forms and messages
     if len(args) == 0:

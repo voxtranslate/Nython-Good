@@ -5808,3 +5808,19 @@ Full detail in `HANDOFF.md` §0u3. New test: `vm_audit103` (43 checks; passes on
 | `for a, b in [(1, 2, 3)]`: a=1, b=2 (interpreter), IndexError / "not subscriptable" (VM); a string item bound one target | lax unpacking of for targets on both engines | CPython's ValueError/TypeError messages; strings, sets and objects iterated (VM: `UNPACK_SEQ` with `kUnpackStrict`) |
 | VM: `for i in range(3): try: ... finally: continue` ran once | the try's state left on the operand stack was read by `FOR_ITER` as its iterator | `Compiler::drop_fin_states` pops it before the jump |
 | Interpreter: `classDerivesFrom` walked `class_by_name` by string for every except clause tested | no memo | memoized per (class, wanted) while no class name is rebound |
+
+## Round 83 — CPython's standard library breadth, ctypes
+
+Full detail in `HANDOFF.md` §0v (part B: system and command-line modules,
+`vm_audit109`), §0v3 (part C: sqlite3, email, the mail protocols, data
+formats, `vm_audit110`) and §0v4 (ctypes, `vm_audit111`; 53 checks, passes on
+both engines and under python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| A program's own `sizeof(x)` returned `len(x)` (both engines) | the parser rewrote every call of the name `sizeof` to `len` | the call keeps its name; the builtin `sizeof` is an alias of `len` |
+| `type.__setattr__(C, n, v)`, `type.__call__(cls)`, `type.__new__(mcs, ...)` written explicitly, `type.mro(C)` ... raised AttributeError (both engines); on the VM `type.__setattr__` was silently a no-op | type's own members were never routed: only `super().__new__` worked, and `_ny_type_new`/`_ny_type_call` were registered but never written on the interpreter and absent on the VM | `nyrt::type_own_member` routes each to the prelude's `_ny_type_m_*` (interpreter: builtin-namespace read; VM: `get_attr`/`try_get_attr`/`missing_attr`/`vm_call_method` for the NATIVE `type` and CLASS `type`), over the two natives written on both |
+| `C * 3` with `__mul__` on C's metaclass: "unsupported operand type(s) for *: 'type' and 'int'" (both engines) | the operator protocol looked for dunders on instances only | arithmetic/bitwise operators on class operands try the metaclass's dunder, then the right operand's reflected one (interpreter `binaryOp` when a metaclass exists, VM `binop`) |
+| No `ctypes` | - | `lib/ctypes/` over `src/builtins/ffi.cpp` (libffi at run time, else Nython's built-in caller) |
+| ctypes: `strtod(b"3.25xyz", byref(end))` left `end` pointing at freed memory | a `bytes` argument was copied into a temporary C string freed after the call (CPython passes the bytes object's own buffer, which lives as long as the object) | C strings made from bytes are kept in a 512-entry cache keyed by their contents (`_cstr_cached`) |
+| ctypes: a `BigEndianStructure` subclass was laid out little-endian | its byte order was read from the class's own attributes only | read through the MRO |

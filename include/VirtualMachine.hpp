@@ -10805,6 +10805,17 @@ private:
         return VMVal::make_bytes(nycall([&]{ return nypy::bytes_construct(ba,enc,err,has_enc,tn); }),mut);
     }
     VMVal binop(int op, const VMVal& l, const VMVal& r) {
+        // a class operand's metaclass operators (round 83): type(C).__mul__(C,
+        // x), then the other's reflected one - ctypes' c_int * 5
+        if(!class_meta_.empty()&&(l.type==VMType::CLASS||r.type==VMType::CLASS)&&op>=1&&op<=12){
+            static const char* const dn[13][2]={{nullptr,nullptr},{"__add__","__radd__"},{"__sub__","__rsub__"},
+                {"__mul__","__rmul__"},{"__truediv__","__rtruediv__"},{"__floordiv__","__rfloordiv__"},
+                {"__mod__","__rmod__"},{"__pow__","__rpow__"},{"__and__","__rand__"},{"__or__","__ror__"},
+                {"__xor__","__rxor__"},{"__lshift__","__rlshift__"},{"__rshift__","__rrshift__"}};
+            VMVal mm;
+            if(l.type==VMType::CLASS&&meta_member(l,dn[op][0],mm)){ VMVal res=call_with_first(mm,l,{r},nullptr); if(!is_ni(res)) return res; }
+            if(r.type==VMType::CLASS&&meta_member(r,dn[op][1],mm)){ VMVal res=call_with_first(mm,r,{l},nullptr); if(!is_ni(res)) return res; }
+        }
         if(l.is_set()||r.is_set()){
             // | & - ^ between sets (round 77); anything else is a TypeError
             char so=op==nypy::A_OR?'|':op==nypy::A_AND?'&':op==nypy::A_SUB?'-':op==nypy::A_XOR?'^':0;
@@ -11537,7 +11548,20 @@ private:
         }
         VMVal v;
         if(lookup_attr(obj, attr, v)) return v;
+        if(type_own_member(obj, attr, v)) return v;   // round 83
         return missing_attr(obj, attr);
+    }
+    // type's own members read from the builtin type (round 83): type.__new__,
+    // type.__setattr__ ... - the prelude's _ny_type_m_* (nyrt::type_own_member);
+    // looked at only where the class lookup found nothing
+    bool type_own_member(const VMVal& obj, const std::string& attr, VMVal& out) {
+        bool is_type=(obj.type==VMType::NATIVE&&(obj.class_name=="__native__:type"||obj.class_name=="__builtin__:type"))
+                     ||(obj.type==VMType::CLASS&&class_key(obj)=="type");
+        if(!is_type) return false;
+        const char* pm=nyrt::type_own_member(attr);
+        if(!pm) return false;
+        out=load_var(pm);
+        return out.type!=VMType::NONE&&out.type!=VMType::UNDEFINED;
     }
     // A dict's methods win over its keys (round 77): a plain dict - not a
     // module or namespace, a bound method, a typed map - read with `.` for
@@ -11953,7 +11977,7 @@ private:
     // obj.attr, or false when it has none (hasattr / getattr with a default):
     // an AttributeError from a property getter or __getattr__ counts as none.
     bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out) {
-        try { return lookup_attr(obj, attr, out); }
+        try { return lookup_attr(obj, attr, out) || type_own_member(obj, attr, out); }
         catch(VMException& e){
             if(class_derives(e.value.class_name,"AttributeError")) return false;
             throw;
@@ -11971,6 +11995,7 @@ private:
     // A missing attribute read: AttributeError, or - NY_LENIENT_READS=log, a
     // porting aid - a line on stderr and none.
     VMVal missing_attr(const VMVal& obj, const std::string& attr){
+        { VMVal tv; if(type_own_member(obj, attr, tv)) return tv; }   // round 83: type.__setattr__ ...
         std::string msg=attr_error_text(obj,attr);
         if(nypy::lenient_reads_log()){ log_lenient_read("AttributeError: "+msg); return VMVal::make_none(); }
         throw_exception(make_exception("AttributeError",{VMVal::make_str(msg)}));
@@ -12617,6 +12642,12 @@ private:
 
     VMVal vm_call_method(VMVal obj, const std::string& method, std::vector<VMVal>& args,
                          const VMVal* kwargs=nullptr) {
+        // type.__new__(mcs, ...), type.__setattr__(cls, n, v) ... read from
+        // the builtin type (round 83: the native's own path set an
+        // attribute of `type` itself and returned None)
+        if(obj.type==VMType::NATIVE&&(obj.class_name=="__native__:type"||obj.class_name=="__builtin__:type")){
+            VMVal tm; if(type_own_member(obj, method, tm)) return vm_call(tm, args, std::nullopt, kwargs);
+        }
         // Generator protocol (round 75): send(v) resumes with v as the value
         // of the paused yield; throw(e) raises e there; close() raises
         // GeneratorExit there, so finally blocks run; __next__; __iter__.
@@ -12867,6 +12898,8 @@ private:
                 set_exc_kw(*args[0].map, args[0].class_name, kwargs);   // round 80
                 return VMVal::make_none();
             }
+            // type.__new__(mcs, ...), type.__setattr__(cls, n, v) ... (round 83)
+            { VMVal tm; if(type_own_member(obj, method, tm)) return vm_call(tm, args, std::nullopt, kwargs); }
             // a method of the class's metaclass, or anything else the
             // metaclass gives the class (round 77)
             if(!class_meta_.empty()&&!is_ctor_name(method)){
@@ -14340,6 +14373,22 @@ private:
         // a function's parameters, flags and place (inspect; round 77)
         globals_["_ny_fn_info"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return fn_info(a.empty()?VMVal::make_none():a[0]); });
         globals_["_ny_fn_globals"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return fn_globals(a.empty()?VMVal::make_none():a[0]); });
+        // type.__new__ / type.__call__ read from the builtin (round 83): the
+        // positional arguments, then the keywords as a dict
+        globals_["_ny_type_new"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            VMVal kw=a.empty()?VMVal::make_none():a.back();
+            if(!a.empty()) a.pop_back();
+            return type_new(a, kw.type==VMType::MAP&&kw.map&&!kw.map->empty()?&kw:nullptr);
+        });
+        globals_["_ny_type_call"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            VMVal kw=a.empty()?VMVal::make_none():a.back();
+            if(!a.empty()) a.pop_back();
+            if(a.empty()) raise_native_exception("TypeError","descriptor '__call__' of 'type' object needs an argument");
+            VMVal cls=a[0];
+            std::vector<VMVal> rest(a.begin()+1,a.end());
+            type_call_skip_=true;
+            return instantiate(cls, rest, kw.type==VMType::MAP&&kw.map&&!kw.map->empty()?&kw:nullptr);
+        });
         globals_["_ny_setattr_raw"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()>=3){ RawAttr raw; VMVal o=a[0]; set_attr(o,a[1].to_string(),a[2]); }
             return VMVal::make_none(); });
