@@ -420,6 +420,18 @@ Value dispatch_io(NythonExecutor& E,
             }
             return E.makeBytesValue(content);
         }
+        if (name == "file_readinto") {
+            // (round 84) file_readinto(h, address, n) -> bytes read: straight
+            // into a buffer's memory (a memoryview's address - its export
+            // keeps it from moving), no bytes object in between
+            FILE* f = file_of(0);
+            if (!f) nyos::raise("ValueError", "I/O operation on closed file");
+            long long addr = args.size() >= 2 ? nyos::to_int(args[1], 0) : 0;
+            long long n = args.size() >= 3 ? nyos::to_int(args[2], 0) : 0;
+            if (n <= 0 || !addr) return nyos::make_int(0);
+            size_t r = fread((char*)(intptr_t)addr, 1, (size_t)n, f);
+            return nyos::make_int((long long)r);
+        }
         if (name == "file_readline_bytes") {
             // file_readline_bytes(h, limit=-1) -> bytes up to and including
             // b"\n" (at most limit bytes); b"" at the end of the file.

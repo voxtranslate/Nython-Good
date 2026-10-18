@@ -15,9 +15,10 @@
 # zero"); a generated name is "psm_" and 8 hex digits, as CPython's. The
 # block is a file mapped shared (mmap / CreateFileMapping): in /dev/shm on
 # Linux (where shm_open puts it too), else in the temporary directory.
-# buf is not a memoryview (Nython has none): a buffer object with len(),
-# indexing and slicing (giving ints / bytes), item and slice assignment,
-# bytes(buf), tobytes() and release(). ShareableList is not here.
+# buf is a memoryview of the mapped block (round 84): writes through it are
+# seen by every process attached; close() raises BufferError while a view
+# made from buf (a slice, a cast) still exports it, as CPython's.
+# ShareableList is not here.
 
 import os
 import tempfile
@@ -38,77 +39,6 @@ def _shm_dir():
 
 def _make_filename():
     return "psm_" + os.urandom(4).hex()
-
-
-class _ShmBuffer(object):
-    def __init__(self, h, size):
-        self._h = h
-        self._size = size
-
-    def _check(self):
-        if self._h is None:
-            raise ValueError("operation forbidden on released memoryview object")
-
-    def __len__(self):
-        return self._size
-
-    @property
-    def nbytes(self):
-        return self._size
-
-    def __getitem__(self, i):
-        self._check()
-        if isinstance(i, slice):
-            var r = range(self._size)[i]
-            if r.step == 1:
-                return _ny_os_call("shm_read", self._h, r.start, len(r))
-            var data = _ny_os_call("shm_read", self._h, 0, self._size)
-            return bytes([data[k] for k in r])
-        if i < 0:
-            i += self._size
-        if not 0 <= i < self._size:
-            raise IndexError("index out of bounds on dimension 1")
-        return _ny_os_call("shm_read", self._h, i, 1)[0]
-
-    def __setitem__(self, i, v):
-        self._check()
-        if isinstance(i, slice):
-            var r = range(self._size)[i]
-            var data = bytes(v)
-            if len(data) != len(r):
-                raise ValueError("memoryview assignment: lvalue and rvalue have different structures")
-            if r.step == 1:
-                if data:
-                    _ny_os_call("shm_write", self._h, r.start, data)
-                return
-            var k = 0
-            for j in r:
-                _ny_os_call("shm_write", self._h, j, data[k:k + 1])
-                k += 1
-            return
-        if i < 0:
-            i += self._size
-        if not 0 <= i < self._size:
-            raise IndexError("index out of bounds on dimension 1")
-        if not isinstance(v, int) or not 0 <= v <= 255:
-            raise TypeError("memoryview: invalid type for format 'B'")
-        _ny_os_call("shm_write", self._h, i, bytes([v]))
-
-    def __bytes__(self):
-        self._check()
-        return _ny_os_call("shm_read", self._h, 0, self._size)
-
-    def tobytes(self):
-        return self.__bytes__()
-
-    def __iter__(self):
-        return iter(self.__bytes__())
-
-    def release(self):
-        self._h = None
-
-    def __repr__(self):
-        return "<memory at " + hex(id(self)) + ">"
 
 
 class SharedMemory:
@@ -140,7 +70,11 @@ class SharedMemory:
         else:
             self._h = _ny_os_call("shm_open", path, 0, False)
         self._size = _ny_os_call("shm_size", self._h)
-        self._buf = _ShmBuffer(self._h, self._size)
+        self._exports = 1
+        var me = self
+        def gone():
+            me._exports -= 1
+        self._buf = _ny_memview_raw(self, _ny_os_call("shm_addr", self._h), self._size, False, release=gone)
 
     def __del__(self):
         try:
@@ -175,6 +109,8 @@ class SharedMemory:
         if self._buf is not None:
             self._buf.release()
             self._buf = None
+        if self._h is not None and getattr(self, "_exports", 0) > 0:
+            raise BufferError("cannot close exported pointers exist")
         if self._h is not None:
             _ny_os_call("shm_close", self._h)
             self._h = None

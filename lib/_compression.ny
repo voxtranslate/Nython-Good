@@ -76,9 +76,9 @@ class DecompressReader(io.RawIOBase):
         return self._fp.seekable()
 
     def readinto(self, b):
-        # (no memoryview in Nython: the bytearray is filled by slice assignment)
-        data = self.read(len(b))
-        b[:len(data)] = data
+        with memoryview(b) as view, view.cast("B") as byte_view:
+            data = self.read(len(byte_view))
+            byte_view[:len(data)] = data
         return len(data)
 
     def read(self, size=-1):

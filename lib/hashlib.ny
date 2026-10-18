@@ -8,6 +8,13 @@
 #     hashlib.sha256(b"abc").hexdigest()
 #     h = hashlib.blake2b(digest_size=16, key=b"secret"); h.update(data)
 
+def _hd(data):
+    # a buffer argument (round 84: memoryview, array.array, mmap ...) as
+    # its bytes; anything else as it is (the natives' own errors)
+    if data is None or isinstance(data, (bytes, bytearray, str)) or not _ny_is_exporter(data):
+        return data
+    return _ny_bytes_like(data)
+
 algorithms_guaranteed = set(_hash_algorithms())
 algorithms_available = set(_hash_algorithms())
 
@@ -20,7 +27,7 @@ class _Hash:
         self.block_size = info[2]
 
     def update(self, data):
-        _hash_update(self._h, data)
+        _hash_update(self._h, _hd(data))
 
     def digest(self, length=none):
         if length != none:
@@ -40,7 +47,7 @@ class _Hash:
         return "<" + self.name + " _hashlib.HASH object>"
 
 def _new(name, data=b"", digest_size=0, key=b""):
-    var h = _hash_new(name, data, digest_size, key)
+    var h = _hash_new(name, _hd(data), digest_size, _hd(key))
     if h == none:
         raise ValueError("unsupported hash type " + str(name))
     return _Hash(h)
@@ -86,15 +93,15 @@ def shake_256(data=b"", **kwargs):
     return _new("shake_256", data)
 
 def blake2b(data=b"", digest_size=64, key=b"", **kwargs):
-    var h = _hash_new("blake2b", data, digest_size, key)
+    var h = _hash_new("blake2b", _hd(data), digest_size, _hd(key))
     return _Hash(h)
 
 def blake2s(data=b"", digest_size=32, key=b"", **kwargs):
-    var h = _hash_new("blake2s", data, digest_size, key)
+    var h = _hash_new("blake2s", _hd(data), digest_size, _hd(key))
     return _Hash(h)
 
 def pbkdf2_hmac(hash_name, password, salt, iterations, dklen=none):
-    return _hash_pbkdf2(hash_name, password, salt, iterations, dklen)
+    return _hash_pbkdf2(hash_name, _hd(password), _hd(salt), iterations, dklen)
 
 def file_digest(fileobj, digest):
     var h = digest

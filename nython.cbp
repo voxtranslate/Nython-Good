@@ -162,6 +162,8 @@
         <Unit filename="src/builtins/nysqlite.cpp" />
         <Unit filename="src/builtins/tls.cpp" />
         <Unit filename="src/builtins/ffi.cpp" />
+        <Unit filename="src/builtins/nybuffer.cpp" />
+        <Unit filename="src/NyPreludeBuffer.cpp" />
         <Unit filename="src/builtins/hashing.cpp" />
         <Unit filename="src/builtins/pymath.cpp" />
         <Unit filename="src/builtins/pyjson.cpp" />

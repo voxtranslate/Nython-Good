@@ -953,7 +953,18 @@ struct BridgeConv {
     void copy_back() {
         for (auto& ba : barrays) {
             VMVal vm = ba.second;
-            if (vm.bdata() != ba.first->s) vm.bdata_mut() = ba.first->s;
+            if (vm.bdata() == ba.first->s) continue;
+            if (vm.ba_exports() > 0) {
+                // round 84: an exported bytearray keeps its storage (a
+                // memoryview points into it): written in place, or refused
+                if (vm.bdata().size() != ba.first->s.size()) {
+                    if (this->vm) this->vm->raise_native_exception("BufferError", "Existing exports of data: object cannot be re-sized");
+                    continue;
+                }
+                if (!ba.first->s.empty()) std::memcpy(&vm.bdata_mut()[0], ba.first->s.data(), ba.first->s.size());
+                continue;
+            }
+            vm.bdata_mut() = ba.first->s;
         }
         for (size_t oi = 0; oi < origin.size(); oi++) {
             Container* c = origin[oi].first;

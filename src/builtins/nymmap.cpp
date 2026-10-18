@@ -16,6 +16,7 @@
 //   _mmap_flush(h, offset, size)   _mmap_madvise(h, option, start, length)
 //   _mmap_move(h, dest, src, count)
 //   _mmap_resize(h, newsize)       _mmap_consts() -> [[name, value], ...]
+//   _mmap_addr(h) -> the address of the mapped memory (round 84: the buffer protocol)
 #include "platform_compat.hpp"
 #include "NythonExecutor.hpp"
 #include "builtins/os.hpp"
@@ -112,7 +113,7 @@ int64_t page_granularity() {
 std::vector<std::string> mmap_builtin_names() {
     return {"_mmap_new", "_mmap_close", "_mmap_len", "_mmap_filesize", "_mmap_read", "_mmap_byte", "_mmap_write",
             "_mmap_setbyte", "_mmap_find", "_mmap_line_end", "_mmap_flush", "_mmap_madvise", "_mmap_move",
-            "_mmap_resize", "_mmap_consts"};
+            "_mmap_resize", "_mmap_consts", "_mmap_addr"};
 }
 
 Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Value>& a, Context* ctx) {
@@ -281,6 +282,10 @@ Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Valu
     }
     auto m = get(iarg(a, 0));
     if (name == "_mmap_len") return Value((int64_t)m->size);
+    // (round 84) the mapped memory's address: lib/mmap.ny's __buffer__
+    // exports it (memoryview(m), readinto(m)); close/resize are refused
+    // while it is exported
+    if (name == "_mmap_addr") return Value((int64_t)(intptr_t)m->data);
     if (name == "_mmap_filesize") {
 #ifdef _WIN32
         if (m->file == INVALID_HANDLE_VALUE) return Value((int64_t)m->size);

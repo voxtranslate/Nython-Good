@@ -215,6 +215,32 @@ class SocketIO:
         self.close()
         return false
 
+def _bl(data):
+    # a bytes-like argument (round 84: any buffer - memoryview, array ...);
+    # a str stays as it is (Nython's send() takes str as UTF-8)
+    if isinstance(data, bytes) or isinstance(data, bytearray) or isinstance(data, str):
+        return data
+    return _ny_bytes_like(data)
+
+def _recv_into(sock, buffer, nbytes, flags, what):
+    # recv_into / recvfrom_into: the bytes received written into the
+    # caller's buffer in place (round 84: any writable buffer)
+    if nbytes < 0:
+        raise ValueError("negative buffersize in " + what)
+    var view = _ny_writable_view(buffer, what + "() argument 1")
+    try:
+        var n = nbytes if nbytes > 0 else len(view)
+        if n > len(view):
+            raise ValueError("buffer too small for requested bytes")
+        if what == "recvfrom_into":
+            var r = _net_recvfrom(sock._h, n, flags)
+            view[0:len(r[0])] = r[0]
+            return (len(r[0]), _addr(r[1]))
+        # straight into the buffer's memory (no bytes object in between)
+        return _net_recv_into(sock._h, view._ny_a, n, flags)
+    finally:
+        view.release()
+
 class socket:
     # _handle: an existing socket-layer handle (accept, socketpair)
     def __init__(self, family=AF_INET, type=SOCK_STREAM, proto=0, fileno=none, _handle=none):
@@ -255,15 +281,15 @@ class socket:
         return _net_connect_ex(self._h, address)
 
     def send(self, data, flags=0):
-        return _net_send(self._h, data, flags)
+        return _net_send(self._h, _bl(data), flags)
 
     def sendall(self, data, flags=0):
-        _net_sendall(self._h, data, flags)
+        _net_sendall(self._h, _bl(data), flags)
 
     def sendto(self, data, flags_or_address, address=none):
         if address is none:
-            return _net_sendto(self._h, data, flags_or_address, 0)
-        return _net_sendto(self._h, data, address, flags_or_address)
+            return _net_sendto(self._h, _bl(data), flags_or_address, 0)
+        return _net_sendto(self._h, _bl(data), address, flags_or_address)
 
     def recv(self, bufsize, flags=0):
         return _net_recv(self._h, bufsize, flags)
@@ -273,10 +299,10 @@ class socket:
         return (r[0], _addr(r[1]))
 
     def recv_into(self, buffer, nbytes=0, flags=0):
-        var n = nbytes if nbytes > 0 else len(buffer)
-        var data = _net_recv(self._h, n, flags)
-        buffer[0:len(data)] = data
-        return len(data)
+        return _recv_into(self, buffer, nbytes, flags, "recv_into")
+
+    def recvfrom_into(self, buffer, nbytes=0, flags=0):
+        return _recv_into(self, buffer, nbytes, flags, "recvfrom_into")
 
     def settimeout(self, value):
         _net_settimeout(self._h, value)

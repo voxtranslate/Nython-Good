@@ -2,9 +2,6 @@
 # lib/wave.ny - Python's wave (CPython 3.12's Lib/wave.py): reading and
 # writing WAV files (PCM, WAVE_FORMAT_EXTENSIBLE read), Wave_read and
 # Wave_write, open(), wave.Error.
-#
-# Frames given as other buffers than bytes/bytearray are taken through
-# tobytes()/bytes() (Nython has no memoryview).
 
 """Stuff to parse WAVE files.
 
@@ -569,7 +566,7 @@ class Wave_write:
 
     def writeframesraw(self, data):
         if not isinstance(data, (bytes, bytearray)):
-            data = data.tobytes() if hasattr(data, 'tobytes') else bytes(data)   # (Nython has no memoryview)
+            data = memoryview(data).cast('B')
         self._ensure_header_written(len(data))
         nframes = len(data) // (self._sampwidth * self._nchannels)
         if self._convert:

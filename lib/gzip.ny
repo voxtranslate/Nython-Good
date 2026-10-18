@@ -350,11 +350,13 @@ class GzipFile(io.BufferedIOBase):
         self._check_not_closed()
         if self.mode != WRITE:
             raise OSError(_EBADF, "write() on read-only GzipFile object")
-        if not (isinstance(data, bytes) or isinstance(data, bytearray)):
-            if isinstance(data, str):
-                raise TypeError("memoryview: a bytes-like object is required, not 'str'")
-            data = zlib._data(data)
-        var length = len(data)
+        var length = 0
+        if isinstance(data, bytes) or isinstance(data, bytearray):
+            length = len(data)
+        else:
+            # accept any data that supports the buffer protocol (round 84)
+            data = memoryview(data)
+            length = data.nbytes
         if length > 0:
             self.fileobj.write(self.compress.compress(data))
             self.size = self.size + length

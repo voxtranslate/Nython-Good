@@ -385,11 +385,8 @@ def _plain(v):
         return str(v)
     if isinstance(v, (bytes, bytearray)):
         return bytes(v)
-    try:
-        if isinstance(v, memoryview):
-            return v.tobytes()
-    except NameError:
-        pass
+    if isinstance(v, memoryview):
+        return v.tobytes()
     return v
 
 
@@ -1540,7 +1537,7 @@ class Blob:
 
     def write(self, data, /):
         self._check()
-        data = bytes(data)
+        data = bytes(_ny_bytes_like(data))
         if len(data) > self._length() - self._offset:
             raise ValueError("data longer than blob length")
         rc = _sql_blob_write(self._h, data, self._offset)
@@ -1612,7 +1609,7 @@ class Blob:
             return
         if isinstance(idx, slice):
             start, stop, step = idx.indices(size)
-            value = bytes(value)
+            value = bytes(_ny_bytes_like(value))
             count = len(range(start, stop, step))
             if len(value) != count:
                 raise IndexError("Blob slice assignment is wrong size")

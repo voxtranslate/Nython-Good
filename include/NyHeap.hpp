@@ -51,6 +51,10 @@ struct Str final : Collectable {
 struct Bytes final : Collectable {
     std::string s;
     bool mut;
+    // (round 84) buffer exports of a bytearray's storage (memoryview, the
+    // engines' _ny_buf_export): while there are any, s must not change size
+    // - BufferError - nor be reallocated (writes go in place).
+    int64_t exports = 0;
     NythonExecutor* E;
     Bytes(NythonExecutor* e, std::string x, bool m);
     ~Bytes() override;

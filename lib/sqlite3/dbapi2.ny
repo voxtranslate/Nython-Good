@@ -3,7 +3,7 @@
 # Lib/sqlite3/dbapi2.py): the DB-API constructors (Date, Time, Timestamp,
 # *FromTicks, Binary), sqlite_version_info, and the default adapters and
 # converters for date and datetime, deprecated in 3.12 (each use warns).
-# Binary is memoryview where Nython has one, bytes otherwise.
+# Binary is memoryview (round 84).
 
 # pysqlite2/dbapi2.py: the DB-API 2.0 interface
 #
@@ -58,10 +58,7 @@ def TimestampFromTicks(ticks):
 _deprecated_version_info = tuple(map(int, _deprecated_version.split(".")))
 sqlite_version_info = tuple([int(x) for x in sqlite_version.split(".")])
 
-try:
-    Binary = memoryview
-except NameError:
-    Binary = bytes
+Binary = memoryview
 collections.abc.Sequence.register(Row)
 
 def register_adapters_and_converters():

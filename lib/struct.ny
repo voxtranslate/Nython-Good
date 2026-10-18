@@ -22,8 +22,10 @@
 # (rounded half to even into f and e, OverflowError when too large); the
 # same bytes come out as CPython's.
 #
-# Buffers are bytes or bytearray (Nython has no memoryview): pack_into
-# writes into a bytearray. Formats are parsed once and cached.
+# Buffers are any bytes-like object (round 84: memoryview, array.array,
+# mmap, ctypes data ...); pack_into writes into any writable buffer in place
+# (a bytearray, a memoryview's slice, an mmap). Formats are parsed once and
+# cached.
 import math
 import sys
 
@@ -328,8 +330,12 @@ def _unpack_at(layout, buf, base):
 
 
 def _check_buffer(buf, what):
-    if not isinstance(buf, (bytes, bytearray)):
+    # the bytes of a bytes-like argument (round 84: any buffer)
+    if isinstance(buf, (bytes, bytearray)):
+        return buf
+    if isinstance(buf, str) or not _ny_is_exporter(buf):
         raise TypeError("a bytes-like object is required, not '" + _tn(buf) + "'")
+    return _ny_bytes_like(buf)
 
 
 def calcsize(fmt):
@@ -342,7 +348,7 @@ def pack(fmt, *values):
 
 def unpack(fmt, buffer):
     var layout = _layout(fmt)
-    _check_buffer(buffer, "unpack")
+    buffer = _check_buffer(buffer, "unpack")
     if len(buffer) != layout.size:
         raise error("unpack requires a buffer of " + str(layout.size) + " bytes")
     return _unpack_at(layout, buffer, 0)
@@ -358,7 +364,7 @@ def _offset(offset, buflen):
 
 def unpack_from(fmt, buffer, offset=0):
     var layout = _layout(fmt)
-    _check_buffer(buffer, "unpack_from")
+    buffer = _check_buffer(buffer, "unpack_from")
     var n = len(buffer)
     var off = _offset(offset, n)
     if n - off < layout.size:
@@ -372,29 +378,37 @@ def unpack_from(fmt, buffer, offset=0):
 
 def pack_into(fmt, buffer, offset, *values):
     var layout = _layout(fmt)
+    var view = none
+    var target = buffer
     if not isinstance(buffer, bytearray):
-        if isinstance(buffer, bytes):
-            raise TypeError("argument must be read-write bytes-like object, not bytes")
-        raise TypeError("argument must be read-write bytes-like object, not " + _tn(buffer))
-    var data = _pack_parts(layout, values)
-    var n = len(buffer)
-    var off = offset
-    if offset < 0:
-        if offset + layout.size > 0:
-            raise error("no space to pack " + str(layout.size) + " bytes at offset " + str(offset))
-        if offset + n < 0:
-            raise error("offset " + str(offset) + " out of range for " + str(n) + "-byte buffer")
-        off = offset + n
-    if n - off < layout.size:
-        raise error("pack_into requires a buffer of at least " + str(layout.size + off) +
-                    " bytes for packing " + str(layout.size) + " bytes at offset " + str(off) +
-                    " (actual buffer size is " + str(n) + ")")
-    buffer[off:off + layout.size] = data
+        # any writable buffer, written in place (round 84)
+        if isinstance(buffer, bytes) or not _ny_is_exporter(buffer):
+            raise TypeError("argument must be read-write bytes-like object, not " + _tn(buffer))
+        view = _ny_writable_view(buffer, "argument")
+        target = view
+    try:
+        var data = _pack_parts(layout, values)
+        var n = len(target)
+        var off = offset
+        if offset < 0:
+            if offset + layout.size > 0:
+                raise error("no space to pack " + str(layout.size) + " bytes at offset " + str(offset))
+            if offset + n < 0:
+                raise error("offset " + str(offset) + " out of range for " + str(n) + "-byte buffer")
+            off = offset + n
+        if n - off < layout.size:
+            raise error("pack_into requires a buffer of at least " + str(layout.size + off) +
+                        " bytes for packing " + str(layout.size) + " bytes at offset " + str(off) +
+                        " (actual buffer size is " + str(n) + ")")
+        target[off:off + layout.size] = data
+    finally:
+        if view is not none:
+            view.release()
 
 
 def iter_unpack(fmt, buffer):
     var layout = _layout(fmt)
-    _check_buffer(buffer, "iter_unpack")
+    buffer = _check_buffer(buffer, "iter_unpack")
     if layout.size == 0:
         raise error("cannot iteratively unpack with a struct of length 0")
     if len(buffer) % layout.size != 0:

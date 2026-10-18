@@ -33,8 +33,8 @@
 # constant tuples written twice in one CPython expression are one object
 # there and two here. A set's elements are written in its iteration order,
 # which for Nython's sets is insertion order (CPython's follows the hash
-# table). PickleBuffer wraps bytes/bytearray (Nython has no memoryview);
-# raw() returns bytes. Pickling a lambda or local class fails as in Python
+# table). PickleBuffer wraps any buffer (round 84) and raw() is a flat
+# memoryview of it, as CPython's. Pickling a lambda or local class fails as in Python
 # only when the lookup by name does not find it. No pickletools.
 
 import io
@@ -347,32 +347,41 @@ def _decode_long(data):
 
 
 class PickleBuffer:
-    """A buffer pickled out of band at protocol 5 (bytes or bytearray
-    here: Nython has no memoryview)."""
+    """Wrapper for potentially out-of-band buffers"""
 
     def __init__(self, buffer):
-        if not (isinstance(buffer, bytes) or isinstance(buffer, bytearray)):
-            raise TypeError("a bytes-like object is required, not '" + type(buffer).__name__ + "'")
+        # (round 84) any buffer, held as a view of it, as CPython's
+        self._view = _ny_mv_export(buffer, "")
         self._obj = buffer
-        self._released = false
+
+    def _ny_live(self):
+        if self._view is none:
+            raise ValueError("operation forbidden on released PickleBuffer object")
+        return self._view
 
     def raw(self):
-        if self._released:
-            raise ValueError("operation forbidden on released PickleBuffer object")
-        return bytes(self._obj)
+        """Return a memoryview of the raw memory underlying this buffer."""
+        var v = self._ny_live()
+        if not v.contiguous:
+            raise BufferError("cannot extract raw buffer from non-contiguous buffer")
+        return _ny_mv_make(v._ny_mb, v._ny_a, "B", 1, (v.nbytes,), (1,), v.readonly)
 
     def release(self):
-        self._released = true
+        """Release the underlying buffer exposed by the PickleBuffer object."""
+        if self._view is not none:
+            self._view.release()
+            self._view = none
+
+    def __buffer__(self, flags):
+        var v = self._ny_live()
+        return _ny_mv_copy(v, v.readonly)
+
+    def __release_buffer__(self, view):
+        view.release()
 
     @property
     def readonly(self):
-        return isinstance(self._obj, bytes)
-
-    def __len__(self):
-        return len(self._obj)
-
-    def __bytes__(self):
-        return bytes(self._obj)
+        return self._ny_live().readonly
 
 
 # ── where globals come from ─────────────────────────────────────────────────
@@ -843,10 +852,11 @@ class Pickler:
         if self._buffer_callback is not none:
             in_band = bool(self._buffer_callback(obj))
         if in_band:
+            var raw = obj._ny_live().tobytes()
             if obj.readonly:
-                self._save_bytes_data(obj, bytes(obj._obj))
+                self._save_bytes_data(obj, raw)
             else:
-                self._write_bytes(BYTEARRAY8 + _u64le(len(obj._obj)), bytes(obj._obj))
+                self._write_bytes(BYTEARRAY8 + _u64le(len(raw)), raw)
                 self._memoize(obj)
         else:
             self._write(NEXT_BUFFER)
@@ -1519,8 +1529,12 @@ class Unpickler:
             var b = self._top()
             if isinstance(b, bytearray):
                 st[-1] = bytes(b)
-            elif isinstance(b, PickleBuffer):
-                st[-1] = bytes(b._obj)
+            elif not isinstance(b, bytes):
+                # a buffer: a read-only view of it, as CPython's (round 84)
+                var m = memoryview(b)
+                if not m.readonly:
+                    st[-1] = m.toreadonly()
+                m.release()
         elif key == 0x56:                      # UNICODE
             st.append(_raw_unicode_unescape(self._readline()[:-1]))
         elif key == 0x58:                      # BINUNICODE

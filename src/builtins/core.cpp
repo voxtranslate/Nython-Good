@@ -697,6 +697,30 @@ Value dispatch_core(NythonExecutor& E,
             return E.globalsView(nullptr);
         }
         if (name == "_ny_frame_jump") return E.frameJump(args);   // frame.f_lineno = n (round 81)
+        // The buffer protocol (round 84; the prelude's memoryview): a bytes /
+        // bytearray value's storage as [address, length, readonly, owner] -
+        // the owner the object a view keeps alive (the value itself here) -
+        // counting an export of a bytearray (its size is then fixed:
+        // BufferError); None for anything else. _ny_buf_unexport gives an
+        // export back, _ny_buf_exports counts them; _ny_buf_addr is a
+        // bytearray's storage address now (no export: valid until it is
+        // resized - lib/array.ny reads and writes its items there).
+        if (name == "_ny_buf_export" || name == "_ny_buf_unexport" || name == "_ny_buf_exports" || name == "_ny_buf_addr") {
+            Value v = args.empty() ? NONE_VALUE : E.unwrapPayload(args[0]);
+            nyheap::Bytes* bo = E.bytesOf(v);
+            if (name == "_ny_buf_addr") return bo && bo->mut ? intValue((int64_t)(intptr_t)bo->s.data()) : NONE_VALUE;
+            if (!bo) return name == "_ny_buf_export" ? NONE_VALUE : intValue(0);
+            if (name == "_ny_buf_exports") return intValue(bo->exports);
+            if (name == "_ny_buf_unexport") { if (bo->exports > 0) bo->exports--; return intValue(bo->exports); }
+            if (bo->mut) bo->exports++;
+            return E.makeListValue({intValue((int64_t)(intptr_t)bo->s.data()), intValue((int64_t)bo->s.size()), Value(!bo->mut), v});
+        }
+        if (name == "_ny_load_chunk") {
+            // (round 84) a prelude chunk loaded on first need - "buffer":
+            // memoryview's members and the buffer helpers (NyPreludeBuffer.cpp)
+            if (!args.empty() && E.isStringValue(args[0])) E.ensureMirror(E.getStringValue(args[0]));
+            return NONE_VALUE;
+        }
         if (name == "_ny_getrefcount") {
             // sys.getrefcount(x) (round 81): the object's count (exact
             // reference counting, NyGC) without the references this call

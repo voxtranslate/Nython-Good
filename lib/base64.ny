@@ -5,7 +5,9 @@ import binascii
 def _bytes(s):
     if isinstance(s, "str"):
         return s.encode("ascii")
-    return bytes(s)
+    if isinstance(s, bytes) or isinstance(s, bytearray):
+        return bytes(s)
+    return bytes(_ny_bytes_like(s))      # round 84: any buffer (memoryview ...)
 
 def b64encode(s, altchars=none):
     return _hash_b64encode(_bytes(s), altchars)

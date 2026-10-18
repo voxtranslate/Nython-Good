@@ -59,6 +59,7 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"StopAsyncIteration", "Exception"},
         {"MemoryError", "Exception"},
         {"EOFError", "Exception"},
+        {"BufferError", "Exception"},       // round 84: the buffer protocol's (memoryview)
         // The OS layer's typed errors (include/builtins/os.hpp raises them).
         {"EnvironmentError", "OSError"},
         {"IsADirectoryError", "OSError"},
@@ -138,7 +139,7 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "FileNotFoundError", "FileExistsError", "PermissionError",
         "TimeoutError", "ConnectionError", "ImportError",
         "ModuleNotFoundError", "SyntaxError", "AssertionError",
-        "StopIteration", "StopAsyncIteration", "MemoryError", "EOFError", "EnvironmentError",
+        "StopIteration", "StopAsyncIteration", "MemoryError", "EOFError", "BufferError", "EnvironmentError",
         "SSLError", "SSLCertVerificationError", "SSLEOFError", "SSLZeroReturnError",
         "SSLWantReadError", "SSLWantWriteError", "SSLSyscallError",
         "IsADirectoryError", "NotADirectoryError", "InterruptedError",

@@ -39,7 +39,6 @@
 # Where the engines differ from CPython (so these answers differ):
 #   - (Coroutine objects are real objects since round 78: a coroutine is a
 #     Coroutine and an Awaitable, as in Python.)
-#   - memoryview does not exist (not registered).
 
 from abc import ABCMeta, abstractmethod
 from abc import _ny_namespace, _ny_mro, iterator as _ny_iterator, generator as _ny_generator
@@ -1027,6 +1026,7 @@ class Sequence(Reversible, Collection):
 Sequence.register(tuple)
 Sequence.register(str)
 Sequence.register(range)
+Sequence.register(memoryview)
 
 
 class ByteString(Sequence):
