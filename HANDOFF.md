@@ -4,6 +4,7 @@ Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
 Last updated: round 84, part 0 — **§0w** (the semantic gaps rounds 82-83 found: module attribute messages, BaseException's members and builtins' docstrings as values, a finally body seeing its exception, strict and starred comprehension targets, sys.audit, True/None spelled by the program's language)
+Round 84, ctypes and Windows — **§0w1** (ctypes structures passed and returned by value on every ABI without libffi - SysV eightbyte classification, AAPCS64, Win64, i686; Windows callback trampolines per float mask and stdcall; the Windows gaps round 83 left: zipapp path-hook recursion, liblzma's header errors, faulthandler's SIGSEGV, mmap's messages, AF_UNIX)
 Round 83, ctypes — **§0v4** (ctypes over libffi loaded at run time, or Nython's own caller built on the calling conventions' register files; type's own members; a metaclass's operators on its classes)
 Round 83, part B — **§0v** (Python's system and command-line modules: errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched, cmath, colorsys, readline, rlcompleter, site, sysconfig, webbrowser, zipimport, zipapp, encodings, stringprep, bz2, lzma; module.__dict__ and hashable modules on both engines; VM comprehension results freed; vm_audit109).
 Round 83, part C — **§0v3** (sqlite3 over libsqlite3 loaded at run time, its callbacks run by suspending a coroutine; dbm/shelve; the email package and the mail modules; smtplib/poplib/imaplib/ftplib/telnetlib/xmlrpc/wsgiref/cgi/netrc; plistlib; audioop and the audio-file modules; vm_audit110).
@@ -192,6 +193,85 @@ probe, lint, class check and cbp check clean.
   the library modules' own. exec's event carries the source string, not a
   code object.
 - A starred target in an async comprehension.
+
+## 0w1. Round 84 (main session) — ctypes structures by value on every ABI, and the Windows gaps round 83 left
+
+Verified on fdfd393 (cherry-picked onto 263695d): sweep 451 runs, 0 not
+ok; `tools/ide_e2e.py` 463 passed; memory probe, lint, class check, cbp
+clean.
+
+`examples/vm_audit111.ny` (55 checks) passes on both engines on Linux
+(through libffi, and with `NY_FFI_NO_LIBFFI=1` on the built-in caller) and
+under Wine 64-bit (no libffi there: the built-in caller); vm_audit109, 110
+and 116 pass under Wine with the platform facts below.
+
+**ctypes without libffi, structures included** (src/builtins/ffi.cpp). The
+built-in caller (round 83) handled scalars; structures passed or returned by
+value needed libffi. Now each ABI's own rules decide where a structure goes,
+and only what no fixed prototype can express still needs libffi
+(`need_libffi`: the error names the structure):
+- **x86-64 System V**: the eightbyte classification (`sysv_classify`:
+  INTEGER / SSE / MEMORY per eightbyte, over the structure's flattened
+  leaves `spec_leaves`, laid out by `struct_layout` as the compiler lays
+  them out). A structure of up to 16 bytes travels in its registers - the
+  general and the vector register files are separate, so the same 6 + 8
+  register prototype still calls any mix - and a MEMORY one is copied to the
+  stack words (`N_STACK_CALL` is 16). A result comes back as `RII` / `RDD` /
+  `RID` / `RDI` (two registers of each class) or, MEMORY, through the hidden
+  pointer in RDI.
+- **AAPCS64**: a composite of up to 16 bytes in x registers; a larger result
+  through x8 (`RBlob<N>`: the compiler passes x8 for a returned aggregate of
+  that size); a homogeneous floating-point aggregate (`aapcs_hfa`) needs
+  libffi.
+- **Windows x64**: sizes 1/2/4/8 travel as integers, anything else by
+  reference to a copy; a result of other sizes through the hidden pointer in
+  RCX.
+- **32-bit x86**: a structure is its stack words; a result of up to 8 bytes
+  comes back in EDX:EAX (Windows; System V i386 returns every structure in
+  memory).
+- On x86-64 System V callbacks receive structures by value too (the pool's
+  dispatcher reads them from the registers or the stack as the caller put
+  them).
+
+**Windows callbacks** (`CFUNCTYPE`/`WINFUNCTYPE` without libffi; they
+raised "callbacks need libffi on this platform"): Win64
+passes the first four arguments in either RCX..R9 or XMM0..3 by position, so
+a trampoline is chosen per float mask of those four (`P64<M,K>`,
+`tramp_i/d/f<M,S>`, `g_pool[3][16][16]`: result class x mask x slot); 32-bit
+x86 has cdecl pools and stdcall trampolines per argument word count
+(`StdTramp`, 0-12 words), as stdcall callees pop their arguments.
+
+**Windows fixes** (found running round 83's suites under Wine):
+- `nython app.pyz` recursed without end: zipimporter's path hook imported
+  `os.path` lazily while the hook ran, which asked the hook again. The
+  prelude's `_ny_path_hooks_spec` caches the entry as "no finder" while the
+  hooks run (the engines search it natively) and removes the entry if a
+  hook raises.
+- `lzma.decompress(garbage)` said "Corrupt input data" where liblzma says
+  "Input format not supported by decoder": the native .lzma decoder now
+  checks the header as liblzma does (properties, and through FORMAT_AUTO a
+  dictionary size of 2^n or 2^n + 2^(n-1) and a plausible size).
+- `faulthandler._sigsegv()` returned and exited 0: Windows' SIGSEGV handler
+  gives the flow back, so the raise is repeated until the previous handler
+  ends the process, as CPython does.
+- mmap's errors were "[WinError N] ... failed": they carry
+  `FormatMessage`'s text now (`fail_win`).
+- `socket.AF_UNIX` is defined only where the platform has it (Windows had it
+  as None, so `hasattr(socket, "AF_UNIX")` said True and the libraries took
+  the Unix branch); lib/sockets.ny and asyncio read it with `getattr`.
+- Test expectations that were Linux facts are platform facts now: `c_long`
+  is 32 bits and `c_int is c_long` on Windows, `find_library`, the mmap
+  error for an over-long map, `complex(-1.0, sin(pi))` from Wine's libm,
+  filecmp's separators, a thread id's width, mailcap's image entry.
+
+### Not done
+- AArch64 structure paths are written to the ABI but were not run (qemu-user
+  runs here; the libffi-less caller was checked on x86-64 and under Wine).
+- HFAs on AArch64, and structures in variadic calls, still need libffi.
+- Under Wine the interpreter's full vm_audit110 run sees one mbox flush raise
+  PermissionError (Wine's rename over an open file); the check passes run
+  alone.
+- lzma compression needs liblzma (only the decoder is native).
 
 ## 0v4. Round 83, ctypes — ctypes, and type's own members (vm_audit111)
 

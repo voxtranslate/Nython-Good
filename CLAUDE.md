@@ -398,7 +398,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit110 | 264 | round 83, part C: sqlite3 over libsqlite3 loaded at run time (every DB-API path, transactions incl. `autocommit=`, user functions/aggregates/window functions/collations, authorizer/progress/trace, Row, blobs, backup, iterdump text, adapters/converters, callbacks from several threads, one connection shared by threads), dbm (dumb, sqlite3)/shelve, the email package (CPython's exact strings: parse/generate round trips, the default policy's EmailMessage/MIMEPart API, MIME classes, utils, headers), quopri/uu/mailbox/mailcap/netrc/cgi/cgitb, plistlib and audioop/wave/aifc/sunau byte-identical to CPython's, wsgiref and xmlrpc over HTTP, smtplib/poplib/imaplib/ftplib/telnetlib/LMTP against servers on localhost, and over TLS; the engine fixes they needed (passes under python3.11/3.12) |
 | vm_audit105 | 118 | round 82: lib/aiagent.ny's NyxAgent on a fixture workspace - `ny_facts`, call/import graphs, BM25F rankings (definitions over uses, call-graph neighbours, incremental, JSON round trip), the rule engine (closure, stratified negation, why), explain/doc/review/fix at exact lines, generated tests that run and pass (doctests, boundaries, a shrunk counterexample, a hang, a .py module under python3), completion MRR before/after training, GitHubLearner over a local http.server (Nython-only) |
 | vm_audit109 | 255 | round 83 (part B): errno, fcntl, termios/tty/pty (os.fork/forkpty/openpty/waitpid/exec*), resource, syslog, mmap, cmath (CPython's special values), colorsys, sched, getopt, optparse (help text identical), fileinput, filecmp, gettext (.mo files, plurals), readline/rlcompleter, site/sysconfig, webbrowser, zipimport/zipapp (`nython app.pyz`), encodings, stringprep, bz2 (byte-identical to libbz2), lzma (liblzma at run time, a native decoder without it), faulthandler (both engines' stacks, a real SIGSEGV), tracemalloc, locale; module.__dict__, comprehension lists freed on the VM (passes under python3) |
-| vm_audit111 | 53 | round 83: ctypes - type's own members (`type.__new__/__call__/__setattr__` in metaclasses), simple types, structures (bit fields, packing, anonymous, byte order), unions, arrays, pointers, libc calls (strlen/labs/strtod/sprintf/div, errcheck), callbacks (qsort, a double callback, a struct by value), errno, util/wintypes, the built-in caller without libffi (passes under python3) |
+| vm_audit111 | 55 | round 83 (structures by value without libffi: round 84): ctypes - type's own members (`type.__new__/__call__/__setattr__` in metaclasses), simple types, structures (bit fields, packing, anonymous, byte order), unions, arrays, pointers, libc calls (strlen/labs/strtod/sprintf/div, errcheck), callbacks (qsort, a double callback, a struct by value), errno, util/wintypes, the built-in caller without libffi (passes under python3) |
 | vm_audit116 | 34 | round 84 (part 0): module AttributeError text, `{}.append` on the interpreter, BaseException's members as values, instance `__module__`/`__weakref__`, builtins' docstrings, a finally body seeing its exception, strict and starred comprehension targets, `sys.audit`/`addaudithook` events, VM comprehension targets freed, True/None spelled by the program's language (passes under python3) |
 | vm_audit108 | 224 | round 83: ast (the real parser's tree: dump of a corpus with positions, f-string parts, unparse round trips, literal_eval, visitors/transformers, compile of a tree, SyntaxErrors), tokenize/token (3.12 f-string tokens, detect_encoding, untokenize), symtable, dis/opcode (Nython's VM bytecode, the adaptive view on the VM), marshal bytes, pickletools.dis/optimize text, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, multi-line string lines; generated from CPython 3.12's values (`tools/gen_vm_audit108.py`; 206 under python3.12, 191 under 3.11) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
@@ -1527,6 +1527,17 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   raise, `__context__`; VM opcode `FIN_EXC_OF`); comprehension targets
   unpack strictly and may be starred (`_ny_star_iter`); the VM deletes a
   comprehension's targets unless something made inside it may read them.
+
+## Round 84: ctypes structures by value everywhere, Windows gaps (see `HANDOFF.md` §0w1)
+
+- The built-in ffi caller (no libffi) passes and returns structures by
+  value as each ABI says (`sysv_classify`, `aapcs_hfa`, `struct_layout` in
+  `src/builtins/ffi.cpp`); only AArch64 HFAs and structures in variadic
+  calls still need libffi (`need_libffi` names the structure). Windows
+  callbacks: Win64 trampolines per float mask of the four register
+  arguments, i686 stdcall trampolines per word count.
+- `socket.AF_UNIX` exists only where the platform has it: read it with
+  `getattr(socket, "AF_UNIX", None)`.
 
 ## Transcripts
 
