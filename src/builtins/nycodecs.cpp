@@ -128,7 +128,7 @@ std::string cp_encode(unsigned cp, const std::string& s, size_t start, const std
     std::string out;
     consumed = start;
     if (start >= cps.size()) { consumed = cps.size(); return out; }
-    BOOL used = FALSE;
+    BOOL used = 0;   // (FALSE: a NodeType member here)
     BOOL* pused = (cp != CP_UTF8 && cp != CP_UTF7) ? &used : nullptr;
     DWORD sflags = cp == CP_UTF8 ? 0x80 /* WC_ERR_INVALID_CHARS */ : cp == CP_UTF7 ? 0 : WC_NO_BEST_FIT_CHARS;
     std::wstring w = wide_of(cps, start, cps.size());
@@ -147,7 +147,7 @@ std::string cp_encode(unsigned cp, const std::string& s, size_t start, const std
     while (pos < cps.size()) {
         std::wstring one = wide_of(cps, pos, pos + 1);
         char buf[8];
-        used = FALSE;
+        used = 0;
         int got = WideCharToMultiByte(cp, flags, one.data(), (int)one.size(), buf, (int)sizeof buf, nullptr, pused);
         if (got > 0 && !(pused && *pused)) { out.append(buf, (size_t)got); pos++; continue; }
         if (got <= 0 && GetLastError() != ERROR_NO_UNICODE_TRANSLATION)
