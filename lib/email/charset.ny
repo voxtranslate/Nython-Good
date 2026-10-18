@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/charset.ny - email.charset (CPython 3.12's
 # Lib/email/charset.py): Charset, add_charset, add_alias, add_codec and the
 # QP/BASE64/SHORTEST encodings per charset.

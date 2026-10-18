@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/json/decoder.ny - json.decoder: JSONDecoder, JSONDecodeError, scanstring
 # (CPython 3.12's Lib/json/decoder.py; the scanning is builtins/pyjson.cpp,
 # which follows Modules/_json.c - see lib/json/__init__.ny).

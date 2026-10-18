@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/zoneinfo.ny - Python's zoneinfo (PEP 615, 3.11): IANA time zones for
 # datetime, read from the system's time zone database. The code is CPython's
 # pure-Python implementation (Lib/zoneinfo/_zoneinfo.py, _common.py,

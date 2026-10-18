@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/modulefinder.ny - Python's modulefinder (round 83): find the modules a
 # script imports, recursively, without running it - CPython 3.12's
 # Lib/modulefinder.py.

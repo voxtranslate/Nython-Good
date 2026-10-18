@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_codecs_iso2022.ny - CPython's _codecs_iso2022 (round 84): the codec
 # objects of the ISO-2022: iso2022_jp (and _1, _2, _2004, _3, _ext) and
 # iso2022_kr codecs, for lib/encodings/ (src/builtins/nycjk.cpp has the

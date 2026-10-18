@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # _thread - Python's low-level threading module (round 82), over the
 # runtime lib/threading.ny uses (src/NyConc.cpp: OS threads under one GIL).
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/errno.ny - Python's errno module (round 83): the platform's error
 # numbers by name, and errorcode, the names by number.
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/feedparser.ny - email.feedparser (CPython 3.12's
 # Lib/email/feedparser.py): FeedParser and BytesFeedParser, the incremental
 # parser under every email parser, with its defects.

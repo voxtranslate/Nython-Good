@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/stat.ny - Python's stat module (round 80): constants and functions for
 # interpreting the results of os.stat() / os.lstat() / os.fstat() and of
 # DirEntry.stat(), CPython 3.11's Lib/stat.py with what its C half (_stat)

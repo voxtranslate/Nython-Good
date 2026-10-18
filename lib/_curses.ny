@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_curses.ny - CPython's _curses module (round 84), over Nython's own
 # curses (builtins/nycurses.cpp) rather than ncurses: `import curses` uses it.
 #

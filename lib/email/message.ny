@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/message.ny - email.message (CPython 3.12's
 # Lib/email/message.py): Message (compat32), EmailMessage and MIMEPart
 # (the default policy's API: get_content/set_content, add_attachment,

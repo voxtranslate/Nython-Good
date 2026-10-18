@@ -1334,6 +1334,9 @@ public:   // NythonExecutor is a struct: members default to public
     // a name declared `global` at module level; otherwise the nearest
     // existing binding, or a new local (Context::setByName).
     void assignName(VariableNode* vn, const Value& val, Context* ctx) {
+        // round 85: Python's rule (NyScope) - a local of the function (or of
+        // code exec'd in a Python-language function): bound in this scope
+        if (__builtin_expect(vn->py_bind != 0, 0)) { ctx->defineByName(vn->name, val); return; }
         if (vn->global_ref) moduleCtx(ctx)->defineByName(vn->name, val);
         else if (ctx->inClass) ctx->defineByName(vn->name, val);
         else {
@@ -1390,8 +1393,29 @@ public:   // NythonExecutor is a struct: members default to public
         }
     }
 
+    // round 85: a local of a Python-language function (VariableNode::py_bind
+    // 1, NyScope): the function's own scope only, as CPython's LOAD_FAST -
+    // unbound, an UnboundLocalError whatever an enclosing scope binds. The
+    // node's cache keeps its slot (depth 0).
+    Value readPyLocal(VariableNode* vn, Context* ctx) {
+        const ContainerType* m = ctx->container;
+        if (m) {
+            NameCache& nc = vn->nc;
+            if (__builtin_expect(!nc.hashed, 0)) { nc.hash = ContainerType::hash_key(vn->name); nc.hashed = true; }
+            if (nc.depth == 0) {
+                const ContainerType::value_type* kv = m->slot_at(nc.slot);
+                if (kv && kv->first == vn->name) return kv->second;
+            }
+            long s = m->index_of_h(vn->name, nc.hash);
+            if (s >= 0) { nc.depth = 0; nc.slot = (uint32_t)s; return m->slot_at((size_t)s)->second; }
+        }
+        throw std::string("__exc__:UnboundLocalError:cannot access local variable '" + vn->name
+                          + "' where it is not associated with a value");
+    }
+
     Value evalVariable(const node_ptr& node, Context* ctx) {
         auto* vn = static_cast<VariableNode*>((node).get());
+        if (__builtin_expect(vn->py_bind == 1, 0)) return readPyLocal(vn, ctx);   // round 85
         // Check user-defined first
         Value found = lookupName(vn, vn->global_ref ? moduleCtx(ctx) : ctx);
         if (found.type != ValueType::UNDEFINED) return found;
@@ -14713,6 +14737,13 @@ public:
             // NameError (x used to stay bound, to undefined here and to
             // none on the VM).
             const std::string n = dn->target->value();
+            // round 85: a local of a Python-language function (NyScope): its
+            // own scope's, an unbound one CPython's UnboundLocalError
+            if (uint8_t pb = static_cast<VariableNode*>(dn->target.get())->py_bind) {
+                if (ctx->container && ctx->container->erase(n)) return NONE_VALUE;
+                if (pb == 1) pyRaise("UnboundLocalError", "cannot access local variable '" + n + "' where it is not associated with a value");
+                pyRaise("NameError", "name '" + n + "' is not defined");
+            }
             for (Context* c = ctx; c; c = c->parent)
                 if (c->container && c->container->erase(n)) return NONE_VALUE;
             pyRaise("NameError", "name '" + n + "' is not defined");
@@ -15348,7 +15379,10 @@ public:
     // from them, the builtins visible but not the program's names, and exec
     // writes what it binds back into the dict; without one, in the caller's
     // scope.
-    std::string snippetSource(const Value& v, std::string& mode, std::string& fname, const char* who) {
+    // pyrule (round 85): a code object's rule - 1 Python's, 0 Nython's (what
+    // compile() recorded, _NyCode._ny_pyrule); -1 for source text
+    std::string snippetSource(const Value& v, std::string& mode, std::string& fname, const char* who, int* pyrule = nullptr) {
+        if (pyrule) *pyrule = -1;
         if (isInstanceValue(v) && shownClassName(instanceClassName(v)) == "_NyCode") {
             auto pit = instance_properties.find(v.value.p);
             if (pit != instance_properties.end() && pit->second && pit->second->container) {
@@ -15356,6 +15390,10 @@ public:
                 auto g = [&](const char* k) { auto it = c.find(k); return it != c.end() ? getStringValue(it->second) : std::string(); };
                 mode = g("mode");
                 fname = g("co_filename");
+                if (pyrule) {
+                    auto pr = c.find("_ny_pyrule");
+                    *pyrule = pr != c.end() && isTruthy(pr->second) ? 1 : 0;
+                }
                 return g("source");
             }
         }
@@ -15364,6 +15402,12 @@ public:
         // (round 83: compile()'s own message names AST objects, as CPython's)
         pyRaise("TypeError", std::string(who) + "() arg 1 must be a string, bytes or " + (std::string(who) == "compile" ? "AST" : "code") + " object");
         return std::string();
+    }
+    // round 85: the running statement is Python-language source's (NyScope's
+    // registry of the files parsed as such)
+    bool callerPython() {
+        Node* cs = cur_stmt();
+        return cs && nython::scope::python_file(cs->tok().fileName());
     }
     node_ptr parseSnippet(const std::string& src, const std::string& fname) {
         try {
@@ -15421,16 +15465,35 @@ public:
         }
         if (any_payload_) { Value p; if (payloadOf(args[0], p)) args[0] = p; }   // a str subclass (round 81: exec is payload-transparent)
         std::string mode = is_exec ? "exec" : "eval", fname = "<string>";
-        std::string src = snippetSource(args[0], mode, fname, who);
+        int crule = -1;
+        std::string src = snippetSource(args[0], mode, fname, who, &crule);
         if (mode == "exec") is_exec = true;    // eval(compile(..., "exec")) runs it
         if (!is_exec) {
             size_t b = src.find_first_not_of(" \t");
             src = b == std::string::npos ? std::string() : src.substr(b);
         }
-        node_ptr ast = parseSnippet(src, fname);
+        bool has_g = args.size() > 1 && !args[1].isNone(), has_l = args.size() > 2 && !args[2].isNone();
+        // round 85: Python's binding rule for code a Python-language file
+        // runs (or compile() made there); exec'd in such a function without
+        // namespaces, what its top level binds stays its own (CPython: exec
+        // cannot change a function's locals)
+        const bool caller_py = callerPython();
+        const bool top_locals = caller_py && !has_g && !has_l && ctx && ctx != moduleCtx(ctx) && !ctx->inClass;
+        node_ptr ast;
+        {
+            nython::scope::RuleScope rule(crule >= 0 ? crule == 1 : nython::scope::code_rule(fname, src, caller_py), top_locals);
+            ast = parseSnippet(src, fname);
+        }
         if (!ast) return NONE_VALUE;
         if (!is_exec && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
-        bool has_g = args.size() > 1 && !args[1].isNone(), has_l = args.size() > 2 && !args[2].isNone();
+        if (top_locals) {
+            // a scope of its own over the function's: it reads the
+            // function's variables, and what it binds is dropped with it
+            Context* sc = new Context(runner, "<string>", nullptr, nullptr, ctx);
+            CtxReaper reap(this, sc);
+            Value r = runSnippetFrame(ast, sc);
+            return is_exec ? NONE_VALUE : r;
+        }
         // round 81: exec(src, globals()) / eval(src, globals()) run in that
         // module's own scope (the view stands for it); any other dict
         // subclass is given as its value
@@ -15565,11 +15628,19 @@ public:
         std::string fname = getStringValue(args[1]), mode = getStringValue(args[2]);
         if (mode != "exec" && mode != "eval" && mode != "single") pyRaise("ValueError", "compile() mode must be 'exec', 'eval' or 'single'");
         std::string m2 = mode, f2 = fname;
-        std::string src = snippetSource(args[0], m2, f2, "compile");
-        node_ptr ast = parseSnippet(src, fname);   // a syntax error is raised now, as Python's
+        int crule = -1;
+        std::string src = snippetSource(args[0], m2, f2, "compile", &crule);
+        // round 85: the code's binding rule - its caller's (or the code
+        // object's it was given), kept for the exec / eval that runs it
+        const bool py = crule >= 0 ? crule == 1 : nython::scope::code_rule(fname, src, callerPython());
+        node_ptr ast;
+        {
+            nython::scope::RuleScope rule(py, false);
+            ast = parseSnippet(src, fname);   // a syntax error is raised now, as Python's
+        }
         if (mode == "eval" && ast && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
         Value cls = global_ctx->getByName("_NyCode");
-        std::vector<Value> a{makeStringValue(src), makeStringValue(fname), makeStringValue(mode == "single" ? "exec" : mode)};
+        std::vector<Value> a{makeStringValue(src), makeStringValue(fname), makeStringValue(mode == "single" ? "exec" : mode), Value(py)};
         return callFunctionValue(cls, a, ctx);
     }
 

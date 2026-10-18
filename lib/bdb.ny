@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/bdb.ny - Python's bdb: the debugger framework pdb is built on (round 79),
 # over sys.settrace and frame objects (f_trace, f_back, f_lineno, f_locals).
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/marshal.ny - Python's marshal: CPython's internal value serialization
 # (round 83), format version 4 (and 0-3 when asked), written after
 # Python/marshal.c.

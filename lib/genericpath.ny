@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/genericpath.ny - Python's genericpath (round 80): the path operations
 # posixpath and ntpath share (CPython 3.11's Lib/genericpath.py). Do not use
 # it directly: posixpath / ntpath (and os.path) re-export what is here.

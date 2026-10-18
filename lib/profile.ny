@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/profile.ny - Python's profile: the pure-Python deterministic profiler
 # (round 79). lib/cProfile.ny is the same interface with _lsprof's
 # bookkeeping; this is CPython's profile.py algorithm, as written there.

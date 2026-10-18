@@ -1,4 +1,5 @@
 # nython: module    (part of the tkinter package: lib/tkinter/)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 """Drag-and-drop support for Tkinter.
 
 This is very preliminary.  I currently only support dnd *within* one

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/urllib/parse.ny - Python's urllib.parse (RFC 3986, round 77):
 # urlparse/urlsplit/urlunparse/urlunsplit/urljoin/urldefrag, quote/unquote
 # (UTF-8), quote_plus/unquote_plus, urlencode, parse_qs/parse_qsl.

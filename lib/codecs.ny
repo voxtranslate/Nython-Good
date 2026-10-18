@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/codecs.ny - Python's codecs module (round 80): the codec registry,
 # its error handlers and the stream and incremental classes, after CPython
 # 3.11's Lib/codecs.py and Modules/_codecsmodule.c.

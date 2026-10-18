@@ -1,4 +1,5 @@
 # nython: module    (a package: import curses, curses.panel, curses.textpad)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/curses/__init__.ny - the curses package (round 84): CPython 3.11's
 # curses/__init__.py, unchanged, over lib/_curses.ny (Nython's own curses,
 # builtins/nycurses.cpp - no ncurses): initscr() (setupterm first, then the

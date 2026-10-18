@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/warnings.ny - Python's warnings: issue warning messages and control
 # what happens to them (CPython's Lib/warnings.py).
 #

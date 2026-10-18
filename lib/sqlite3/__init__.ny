@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/sqlite3/__init__.ny - Python's sqlite3 package (CPython 3.12's
 # Lib/sqlite3/__init__.py): the DB-API 2.0 interface to SQLite. The module
 # itself is lib/_sqlite3.ny (CPython's C module, written in Nython) over

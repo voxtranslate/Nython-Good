@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/dbm/__init__.ny - Python's dbm (CPython 3.13's Lib/dbm/__init__.py):
 # open(file, flag='r', mode=0o666) choosing the first available of
 # dbm.sqlite3, dbm.gnu, dbm.ndbm, dbm.dumb for a new file, whichdb() for an

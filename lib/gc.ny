@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # gc - Python's interface to the garbage collector, over the engines' own
 # (round 82). Both engines free objects by reference counting and collect
 # cycles with a generational collector (round 75, GC_NOTES.md); the native

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/sunau.ny - Python's sunau (CPython 3.12's Lib/sunau.py, deprecated
 # for removal in 3.13 - importing it warns): reading and writing Sun AU
 # files (linear 8/16/24/32 bit, u-law, A-law), Au_read, Au_write, open(),

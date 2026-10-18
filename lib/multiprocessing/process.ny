@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing/process.ny - Process objects (round 80): CPython's
 # BaseProcess API over real child processes started with the "spawn"
 # method - the interpreter (sys.executable) runs

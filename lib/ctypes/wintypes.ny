@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # ctypes.wintypes - the Windows data types (round 83), as CPython's
 # (importable on every platform, as there).
 import ctypes

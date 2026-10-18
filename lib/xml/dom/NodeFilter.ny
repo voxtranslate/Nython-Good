@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/xml/dom/NodeFilter.ny - xml.dom.NodeFilter (CPython 3.11).
 # This is the Python mapping for interface NodeFilter from
 # DOM2-Traversal-Range. It contains only constants.

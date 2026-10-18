@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/imaplib.ny - Python's imaplib (CPython 3.12's Lib/imaplib.py):
 # IMAP4 (every command of RFC 3501 - login, authenticate, select, search,
 # fetch, store, copy, expunge, list, status, uid, ... - with untagged

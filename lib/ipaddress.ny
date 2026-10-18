@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/ipaddress.ny - Python's ipaddress (3.11; CPython's Lib/ipaddress.py,
 # so the same strings parse, print and compare the same and errors carry
 # the same messages).

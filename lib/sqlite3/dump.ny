@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/sqlite3/dump.ny - Python's sqlite3.dump (CPython 3.12's
 # Lib/sqlite3/dump.py): _iterdump(connection), the SQL text
 # Connection.iterdump() yields - the same lines CPython's gives. Also from

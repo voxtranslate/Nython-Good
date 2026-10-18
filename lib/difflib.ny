@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/difflib.ny - Python's difflib (3.11; CPython's Lib/difflib.py, so the
 # same inputs give byte-identical output).
 #

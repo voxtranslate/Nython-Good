@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tomllib.ny - Python's tomllib (3.11): TOML 1.0.0 (https://toml.io/en/
 # v1.0.0) parsed to Python values. The parser is CPython's Lib/tomllib
 # (Taneli Hukkinen's tomli, MIT licence, notice below), its three files

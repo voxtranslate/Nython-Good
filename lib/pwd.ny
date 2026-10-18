@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pwd.ny - Python's pwd module (round 80): the Unix password database,
 # through the C library (getpwnam/getpwuid/getpwent, src/builtins/os_fd.cpp)
 # - /etc/passwd, NSS, whatever the system is configured with.

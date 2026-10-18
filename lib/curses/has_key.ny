@@ -1,4 +1,5 @@
 # nython: module    (import curses.has_key)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/curses/has_key.ny - curses.has_key (round 84): CPython 3.11's
 # curses/has_key.py, unchanged - has_key() from the terminfo k* capabilities,
 # for a _curses without one (Nython's _curses has its own).

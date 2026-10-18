@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/shutil.ny - Python's shutil: high-level file operations.
 #
 #     copyfileobj, copyfile, copymode, copystat, copy, copy2, ignore_patterns,

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pdb.ny - Python's pdb: the interactive source debugger (round 79), CPython
 # 3.11's pdb over lib/bdb.ny (sys.settrace, frame objects) and lib/cmd.ny.
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/antigravity.ny - `import antigravity` (round 83), as CPython's: it
 # asks the webbrowser module to open https://xkcd.com/353/, and provides
 # geohash() (xkcd 426, the Munroe algorithm).

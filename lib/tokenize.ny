@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tokenize.ny - Python's tokenize: Python source broken into tokens, as
 # CPython 3.12's tokenizer gives them (round 83).
 #

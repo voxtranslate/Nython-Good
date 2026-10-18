@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # ctypes.util - find_library (round 83), CPython's strategies: on Linux the
 # dynamic linker's cache (`ldconfig -p`), then LD_LIBRARY_PATH and the usual
 # library directories (CPython also asks gcc/ld; reading the directories

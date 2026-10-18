@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tracemalloc.ny - Python's tracemalloc module (round 83, CPython 3.12's
 # tracemalloc.py over a native _tracemalloc): trace memory blocks to the
 # Python lines that allocated them.

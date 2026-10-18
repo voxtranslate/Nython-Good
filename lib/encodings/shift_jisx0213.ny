@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/shift_jisx0213.ny - CPython 3.11's encodings/shift_jisx0213.py (round 84), unchanged:
 # the shift_jisx0213 codec over _codecs_jp / _multibytecodec (src/builtins/nycjk.cpp).
 #

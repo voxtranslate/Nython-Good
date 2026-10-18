@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing/managers.ny - the object server every cross-process
 # object of lib/multiprocessing lives in (round 80), and Python's managers
 # API on top of it (BaseManager, SyncManager, BaseProxy, Namespace,

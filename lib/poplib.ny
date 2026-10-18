@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/poplib.ny - Python's poplib (CPython 3.12's Lib/poplib.py): POP3
 # (user/pass_, apop, rpop, stat, list, retr, dele, noop, rset, quit, top,
 # uidl, utf8, capa, stls) and POP3_SSL, error_proto - over lib/socket.ny

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/headerregistry.ny - email.headerregistry (CPython 3.12's
 # Lib/email/headerregistry.py): Address, Group, the header classes
 # (UnstructuredHeader, DateHeader, AddressHeader, ContentTypeHeader, ...)

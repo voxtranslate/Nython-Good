@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/code.ny - Python's code: read-eval-print loops in a program (round 79).
 #
 #     import code

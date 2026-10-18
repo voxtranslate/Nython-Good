@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/utils.ny - email.utils (CPython 3.12's Lib/email/utils.py):
 # formataddr, parseaddr, getaddresses (strict=), formatdate,
 # format_datetime, parsedate, parsedate_tz, parsedate_to_datetime,

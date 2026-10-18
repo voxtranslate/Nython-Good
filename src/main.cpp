@@ -1256,6 +1256,39 @@ static int check_program(const Program& prog, bool vm) {
     }
 }
 
+// --scope-report file... (round 85; tools/ny_scopecheck.py reads it): each
+// file parsed as it would be run, and every place where Nython's binding
+// rule and Python's give a function different bindings printed, one line
+// each (NyScope.cpp, differences()):
+//   file line col function name assign|aug|del module|function:<q>
+//   outer_line outer_kind uses_outer(0/1) python|nython def_line insert_line
+// Status 1 when a file could not be read or parsed.
+static int scope_report(int argc, char** argv, int from) {
+    int status = 0;
+    nython::scope::report_sink() = &std::cout;
+    for (int k = from; k < argc; k++) {
+        std::string f = argv[k];
+        struct stat st;
+        if (stat(f.c_str(), &st) != 0) { std::cerr << f << ": no such file\n"; status = 1; continue; }
+        try {
+            SourceCode source(f);
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            Parser par(reporter.get(), nullptr, lex.get());
+            lex->tokenize();
+            par.parse();
+        } catch (exception::SyntaxError& e) {
+            report_compiler_error("syntax error", e.location(), e.message()); status = 1;
+        } catch (exception::UnexpectedCharError& e) {
+            report_compiler_error("error", e.location(), e.message()); status = 1;
+        } catch (std::exception& e) {
+            std::cerr << f << ": " << e.what() << "\n"; status = 1;
+        }
+    }
+    nython::scope::report_sink() = nullptr;
+    return status;
+}
+
 // -m: a library module's file (a/b.ny, or a package's a/b/__main__.ny),
 // looked up where `import` looks: the working directory and its lib/, then
 // NYTHONPATH and the library beside the interpreter.
@@ -1358,6 +1391,9 @@ int main(int argc, char** argv, char** env) {
                 else if (a == "--ast") tool = "ast";
                 else if (a == "--disasm") tool = "disasm";
                 else if (a == "--check") tool = "check";
+                // round 85 (hidden; tools/ny_scopecheck.py): where Nython's and
+                // Python's binding rules differ in each file given
+                else if (a == "--scope-report") return scope_report(argc, argv, i + 1);
                 else if (a == "--profile") profile = true;
                 else if (a == "--trace") {
                     if (i + 1 >= argc) return bad("--trace needs an output file");
@@ -1399,7 +1435,11 @@ int main(int argc, char** argv, char** env) {
                             if (i + 1 >= argc) return bad(std::string("option -") + c + " needs an argument");
                             val = argv[++i];
                         }
-                        if (c == 'W') nyrt::warn_options().push_back(val);
+                        // round 85: -W nython-scope[:filter] - the binding-rule
+                        // warnings for Nython-language code (NyScope.hpp)
+                        if (c == 'W' && val.rfind("nython-scope", 0) == 0 && (val.size() == 12 || val[12] == ':'))
+                            nython::scope::warn_filter() = val.size() > 13 ? val.substr(13) : std::string("1");
+                        else if (c == 'W') nyrt::warn_options().push_back(val);
                         stop = true;
                     }
                     else if (c == 'i') { inspect = true; nyrt::cli_flags().inspect = nyrt::cli_flags().interactive = 1; }

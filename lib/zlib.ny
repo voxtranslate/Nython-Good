@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/zlib.ny - Python's zlib (round 79): DEFLATE (RFC 1951) with the zlib
 # (RFC 1950) and gzip (RFC 1952) wrappers, over a native implementation
 # written for Nython (src/builtins/nyzlib.cpp - no system zlib). Streams are

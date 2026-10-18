@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tkinter/constants.ny - tkinter.constants, as CPython's (round 84).
 
 # Symbolic constants for Tk

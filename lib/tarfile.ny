@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tarfile.ny - Python's tarfile (round 79): read and write tar archives
 # in the ustar, GNU and pax formats, plain or gzip-compressed, after
 # CPython 3.11's Lib/tarfile.py (headers come out byte for byte the same).

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/plistlib.ny - Python's plistlib (CPython 3.12's Lib/plistlib.py):
 # load/loads/dump/dumps of Apple property lists in the XML format and the
 # binary format (FMT_XML, FMT_BINARY), with sort_keys=, skipkeys=, dict_type=,

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/__init__.ny - Python's email package (CPython 3.12's Lib/email,
 # ported file by file with its structure kept, so parsing and generating give
 # CPython's bytes and strings). message_from_string / message_from_bytes /

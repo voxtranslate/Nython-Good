@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/big5hkscs.ny - CPython 3.11's encodings/big5hkscs.py (round 84), unchanged:
 # the big5hkscs codec over _codecs_hk / _multibytecodec (src/builtins/nycjk.cpp).
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/quopri.ny - Python's quopri (CPython 3.12's Lib/quopri.py):
 # encode/decode (files), encodestring/decodestring, quoted-printable per
 # RFC 1521, header= for RFC 1522 headers; over binascii's a2b_qp/b2a_qp.

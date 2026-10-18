@@ -74,7 +74,13 @@ node_ptr Parser::parse() {
         // nonlocal / const / global binding forms (NyScope.hpp); not in ast
         // mode (round 83: ast.parse checks no scopes - CPython's symtable
         // pass reports those at compile time)
-        if(!ast_mode_) nython::scope::check(root);
+        // round 85: with the source, which tells whether it is Python-language
+        // (Python's binding rule; `stdin` is the engines' own text - the prelude)
+        if(!ast_mode_){
+            std::string file = scanner->source.fileName();
+            if(file == "stdin") file.clear();
+            nython::scope::check(root, file, scanner->source.sourceCode());
+        }
         return root;
     }
     catch (SyntaxError& ex) { throw ex; }

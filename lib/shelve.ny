@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/shelve.ny - Python's shelve (CPython 3.12's Lib/shelve.py): Shelf,
 # BsdDbShelf, DbfilenameShelf and open(filename, flag, protocol,
 # writeback) - a persistent dict of pickled values over dbm.

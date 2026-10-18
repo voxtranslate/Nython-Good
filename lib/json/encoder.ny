@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/json/encoder.ny - json.encoder: JSONEncoder, encode_basestring(_ascii)
 # (CPython 3.12's Lib/json/encoder.py). encode() writes the document with the
 # native encoder (builtins/pyjson.cpp) when every value is a dict, list,

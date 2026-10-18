@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/xmlrpc/server.ny - xmlrpc.server (CPython 3.12's
 # Lib/xmlrpc/server.py): SimpleXMLRPCServer, SimpleXMLRPCRequestHandler,
 # SimpleXMLRPCDispatcher (register_function, register_instance,

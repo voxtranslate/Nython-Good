@@ -1,4 +1,5 @@
 # nython: module    (a package: http.client, http.server)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/http - Python's http package (round 77): status codes and phrases.
 #
 #   HTTPStatus.NOT_FOUND == 404, phrase(404) == "Not Found",

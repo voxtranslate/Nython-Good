@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/html/parser.ny - Python's html.parser (CPython 3.11.15's
 # Lib/html/parser.py, the same tokenizing as Python, including its 2025
 # security fixes to comments, CDATA content and end-of-input handling).

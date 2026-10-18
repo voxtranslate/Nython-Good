@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/runpy.ny - runpy, CPython 3.11's API (round 80).
 #
 # run_module(mod_name, init_globals=None, run_name=None, alter_sys=False)

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/mimetypes.ny - Python's mimetypes (3.11.15; CPython's Lib/mimetypes.py
 # with its default table, so the same names give the same answers).
 #

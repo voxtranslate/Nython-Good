@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/datetime.ny - Python's datetime module (CPython 3.12's Lib/_pydatetime.py
 # algorithms, with the messages of its C implementation, _datetimemodule.c,
 # which is what Python programs see).

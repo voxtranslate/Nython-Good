@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/array.ny - Python's array (round 79): compact arrays of numbers of one
 # C type, with CPython's typecodes, sizes, conversions and messages.
 #

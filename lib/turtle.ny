@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/turtle.ny - CPython 3.12's Lib/turtle.py (Gregor Lingl's turtle graphics,
 # its licence below) over Nython's tkinter (lib/tkinter/, lib/_tkinter/).
 # Round 84. Changes from CPython's file are marked "Nython:".

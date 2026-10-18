@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pickletools.ny - Python's pickletools (round 83): CPython 3.12's
 # Lib/pickletools.py, adapted - the opcode table (opcodes, code2op, every
 # ArgumentDescriptor and StackObject with CPython's documentation), genops,

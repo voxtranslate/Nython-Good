@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/faulthandler.ny - Python's faulthandler module (round 83): dump the
 # Python stacks on a fault, after a timeout, or on a user signal.
 #

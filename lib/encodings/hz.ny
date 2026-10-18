@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/hz.ny - CPython 3.11's encodings/hz.py (round 84), unchanged:
 # the hz codec over _codecs_cn / _multibytecodec (src/builtins/nycjk.cpp).
 #

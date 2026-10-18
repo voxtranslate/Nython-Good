@@ -1,4 +1,5 @@
 # nython: module    (a package: html.parser, html.entities)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/html - Python's html package (3.11; CPython's Lib/html/__init__.py).
 #
 #     import html

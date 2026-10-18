@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/_parseaddr.ny - the compat32 address and date parser of the
 # email package (CPython 3.12's Lib/email/_parseaddr.py): parsedate,
 # parsedate_tz, mktime_tz, quote, AddressList.

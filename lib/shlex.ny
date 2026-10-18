@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/shlex.ny - Python's shlex (3.11): a lexer for shell-like syntax
 # (CPython's Lib/shlex.py, so the same input gives the same tokens).
 #

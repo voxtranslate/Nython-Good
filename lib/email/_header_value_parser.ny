@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/_header_value_parser.ny - the RFC 5322 header value parser of
 # the email package (CPython 3.12's Lib/email/_header_value_parser.py): the
 # token classes (TokenList, Terminal, ...) and get_* parsers that

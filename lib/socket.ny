@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/socket.ny - Python's socket module over the socket layer
 # (src/builtins/net.cpp; round 77). `import socket`.
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing/pool.ny - Pool: a pool of worker processes (round 80),
 # CPython's API: apply, apply_async(func, args, kwds, callback,
 # error_callback), map, map_async, imap, imap_unordered, starmap,

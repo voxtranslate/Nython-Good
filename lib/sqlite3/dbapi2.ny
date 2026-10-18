@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/sqlite3/dbapi2.ny - Python's sqlite3.dbapi2 (CPython 3.12's
 # Lib/sqlite3/dbapi2.py): the DB-API constructors (Date, Time, Timestamp,
 # *FromTicks, Binary), sqlite_version_info, and the default adapters and

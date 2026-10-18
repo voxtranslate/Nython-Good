@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/ast.ny - Python's ast (round 83): Python's abstract syntax trees, as
 # CPython 3.12's module has them, built from Nython's own parser.
 #

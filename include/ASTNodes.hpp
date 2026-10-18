@@ -128,6 +128,15 @@ struct VariableNode : Node {
     // nowhere when read, it is CPython's UnboundLocalError, not a NameError
     // (round 81; the flag is looked at only where a NameError would be).
     bool local_read = false;
+    // Python's binding rule (round 85, set by NyScope for Python-language
+    // source): 1 - a local of the function it is in, because that function
+    // binds the name somewhere (CPython's LOAD_FAST / STORE_FAST /
+    // DELETE_FAST): read from the function's own scope only (unbound: an
+    // UnboundLocalError, whatever an enclosing function or the module
+    // binds), assigned and deleted there; 2 - a write at the top level of
+    // code exec'd in a Python-language function (exec cannot change the
+    // function's locals): bound in the code's own scope, read as usual.
+    uint8_t py_bind = 0;
     NameCache nc;   // round 81: reading it (NythonExecutor::lookupName)
     // ... and for assigning it: whether it is one of the builtins' names,
     // as of the executor's version of that set (base_names_ver_).

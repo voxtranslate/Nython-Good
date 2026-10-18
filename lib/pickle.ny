@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pickle.ny - Python's pickle (round 79): object serialization, every
 # protocol (0-5), written after CPython's C pickler (Modules/_pickle.c) so
 # that the bytes come out the same.

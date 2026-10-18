@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/sqlite3/__main__.ny - CPython 3.12's Lib/sqlite3/__main__.py: `nython -m sqlite3
 # [-v] [filename [sql]]` - run SQL on a database, or an interactive shell
 # (code.InteractiveConsole) that runs each complete statement.

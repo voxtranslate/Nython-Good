@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/hashlib.ny - Python's hashlib (round 77): md5, sha1, sha224/256/384/512,
 # sha3_224/256/384/512, shake_128/256, blake2b/blake2s, new(name),
 # pbkdf2_hmac, file_digest. The digests are NyHash.hpp's, the same on every

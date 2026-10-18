@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/fnmatch.ny - Python's fnmatch: Unix shell-style wildcards.
 #
 #     fnmatch(name, pat)       match after os.path.normcase on both (case-

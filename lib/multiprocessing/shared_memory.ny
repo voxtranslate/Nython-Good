@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing/shared_memory.ny - SharedMemory (round 80): a named
 # block of memory any process can attach to by name.
 #

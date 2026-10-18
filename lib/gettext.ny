@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/gettext.ny - Python's gettext module (round 83, CPython 3.12's code):
 # message catalogs - GNU .mo files with plural forms and contexts.
 #

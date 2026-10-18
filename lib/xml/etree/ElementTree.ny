@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/xml/etree/ElementTree.ny - Python's xml.etree.ElementTree (3.11;
 # CPython's Lib/xml/etree/ElementTree.py, Fredrik Lundh's ElementTree,
 # licence notice below; the parser under XMLParser is lib/xml/parsers/

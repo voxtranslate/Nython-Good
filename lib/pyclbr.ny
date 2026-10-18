@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pyclbr.ny - Python's pyclbr (round 83): the classes and functions a
 # module defines, read from its source without importing it - CPython
 # 3.12's Lib/pyclbr.py over lib/ast.ny (so over Nython's own parser).

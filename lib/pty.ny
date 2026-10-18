@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pty.ny - Python's pty module (round 83, CPython 3.12's code):
 # pseudo-terminals. POSIX only: on Windows importing it fails on termios
 # (ModuleNotFoundError), as CPython's does.

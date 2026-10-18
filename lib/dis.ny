@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/dis.ny - Python's dis module (round 83) over NYTHON'S VM: the
 # instructions include/VirtualMachine.hpp's compiler makes for a function, a
 # class or source text, shown in CPython 3.12's layout.
@@ -87,7 +88,7 @@ deoptmap = dict(_opcode._generic_of)
 _have_code = (types.MethodType, types.FunctionType, classmethod, staticmethod, type)
 
 # the generic instructions whose argument means something (shown even when 0)
-_ARG_OPS = set(["LOAD_CONST", "LOAD_NAME", "STORE_NAME", "DEFINE_NAME", "DELETE_NAME",
+_ARG_OPS = set(["LOAD_CONST", "LOAD_NAME", "STORE_NAME", "DEFINE_NAME", "DELETE_NAME", "LOAD_LOCAL", "DELETE_LOCAL",
                 "LOAD_GLOBAL_NAME", "STORE_GLOBAL_NAME", "LOAD_ATTR", "STORE_ATTR", "DELETE_ATTR",
                 "LOAD_ATTR_OPT", "CHECK_MEMBER", "IMPORT_NAME", "STORE_EXCEPT_AS",
                 "LOAD_SELF_ATTR", "STORE_SELF_ATTR", "DEFINE_OUTER", "INPLACE_TRY",
@@ -95,7 +96,7 @@ _ARG_OPS = set(["LOAD_CONST", "LOAD_NAME", "STORE_NAME", "DEFINE_NAME", "DELETE_
                 "CALL_KW", "CALL_EX", "UNPACK_SEQ", "MAKE_FUNCTION", "MAKE_CLASS",
                 "FOR_ITER", "FOR_PREP", "FIN_JUMP", "RAISE_ERROR", "PRINT"])
 _CONST_OPS = set(["LOAD_CONST", "LOAD_METHNAME"])
-_NAME_OPS = set(["LOAD_NAME", "STORE_NAME", "DEFINE_NAME", "DELETE_NAME",
+_NAME_OPS = set(["LOAD_NAME", "STORE_NAME", "DEFINE_NAME", "DELETE_NAME", "LOAD_LOCAL", "DELETE_LOCAL",
                  "LOAD_GLOBAL_NAME", "STORE_GLOBAL_NAME", "LOAD_ATTR", "STORE_ATTR",
                  "DELETE_ATTR", "LOAD_ATTR_OPT", "CHECK_MEMBER", "IMPORT_NAME",
                  "STORE_EXCEPT_AS", "LOAD_SELF_ATTR", "STORE_SELF_ATTR", "DEFINE_OUTER",

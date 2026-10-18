@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/xml/parsers/expat.ny - Python's xml.parsers.expat (pyexpat) interface
 # over an XML 1.0 parser written in Nython (CPython wraps the C library
 # expat; Nython has no C library for it, so this is a parser of its own that

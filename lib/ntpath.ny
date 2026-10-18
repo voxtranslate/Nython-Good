@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/ntpath.ny - Python's ntpath (round 80): operations on Windows path
 # names, CPython 3.11's Lib/ntpath.py, importable on every platform (it
 # computes the same results on Linux, as CPython's does).

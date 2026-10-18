@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/encoders.ny - email.encoders (CPython 3.12's
 # Lib/email/encoders.py): encode_base64, encode_quopri, encode_7or8bit,
 # encode_noop.

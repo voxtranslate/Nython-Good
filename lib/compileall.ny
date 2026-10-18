@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/compileall.ny - Python's compileall (round 83): "byte-compile" every
 # source file of a directory tree, a list of files or sys.path - CPython
 # 3.12's Lib/compileall.py over lib/py_compile.ny.

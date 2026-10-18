@@ -1079,12 +1079,15 @@ class mappingproxy:
         return str(self._ny_mapping)
 
 class _NyCode:
-    # what compile(source, filename, mode) returns; eval() / exec() run it
-    def __init__(self, source, filename, mode):
+    # what compile(source, filename, mode) returns; eval() / exec() run it.
+    # _ny_pyrule (round 85): compiled with Python's binding rule (compile()
+    # called from Python-language source - lib/ast.ny's for a tree)
+    def __init__(self, source, filename, mode, pyrule=false):
         self.source = source
         self.co_filename = filename
         self.mode = mode
         self.co_name = "<module>"
+        self._ny_pyrule = pyrule
 
     def __repr__(self):
         return "<code object <module>, file \"" + self.co_filename + "\", line 1>"

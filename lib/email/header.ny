@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/header.ny - email.header (CPython 3.12's Lib/email/header.py):
 # Header, decode_header, make_header - RFC 2047 headers, compat32.
 

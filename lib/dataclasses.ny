@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/dataclasses.ny - Python's dataclasses module: CPython 3.11's
 # Lib/dataclasses.py, its algorithms and its messages (round 77).
 #

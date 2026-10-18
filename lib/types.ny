@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/types.ny - Python's types module (round 77): names for the types of
 # the runtime's values, and helpers for making classes dynamically.
 #

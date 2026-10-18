@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/decimal.ny - Python's decimal (3.11): decimal floating point as the
 # General Decimal Arithmetic Specification (Cowlishaw; the arithmetic of
 # IEEE 754-2008's decimal formats) defines it. The algorithms are CPython's

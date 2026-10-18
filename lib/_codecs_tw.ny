@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_codecs_tw.ny - CPython's _codecs_tw (round 84): the codec objects of
 # the Taiwanese: Big5 and CP950 codecs, for lib/encodings/
 # (src/builtins/nycjk.cpp has the codecs).

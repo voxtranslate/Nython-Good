@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/hex_codec.ny - CPython 3.12's encodings/hex_codec.py (round 83), unchanged.
 
 """Python 'hex_codec' Codec - 2-digit hex content transfer encoding.

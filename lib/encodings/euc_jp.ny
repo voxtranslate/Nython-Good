@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/euc_jp.ny - CPython 3.11's encodings/euc_jp.py (round 84), unchanged:
 # the euc_jp codec over _codecs_jp / _multibytecodec (src/builtins/nycjk.cpp).
 #

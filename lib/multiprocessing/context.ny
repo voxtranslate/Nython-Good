@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing/context.ny - start-method contexts (round 80). Nython
 # starts processes one way, "spawn" (a fresh interpreter that re-runs the
 # main program as __mp_main__): get_context() / get_context("spawn") give

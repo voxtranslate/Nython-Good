@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/telnetlib.ny - Python's telnetlib (CPython 3.12's
 # Lib/telnetlib.py, deprecated for removal in 3.13 - importing it warns):
 # Telnet (read_until, read_all, read_some, read_very_eager, read_eager,

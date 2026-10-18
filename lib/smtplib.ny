@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/smtplib.ny - Python's smtplib (CPython 3.12's Lib/smtplib.py):
 # SMTP (connect, helo/ehlo with the ESMTP features, login with CRAM-MD5,
 # PLAIN and LOGIN, auth() with your own authobject, starttls, sendmail,

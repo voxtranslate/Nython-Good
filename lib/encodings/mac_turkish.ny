@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/mac_turkish.ny - CPython 3.12's encodings/mac_turkish.py (round 83), unchanged.
 
 """ Python Character Mapping Codec mac_turkish generated from 'MAPPINGS/VENDORS/APPLE/TURKISH.TXT' with gencodec.py.

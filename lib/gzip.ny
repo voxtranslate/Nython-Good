@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/gzip.ny - Python's gzip (round 79): read and write gzip files
 # (RFC 1952) over lib/zlib.ny, interchangeable with CPython's and gzip(1)'s.
 #

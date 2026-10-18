@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_sqlite3.ny - CPython's C module _sqlite3 (3.12), written in Nython over
 # libsqlite3 loaded at run time (src/builtins/nysqlite.cpp, natives _sql_*).
 # lib/sqlite3/ is CPython's package over it: use `import sqlite3`.

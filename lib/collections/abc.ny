@@ -1,4 +1,5 @@
 # nython: module    (import collections.abc / from collections.abc import Mapping)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/collections/abc.ny - Python's collections.abc: the abstract base
 # classes for containers (PEP 3119), CPython 3.12's Lib/_collections_abc.py.
 #

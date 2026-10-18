@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/io.ny - Python's io module (CPython 3.12): in-memory streams and the
 # stream base classes.
 #

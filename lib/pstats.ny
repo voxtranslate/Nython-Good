@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/pstats.ny - Python's pstats: reports of profiler statistics (round 79;
 # lib/cProfile.ny and lib/profile.ny make them).
 #

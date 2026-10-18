@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_codecs_cn.ny - CPython's _codecs_cn (round 84): the codec objects of
 # the Mainland Chinese: GB2312, GBK, GB18030 (with its four-byte ranges) and
 # HZ codecs, for lib/encodings/ (src/builtins/nycjk.cpp has the codecs).

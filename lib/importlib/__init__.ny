@@ -1,4 +1,5 @@
 # nython: module    (a package: importlib.util, importlib.machinery, importlib.abc, importlib.resources)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/importlib - Python's importlib (CPython 3.12's API) over the engines'
 # own module loader (round 80).
 #

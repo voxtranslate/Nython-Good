@@ -1,4 +1,5 @@
 # nython: module    (a package: tkinter.ttk, font, messagebox, simpledialog, filedialog, ...)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tkinter - Python's tkinter over Nython's own Tk (round 84).
 #
 #     import tkinter as tk

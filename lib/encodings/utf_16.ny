@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/utf_16.ny - CPython 3.12's encodings/utf_16.py (round 83), unchanged.
 
 """ Python 'utf-16' Codec

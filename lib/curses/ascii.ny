@@ -1,4 +1,5 @@
 # nython: module    (import curses.ascii)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/curses/ascii.ny - curses.ascii (round 84): CPython 3.11's curses/ascii.py,
 # unchanged - the ASCII constants, isalnum() ... ismeta(), ascii/ctrl/alt, unctrl.
 #

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/this.ny - The Zen of Python, by Tim Peters (round 83): `import this`
 # prints it, as CPython's Lib/this.py does (the text kept ROT13-encoded in
 # `s`, the decoding table in `d`).

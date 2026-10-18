@@ -1,4 +1,5 @@
 # nython: module
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # ctypes - Python's foreign function library (round 83), over the native
 # _ffi_* builtins (src/builtins/ffi.cpp): shared libraries, C data types in
 # raw memory, calls into C and C-callable callbacks.

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/cmath.ny - Python's cmath module (round 83): mathematical functions
 # for complex numbers.
 #

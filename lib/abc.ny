@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/abc.ny - Python's abc: abstract base classes (PEP 3119), as CPython
 # 3.12's Lib/abc.py over Lib/_py_abc.py (the pure-Python implementation of
 # the C accelerator, with the same caches and the same messages).

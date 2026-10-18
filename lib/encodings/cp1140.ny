@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/cp1140.ny - CPython 3.12's encodings/cp1140.py (round 83), unchanged.
 
 """ Python Character Mapping Codec cp1140 generated from 'python-mappings/CP1140.TXT' with gencodec.py.

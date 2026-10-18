@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/base64mime.ny - base64 MIME bodies and headers (CPython 3.12's
 # Lib/email/base64mime.py): header_length, header_encode, body_encode,
 # decode, body_decode/decodestring.

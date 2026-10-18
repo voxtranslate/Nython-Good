@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/contentmanager.ny - email.contentmanager (CPython 3.12's
 # Lib/email/contentmanager.py): ContentManager and raw_data_manager,
 # EmailMessage.get_content/set_content's handlers.

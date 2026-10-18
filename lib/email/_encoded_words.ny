@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/_encoded_words.ny - RFC 2047 encoded words for email (CPython 3.12's
 # Lib/email/_encoded_words.py): decode/encode, decode_q/encode_q,
 # decode_b/encode_b, len_q/len_b.

@@ -1,4 +1,5 @@
 # nython: module    (a package: collections.abc is lib/collections/abc.ny)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/collections/__init__.ny - Python's collections (round 77).
 #
 #     from collections import deque, Counter, defaultdict, OrderedDict, namedtuple

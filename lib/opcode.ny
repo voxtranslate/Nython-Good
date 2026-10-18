@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/opcode.ny - Python's opcode module (round 83) for NYTHON'S VM: the
 # names and numbers of the instructions of Nython's bytecode virtual
 # machine (include/VirtualMachine.hpp's Op), not CPython's.
@@ -68,7 +69,7 @@ hasname = _ops([n for n in opname
 hasjrel = []
 hasjabs = _ops([n for n in opname if _generic(n).startswith("JUMP_")] +
                ["FOR_ITER", "FOR_ITER_RANGE", "FOR_ITER_LIST", "FOR_ITER_GEN", "FIN_JUMP"])
-haslocal = []
+haslocal = _ops(["LOAD_LOCAL", "DELETE_LOCAL"])   # round 85: Python's rule (CPython's LOAD_FAST / DELETE_FAST)
 hasfree = []
 hascompare = _ops([n for n in opname if _generic(n).startswith("COMPARE_")])
 _counted = ["BUILD_LIST", "BUILD_TUPLE", "BUILD_MAP", "CALL_FUNCTION", "CALL_METHOD", "CALL_KW",
@@ -82,6 +83,7 @@ hasarg = sorted(set(hasconst + hasname + hasjabs +
 def _effect_table():
     t = {
         "LOAD_CONST": 1, "LOAD_NAME": 1, "STORE_NAME": -1, "DEFINE_NAME": -1, "DELETE_NAME": 0,
+        "LOAD_LOCAL": 1, "DELETE_LOCAL": 0,
         "LOAD_GLOBAL_NAME": 1, "STORE_GLOBAL_NAME": -1, "LOAD_ATTR": 0, "STORE_ATTR": -2,
         "DELETE_ATTR": -1, "LOAD_SUBSCR": -1, "STORE_SUBSCR": -3, "DELETE_SUBSCR": -2,
         "DUP_TOP": 1, "DUP_TOP_TWO": 2, "POP_TOP": -1, "ROT_TWO": 0, "ROT_THREE": 0,

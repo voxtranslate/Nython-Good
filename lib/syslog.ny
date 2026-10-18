@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/syslog.ny - Python's syslog module (round 83): the Unix system
 # logger. POSIX only: on Windows `import syslog` raises ModuleNotFoundError,
 # as CPython's does.

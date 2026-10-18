@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/sndhdr.ny - Python's sndhdr (CPython 3.12's Lib/sndhdr.py,
 # deprecated for removal in 3.13 - importing it warns): what(), whathdr()
 # - the sound file type (aifc, aiff, au, hcom, sndr, sndt, voc, wav, 8svx,

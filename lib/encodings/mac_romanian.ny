@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/mac_romanian.ny - CPython 3.12's encodings/mac_romanian.py (round 83), unchanged.
 
 """ Python Character Mapping Codec mac_romanian generated from 'MAPPINGS/VENDORS/APPLE/ROMANIAN.TXT' with gencodec.py.

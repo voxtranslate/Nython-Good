@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/oem.ny - CPython 3.11's encodings/oem.py (round 84), unchanged:
 # Windows' OEM code page over codecs.oem_encode/_decode (src/builtins/nycodecs.cpp);
 # on other systems the import fails, so the lookup is a LookupError, as in CPython.

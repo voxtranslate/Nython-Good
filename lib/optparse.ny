@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/optparse.ny - Python's optparse module (round 83, CPython 3.12's
 # code): the older command-line parser, with help output identical to
 # CPython's.

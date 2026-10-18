@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/wsgiref/simple_server.ny - wsgiref.simple_server (CPython 3.12's
 # Lib/wsgiref/simple_server.py): WSGIServer, WSGIRequestHandler,
 # make_server, demo_app, ServerHandler - a WSGI server over http.server.

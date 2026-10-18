@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/wsgiref/util.ny - wsgiref.util (CPython 3.12's Lib/wsgiref/util.py):
 # FileWrapper, guess_scheme, application_uri, request_uri,
 # shift_path_info, setup_testing_defaults, is_hop_by_hop.

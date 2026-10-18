@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/dbm/sqlite3.ny - Python's dbm.sqlite3 (CPython 3.13's
 # Lib/dbm/sqlite3.py): a dbm over an SQLite database (lib/_sqlite3.ny).
 

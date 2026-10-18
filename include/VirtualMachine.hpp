@@ -211,6 +211,12 @@ enum class Op : uint8_t {
     // while an exception propagates keeps it where sys.exc_info(), the
     // __context__ of one raised there and a bare raise find it
     FIN_EXC_OF,
+    // round 85 (generic): Python's binding rule (VariableNode::py_bind 1,
+    // NyScope) - a local of the running function, as CPython's LOAD_FAST /
+    // DELETE_FAST: names[arg] in the frame's own variables only, an unbound
+    // one an UnboundLocalError (DELETE_LOCAL in code exec'd at a function's
+    // top level, py_bind 2: a NameError). Its stores are DEFINE_NAME.
+    LOAD_LOCAL, DELETE_LOCAL,
     OP_COUNT_
 };
 
@@ -1346,6 +1352,8 @@ private:
             auto* vn=static_cast<nython::node::VariableNode*>(nd.get());
             if(vn->global_ref)
                 emit(Op::LOAD_GLOBAL_NAME,C().add_name(nd->token().value),l);
+            else if(vn->py_bind==1)   // round 85: Python's rule, a local of the function
+                emit(Op::LOAD_LOCAL,C().add_name(rn(nd->token().value)),l);
             else {
                 if(vn->local_read){   // round 81
                     auto& lr=C().local_reads;
@@ -1674,7 +1682,9 @@ private:
             auto dn=std::static_pointer_cast<nython::node::DeleteNode>(nd);
             if(!dn->target) break;
             if(dn->target->type()==NT::VARIABLE){
-                emit(Op::DELETE_NAME,C().add_name(rn(dn->target->token().value)),l);
+                // round 85: Python's rule - the running frame's own (DELETE_LOCAL)
+                bool own=static_cast<nython::node::VariableNode*>(dn->target.get())->py_bind!=0;
+                emit(own?Op::DELETE_LOCAL:Op::DELETE_NAME,C().add_name(rn(dn->target->token().value)),l);
             } else if(dn->target->type()==NT::SUBSCRIPT){
                 // del obj[key] — emit: LOAD obj, LOAD key, DELETE_SUBSCR
                 auto s=std::static_pointer_cast<nython::node::SubscriptNode>(dn->target);
@@ -2814,6 +2824,8 @@ private:
             if(tgt->token().value=="self" && C().is_method && !C().bind_first) { emit(Op::STORE_SELF,0,l); return; }   // round 77
             if(std::static_pointer_cast<nython::node::VariableNode>(tgt)->global_ref)
                 emit(Op::STORE_GLOBAL_NAME,C().add_name(tgt->token().value),l);
+            else if(static_cast<nython::node::VariableNode*>(tgt.get())->py_bind)
+                emit_dn(tgt->token().value,l);   // round 85: Python's rule - bound in the running frame
             else emit_sn(tgt->token().value,l);
         } else if(tgt->type()==NT::ATTRIBUTE) {
             auto a=std::static_pointer_cast<nython::node::AttributeNode>(tgt);
@@ -6449,10 +6461,17 @@ private:
         return VMVal::make_instance("_NyInstanceDict",attrs);
     }
     // ── eval / exec / compile (round 77; as NythonExecutor's) ──
-    std::string snippet_source(const VMVal& v, std::string& mode, std::string& fname, const char* who) {
+    // pyrule (round 85): a code object's binding rule - 1 Python's, 0
+    // Nython's (what compile() recorded, _NyCode._ny_pyrule); -1 for text
+    std::string snippet_source(const VMVal& v, std::string& mode, std::string& fname, const char* who, int* pyrule=nullptr) {
+        if(pyrule) *pyrule=-1;
         if(v.type==VMType::INSTANCE&&nyrt::shown_class_name(v.class_name)=="_NyCode"&&v.map){
             auto g=[&](const char* k){ auto it=v.map->find(k); return it!=v.map->end()?it->second.to_string():std::string(); };
             mode=g("mode"); fname=g("co_filename");
+            if(pyrule){
+                auto pr=v.map->find("_ny_pyrule");
+                *pyrule=pr!=v.map->end()&&pr->second.is_truthy()?1:0;
+            }
             return g("source");
         }
         if(v.type==VMType::BYTES) return v.bdata();
@@ -6509,19 +6528,31 @@ private:
         }
         a[0]=unwrap_payload(a[0]);   // a str subclass (round 81: exec is payload-transparent)
         std::string mode=is_exec?"exec":"eval", fname="<string>";
-        std::string src=snippet_source(a[0],mode,fname,who);
+        int crule=-1;
+        std::string src=snippet_source(a[0],mode,fname,who,&crule);
         if(mode=="exec") is_exec=true;
         if(!is_exec){
             size_t b=src.find_first_not_of(" \t");
             src=b==std::string::npos?std::string():src.substr(b);
         }
-        auto ast=parse_snippet(src,fname);
-        if(!ast) return VMVal::make_none();
-        if(!is_exec){
-            if(!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
-            ast=parse_snippet("__ny_eval__ = (" + src + "\n)",fname);   // its value lands in a variable
-        }
         bool has_g=a.size()>1&&a[1].type!=VMType::NONE, has_l=a.size()>2&&a[2].type!=VMType::NONE;
+        // round 85: Python's binding rule for code a Python-language file runs
+        // (or compile() made there); exec'd in such a function without
+        // namespaces, what its top level binds stays its own (CPython: exec
+        // cannot change a function's locals), as the interpreter's
+        const bool caller_py=vm_caller_python();
+        const bool top_locals=caller_py&&!has_g&&!has_l&&!call_stack_.empty()&&call_stack_.back().code
+            &&call_stack_.back().code->first_line>0&&!call_stack_.back().code->is_class;
+        nython::node::node_ptr ast;
+        {
+            nython::scope::RuleScope rule(crule>=0?crule==1:nython::scope::code_rule(fname,src,caller_py), top_locals);   // (the parses only)
+            ast=parse_snippet(src,fname);
+            if(!ast) return VMVal::make_none();
+            if(!is_exec){
+                if(!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
+                ast=parse_snippet("__ny_eval__ = (" + src + "\n)",fname);   // its value lands in a variable
+            }
+        }
         // round 81: exec(src, globals()) / eval(src, globals()) run in that
         // module's own scope: a module's map is its scope (the live path
         // below); the program's globals are given to the code and what it
@@ -6655,6 +6686,7 @@ private:
             auto it=locals.find("__ny_eval__");
             return it!=locals.end()?it->second:VMVal::make_none();
         }
+        if(top_locals) return VMVal::make_none();   // round 85: the function's locals stay as they were
         {
             // what it bound or rebound, into the caller's scope
             for(auto& kv:locals){
@@ -6704,11 +6736,25 @@ private:
         std::string fname=a[1].to_string(), mode=a[2].to_string();
         if(mode!="exec"&&mode!="eval"&&mode!="single") raise_native_exception("ValueError","compile() mode must be 'exec', 'eval' or 'single'");
         std::string m2=mode, f2=fname;
-        std::string src=snippet_source(a[0],m2,f2,"compile");
-        auto ast=parse_snippet(src,fname);
+        int crule=-1;
+        std::string src=snippet_source(a[0],m2,f2,"compile",&crule);
+        // round 85: the code's binding rule - its caller's (or the code
+        // object's it was given), kept for the exec / eval that runs it
+        const bool py=crule>=0?crule==1:nython::scope::code_rule(fname,src,vm_caller_python());
+        nython::node::node_ptr ast;
+        {
+            nython::scope::RuleScope rule(py,false);
+            ast=parse_snippet(src,fname);
+        }
         if(mode=="eval"&&ast&&!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
-        std::vector<VMVal> ca{VMVal::make_str(src),VMVal::make_str(fname),VMVal::make_str(mode=="single"?"exec":mode)};
+        std::vector<VMVal> ca{VMVal::make_str(src),VMVal::make_str(fname),VMVal::make_str(mode=="single"?"exec":mode),VMVal::make_bool(py)};
         return vm_call(load_var("_NyCode"),ca,std::nullopt,nullptr);
+    }
+    // round 85: the running code is Python-language source's (NyScope's
+    // registry of the files parsed as such)
+    bool vm_caller_python() {
+        if(call_stack_.empty()||!call_stack_.back().code) return false;
+        return nython::scope::python_file(call_stack_.back().code->file);
     }
 
     // ── Reflection (round 77) ──
@@ -8817,6 +8863,33 @@ private:
                 VMVal res=ni_none(call_dunder(lv,dn,{r}));
                 if(res.type!=VMType::NONE){ push(std::move(res)); call_stack_.back().ip++; break; }
                 push(std::move(lv)); push(std::move(r));
+                break;
+            }
+            case Op::LOAD_LOCAL: {   // round 85: Python's rule (see the Op)
+                const std::string& n=fr.code->names[ins.arg];
+                const VMVal* p=nullptr;
+                if(fr.own_env){
+                    auto e=fr.closure_env->find(n);
+                    if(e!=fr.closure_env->end()) p=&e->second;
+                }
+                if(!p){
+                    auto it=fr.locals.find(n);
+                    if(it!=fr.locals.end()) p=&it->second;
+                }
+                if(!p||p->is_missing())
+                    throw_exception(make_exception("UnboundLocalError",{VMVal::make_str("cannot access local variable '"+n+"' where it is not associated with a value")}));
+                push(*p);
+                break;
+            }
+            case Op::DELETE_LOCAL: {   // round 85
+                const std::string& n=fr.code->names[ins.arg];
+                bool hit=fr.locals.erase(n)>0;
+                if(fr.own_env && fr.closure_env->erase(n)>0) hit=true;
+                if(!hit){
+                    if(fr.code->first_line>0)
+                        throw_exception(make_exception("UnboundLocalError",{VMVal::make_str("cannot access local variable '"+n+"' where it is not associated with a value")}));
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                }
                 break;
             }
             case Op::DELETE_NAME: {
@@ -17309,6 +17382,8 @@ private:
         case Op::END_EXCEPT:   return "END_EXCEPT";
         case Op::FIN_NORMAL:   return "FIN_NORMAL";
         case Op::FIN_EXC_OF:   return "FIN_EXC_OF";
+        case Op::LOAD_LOCAL:   return "LOAD_LOCAL";     // round 85
+        case Op::DELETE_LOCAL: return "DELETE_LOCAL";   // round 85
         case Op::FIN_RETURN:   return "FIN_RETURN";
         case Op::FIN_JUMP:     return "FIN_JUMP";
         case Op::END_FINALLY:  return "END_FINALLY";

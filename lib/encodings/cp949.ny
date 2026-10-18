@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/cp949.ny - CPython 3.11's encodings/cp949.py (round 84), unchanged:
 # the cp949 codec over _codecs_kr / _multibytecodec (src/builtins/nycjk.cpp).
 #

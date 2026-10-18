@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/tabnanny.ny - Python's tabnanny (round 83): detection of ambiguous
 # indentation - CPython 3.12's Lib/tabnanny.py (Tim Peters') over
 # lib/tokenize.ny.

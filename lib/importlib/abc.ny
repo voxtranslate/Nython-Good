@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/importlib/abc.ny - importlib.abc (CPython 3.12's API, round 80): the
 # abstract base classes of finders and loaders, for programs that write
 # their own (put on sys.meta_path, a MetaPathFinder is asked by

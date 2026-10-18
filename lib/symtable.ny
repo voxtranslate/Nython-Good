@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/symtable.ny - Python's symtable (round 83): the compiler's symbol
 # tables - which names each scope binds, uses, declares, and whether each is
 # local, global, free or a cell - as CPython 3.12 computes them.

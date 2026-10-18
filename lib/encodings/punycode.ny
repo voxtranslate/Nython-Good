@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/punycode.ny - CPython 3.12's encodings/punycode.py (round 83); its memoryview test adapted.
 
 """ Codec for the Punicode encoding, as specified in RFC 3492

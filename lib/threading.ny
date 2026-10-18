@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/threading.ny - Python's threading module (round 77) over the runtime's
 # threads (src/NyConc.cpp): real OS threads under one GIL, blocking calls
 # that release it. `import threading` binds this namespace and, as before,

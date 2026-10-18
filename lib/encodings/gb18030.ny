@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/gb18030.ny - CPython 3.11's encodings/gb18030.py (round 84), unchanged:
 # the gb18030 codec over _codecs_cn / _multibytecodec (src/builtins/nycjk.cpp).
 #

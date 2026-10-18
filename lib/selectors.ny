@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/selectors.ny - Python's selectors module (round 77). `import selectors`.
 # DefaultSelector over the socket layer's waits; like every wait there, a
 # select() inside an async task parks the task instead of blocking the loop.

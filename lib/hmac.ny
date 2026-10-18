@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/hmac.ny - Python's hmac (RFC 2104, round 77) over lib/hashlib.ny.
 #
 #     import hmac

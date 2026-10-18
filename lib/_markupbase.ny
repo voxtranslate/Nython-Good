@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_markupbase.ny - Python's _markupbase (CPython 3.11's
 # Lib/_markupbase.py): ParserBase, the shared support html.parser uses for
 # declarations (<!DOCTYPE ...>, <!ELEMENT ...>, <![CDATA[...]]> and other

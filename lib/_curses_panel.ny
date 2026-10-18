@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_curses_panel.ny - CPython's _curses_panel (round 84): panel stacks
 # over Nython's curses (lib/_curses.ny), with ncurses' panel library's
 # algorithms (panel/p_*.c): the deck has stdscr as its bottom pseudo-panel;

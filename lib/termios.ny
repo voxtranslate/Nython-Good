@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/termios.ny - Python's termios module (round 83): POSIX terminal
 # control. POSIX only: on Windows `import termios` raises
 # ModuleNotFoundError, as CPython's does.

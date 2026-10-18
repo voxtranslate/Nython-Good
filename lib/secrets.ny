@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/secrets.ny - Python's secrets (round 77) over the OS's random source
 # (os_urandom: /dev/urandom, RtlGenRandom on Windows).
 import base64

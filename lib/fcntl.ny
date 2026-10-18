@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/fcntl.ny - Python's fcntl module (round 83): fcntl(2) and ioctl(2) on
 # file descriptors, and advisory file locks. POSIX only: on Windows
 # `import fcntl` raises ModuleNotFoundError, as CPython's does.

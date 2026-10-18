@@ -1,4 +1,5 @@
 # nython: module    (a package: xml.dom.minidom, its builders and helpers)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/xml/dom - Python's xml.dom (3.11; CPython's Lib/xml/dom/__init__.py):
 # the Node type constants, the DOMException hierarchy (IndexSizeErr ...
 # NamespaceErr, with their codes), UserDataHandler, the XML/XMLNS/XHTML

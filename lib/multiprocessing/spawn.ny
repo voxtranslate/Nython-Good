@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing/spawn.ny - the spawn start method (round 80): what a
 # parent sends its child and what the child does with it (CPython's
 # multiprocessing/spawn.py). The child is sys.executable running

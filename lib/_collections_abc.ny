@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_collections_abc.ny - CPython's internal name for collections.abc
 # (what os, typing and collections import): the same module's classes,
 # defined in lib/collections/abc.ny so that they are named

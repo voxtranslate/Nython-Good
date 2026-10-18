@@ -1,4 +1,5 @@
 # nython: module    (part of the tkinter package: lib/tkinter/)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 """A ScrolledText widget feels like a text widget but also has a
 vertical scroll bar on its right.  (Later, options may be added to
 add a horizontal bar as well, to make the bars disappear

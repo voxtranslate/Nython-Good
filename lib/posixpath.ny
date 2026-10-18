@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/posixpath.ny - Python's posixpath (round 80): operations on POSIX path
 # names, CPython 3.11's Lib/posixpath.py, importable on every platform (on
 # Windows too, as CPython's: it only computes, except where it asks the

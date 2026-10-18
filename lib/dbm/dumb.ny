@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/dbm/dumb.ny - Python's dbm.dumb (CPython 3.13's Lib/dbm/dumb.py): the
 # portable dbm in pure Python - a .dat file of values and a .dir index.
 #

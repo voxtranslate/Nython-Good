@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/asyncio/__init__.ny - Python's asyncio (3.12) over Nython's event loop
 # (round 77; the event-loop API, transports and protocols, subprocesses, Unix
 # sockets, signals, TLS and the 3.12 cancellation rules: round 82).

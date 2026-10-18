@@ -1,4 +1,5 @@
 # nython: module    (import curses.textpad)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/curses/textpad.ny - curses.textpad (round 84): CPython 3.11's
 # curses/textpad.py, unchanged - rectangle() and the Emacs-style Textbox
 # (edit, do_command, gather, insert_mode, stripspaces).

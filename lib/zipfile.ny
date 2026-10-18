@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/zipfile.ny - Python's zipfile (round 79): read and write ZIP archives
 # (PKWARE APPNOTE 6.3), interchangeable with CPython's and Info-ZIP's.
 #

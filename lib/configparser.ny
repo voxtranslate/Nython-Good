@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/configparser.ny - Python's configparser (3.11; CPython's
 # Lib/configparser.py, so the same files parse to the same values and
 # write() gives the same text).

@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/readline.ny - Python's readline module (round 83), over the line
 # editor of Nython's own interactive prompt (NythonREPL.hpp's
 # MultilineEditor) rather than over GNU readline or libedit.

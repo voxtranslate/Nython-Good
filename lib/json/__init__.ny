@@ -1,4 +1,5 @@
 # nython: module    (a package: json.decoder, json.encoder)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/json - Python's json module (CPython 3.12's Lib/json).
 #
 #     import json

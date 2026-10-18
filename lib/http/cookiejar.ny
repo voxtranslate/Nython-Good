@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/http/cookiejar.ny - cookies for HTTP clients (round 77), RFC 6265's
 # rules: CookieJar, Cookie, DefaultCookiePolicy (the RFC 6265 subset Python's
 # applies by default).

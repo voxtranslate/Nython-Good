@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/_codecs_jp.ny - CPython's _codecs_jp (round 84): the codec objects of
 # the Japanese: Shift_JIS, CP932, EUC-JP, Shift_JIS-2004, EUC-JIS-2004 and the
 # JIS X 0213:2000 variants codecs, for lib/encodings/ (src/builtins/nycjk.cpp

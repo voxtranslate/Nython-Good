@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/encodings/utf_7.ny - CPython 3.11's encodings/utf_7.py (round 84), unchanged:
 # the UTF-7 codec over codecs.utf_7_encode/_decode (native: include/NyCodecs.hpp).
 

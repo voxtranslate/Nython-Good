@@ -1,4 +1,5 @@
 # nython: module    (a package: multiprocessing.process, .queues, .synchronize, .connection, .pool, ...)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/multiprocessing - Python's multiprocessing (round 80): processes,
 # their communication and synchronisation, shared memory, pools and
 # managers, with CPython 3.11's API, on the spawn start method.

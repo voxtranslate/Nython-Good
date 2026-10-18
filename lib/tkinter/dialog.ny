@@ -1,4 +1,5 @@
 # nython: module    (part of the tkinter package: lib/tkinter/)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # dialog.py -- Tkinter interface to the tk_dialog script.
 #
 # lib/tkinter/dialog.ny - CPython 3.12's Lib/tkinter/dialog.py over

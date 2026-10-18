@@ -1,4 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/email/generator.ny - email.generator (CPython 3.12's
 # Lib/email/generator.py): Generator, BytesGenerator, DecodedGenerator -
 # flattening a message to text or bytes under a policy.

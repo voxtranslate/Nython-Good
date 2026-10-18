@@ -3,9 +3,14 @@
 #include "ASTNodes.hpp"
 #include "Except.hpp"
 #include "Script.hpp"
+#include "NyRuntime.hpp"   // round 85: library_dirs (the warnings' default filter)
 
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -33,16 +38,33 @@ struct WriteSite {
     std::string name;
     Write how;
     Location where;
+    VariableNode* node = nullptr;   // round 85: the name written (an assignment's or del's target)
+    bool aug = false;               // round 85: `x op= v`
+};
+
+// A position in the source, for ordering (round 85).
+struct Pos {
+    uint32_t row = 0, col = 0;
+    Pos() = default;
+    Pos(const Location& l) : row(l.row), col(l.column) {}
 };
 
 struct Scope {
     Kind kind;
     Scope* parent;
+    bool py = false;    // round 85: Python's binding rule here (NyScope.hpp)
+    Node* fn = nullptr; // round 85: the def or lambda this function scope is
     std::map<std::string, Location> declared;  // var/let/const, params, def, class, import, loop/except/with targets
+    // round 85: what declared each name first - 'p' a parameter, 'd' def,
+    // 'c' class, 'i' import, 'v' var/let/const, 't' a for/with/except
+    // target or walrus, 'n' an enum/interface/namespace
+    std::map<std::string, char> dkind;
     std::set<std::string> assigned;            // plain assignment targets
+    std::map<std::string, Pos> assigned_at;    // round 85: ... where first assigned
     std::map<std::string, Location> consts;    // const declarations here
     std::map<std::string, Location> globals;   // `global x`
     std::map<std::string, Location> nonlocals; // `nonlocal x`
+    std::set<std::string> comp_walrus;         // round 85: names a walrus in a comprehension binds here (PEP 572)
     std::vector<WriteSite> writes;
     // Binding forms whose `global` flag NyScope sets.
     std::vector<WalrusNode*> walruses;
@@ -64,12 +86,47 @@ std::string bare(std::string n) {
     return n;
 }
 
+// The lines of a source, made only when a def line may carry the opt-in
+// comment (round 85).
+struct Lines {
+    const std::string* code = nullptr;
+    std::vector<size_t> starts;
+    bool any = false;   // the source holds "nython: python" at all
+    void init(const std::string& c) {
+        code = &c;
+        any = c.find("nython: python") != std::string::npos || c.find("nython:python") != std::string::npos;
+        if (!any) return;
+        starts.push_back(0);
+        for (size_t i = 0; i < c.size(); i++) if (c[i] == '\n') starts.push_back(i + 1);
+    }
+    // whether line `row` (1-based) ends with the comment `# nython: python`
+    bool opts_in(uint32_t row) const {
+        if (!any || row == 0 || row > starts.size()) return false;
+        size_t b = starts[row - 1], e = row < starts.size() ? starts[row] : code->size();
+        std::string ln = code->substr(b, e - b);
+        size_t h = ln.find('#');
+        while (h != std::string::npos) {
+            size_t p = ln.find_first_not_of(" \t", h + 1);
+            if (p != std::string::npos && ln.compare(p, 7, "nython:") == 0) {
+                size_t w = ln.find_first_not_of(" \t", p + 7);
+                if (w != std::string::npos && ln.compare(w, 6, "python") == 0) return true;
+            }
+            h = ln.find('#', h + 1);
+        }
+        return false;
+    }
+};
+
 struct Collector {
     std::unique_ptr<Scope> root;
+    Lines lines;           // round 85
+    bool cur_aug = false;  // round 85: the target being written is an augmented assignment's
 
     Scope* child(Scope* s, Kind k) {
         s->children.push_back(std::make_unique<Scope>(k, s));
-        return s->children.back().get();
+        Scope* c = s->children.back().get();
+        c->py = s->py;   // round 85: the rule is inherited
+        return c;
     }
 
     static std::string on_line(const Location& at) {
@@ -79,7 +136,7 @@ struct Collector {
     // A declaration: var/let/const, def, class, import, a parameter. A name
     // declared const in this scope cannot be declared again, and a const
     // cannot take over a name this scope already declared.
-    void declare(Scope* s, const std::string& n, const Location& at, bool is_const = false) {
+    void declare(Scope* s, const std::string& n, const Location& at, bool is_const = false, char kind = 'v') {
         if (n.empty()) return;
         auto c = s->consts.find(n);
         if (c != s->consts.end())
@@ -90,14 +147,19 @@ struct Collector {
                 throw SyntaxError(at, "cannot redeclare '" + n + "' as a constant " + on_line(d->second));
             s->consts.emplace(n, at);
         }
-        s->declared.emplace(n, at);
+        if (s->declared.emplace(n, at).second) s->dkind.emplace(n, kind);
     }
 
-    void write(Scope* s, const std::string& n, Write how, const Location& at) {
-        if (n.empty() || n == "_") return;
-        s->writes.push_back({n, how, at});
-        if (how == Write::ASSIGN) s->assigned.insert(n);
-        else if (how == Write::LOCAL) s->declared.emplace(n, at);
+    void write(Scope* s, const std::string& n, Write how, const Location& at, VariableNode* node = nullptr) {
+        // `_` was left out of every scope check; under Python's rule it is a
+        // name like any other (`_ = f()` in a function is its local)
+        if (n.empty() || (n == "_" && !s->py)) return;
+        s->writes.push_back({n, how, at, node, cur_aug});
+        if (how == Write::ASSIGN) {
+            s->assigned.insert(n);
+            s->assigned_at.emplace(n, Pos(at));   // round 85
+        }
+        else if (how == Write::LOCAL) { if (s->declared.emplace(n, at).second) s->dkind.emplace(n, 't'); }
     }
 
     // An assignment / loop target: a name, or a tuple/list of targets.
@@ -105,7 +167,7 @@ struct Collector {
         if (!t) return;
         switch (t->type()) {
         case NodeType::VARIABLE:
-            write(s, bare(t->value()), how, t->token().location());
+            write(s, bare(t->value()), how, t->token().location(), static_cast<VariableNode*>(t.get()));
             break;
         case NodeType::TUPLE: case NodeType::LIST: case NodeType::ARRAY:
             for (auto& e : t->statements()) target(e, s, how);
@@ -122,7 +184,7 @@ struct Collector {
     }
 
     void params(const std::vector<node_ptr>& ps, Scope* fs) {
-        for (auto& p : ps) if (p) declare(fs, bare(p->value()), p->token().location());
+        for (auto& p : ps) if (p) declare(fs, bare(p->value()), p->token().location(), false, 'p');
     }
 
     void all(const std::vector<node_ptr>& v, Scope* s) { for (auto& n : v) walk(n, s); }
@@ -133,8 +195,11 @@ struct Collector {
         case NodeType::FUNCTION: {
             auto f = std::static_pointer_cast<FunctionNode>(n);
             all(f->defaults, s);
-            if (!f->name.empty()) declare(s, f->name, n->token().location());
+            if (!f->name.empty()) declare(s, f->name, n->token().location(), false, 'd');
             Scope* fs = child(s, Kind::FUNCTION);
+            fs->fn = n.get();
+            // round 85: `def f(...):  # nython: python` opts a Nython function in
+            if (!fs->py && lines.opts_in(n->token().location().row)) fs->py = true;
             params(f->params, fs);
             walk(f->body, fs);
             break;
@@ -143,6 +208,7 @@ struct Collector {
             auto f = std::static_pointer_cast<LambdaNode>(n);
             all(f->defaults, s);
             Scope* fs = child(s, Kind::FUNCTION);
+            fs->fn = n.get();
             params(f->params, fs);
             walk(f->body, fs);
             break;
@@ -150,25 +216,25 @@ struct Collector {
         case NodeType::CLASS: {
             auto c = std::static_pointer_cast<ClassNode>(n);
             all(c->bases, s);
-            declare(s, c->name, n->token().location());
+            declare(s, c->name, n->token().location(), false, 'c');
             walk(c->body, child(s, Kind::CLASS));
             break;
         }
         case NodeType::INTERFACE: {
             auto c = std::static_pointer_cast<InterfaceNode>(n);
-            declare(s, c->name, n->token().location());
+            declare(s, c->name, n->token().location(), false, 'n');
             walk(c->body, child(s, Kind::CLASS));
             break;
         }
         case NodeType::NAMESPACE: {
             auto c = std::static_pointer_cast<NameSpaceNode>(n);
-            declare(s, c->name, n->token().location());
+            declare(s, c->name, n->token().location(), false, 'n');
             walk(c->body, child(s, Kind::CLASS));
             break;
         }
         case NodeType::ENUM: {
             auto e = std::static_pointer_cast<EnumNode>(n);
-            declare(s, e->name, n->token().location());
+            declare(s, e->name, n->token().location(), false, 'n');
             for (auto& it : e->items)
                 if (it && it->type() == NodeType::ENUM_ITEM)
                     walk(std::static_pointer_cast<EnumItemNode>(it)->value_node, s);
@@ -191,7 +257,9 @@ struct Collector {
             walk(a->value_node, s);
             if (a->target && a->target->type() == NodeType::VARIABLE)   // `x += 1` reads x first
                 s->reads.push_back(static_cast<VariableNode*>(a->target.get()));
+            cur_aug = true;
             target(a->target, s, Write::ASSIGN);
+            cur_aug = false;
             break;
         }
         case NodeType::VARIABLE:
@@ -202,12 +270,20 @@ struct Collector {
             walk(w->init, s);
             write(s, w->name, Write::LOCAL, n->token().location());
             s->walruses.push_back(w.get());
+            // round 85: in a comprehension it binds in the scope around
+            // the comprehensions (PEP 572)
+            if (s->kind == Kind::COMP) {
+                Scope* t = s;
+                while (t && t->kind == Kind::COMP) t = t->parent;
+                if (t) t->comp_walrus.insert(w->name);
+            }
             break;
         }
         case NodeType::DELETE: {
             auto d = std::static_pointer_cast<DeleteNode>(n);
             if (d->target && d->target->type() == NodeType::VARIABLE)
-                write(s, d->target->value(), Write::DEL, d->target->token().location());
+                write(s, d->target->value(), Write::DEL, d->target->token().location(),
+                      static_cast<VariableNode*>(d->target.get()));
             else walk(d->target, s);
             break;
         }
@@ -293,8 +369,8 @@ struct Collector {
         }
         case NodeType::IMPORT: {
             auto im = std::static_pointer_cast<ImportNode>(n);
-            if (!im->alias.empty()) declare(s, im->alias, n->token().location());
-            for (auto& nm : im->names) declare(s, nm, n->token().location());
+            if (!im->alias.empty()) declare(s, im->alias, n->token().location(), false, 'i');
+            for (auto& nm : im->names) declare(s, nm, n->token().location(), false, 'i');
             break;
         }
         case NodeType::COMPREHENSION: {
@@ -409,7 +485,166 @@ Scope* resolve(Scope* s, const WriteSite& w) {
     return s;
 }
 
-void check_scope(Scope* s) {
+// ── Python's rule and the two rules' differences (round 85) ─────────────────
+
+// What check_scope needs besides the tree.
+struct Pass {
+    bool top_locals = false;         // RuleScope: a snippet exec'd in a Python-language function
+    bool warn = false;               // print the differences of Nython-rule functions (warn_filter)
+    std::ostream* report = nullptr;  // --scope-report
+    std::string file;
+    Scope* root = nullptr;
+};
+
+// Python's rule: the names function scope `s` binds - its locals.
+std::set<std::string> py_locals(const Scope* s) {
+    std::set<std::string> L;
+    for (auto& d : s->declared) L.insert(d.first);
+    for (auto& a : s->assigned) L.insert(a);
+    for (auto& w : s->writes) if (w.how == Write::DEL) L.insert(w.name);
+    for (auto& n : s->comp_walrus) L.insert(n);
+    for (auto& g : s->globals) L.erase(g.first);
+    for (auto& g : s->nonlocals) L.erase(g.first);
+    // self / this stay as they are (a method's receiver: STORE_SELF / LOAD_SELF)
+    L.erase("self");
+    L.erase("this");
+    return L;
+}
+
+bool before(const Pos& a, const Pos& b) { return a.row < b.row || (a.row == b.row && a.col < b.col); }
+
+std::string qual_of(const Scope* s) {
+    if (!s || !s->fn) return "<module>";
+    if (s->fn->type() == NodeType::FUNCTION) {
+        auto* f = static_cast<FunctionNode*>(s->fn);
+        return f->qualname.empty() ? f->name : f->qualname;
+    }
+    auto* l = static_cast<LambdaNode*>(s->fn);
+    return l->qualname.empty() ? std::string("<lambda>") : l->qualname;
+}
+
+uint32_t def_line(const Scope* s) { return s->fn ? s->fn->token().location().row : 0; }
+
+// The line of a function's first statement after its docstring, where a
+// declaration can be put (0: none - a body on the def line, a lambda).
+uint32_t insert_line(const Scope* s) {
+    if (!s->fn || s->fn->type() != NodeType::FUNCTION) return 0;
+    auto* f = static_cast<FunctionNode*>(s->fn);
+    if (!f->body) return 0;
+    auto st = f->body->statements();
+    size_t i = 0;
+    if (!st.empty() && st[0] && st[0]->type() == NodeType::STRING) i = 1;
+    if (i >= st.size() || !st[i]) return 0;
+    uint32_t row = st[i]->token().location().row;
+    return row > def_line(s) ? row : 0;
+}
+
+// Where Nython's rule and Python's give `s` (a function) different
+// bindings: a plain assignment, augmented assignment or del of a name an
+// enclosing function or the module binds, with no global / nonlocal for it
+// and no declaration of it earlier in the function - Nython rebinds (or
+// unbinds) the outer variable, Python makes it a local. One per name, the
+// first such write.
+void differences(Scope* s, Pass& ps) {
+    std::set<std::string> seen;
+    for (auto& w : s->writes) {
+        if (w.how == Write::LOCAL || !w.node) continue;
+        const std::string& n = w.name;
+        if (n == "self" || n == "this" || n == "_" || seen.count(n)) continue;
+        if (s->globals.count(n) || s->nonlocals.count(n)) continue;
+        Pos wp(w.where);
+        auto d = s->declared.find(n);
+        if (d != s->declared.end() && before(Pos(d->second), wp)) continue;
+        Scope* outer = nullptr;
+        for (Scope* p = s->parent; p; p = p->parent) {
+            if (p->kind == Kind::CLASS || p->kind == Kind::COMP) continue;
+            if (p->globals.count(n)) { outer = ps.root; break; }
+            if (p->declared.count(n) || p->assigned.count(n) || p->nonlocals.count(n)) { outer = p; break; }
+        }
+        if (!outer) continue;
+        seen.insert(n);
+        char okind = 'a';
+        Pos opos;
+        auto od = outer->declared.find(n);
+        if (od != outer->declared.end()) {
+            opos = Pos(od->second);
+            auto k = outer->dkind.find(n);
+            okind = k != outer->dkind.end() ? k->second : 'v';
+        } else {
+            auto oa = outer->assigned_at.find(n);
+            if (oa != outer->assigned_at.end()) opos = oa->second;
+            else okind = 'g';
+        }
+        // the function uses the outer value: an augmented assignment, a
+        // del, or a read of the name on or before the line of the write
+        bool uses = w.aug || w.how == Write::DEL;
+        for (size_t i = 0; !uses && i < s->reads.size(); i++)
+            if (s->reads[i]->name == n && s->reads[i]->token().location().row <= wp.row) uses = true;
+        const char* how = w.how == Write::DEL ? "del" : w.aug ? "aug" : "assign";
+        std::string where = outer == ps.root ? std::string("module") : "function:" + qual_of(outer);
+        if (ps.report)
+            *ps.report << ps.file << '\t' << wp.row << '\t' << wp.col << '\t' << qual_of(s) << '\t' << n << '\t'
+                       << how << '\t' << where << '\t' << opos.row << '\t' << okind << '\t' << (uses ? 1 : 0) << '\t'
+                       << (s->py ? "python" : "nython") << '\t' << def_line(s) << '\t' << insert_line(s) << '\n';
+        if (ps.warn && !s->py) {
+            const char* verb = w.how == Write::DEL ? "deletes" : w.aug ? "augments" : "assigns";
+            std::string what = outer == ps.root
+                ? "rebinding the module's '" + n + "'"
+                : "rebinding '" + n + "' of the enclosing function '" + qual_of(outer) + "'";
+            if (opos.row) what += " (line " + std::to_string(opos.row) + ")";
+            std::string decl = outer == ps.root ? "global" : "nonlocal";
+            std::cerr << ps.file << ":" << wp.row << ":" << wp.col << ": warning: function '" << qual_of(s) << "' "
+                      << verb << " '" << n << "', " << what << " without a declaration - Python's rule makes it a"
+                      << " local of the function: declare '" << decl << " " << n << "' to keep rebinding it, or"
+                      << " 'var " << n << "' for a local [nython-scope]\n";
+        }
+    }
+    // A read of a name the function binds later with a local form (a for /
+    // with / except target, import, def, class, var): Nython reads the outer
+    // variable there, Python's rule raises UnboundLocalError ("read").
+    for (auto& [n, at] : s->declared) {
+        if (seen.count(n) || s->globals.count(n) || s->nonlocals.count(n) || n == "self" || n == "this") continue;
+        auto k = s->dkind.find(n);
+        if (k == s->dkind.end() || k->second == 'p') continue;
+        Pos dp(at);
+        VariableNode* first = nullptr;
+        for (auto* r : s->reads)
+            if (r->name == n && before(Pos(r->token().location()), dp)
+                && (!first || before(Pos(r->token().location()), Pos(first->token().location())))) first = r;
+        if (!first) continue;
+        Scope* outer = nullptr;
+        for (Scope* p = s->parent; p; p = p->parent) {
+            if (p->kind == Kind::CLASS || p->kind == Kind::COMP) continue;
+            if (p->globals.count(n)) { outer = ps.root; break; }
+            if (p->declared.count(n) || p->assigned.count(n) || p->nonlocals.count(n)) { outer = p; break; }
+        }
+        if (!outer) continue;
+        Pos rp(first->token().location());
+        Pos opos;
+        char okind = 'a';
+        auto od = outer->declared.find(n);
+        if (od != outer->declared.end()) {
+            opos = Pos(od->second);
+            auto ok = outer->dkind.find(n);
+            okind = ok != outer->dkind.end() ? ok->second : 'v';
+        } else {
+            auto oa = outer->assigned_at.find(n);
+            if (oa != outer->assigned_at.end()) opos = oa->second; else okind = 'g';
+        }
+        std::string where = outer == ps.root ? std::string("module") : "function:" + qual_of(outer);
+        if (ps.report)
+            *ps.report << ps.file << '\t' << rp.row << '\t' << rp.col << '\t' << qual_of(s) << '\t' << n << '\t'
+                       << "read" << '\t' << where << '\t' << opos.row << '\t' << okind << '\t' << 1 << '\t'
+                       << (s->py ? "python" : "nython") << '\t' << def_line(s) << '\t' << 0 << '\n';
+        if (ps.warn && !s->py)
+            std::cerr << ps.file << ":" << rp.row << ":" << rp.col << ": warning: function '" << qual_of(s) << "' reads '"
+                      << n << "' before binding it (line " << dp.row << "): Nython reads the "
+                      << (outer == ps.root ? std::string("module's '") + n + "'" : "enclosing function's '" + n + "'")
+                      << " there, Python's rule raises UnboundLocalError [nython-scope]\n";
+    }
+}
+
+void check_scope(Scope* s, Pass& ps) {
     // nonlocal x: an enclosing function must bind x.
     for (auto& [name, at] : s->nonlocals) {
         bool found = false;
@@ -417,8 +652,12 @@ void check_scope(Scope* s) {
             if (p->kind == Kind::FUNCTION && p->binds(name)) found = true;
         if (!found) throw SyntaxError(at, "no binding for nonlocal '" + name + "' found");
     }
+    // round 85: Python's rule - the names the function binds are its locals
+    const bool pyf = s->py && s->kind == Kind::FUNCTION;
+    std::set<std::string> L;
+    if (pyf) L = py_locals(s);
     for (auto& w : s->writes) {
-        Scope* t = resolve(s, w);
+        Scope* t = pyf && L.count(w.name) ? s : resolve(s, w);
         if (!t) continue;
         auto c = t->consts.find(w.name);
         if (c == t->consts.end()) continue;
@@ -438,17 +677,123 @@ void check_scope(Scope* s) {
             if (!s->globals.count(r->name) && !s->nonlocals.count(r->name)
                 && (s->declared.count(r->name) || s->assigned.count(r->name)))
                 r->local_read = true;
-    for (auto& c : s->children) check_scope(c.get());
+    // round 85: Python's rule marks each read, assignment and del of a local
+    // (VariableNode::py_bind 1); both engines then use the function's own
+    // scope for it. A snippet exec'd in a Python-language function binds
+    // its top level's names in its own scope (py_bind 2).
+    if (pyf) {
+        for (auto* r : s->reads) if (L.count(r->name)) r->py_bind = 1;
+        for (auto& w : s->writes) if (w.node && L.count(w.name)) w.node->py_bind = 1;
+    } else if (s->kind == Kind::MODULE && ps.top_locals) {
+        for (auto& w : s->writes)
+            if (w.node && w.how != Write::LOCAL && !s->globals.count(w.name)) w.node->py_bind = 2;
+    }
+    if (s->kind == Kind::FUNCTION && (ps.report || ps.warn)) differences(s, ps);
+    for (auto& c : s->children) check_scope(c.get(), ps);
+}
+
+// round 85: the Python-language files parsed so far, and this thread's rule
+std::mutex& py_files_mu() { static std::mutex m; return m; }
+std::set<std::string>& py_files() { static std::set<std::string> s; return s; }
+thread_local int t_rule_python = -1;   // -1: decided by the source
+thread_local bool t_rule_top = false;
+
+// Whether the warnings are wanted for `file` (warn_filter: see NyScope.hpp).
+bool warn_matches(const std::string& filter, const std::string& file) {
+    if (filter == "all") return true;
+    if (filter != "1" && filter != "on" && filter != "yes" && filter != "true") return file.find(filter) != std::string::npos;
+    if (file[0] == '<') return true;   // -c, stdin
+    // not the standard library's
+    namespace fs = std::filesystem;
+    static std::vector<std::string> libs = [] {
+        std::vector<std::string> out;
+        for (auto& d : nyrt::library_dirs()) {
+            std::error_code ec;
+            fs::path p = fs::weakly_canonical(fs::path(d), ec);
+            if (!ec) out.push_back(p.generic_string());
+        }
+        return out;
+    }();
+    std::error_code ec;
+    std::string f = fs::weakly_canonical(fs::path(file), ec).generic_string();
+    if (ec) return true;
+    for (auto& l : libs) if (!l.empty() && f.compare(0, l.size(), l) == 0) return false;
+    return true;
 }
 
 } // namespace
 
-void check(const node_ptr& root) {
+bool python_source(const std::string& file, const std::string& code) {
+    if (file.size() > 3 && file.compare(file.size() - 3, 3, ".py") == 0) return true;
+    // the leading comment block (as the lexer reads `# nython: module`)
+    size_t i = 0;
+    while (i < code.size()) {
+        size_t e = code.find('\n', i);
+        if (e == std::string::npos) e = code.size();
+        size_t b = code.find_first_not_of(" \t\r", i);
+        if (b == std::string::npos || b >= e) { i = e + 1; continue; }   // a blank line
+        if (code[b] != '#') break;                                       // the code starts
+        size_t p = code.find("nython:", b);
+        if (p != std::string::npos && p < e) {
+            size_t w = code.find_first_not_of(" \t", p + 7);
+            if (w != std::string::npos && w + 6 <= e && code.compare(w, 6, "python") == 0
+                && (w + 6 == e || !(std::isalnum((unsigned char)code[w + 6]) || code[w + 6] == '_' || code[w + 6] == '-')))
+                return true;
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
+bool python_file(const std::string& file) {
+    std::lock_guard<std::mutex> lk(py_files_mu());
+    return py_files().count(file) > 0;
+}
+
+bool code_rule(const std::string& name, const std::string& code, bool caller_python) {
+    auto ends = [&](const char* x) { size_t n = std::char_traits<char>::length(x); return name.size() > n && name.compare(name.size() - n, n, x) == 0; };
+    if (!name.empty() && name[0] != '<' && (ends(".ny") || ends(".py"))) return python_source(name, code);
+    return caller_python;
+}
+
+RuleScope::RuleScope(bool python, bool top_locals) : saved_python(t_rule_python), saved_top(t_rule_top) {
+    t_rule_python = python ? 1 : 0;
+    t_rule_top = top_locals;
+}
+RuleScope::~RuleScope() { t_rule_python = saved_python; t_rule_top = saved_top; }
+
+std::string& warn_filter() {
+    static std::string f = [] { const char* e = std::getenv("NY_SCOPE_WARN"); return std::string(e && std::string(e) != "0" ? e : ""); }();
+    return f;
+}
+std::ostream*& report_sink() { static std::ostream* s = nullptr; return s; }
+
+void check(const node_ptr& root) { check(root, std::string(), std::string()); }
+
+void check(const node_ptr& root, const std::string& file, const std::string& code) {
     if (!root) return;
+    bool py;
+    if (t_rule_python >= 0) py = t_rule_python == 1;
+    else {
+        py = python_source(file, code);
+        if (py && !file.empty()) {
+            std::lock_guard<std::mutex> lk(py_files_mu());
+            py_files().insert(file);
+        }
+    }
+    Pass ps;
+    ps.top_locals = t_rule_top;
+    ps.report = report_sink();
+    ps.file = file;
+    const std::string& wf = warn_filter();
+    ps.warn = !wf.empty() && !file.empty() && warn_matches(wf, file);
     Collector c;
     c.root = std::make_unique<Scope>(Kind::MODULE, nullptr);
+    c.root->py = py;
+    if (!py) c.lines.init(code);   // a def may opt in
+    ps.root = c.root.get();
     c.walk(root, c.root.get());
-    check_scope(c.root.get());
+    check_scope(c.root.get(), ps);
 }
 
 static void target_names(const node_ptr& t, std::set<std::string>& out) {

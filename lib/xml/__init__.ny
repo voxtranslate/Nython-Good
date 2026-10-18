@@ -1,4 +1,5 @@
 # nython: module    (a package: xml.etree, xml.parsers, xml.dom)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/xml - Python's xml package (round 79).
 #
 #   xml.etree.ElementTree   the ElementTree API (lib/xml/etree/ElementTree.ny)

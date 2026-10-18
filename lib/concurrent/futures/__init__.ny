@@ -1,4 +1,5 @@
 # nython: module    (a package: concurrent.futures._base, .thread, .process)
+# nython: python    (Python's binding rule: a name a function binds is its local - round 85)
 # lib/concurrent/futures - Python's concurrent.futures (3.11): run calls
 # asynchronously on a pool of threads or of processes (round 79).
 #
