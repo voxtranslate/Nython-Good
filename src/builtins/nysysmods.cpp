@@ -1038,6 +1038,11 @@ int fdarg(std::vector<Value>& a, size_t i) {
 
 } // namespace
 
+// round 84: curses without ncurses (nycurses.cpp), the `_curses_*` natives;
+// declared here rather than in sysmods.hpp, which every engine file includes
+Value dispatch_curses(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> curses_builtin_names();
+
 std::vector<std::string> sysmods_builtin_names() {
     std::vector<std::string> v = {
         "_sys_platform_posix", "_sys_errno_table", "_sys_consts", "_sys_fcntl", "_sys_ioctl", "_sys_flock",
@@ -1053,6 +1058,7 @@ std::vector<std::string> sysmods_builtin_names() {
     for (auto& n : cmath_builtin_names()) v.push_back(n);
     for (auto& n : fault_builtin_names()) v.push_back(n);
     for (auto& n : readline_builtin_names()) v.push_back(n);
+    for (auto& n : curses_builtin_names()) v.push_back(n);   // round 84
     return v;
 }
 
@@ -1064,6 +1070,7 @@ Value dispatch_sysmods(NythonExecutor& E, const std::string& name, std::vector<V
     if (name.compare(0, 7, "_cmath_") == 0) return dispatch_cmath(E, name, a, ctx);
     if (name.compare(0, 7, "_fault_") == 0 || name.compare(0, 4, "_tm_") == 0) return dispatch_fault(E, name, a, ctx);
     if (name.compare(0, 4, "_rl_") == 0) return dispatch_readline(E, name, a, ctx);
+    if (name.compare(0, 8, "_curses_") == 0) return dispatch_curses(E, name, a, ctx);   // round 84
     if (name.compare(0, 5, "_sys_") != 0) return UNDEFINED_VALUE;
 
     if (name == "_sys_platform_posix") {

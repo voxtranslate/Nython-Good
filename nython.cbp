@@ -186,6 +186,7 @@
         <Unit filename="src/builtins/nycmath.cpp" />
         <Unit filename="src/builtins/nyfault.cpp" />
         <Unit filename="src/builtins/nyreadline.cpp" />
+        <Unit filename="src/builtins/nycurses.cpp" />
         <Unit filename="src/builtins/pycore.cpp" />
         <Unit filename="src/builtins/gui_harness.cpp" />
         <Unit filename="src/NyConc.cpp" />
