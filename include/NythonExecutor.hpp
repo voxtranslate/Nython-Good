@@ -15449,6 +15449,10 @@ public:
     // as for a plain call.
     Value invokeMember(Value m, Node* owner, Value self, std::vector<Value>& args,
                        const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        // round 84: a bound method kept in a class is called as it is, on
+        // its own instance (a method object has no __get__ - `class Codec:
+        // encode = codec.encode`, called as Codec().encode(s) or Codec.encode(s))
+        if (!bound_self_.empty() && bound_self_.count(m.value.p)) return callFunctionValue(m, args, ctx, &kw);
         std::string tag = fnTag(func_names, m.value.p);
         bool is_static = tag.find("__static__") != std::string::npos;
         bool is_cm = tag.find("__classmethod__") != std::string::npos;

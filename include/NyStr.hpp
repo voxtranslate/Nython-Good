@@ -191,6 +191,10 @@ inline std::string str_casefold(const std::string& s) {
 }
 inline std::string str_swapcase(const std::string& s) {
     std::string r; r.reserve(s.size());
+    if (is_ascii(s)) {   // (round 84: ASCII inline)
+        for (char c : s) r += (c >= 'a' && c <= 'z') ? (char)(c - 32) : (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+        return r;
+    }
     auto cps = u8_codepoints(s);
     uint32_t m[3];
     for (size_t i = 0; i < cps.size(); i++) {
@@ -204,6 +208,13 @@ inline std::string str_swapcase(const std::string& s) {
 inline std::string str_capitalize(const std::string& s) {
     // (the first character title-cased, as CPython 3.8+)
     std::string r; r.reserve(s.size());
+    if (is_ascii(s)) {   // (round 84: ASCII inline)
+        for (size_t i = 0; i < s.size(); i++) {
+            char c = s[i];
+            r += i == 0 ? ((c >= 'a' && c <= 'z') ? (char)(c - 32) : c) : ((c >= 'A' && c <= 'Z') ? (char)(c + 32) : c);
+        }
+        return r;
+    }
     auto cps = u8_codepoints(s);
     uint32_t m[3];
     for (size_t i = 0; i < cps.size(); i++)
@@ -212,6 +223,15 @@ inline std::string str_capitalize(const std::string& s) {
 }
 inline std::string str_title(const std::string& s) {
     std::string r; r.reserve(s.size());
+    if (is_ascii(s)) {   // (round 84: ASCII inline - the cased letters are the letters)
+        bool prev = false;
+        for (char c : s) {
+            bool up = c >= 'A' && c <= 'Z', lo = c >= 'a' && c <= 'z';
+            r += prev ? (up ? (char)(c + 32) : c) : (lo ? (char)(c - 32) : c);
+            prev = up || lo;
+        }
+        return r;
+    }
     auto cps = u8_codepoints(s);
     uint32_t m[3];
     bool prev_cased = false;
