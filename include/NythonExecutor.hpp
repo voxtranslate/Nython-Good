@@ -3333,7 +3333,9 @@ public:   // NythonExecutor is a struct: members default to public
                 return nypy::key_of_tuple(parts);
             }
             if (isSetCont(c)) return setKey(k);       // a frozenset; a set raises
-            if (!isInstanceVal(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
+            // a module is hashed by identity, as in Python (round 83: site's
+            // set(sys.modules.values()) raised)
+            if (!isInstanceVal(k) && !isModuleNamespace(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
         }
         {
             Value p;   // MyStr("k") is the key "k" (round 77)

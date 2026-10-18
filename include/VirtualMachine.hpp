@@ -11113,7 +11113,11 @@ private:
                     return nypy::key_of_tuple(parts);
                 }
                 raise_native_exception("TypeError","unhashable type: 'list'");
-            case VMType::MAP: raise_native_exception("TypeError","unhashable type: 'dict'");
+            case VMType::MAP:
+                // a module is hashed by identity, as in Python (round 83:
+                // site's set(sys.modules.values()) raised)
+                if(is_module_ns(k)&&!is_property_desc(k)&&k.class_name.rfind("__",0)!=0) break;
+                raise_native_exception("TypeError","unhashable type: 'dict'");
             case VMType::BYTES:
                 if(k.b) raise_native_exception("TypeError","unhashable type: 'bytearray'");
                 return nypy::key_of_bytes(k.s);

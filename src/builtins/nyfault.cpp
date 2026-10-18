@@ -200,8 +200,11 @@ bool ends_with(const char* s, const char* tail) {
     size_t a = std::strlen(s), b = std::strlen(tail);
     return a >= b && std::memcmp(s + a - b, tail, b) == 0;
 }
-// faulthandler's own Nython code is not shown (CPython's is C)
-bool own_file(const char* f) { return ends_with(f, "faulthandler.ny"); }
+// faulthandler's own Nython code is not shown (CPython's is C): lib's
+// faulthandler.ny, not a program whose name ends so (test_faulthandler.ny)
+bool own_file(const char* f) {
+    return std::strcmp(f, "faulthandler.ny") == 0 || ends_with(f, "/faulthandler.ny") || ends_with(f, "\\faulthandler.ny");
+}
 
 struct DumpSink { int fd; int depth; bool started; };
 void dump_emit(void* s, const char* file, long line, const char* name) {

@@ -906,8 +906,9 @@ check("a segfault is reported", [r[0] == -11 if posix else r[0] != 0, lines[0], 
        '  File "%s", line 5 in <module>' % r[3]])
 r = child("import faulthandler, time\nfaulthandler.dump_traceback_later(0.2, exit=True)\nfor i in range(100):\n    time.sleep(0.1)\n")
 lines = r[2].splitlines()
+# (time.sleep is Nython code in lib/time.ny: its frame comes first there)
 check("dump_traceback_later: the watchdog", [r[0], lines[0], lines[1].startswith("Thread 0x"),
-                                              lines[2].startswith('  File "%s", line 4 in <module>' % r[3])],
+                                              lines[-1].startswith('  File "%s", line 4 in <module>' % r[3])],
       [1, "Timeout (0:00:00.200000)!", True, True])
 if posix:
     import signal
@@ -939,16 +940,18 @@ check("get_traced_memory", [cur >= 200 * 1000, peak >= cur], [True, True])
 tracemalloc.reset_peak()
 cur2, peak2 = tracemalloc.get_traced_memory()
 check("reset_peak", peak2 - cur2 < 100000, True)
-obj_line = sys._getframe().f_lineno + 1
-tracked = [1, 2, 3, "four"]
-tb = tracemalloc.get_object_traceback(tracked)
-check("get_object_traceback", [tb is not None, tb[0].lineno if tb else None, tb[0].filename == __file__ if tb else None],
-      [True, obj_line, True])
 del blob
 gc.collect()
 snap2 = tracemalloc.take_snapshot()
 diff = [s for s in snap2.compare_to(snap, "lineno") if s.traceback[0].filename == __file__ and s.traceback[0].lineno == alloc_line]
 check("compare_to sees the memory go", [len(diff), diff[0].size_diff < -150000 if diff else False], [1, True])
+# (after the compare: on Nython, reading a module frame's f_lineno keeps a
+# copy of its variables in the frame object until the next read - blob too)
+obj_line = sys._getframe().f_lineno + 1
+tracked = [1, 2, 3, "four"]
+tb = tracemalloc.get_object_traceback(tracked)
+check("get_object_traceback", [tb is not None, tb[0].lineno if tb else None, tb[0].filename == __file__ if tb else None],
+      [True, obj_line, True])
 filtered = snap.filter_traces([tracemalloc.Filter(True, __file__)])
 check("Filter", all(t.traceback[0].filename == __file__ for t in filtered.traces), True)
 check("Statistic str", str(mine[0]).startswith("%s:%d: size=" % (__file__, alloc_line)) if mine else False, True)

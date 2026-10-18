@@ -3097,6 +3097,16 @@ def _ny_load_spec(sysm, spec):
         raise
     module = sysm.modules.pop(name)
     sysm.modules[name] = module
+    # (round 83) a submodule is an attribute of its package, as CPython's
+    # _find_and_load_unlocked makes it (zipimport's `import pkg.sub`)
+    var parent = name.rpartition(".")[0]
+    if parent:
+        var pm = sysm.modules.get(parent)
+        if pm is not None:
+            try:
+                setattr(pm, name.rpartition(".")[2], module)
+            except AttributeError:
+                pass
     return module
 
 def _ny_mapping_snapshot(m):

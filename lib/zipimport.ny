@@ -184,7 +184,11 @@ class zipimporter:
 
     def create_module(self, spec):
         """Use default semantics for module creation."""
-        return None
+        # a types.ModuleType: its __dict__ is live, so the module's code
+        # binds into it (the import statement's default module is not one
+        # exec() can fill through vars())
+        import types
+        return types.ModuleType(spec.name)
 
     def exec_module(self, module):
         """Execute the module."""
