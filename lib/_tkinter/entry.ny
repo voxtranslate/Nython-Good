@@ -254,8 +254,13 @@ class TkEntry(TkWin):
         return k
 
     # ── editing ──
+    def estate(self):
+        # normal / disabled / readonly (ttk entries take it from their state
+        # flags)
+        return self.opts["state"]
+
     def can_edit(self):
-        return self.opts["state"] == "normal"
+        return self.estate() == "normal"
 
     def insert(self, index, s):
         if not self.can_edit() or s == "":
@@ -658,7 +663,7 @@ class TkEntry(TkWin):
 
     # ── drawing ──
     def background_color(self):
-        st = self.opts["state"]
+        st = self.estate()
         if st == "disabled" and self.opts.get("disabledbackground", ""):
             return self.color("disabledbackground")
         if st == "readonly" and self.opts.get("readonlybackground", ""):
@@ -672,7 +677,7 @@ class TkEntry(TkWin):
         asc, desc, ls, fixed = f.metrics()
         ds = self.display_string()
         ty = (self.height - ls) // 2
-        st = self.opts["state"]
+        st = self.estate()
         fg = self.color("disabledforeground") if (st == "disabled" and self.opts.get("disabledforeground", "")) else self.color("foreground")
         gui_push_clip(h, ax + self.inset, ay, self.width - 2 * self.inset - self.xwidth, self.height)
         if self.sel_first >= 0:
@@ -722,7 +727,7 @@ def EntryButton1(app, args):
     w.insert_pos = min(len(w.string), EntryClosestGap(w, x))
     w.sel_anchor = w.insert_pos
     w.damage()
-    if w.opts["state"] != "disabled":
+    if w.estate() != "disabled":
         app.set_focus(w)
     return ""
 
@@ -995,7 +1000,7 @@ class TkSpinbox(TkEntry):
 
     def spin(self, up):
         vals = split_list(self.opts.get("values", ""))
-        if self.opts["state"] == "disabled":
+        if self.estate() == "disabled":
             return
         if vals:
             try:
@@ -1041,7 +1046,7 @@ class TkSpinbox(TkEntry):
     def w_set(self, args):
         if args:
             v = tcl_str(args[0])
-            if self.opts["state"] != "normal":
+            if self.estate() != "normal":
                 return self.string
             self.set_value(v)
             self.value_changed()

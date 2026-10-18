@@ -34,6 +34,7 @@ from _tkinter import text
 from _tkinter import canvas
 from _tkinter import image
 from _tkinter import ttk
+from _tkinter import ttk2
 
 TK_VERSION = core.TK_VERSION
 TCL_VERSION = core.TCL_VERSION
