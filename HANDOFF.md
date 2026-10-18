@@ -698,6 +698,10 @@ probe, lint, class check and cbp check clean.
 
 ## 0w2. Round 84 (main session) — C-implemented functions as builtins, module __getattr__, PEP 701 f-strings, the gaps the round's agents found (vm_audit117)
 
+Verified with all of round 84 merged (a0af3f7: parts A-D and this): sweep
+461 runs, 0 not ok; `tools/ide_e2e.py` 463 passed; memory probe, lint, class
+check, cbp (76 units) clean.
+
 `examples/vm_audit117.ny` (33 checks) passes on both engines and under
 python3.12 (32 under python3.11, which has no PEP 701).
 
