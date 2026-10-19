@@ -20,6 +20,13 @@
 #
 # Inside an async task the waits suspend only that task (the runtime's I/O
 # is colorless), so urlopen() needs no async twin.
+#
+# HTTP/2 (round 86, Nython's, opt-in): urlopen(url, http2=True) /
+# HTTPSHandler(http2=True) negotiate HTTP/2 with ALPN on https URLs (and
+# fall back to HTTP/1.1 when the server does not select h2);
+# http2="prior_knowledge" also speaks h2c to http URLs (HTTPHandler(http2=
+# "prior_knowledge")). The response is http.client's HTTP2Response
+# (r.version == 20).
 import socket
 import http
 import http.client
@@ -35,10 +42,15 @@ ContentTooShortError = urllib.error.ContentTooShortError
 
 _opener = none
 
-def urlopen(url, data=none, timeout=none, cafile=none, capath=none, cadefault=false, context=none):
+def urlopen(url, data=none, timeout=none, cafile=none, capath=none, cadefault=false, context=none, http2=false):
     global _opener
     var opener = none
-    if context != none:
+    if http2:
+        var hs = [HTTPSHandler(context=context, http2=http2)]
+        if http2 == "prior_knowledge":
+            hs.append(HTTPHandler(http2=http2))
+        opener = build_opener(*hs)
+    elif context != none:
         opener = build_opener(HTTPSHandler(context=context))
     elif cafile != none or capath != none:
         import ssl
@@ -491,7 +503,13 @@ def _close_response_socket(resp):
             pass
 
 class HTTPHandler(AbstractHTTPHandler):
+    def __init__(self, debuglevel=none, http2=false):
+        AbstractHTTPHandler.__init__(self, debuglevel)
+        self._http2 = http2
+
     def http_open(self, req):
+        if self._http2 == "prior_knowledge":
+            return self.do_open(http.client.HTTPConnection, req, http2=self._http2)
         return self.do_open(http.client.HTTPConnection, req)
 
     def http_request(self, req):
@@ -502,12 +520,13 @@ class HTTPSHandler(AbstractHTTPHandler):
     # build_opener() installs this handler in every opener, and on a system
     # without OpenSSL that made every urlopen() fail, plain http included
     # (CPython leaves the handler out when there is no ssl module).
-    def __init__(self, debuglevel=none, context=none, check_hostname=none):
+    def __init__(self, debuglevel=none, context=none, check_hostname=none, http2=false):
         AbstractHTTPHandler.__init__(self, debuglevel)
         if context != none and check_hostname != none:
             context.check_hostname = check_hostname
         self._context = context
         self._check_hostname = check_hostname
+        self._http2 = http2
 
     def https_open(self, req):
         if self._context == none:
@@ -515,6 +534,8 @@ class HTTPSHandler(AbstractHTTPHandler):
             self._context = ssl.create_default_context()
             if self._check_hostname != none:
                 self._context.check_hostname = self._check_hostname
+        if self._http2:
+            return self.do_open(http.client.HTTPSConnection, req, context=self._context, http2=self._http2)
         return self.do_open(http.client.HTTPSConnection, req, context=self._context)
 
     def https_request(self, req):

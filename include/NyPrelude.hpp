@@ -1995,7 +1995,13 @@ def _ny_drive_await(g):
 
 def _ny_await_iter(g):
     # the handle of a coroutine running _ny_drive_await(g) (the engines'
-    # await of an __await__ generator)
+    # await of an __await__ generator). Round 86: a coroutine's own
+    # __await__ (`def __await__(self): return self._coro().__await__()`, the
+    # websockets package's connect/serve shape) is that coroutine, awaited
+    # as it is when it has not started: driven by hand, its native waits
+    # parked the task - and a wait for another task of the loop never ended.
+    if type(g) is _NyCoroWrapper and async_coro_info(g._ny_coro_h)[0] == 0:
+        return g._ny_coro_h
     return async_coroutine(_ny_drive_await, g)
 
 # ── async generators (round 78: their own objects) ───────────────────────

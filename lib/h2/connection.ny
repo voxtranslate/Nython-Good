@@ -320,8 +320,6 @@ class H2Connection:
             if self.open_outbound_streams + 1 > self.remote_settings.max_concurrent_streams:
                 raise TooManyStreamsError("Max outbound streams is %d, %d open" % (
                     self.remote_settings.max_concurrent_streams, self.open_outbound_streams))
-            stream = self._new_stream(stream_id, True)
-            self.highest_outbound_stream_id = stream_id
             kind = "request"
         elif stream.state == StreamState.RESERVED_LOCAL:
             kind = "response"
@@ -344,6 +342,10 @@ class H2Connection:
                 if end_stream:
                     raise ProtocolError("A 1xx response cannot end the stream")
         fields = self._encode_headers(headers, kind, stream)
+        if stream is None:
+            # opened only once its field block is known to be valid
+            stream = self._new_stream(stream_id, True)
+            self.highest_outbound_stream_id = stream_id
         if kind == "request":
             stream.request_method = utilities.header_value(fields, b":method")
         block = self.encoder.encode(fields)

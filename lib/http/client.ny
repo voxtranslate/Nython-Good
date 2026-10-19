@@ -13,6 +13,18 @@
 # the server allows it; a kept-alive connection the server closed meanwhile
 # is reopened once, transparently. set_tunnel() goes through an HTTP proxy
 # (CONNECT). HTTPS uses lib/ssl.ny (certificates verified by default).
+#
+# HTTP/2 (round 86, Nython's, opt-in): HTTPSConnection(..., http2=True)
+# offers ALPN ["h2", "http/1.1"] and speaks HTTP/2 (lib/h2/sync.ny) when the
+# server selects "h2", HTTP/1.1 otherwise; HTTPConnection(...,
+# http2="prior_knowledge") speaks h2c from the first byte (RFC 9113 3.3).
+# The API stays http.client's: request()/putrequest()... and getresponse(),
+# whose HTTP2Response has status, reason, version (20), headers/msg,
+# getheader(s), read(amt)/read1/readline/readinto/iteration, and .trailers;
+# conn.http_version is "HTTP/2" or "HTTP/1.1" once connected. Requests on
+# one HTTP/2 connection reuse it, one at a time as http.client allows (h2.sync
+# multiplexes for callers that want more). Connection-specific header fields
+# are dropped and Host becomes :authority.
 import socket
 import http
 
@@ -499,7 +511,11 @@ class HTTPConnection:
     default_port = HTTP_PORT
     debuglevel = 0
 
-    def __init__(self, host, port=none, timeout=none, source_address=none, blocksize=8192):
+    def __init__(self, host, port=none, timeout=none, source_address=none, blocksize=8192, http2=false):
+        self.http2 = http2
+        self.http_version = none
+        self._h2 = none             # an h2.sync.SyncConnection once HTTP/2 is agreed
+        self._h2_req = none         # [method, url, headers, body chunks] being built
         self.timeout = timeout
         self.source_address = source_address
         self.blocksize = blocksize
@@ -583,9 +599,27 @@ class HTTPConnection:
         if self._tunnel_host != none:
             self._tunnel()
         self._reader = _Reader(self.sock)
+        self.http_version = "HTTP/1.1"
+        if self.http2 == "prior_knowledge" and self.default_port == HTTP_PORT:
+            self._start_h2("http")
+
+    def _start_h2(self, scheme):
+        import h2.sync
+        var host = self._tunnel_host if self._tunnel_host != none else self.host
+        var port = self._tunnel_port if self._tunnel_host != none else self.port
+        self._h2 = h2.sync.SyncConnection(self.sock, self._host_header(host, port), scheme)
+        self._reader = none
+        self.http_version = "HTTP/2"
 
     def close(self):
         self._state = "idle"
+        if self._h2 != none:
+            try:
+                self._h2.close()
+            except Exception:
+                pass
+            self._h2 = none
+        self._h2_req = none
         if self.sock != none:
             self.sock.close()
         self.sock = none
@@ -596,6 +630,16 @@ class HTTPConnection:
     def send(self, data):
         if self.sock == none:
             self.connect()
+        if self._h2 != none and self._h2_req != none:
+            # HTTP/2: the request body, sent with the request by getresponse()
+            if isinstance(data, "str"):
+                data = data.encode("iso-8859-1")
+            if hasattr(data, "read") or isinstance(data, "bytes") or isinstance(data, "bytearray"):
+                self._h2_req[3].append(data)
+            else:
+                for d in data:
+                    self._h2_req[3].append(d)
+            return
         if self.debuglevel > 0:
             print("send:", repr(data))
         if isinstance(data, "str"):
@@ -630,6 +674,11 @@ class HTTPConnection:
         for ch in url:
             if ord(ch) <= 32 or ord(ch) == 127:
                 raise InvalidURL("URL can't contain control characters. " + repr(url))
+        if self._h2 != none:
+            self._h2_req = [method, url, [], []]
+            if not skip_accept_encoding:
+                self._h2_req[2].append(("accept-encoding", "identity"))
+            return
         self._buffer = [method + " " + url + " HTTP/1.1"]
         if not skip_host:
             if self._tunnel_host != none:
@@ -647,6 +696,9 @@ class HTTPConnection:
             if isinstance(v, "bytes"):
                 v = v.decode("iso-8859-1")
             vs.append(str(v))
+        if self._h2_req != none:
+            self._h2_req[2].append((str(header), ", ".join(vs)))
+            return
         var line = str(header) + ": " + "\r\n\t".join(vs)
         if line.find("\n") >= 0 and line.find("\r\n\t") < 0:
             raise ValueError("Invalid header value " + repr(line))
@@ -656,6 +708,11 @@ class HTTPConnection:
         if self._state != "started":
             raise CannotSendHeader()
         self._state = "sent"
+        if self._h2_req != none:
+            # HTTP/2: sent by getresponse() (send() may still add body data)
+            if message_body != none:
+                self.send(message_body)
+            return
         var head = ("\r\n".join(self._buffer) + "\r\n\r\n").encode("iso-8859-1")
         self._buffer = []
         if message_body == none:
@@ -704,6 +761,8 @@ class HTTPConnection:
             var reused = self.sock != none
             try:
                 self._send_request(method, url, body, headers, encode_chunked)
+                if self._h2 != none:
+                    return
                 if reused:
                     # The server may have closed an idle kept-alive connection:
                     # find out now (its status line), and retry once on a
@@ -747,6 +806,8 @@ class HTTPConnection:
             self._reader = none
 
     def getresponse(self):
+        if self._h2_req != none:
+            return self._h2_response()
         if self._pending != none:
             var p = self._pending
             self._pending = none
@@ -768,6 +829,28 @@ class HTTPConnection:
             self._state = "response"
         return r
 
+    def _h2_response(self):
+        var req = self._h2_req
+        self._h2_req = none
+        if self._state != "sent":
+            raise ResponseNotReady(self._state)
+        var body = none
+        if len(req[3]) > 0:
+            body = req[3]
+        var r = none
+        try:
+            var sid = self._h2.request(req[0], req[1], req[2], body)
+            r = HTTP2Response(self, sid, req[0])
+        except BaseException:
+            self.close()
+            raise
+        self._response = r
+        if r._done:
+            self._state = "idle"
+        else:
+            self._state = "response"
+        return r
+
     def __enter__(self):
         return self
 
@@ -775,11 +858,141 @@ class HTTPConnection:
         self.close()
         return false
 
+class HTTP2Response:
+    # http.client's HTTPResponse for a stream of an HTTP/2 connection (round 86)
+    def __init__(self, conn, sid, method):
+        self._conn = conn
+        self._h2 = conn._h2
+        self.sock = conn.sock
+        self.stream_id = sid
+        self._method = method
+        self.version = 20
+        self.debuglevel = 0
+        self.will_close = false
+        self.chunked = false
+        self.url = none
+        self._on_done = none
+        self._done = false
+        self.trailers = none
+        var sh = self._h2.response_headers(sid)
+        self.status = sh[0]
+        self.code = self.status
+        self.reason = responses.get(self.status, "")
+        self.headers = HTTPMessage()
+        for kv in sh[1]:
+            self.headers.add(kv[0], kv[1])
+        self.msg = self.headers
+        self.length = none
+        var cl = self.headers.get("content-length")
+        if cl != none and cl.isdigit():
+            self.length = int(cl)
+        if method == "HEAD" or self.status == 204 or self.status == 304:
+            self.length = 0
+        if self._h2.ended(sid):
+            self._finish()
+
+    def _finish(self):
+        if self._done:
+            return
+        self._done = true
+        var t = self._h2.trailers(self.stream_id)
+        if t != none:
+            self.trailers = HTTPMessage()
+            for kv in t:
+                self.trailers.add(kv[0], kv[1])
+        self._h2.release(self.stream_id)
+        self._conn._state = "idle"
+        if self._on_done != none:
+            self._on_done(self)
+
+    def read(self, amt=none):
+        if self._done:
+            return b""
+        var data = self._h2.read(self.stream_id, amt)
+        if self.length != none:
+            self.length = max(0, self.length - len(data))
+        if self._h2.ended(self.stream_id):
+            self._finish()
+        return data
+
+    def read1(self, n=-1):
+        if n == none or n < 0:
+            n = 65536
+        return self.read(n)
+
+    def readinto(self, b):
+        var data = self.read(len(b))
+        b[0:len(data)] = data
+        return len(data)
+
+    def readline(self, limit=-1):
+        var out = b""
+        while not self._done:
+            var c = self.read(1)
+            if c == b"":
+                break
+            out = out + c
+            if c == b"\n" or (limit >= 0 and len(out) >= limit):
+                break
+        return out
+
+    def readlines(self):
+        var out = []
+        while true:
+            var l = self.readline()
+            if l == b"":
+                return out
+            out.append(l)
+
+    def __iter__(self):
+        return iter(self.readlines())
+
+    def getheader(self, name, default=none):
+        var v = self.headers.get_all(name)
+        if v == none or len(v) == 0:
+            return default
+        return ", ".join(v)
+
+    def getheaders(self):
+        return list(self.headers.items())
+
+    def info(self):
+        return self.headers
+
+    def geturl(self):
+        return self.url
+
+    def getcode(self):
+        return self.status
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def isclosed(self):
+        return self._done
+
+    def close(self):
+        if not self._done:
+            self._done = true
+            self._conn._state = "idle"
+            if self._on_done != none:
+                self._on_done(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, a, b, c):
+        self.close()
+        return false
+
+    def __repr__(self):
+        return "<http.client.HTTP2Response [" + str(self.status) + "] stream " + str(self.stream_id) + ">"
+
 class HTTPSConnection(HTTPConnection):
     default_port = HTTPS_PORT
 
-    def __init__(self, host, port=none, timeout=none, source_address=none, context=none, blocksize=8192, **kwargs):
-        HTTPConnection.__init__(self, host, port, timeout, source_address, blocksize)
+    def __init__(self, host, port=none, timeout=none, source_address=none, context=none, blocksize=8192, http2=false, **kwargs):
+        HTTPConnection.__init__(self, host, port, timeout, source_address, blocksize, http2)
         if context == none:
             import ssl
             context = ssl.create_default_context()
@@ -790,5 +1003,10 @@ class HTTPSConnection(HTTPConnection):
         var server_hostname = self.host
         if self._tunnel_host != none:
             server_hostname = self._tunnel_host
+        if self.http2:
+            self._context.set_alpn_protocols(["h2", "http/1.1"])
         self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
         self._reader = _Reader(self.sock)
+        self.http_version = "HTTP/1.1"
+        if self.http2 and self.sock.selected_alpn_protocol() == "h2":
+            self._start_h2("https")

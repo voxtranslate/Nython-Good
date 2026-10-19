@@ -49,25 +49,38 @@
 # unless that would make it longer (the hpack package codes every string).
 #
 # Beyond the hpack package (Nython's; opt-in, the default output is above):
-# what to index. RFC 7541 keeps the dynamic table FIFO (an eviction policy
-# cannot be changed without breaking interoperability), but the encoder alone
-# decides what goes into it. Encoder(policy=SmartIndexing()) does not index
-#   - credentials: authorization, proxy-authorization and short cookies are
-#     sent never-indexed (RFC 7541 7.1.3; the cookie rule is nghttp2's: a
-#     value under 20 bytes can be guessed by a CRIME-style probe);
-#   - high-entropy values: tokens, nonces, hashes, request ids (a
-#     character-entropy and character-class test on the value, 7.1.2 asks
-#     encoders to weigh this) - indexing them only pushes reusable entries
-#     out of the FIFO table;
-#   - values whose name keeps missing: per header name the policy counts
-#     how often an indexed value was later reused, and a name with several
-#     insertions and no reuse (content-length, :path with queries, etag,
-#     date in most responses ...) is sent without indexing from then on;
-#   - fields larger than a quarter of the table (one would evict most of it).
+# what to index. RFC 7541 keeps the dynamic table FIFO (changing the eviction
+# policy would break interoperability), but what goes INTO it is the
+# encoder's choice alone - an admission policy, as in caching.
+# Encoder(policy=SmartIndexing()):
+#   - credentials (Authorization, Proxy-Authorization, Cookie, Set-Cookie)
+#     shorter than 20 octets are sent never-indexed: HPACK makes a probe
+#     guess a whole value (RFC 7541 7.1.1), so short ones are the guessable
+#     ones (7.1.3; nghttp2 applies the rule to cookies); long tokens are
+#     safe to index and worth it - they repeat on every request;
+#   - one-hit wonders are not admitted on first sight: a value that looks
+#     random (a character-entropy and alphabet test: request ids, nonces,
+#     etags, hashes) or whose name's values rarely repeat is remembered in
+#     a small "doorkeeper" and indexed only if it comes again - the CDN
+#     "cache on second hit" rule (Maggs & Sitaraman, "Algorithmic Nuggets
+#     in Content Delivery", 2015; TinyLFU's doorkeeper, Einziger, Friedman
+#     & Manes 2017), so a repeated high-entropy value (a session cookie, a
+#     bearer token) costs one literal more and a unique one never evicts
+#     anything;
+#   - RFC 7541 7.1.2's penalty for "a header field with many different
+#     values": a name with 24+ literal values and under 1/8 as many hits is
+#     no longer compared with the dynamic table nor added to it (a probe
+#     defence that also keeps content-length and the like out);
+#   - a field larger than a quarter of the table is not indexed.
 # IndexAll() is the hpack package's choice (the default), IndexNone() never
-# indexes. compression_report(blocks, policies) measures them on a header
-# corpus: the HTTP/1.1 size of the header lists, each policy's encoded size
-# and ratio, and the dynamic-table hit rate (vm_audit123 reports it).
+# indexes. compression_report(blocks, policies, table_size) measures them on
+# a header corpus (the HTTP/1.1 size of the lists, each policy's encoded
+# size and ratio, the dynamic-table hits; every block is decoded again). On
+# vm_audit123's browsing-session corpus (80 requests and responses): requests
+# 5223 -> 5039 octets with a 4 KiB table and 10662 -> 5542 with 1 KiB;
+# responses 8205 -> 7337 with 1 KiB but 6174 -> 6324 (+2.4%) with 4 KiB - a
+# table with room to spare loses little to one-off entries, and a literal
+# without indexing names a static entry past 14 in two octets, not one.
 #
 # Written in the subset of the language CPython also runs: python3 can load
 # this file with importlib (SourceFileLoader) - vm_audit123 runs RFC 7541's
@@ -274,6 +287,20 @@ class HeaderTable:
         s = self._names.get(name)
         if s is not None:
             return (self._index_of(s), name, None)
+        return None
+
+    def has_name(self, name):
+        """Whether a name is in the static or the dynamic table."""
+        return name in _STATIC_NAMES or name in self._names
+
+    def search_static(self, name, value):
+        """search() in the static table only."""
+        i = _STATIC_FULL.get((name, value))
+        if i is not None:
+            return (i, name, value)
+        i = _STATIC_NAMES.get(name)
+        if i is not None:
+            return (i, name, None)
         return None
 
     def __repr__(self):
@@ -495,6 +522,9 @@ class IndexAll:
     """The hpack package's choice: index every field not marked sensitive."""
     name = "index-all"
 
+    def lookup(self, name):
+        return True
+
     def decide(self, name, value, table):
         return "index"
 
@@ -503,8 +533,11 @@ class IndexAll:
 
 
 class IndexNone:
-    """Never touch the dynamic table: every literal without indexing."""
+    """Never add to the dynamic table: every literal without indexing."""
     name = "index-none"
+
+    def lookup(self, name):
+        return True
 
     def decide(self, name, value, table):
         return "literal"
@@ -513,13 +546,15 @@ class IndexNone:
         pass
 
 
-_SECRET_NAMES = (b"authorization", b"proxy-authorization")
-_TOKEN_CHARS = b"0123456789abcdefABCDEF-_=+/."
+_CREDENTIALS = (b"authorization", b"proxy-authorization", b"cookie", b"set-cookie")
 
 
 def _looks_random(value):
     # A token, nonce, hash or id: long enough to matter, made of one
-    # "alphabet" (hex, base64, uuid-like) with high per-character entropy.
+    # "alphabet" (hex, base64, uuid-like), with high per-character entropy
+    # - the collision (Renyi order-2) entropy -log2(sum p^2) over 3.3 bits,
+    # computed without logarithms: sum p^2 < 2^-3.3 ~ 1/10. Random base64
+    # or hex sits at 4-6 bits per character, words and lists near 3.
     n = len(value)
     if n < 16:
         return False
@@ -529,61 +564,84 @@ def _looks_random(value):
     other = 0
     for c in value:
         counts[c] = counts.get(c, 0) + 1
-        if (c >= 65 and c <= 90) or (c >= 97 and c <= 122):
+        if (65 <= c <= 90) or (97 <= c <= 122):
             letters += 1
-        elif c >= 48 and c <= 57:
+        elif 48 <= c <= 57:
             digits += 1
-        elif c not in b"-_=+/.:":
+        elif c not in b"-_=+/.:\"":
             other += 1
     if other * 10 > n:          # spaces, commas, semicolons: prose or lists
         return False
-    if digits == 0 or letters + digits < n * 3 // 4:
+    if digits == 0:
         return False
-    # entropy in bits per character, without logarithms: the collision
-    # probability (Renyi order-2) estimate, -log2(sum p^2), against a
-    # threshold - random base64/hex sits near 4-6 bits, words near 3.
     total = 0
     for c in counts:
         total += counts[c] * counts[c]
-    # sum p^2 = total / n^2 < 2^-3.3  <=>  total * 10 < n * n
     return total * 10 < n * n
 
 
 class SmartIndexing:
-    """Do not index what will not be reused or must not be guessable.
+    """What to index, decided per field (see the module header).
 
-    min_inserts: insertions of a name with no reuse before the name is no
-    longer indexed; max_fraction: the largest share of the table one entry
-    may take."""
+    short_secret: credentials (Authorization, Proxy-Authorization, Cookie,
+    Set-Cookie) shorter than this are never indexed - a CRIME-style probe
+    can guess them whole (RFC 7541 7.1.1, 7.1.3; nghttp2's cookie rule);
+    penalty_after / penalty_ratio: a name with this many distinct literal
+    values and fewer hits than misses * ratio is no longer compared to the
+    dynamic table nor added to it (RFC 7541 7.1.2's penalty for "a header
+    field with many different values" - a probe defence that also keeps
+    one-off values out of the FIFO); doorkeeper: how many one-hit-wonder
+    candidates are remembered - a value predicted to be seen once (high
+    entropy, or a name whose values rarely repeat) is indexed only when it
+    comes a second time (the CDN "cache on second hit" rule, Maggs &
+    Sitaraman 2015; TinyLFU's doorkeeper, Einziger et al. 2017);
+    max_fraction: the largest share of the table one entry may take."""
     name = "smart"
 
-    def __init__(self, min_inserts=3, max_fraction=0.25, cookie_crumb=20):
-        self.min_inserts = min_inserts
+    def __init__(self, short_secret=20, penalty_after=24, penalty_ratio=0.125, doorkeeper=256, max_fraction=0.25):
+        self.short_secret = short_secret
+        self.penalty_after = penalty_after
+        self.penalty_ratio = penalty_ratio
         self.max_fraction = max_fraction
-        self.cookie_crumb = cookie_crumb
-        self.inserted = {}
-        self.reused = {}
+        self.doorkeeper_size = doorkeeper
+        self.hits = {}
+        self.misses = {}
+        self._door = {}
+        self._door_order = []
+
+    def _hit_ratio_low(self, name, after):
+        m = self.misses.get(name, 0)
+        return m >= after and self.hits.get(name, 0) < m * self.penalty_ratio
+
+    def lookup(self, name):
+        return not self._hit_ratio_low(name, self.penalty_after)
 
     def decide(self, name, value, table):
-        if name in _SECRET_NAMES:
-            return "never"
-        if name == b"cookie" and len(value) < self.cookie_crumb:
+        if name in _CREDENTIALS and len(value) < self.short_secret:
             return "never"
         if table_entry_size(name, value) > table.maxsize * self.max_fraction:
             return "literal"
-        if _looks_random(value):
+        if self._hit_ratio_low(name, self.penalty_after):
             return "literal"
-        ins = self.inserted.get(name, 0)
-        if ins >= self.min_inserts and self.reused.get(name, 0) == 0:
+        key = (name, value)
+        if key in self._door:
+            del self._door[key]
+            return "index"              # its second time: admitted
+        if _looks_random(value) or self._hit_ratio_low(name, 3):
+            self._door[key] = True
+            self._door_order.append(key)
+            if len(self._door_order) > self.doorkeeper_size:
+                old = self._door_order.pop(0)
+                self._door.pop(old, None)
             return "literal"
         return "index"
 
     def observe(self, name, value, hit):
-        # hit: an exact match was found in the dynamic table (a reuse)
+        # hit: an exact dynamic-table match; else a literal was sent
         if hit:
-            self.reused[name] = self.reused.get(name, 0) + 1
+            self.hits[name] = self.hits.get(name, 0) + 1
         else:
-            self.inserted[name] = self.inserted.get(name, 0) + 1
+            self.misses[name] = self.misses.get(name, 0) + 1
 
 
 # ── the encoder ────────────────────────────────────────────────────────────
@@ -644,20 +702,24 @@ class Encoder:
     def add(self, to_add, sensitive, huffman=False):
         """The representation of one (name, value) field."""
         name, value = to_add
-        match = self.header_table.search(name, value)
+        pol = self.policy
+        if pol is None or sensitive or pol.lookup(name):
+            match = self.header_table.search(name, value)
+        else:
+            match = self.header_table.search_static(name, value)
         if match is not None and match[2] is not None and not sensitive:
             if match[0] > STATIC_TABLE_LENGTH:
                 self.dynamic_hits += 1
-                if self.policy is not None:
-                    self.policy.observe(name, value, True)
+                if pol is not None:
+                    pol.observe(name, value, True)
             else:
                 self.static_hits += 1
             return self._encode_indexed(match[0])
         mode = "index"
         if sensitive:
             mode = "never"
-        elif self.policy is not None:
-            mode = self.policy.decide(name, value, self.header_table)
+        elif pol is not None:
+            mode = pol.decide(name, value, self.header_table)
         if mode == "index":
             prefix = 0x40
             bits = 6
@@ -676,8 +738,8 @@ class Encoder:
             out = bytes(idx) + self._encode_string(value, huffman)
         if mode == "index":
             self.header_table.add(name, value)
-            if self.policy is not None:
-                self.policy.observe(name, value, False)
+        if pol is not None:
+            pol.observe(name, value, False)
         return out
 
     def _encode_indexed(self, index):
