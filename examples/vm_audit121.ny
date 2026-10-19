@@ -21,9 +21,10 @@
 # table itself, input()'s result on a terminal (a pty), and - Nython only -
 # lib/nyaudit.ny's policies and `nython --audit-policy` / `--audit-log`.
 #
-#     ./build/nython-cli examples/vm_audit121.ny
+#     ./build/nython-cli examples/vm_audit121.ny        (108 checks)
 #     ./build/nython-cli --vm examples/vm_audit121.ny
-#     python3 examples/vm_audit121.ny
+#     python3 examples/vm_audit121.ny                   (88 under 3.11, 90 under 3.12;
+#                                                        3.13's rglob raises pathlib.Path.glob too)
 try:
     true
     nython = True
