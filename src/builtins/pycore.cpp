@@ -441,7 +441,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             Value k = keyv ? call1(*keyv, items[i]) : items[i];
             // item < best / item > best, as CPython's min_max (round 86: its
             // TypeError names them in that order)
-            if (E.sortLess(k, bestk, ctx, id == B_MIN ? "<" : ">")) { best = i; bestk = k; }
+            if (id == B_MIN ? E.sortOrder<false>(k, bestk, ctx) : E.sortOrder<true>(k, bestk, ctx)) { best = i; bestk = k; }
         }
         return items[best];
     }

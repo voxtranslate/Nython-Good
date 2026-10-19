@@ -15987,15 +15987,14 @@ private:
     }
     // sorted()/min()/max()/list.sort() ordering: Python's where defined;
     // values Python cannot compare fall back to type name then text.
-    // x < y (x > y for `op` ">") as sorted, min, max and list.sort compare
-    // - round 86: CPython's, values Python cannot order are a TypeError
+    // x < y (x > y for GT) as sorted, min, max and list.sort compare -
+    // round 86: CPython's, values Python cannot order are a TypeError
     // ("'<' not supported between instances of 'str' and 'int'"; they fell
     // back to type name, then text, so [1, "a"] sorted), as the
-    // interpreter's sortLess
-    bool sort_less(const VMVal& x, const VMVal& y, const char* op="<") {
-        const bool gt=op[0]=='>';
-        if(x.is_num()&&y.is_num()){ int c=VMVal::num_compare(x,y); return gt?c==1:c==-1; }
-        if(x.type==VMType::STRING&&y.type==VMType::STRING) return gt?x.s>y.s:x.s<y.s;
+    // interpreter's sortLess. A template: sorted's `<` tests no direction.
+    template<bool GT> bool sort_order(const VMVal& x, const VMVal& y) {
+        if(x.is_num()&&y.is_num()){ int c=VMVal::num_compare(x,y); return GT?c==1:c==-1; }
+        if(x.type==VMType::STRING&&y.type==VMType::STRING) return GT?x.s>y.s:x.s<y.s;
         // two lists or two tuples item by item (two sets too, as before -
         // not CPython's inclusion order)
         if(x.type==VMType::LIST&&y.type==VMType::LIST&&x.list&&y.list&&x.b==y.b){
@@ -16003,20 +16002,21 @@ private:
             for(size_t k=0;k<n;k++){
                 const VMVal& p=(*x.list)[k]; const VMVal& q=(*y.list)[k];
                 if(p==q) continue;
-                return sort_less(p,q,op);
+                return sort_order<GT>(p,q);
             }
-            return gt?x.list->size()>y.list->size():x.list->size()<y.list->size();
+            return GT?x.list->size()>y.list->size():x.list->size()<y.list->size();
         }
         if(x.type==VMType::INSTANCE||y.type==VMType::INSTANCE){
             // x.__lt__(y), else y.__gt__(x): sorted([F(3), 1, F(2)]) sorts
             // an int against objects (it compared type names)
             VMVal r;
-            if(gt?rich_compare(x,y,"__gt__","__lt__",r):rich_compare(x,y,"__lt__","__gt__",r)) return vm_truthy(r);
-            order_unsupported(op,x,y);
+            if(GT?rich_compare(x,y,"__gt__","__lt__",r):rich_compare(x,y,"__lt__","__gt__",r)) return vm_truthy(r);
+            order_unsupported(GT?">":"<",x,y);
         }
-        if(x.type==VMType::BYTES&&y.type==VMType::BYTES) return gt?x.bdata()>y.bdata():x.bdata()<y.bdata();
-        order_unsupported(op,x,y);
+        if(x.type==VMType::BYTES&&y.type==VMType::BYTES) return GT?x.bdata()>y.bdata():x.bdata()<y.bdata();
+        order_unsupported(GT?">":"<",x,y);
     }
+    bool sort_less(const VMVal& x, const VMVal& y) { return sort_order<false>(x,y); }
     VMVal list_method(VMVal obj, const std::string& m) {
         VirtualMachine* vm=this;
         return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{ return vm->list_call(obj,m,a); });
@@ -16446,7 +16446,7 @@ private:
                 VMVal bk=keyv?call1(*keyv,items[0]):items[0];
                 for(size_t k=1;k<items.size();k++){
                     VMVal kk=keyv?call1(*keyv,items[k]):items[k];
-                    if(vm->sort_less(kk,bk,is_min?"<":">")){ best=k; bk=kk; }   // item < best / item > best, CPython's min_max (round 86)
+                    if(is_min?vm->sort_order<false>(kk,bk):vm->sort_order<true>(kk,bk)){ best=k; bk=kk; }   // item < best / item > best, CPython's min_max (round 86)
                 }
                 return items[best];
             });

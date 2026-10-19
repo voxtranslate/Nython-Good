@@ -2344,19 +2344,20 @@ public:   // NythonExecutor is a struct: members default to public
         return orderFail(a, b);
     }
 
-    // round 86: a < b (a > b for `op` ">") as sorted, min, max and list.sort
+    // round 86: a < b (a > b for GT) as sorted, min, max and list.sort
     // compare, CPython's: values Python cannot order are a TypeError ("'<'
     // not supported between instances of 'str' and 'int'"; they fell back to
-    // type name, then text, so [1, "a"] sorted); a NaN compares false.
-    bool sortLess(const Value& a, const Value& b, Context* ctx, const char* op = "<") {
-        const bool lt = op[0] == '<';
+    // type name, then text, so [1, "a"] sorted); a NaN compares false. A
+    // template, as the VM's sort_order: sorted's `<` tests no direction.
+    template <bool GT> bool sortOrder(const Value& a, const Value& b, Context* ctx) {
         int c = 3;
-        if (orderValues(a, b, c, ctx)) return lt ? c < 0 : c > 0;
+        if (orderValues(a, b, c, ctx)) return GT ? c > 0 : c < 0;
         if (c == 2) return false;
         // bytes by their bytes, as the operators order them (orderValues has no case for them)
-        if (auto* ba = bytesOf(a)) if (auto* bb = bytesOf(b)) { int k = ba->s.compare(bb->s); return lt ? k < 0 : k > 0; }
-        pyRaise("TypeError", std::string("'") + op + "' not supported between instances of '" + order_fail_l_ + "' and '" + order_fail_r_ + "'");
+        if (auto* ba = bytesOf(a)) if (auto* bb = bytesOf(b)) { int k = ba->s.compare(bb->s); return GT ? k > 0 : k < 0; }
+        pyRaise("TypeError", std::string(GT ? "'>'" : "'<'") + " not supported between instances of '" + order_fail_l_ + "' and '" + order_fail_r_ + "'");
     }
+    bool sortLess(const Value& a, const Value& b, Context* ctx) { return sortOrder<false>(a, b, ctx); }
 
     // `x in c`
     bool containsValue(const Value& c, const Value& x, Context* ctx) {
