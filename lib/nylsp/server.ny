@@ -116,7 +116,12 @@ class Document:
         self.path = path
         self.version = version
         self.language = language
-        self.h = int(L("open", text, path, ""))
+        # the binding rule is the file's (.py, `# nython: python`); a document
+        # with no such name (untitled:) takes it from its languageId
+        forced = ""
+        if language == "python" and not (path.endswith(".ny") or path.endswith(".py")):
+            forced = "1"
+        self.h = int(L("open", text, path, forced))
         self.edits = 0
         self.analysis = None
         self.analysis_edits = -1

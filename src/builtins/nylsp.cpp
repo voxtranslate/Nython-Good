@@ -2286,7 +2286,11 @@ std::shared_ptr<Analysis> analyze(Doc& d) {
     for (size_t i = 0; i < A->lines.size(); i++) A->line_ascii[i] = ascii(A->lines[i]) ? 1 : 0;
     A->patched.assign(A->lines.size(), 0);
     A->python = doc_python(d);
-    std::string fname = d.path.empty() ? std::string(A->python ? "<document>.py" : "<document>.ny") : d.path;
+    // the name the parses see gives them the document's binding rule (an
+    // untitled document's is its languageId's)
+    std::string fname = d.path;
+    if (fname.empty() || nython::scope::python_source(fname, A->text) != A->python)
+        fname = A->python ? "<document>.py" : "<document>.ny";
     // 1. parse, cutting out what does not
     std::vector<std::string> work = A->lines;
     ParseErr pe;
@@ -2619,10 +2623,6 @@ void ty_json(J& j, const Analysis& A, const Sym::TyV& t) {
     j.end_obj();
 }
 
-std::string first_para(const std::string& doc) {
-    return doc;
-}
-
 void sym_json(J& j, Analysis& A, int id, bool full = true) {
     Sym& y = A.syms[(size_t)id];
     j.obj();
@@ -2835,6 +2835,7 @@ std::vector<uint32_t> semantic_data(Analysis& A) {
         STok t{row, (uint32_t)enc_col(A, row, c0), (uint32_t)enc_col(A, row, c1), type, mods};
         if (t.end > t.col) out.push_back(t);
     };
+    long prefix_col = -1;   // a string prefix just seen: the string's token starts there
     for (size_t i = 0; i < A.nlex; i++) {
         const Tk& k = A.toks[i];
         if (k.row >= A.lines.size()) continue;
@@ -2845,8 +2846,10 @@ std::vector<uint32_t> semantic_data(Analysis& A) {
         default: break;
         }
         if (k.type == TokenType::String || k.type == TokenType::Bytes) {
+            uint32_t first = prefix_col >= 0 ? (uint32_t)prefix_col : k.col;
+            prefix_col = -1;
             for (uint32_t r = k.row; r <= k.erow && r < A.lines.size(); r++) {
-                uint32_t c0 = r == k.row ? k.col : 0;
+                uint32_t c0 = r == k.row ? first : 0;
                 uint32_t c1 = r == k.erow ? k.ecol : (uint32_t)cp_of_byte(A.lines[r], A.lines[r].size());
                 strs[r].push_back({c0, c1});
                 push(r, c0, c1, T_STRING, 0);
@@ -2864,7 +2867,7 @@ std::vector<uint32_t> semantic_data(Analysis& A) {
             && A.toks[i + 1].row == k.row && A.toks[i + 1].col == k.ecol && A.occ[i] < 0) {
             bool prefix = true;
             for (char ch : k.val) if (!strchr("fFrRbBuU", ch)) prefix = false;
-            if (prefix) { push(k.row, k.col, k.ecol, T_STRING, 0); continue; }
+            if (prefix) { prefix_col = (long)k.col; continue; }
         }
         int sym = A.occ[i];
         if (sym >= 0) {

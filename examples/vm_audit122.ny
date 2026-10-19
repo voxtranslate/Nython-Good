@@ -744,6 +744,11 @@ check("... (.ny, no outer binding: the same)", [g[:3] for g in diag_of("unb.ny",
 check("... (.ny with a module binding: Nython reads it there; the rules' difference noted)",
       [g[:3] for g in diag_of("unb2.ny", "n = 0\ndef f():\n    print(n)\n    for n in range(2):\n        pass\n")],
       [[2, 10, "nython-scope"]])
+c.notify("textDocument/didOpen", {"textDocument": {"uri": "untitled:Untitled-1", "languageId": "python", "version": 1,
+                                                   "text": "n = 0\ndef f():\n    print(n)\n    for n in range(2):\n        pass\n"}})
+check("... (an untitled document: the rule of its languageId, python)",
+      [[g["range"]["start"]["line"], g["range"]["start"]["character"], g["code"]] for g in c.diagnostics("untitled:Untitled-1")["diagnostics"]],
+      [[2, 10, "unbound-local"]])
 check("... not when a loop binds it on an earlier iteration",
       diag_of("unb3.py", "def f():\n    for i in range(3):\n        if i:\n            print(v)\n        v = i\n"), [])
 check("nonlocal without a binding (NyScope's SyntaxError)",
@@ -842,6 +847,13 @@ dl2 = c.req("textDocument/semanticTokens/full/delta", {"textDocument": {"uri": u
 check("... nothing changed: no edits", dl2["edits"], [])
 dl3 = c.req("textDocument/semanticTokens/full/delta", {"textDocument": {"uri": uri(p_tok)}, "previousResultId": "nope"})
 check("... an unknown previous result: the full data", "data" in dl3, True)
+PFX = "x = 1\ns = rb'z' + f\"a{x}\"\n"
+p_pfx = write("pfx.py", PFX)
+open_doc(p_pfx, PFX, "python")
+c.diagnostics(uri(p_pfx))
+st4 = c.req("textDocument/semanticTokens/full", {"textDocument": {"uri": uri(p_pfx)}})
+check("... a string's prefix is part of its string token", decode(st4["data"])[2:],
+      [[1, 0, 1, "variable", 1], [1, 4, 5, "string", 0], [1, 12, 7, "string", 0]])
 
 # ── code actions ─────────────────────────────────────────────────────────────
 FIX = "import os\nimport sys\n\ndef f(x):\n    if x == None:\n        return 1\n    print(sys.argv)\n"
