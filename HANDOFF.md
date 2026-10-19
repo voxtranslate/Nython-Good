@@ -501,12 +501,15 @@ paths only.**
   `FunctionNode::py_rule` / `LambdaNode::py_rule` to the body's own rule
   (the def-line opt-in included).
 - Interpreter: the node's flag where the node is at hand - evalBinary's
-  `is` (identity) and `binaryOp(opc, l, r, ctx, py)` (1/0 from the node;
-  -1, the default, asks `pyCode()`), evalAugAssignment, evalFor's int
-  branch, comprehension clauses, generator expressions' clauses (NyGen's
-  `open(..., py)`), evalAttribute / evalAugAssignment's attribute read
-  (after a read succeeded, `pyDictKeyRead(obj, attr)`: was it a plain
-  dict's key? - a test inside getAttrValue cost deltablue 3.3M
+  `is` (identity) and binaryOp (the node's 1/0 in opc's upper bits,
+  `binaryOp(opcRule(opc, bn->py_src), l, r, ctx)`; a plain opc - sum's -
+  asks `pyCode()`. **Not a parameter**: binaryOp has six register
+  arguments, a seventh went on the stack and gave evalBinary a frame
+  pointer, +3 instructions per operator, +0.26% on fib), evalAugAssignment,
+  evalFor's int branch, comprehension clauses, generator expressions'
+  clauses (NyGen's `open(..., py)`), evalAttribute / evalAugAssignment's
+  attribute read (after a read succeeded, `pyDictKeyRead(obj, attr)`: was
+  it a plain dict's key? - a test inside getAttrValue cost deltablue 3.3M
   instructions), attribute stores -> `dictAttrStoreCheck`. Builtins ask `pyCode()` - the running
   lambda's `py_rule` (a lambda body has no statements), else the running
   statement's `py_src` (`cur_stmt()`) - on their rare paths only:

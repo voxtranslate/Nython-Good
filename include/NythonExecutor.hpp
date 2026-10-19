@@ -2447,11 +2447,18 @@ public:   // NythonExecutor is a struct: members default to public
         if (isSeq(rv)) pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(lv) + "'");
         unsupportedOperands(OP_MUL, lv, rv);
     }
-    // `py` (round 86): the operator is Python-language source's (Node::py_src)
-    // - 1 yes, 0 no, -1 a builtin's (sum) operation: its caller's (pyCode).
-    // Python's + then concatenates no str with a non-str, nor a list with a
-    // tuple (Nython's leniencies): CPython's TypeError.
-    Value binaryOp(int opc, Value lv, Value rv, Context* ctx, int py = -1) {
+    // Round 86: whether the operator is Python-language source's
+    // (Node::py_src) travels in opc's upper bits, `opcRule(opc, py_src)` - 1
+    // yes, 0 no; a plain opc (a builtin's operation, sum's) asks its caller's
+    // rule (pyCode). Python's + then concatenates no str with a non-str, nor
+    // a list with a tuple (Nython's leniencies): CPython's TypeError. Not a
+    // parameter: a seventh argument goes on the stack, and that gave
+    // evalBinary a frame pointer (3 instructions more per binary operator).
+    static constexpr int kOpRuleShift = 8;
+    static int opcRule(int opc, int py_src) { return opc | ((py_src + 1) << kOpRuleShift); }
+    Value binaryOp(int opc, Value lv, Value rv, Context* ctx) {
+        const int py = (opc >> kOpRuleShift) - 1;   // round 86: 1, 0, or -1 (ask pyCode)
+        opc &= (1 << kOpRuleShift) - 1;
         // Sets: | & - ^ and the subset comparisons (round 77).
         if (opc == OP_BOR || opc == OP_BAND || opc == OP_SUB || opc == OP_BXOR ||
             opc == OP_LT || opc == OP_LE || opc == OP_GT || opc == OP_GE) {
@@ -3025,7 +3032,7 @@ public:   // NythonExecutor is a struct: members default to public
             }
             if (!done) {
                 if (opc == OP_UNKNOWN) result = new_val;
-                else result = binaryOp(opc, old_val, new_val, ctx, an->py_src);   // round 86: the node's rule
+                else result = binaryOp(opcRule(opc, an->py_src), old_val, new_val, ctx);   // round 86: the node's rule
             }
         }
         storeAugTarget(an, kind, obj, idx, result, ctx);
@@ -4939,7 +4946,7 @@ public:   // NythonExecutor is a struct: members default to public
             Value r;
             if (numBinary(opc, lv, rv, r)) return r;
         }
-        return binaryOp(opc, std::move(lv), std::move(rv), ctx, bn->py_src);   // round 86: the node's rule
+        return binaryOp(opcRule(opc, bn->py_src), std::move(lv), std::move(rv), ctx);   // round 86: the node's rule
     }
     // round 82: the message of the ZeroDivisionError x / // % y raises
     // (nypy::arith's), or nullptr when y is not zero

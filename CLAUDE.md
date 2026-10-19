@@ -1845,8 +1845,11 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   top frame's: `vm_py()`), **only on the lenient paths** - no hot path
   tests it, and no specialized VM form handles a lenient case, so
   quickening keeps the distinction. **A new leniency must test the flag on
-  its slow path the same way** (`binaryOp(..., py)`, `pyDictKeyRead`
-  after a successful read, `lookup_attr(..., py)`).
+  its slow path the same way** (`opcRule(opc, py_src)` into binaryOp, `pyDictKeyRead`
+  after a successful read, `lookup_attr(..., py)`). **Keep a hot callee at
+  six register arguments** (`this` and a returned Value's hidden pointer
+  count): a seventh goes on the stack, and binaryOp's gave evalBinary a
+  frame pointer (+0.26% on fib) - hence `opcRule`.
 - **Every file** (both engines): sorted/min/max/list.sort raise CPython's
   TypeError for values Python cannot order (they ordered by type name,
   then text); `[1, 2]["0"]` is a TypeError; CPython's messages for seq *
