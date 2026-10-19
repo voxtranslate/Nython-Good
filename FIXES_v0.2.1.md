@@ -5845,6 +5845,21 @@ Full detail in `HANDOFF.md` §0y (part E), §0y2 (part F) and §0y3 (main sessio
 | tkinter's `_ny_drive` delivered no input under Wine (vm_audit114) | the Windows CRT never read lines appended to a file that was empty when the stream met EOF | the reader seeks back to its offset after EOF (real-SDL harness and the stub) |
 | vm_audit112 failed on Windows | it called `os.writev` (POSIX-only) and expected `<i` for c_int | Windows branches: os.write; `<l` where c_int is c_long (CPython's ctypes) |
 
+## Round 86 — audit events, a language server, HTTP/2
+
+Full detail in `HANDOFF.md` §0z (part G), §0z2 (part H), §0z3 (part I). New tests: `vm_audit121` (109; 89-91 under python3.11-3.13), `vm_audit122` (169, Nython-only), `vm_audit123` (242; 233 under python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| An audit hook saw exec/compile/import/open/input and a few library modules' events, not the ~190 CPython raises (os.*, socket.*, subprocess.Popen, builtins.id, object.__setattr__ of code attributes, sys._getframe, pickle.find_class ...) | never raised | `tools/gen_audit_events.py` -> `tools/audit_events.json` (CPython's docs, its Lib/ and probes of python3.11-3.13); the events raised with CPython's names and arguments on both engines and in lib/; engine audit points test `nyrt::audit_on()` first and stay quiet for prelude callers; hook-only helpers are the lazily loaded "audit" chunk (part G) |
+| `types.FunctionType(code, globals)` failed | not implemented | `_ny_function_new`, CPython 3.12's argument checks and messages |
+| `shutil.chown` raised NotImplementedError; `os.makedirs` made no `os.mkdir` events | stubs | CPython's implementations |
+| No way to restrict what a program may do | - | `lib/nyaudit.ny`: allow/deny/log policies over event globs and argument patterns (after Miller 2006's object capabilities), `nython --audit-policy FILE`, `--audit-log FILE`, `nython -m nyaudit derive LOG` |
+| Only Nython's own IDE could use the parser's analyses | no language server | `nython -m nylsp`: LSP 3.17 over the real parser (`src/builtins/nylsp.cpp`) - diagnostics, completion, hover, signature help, definition/references, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens, code actions, inlay hints; error recovery by indentation islands (part H) |
+| No HTTP/2, no HPACK, no WebSocket compression | not written (CPython has none) | `lib/hpack.ny` (RFC 7541, Appendix C byte for byte), `lib/h2/` (RFC 9113, sans-I/O after the h2 package, asyncio client/server with ALPN, RFC 9218 priorities), `http.client`/`urllib` with `http2=`, `lib/permessage_deflate.ny` (RFC 7692) in lib/websocket.ny, `lib/websocket_asyncio.ny` (part I) |
+| A thread using memoryview while another thread loaded its prelude chunk got "object of type 'memoryview' has no len()" (about half the http.client runs) | a lazily loaded chunk was marked loaded before its definitions ran, and the GIL could change hands meanwhile | a thread arriving during a load waits for it with the GIL released (`mirrors_loading_`, both engines) |
+| `await websocket_asyncio.connect(...)` deadlocked | an `__await__` returning an unstarted coroutine's own `__await__()` was driven by hand, which cannot wait on another task of the loop | awaited as that coroutine (`_ny_await_iter`) |
+
 ## Round 84, part 0 — the semantic gaps rounds 82-83 found
 
 Full detail in `HANDOFF.md` §0w. New test: `vm_audit116` (34 checks; both engines and python3).
