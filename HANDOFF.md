@@ -313,6 +313,10 @@ files) and runs the same checks there: **242 checks; 242 pass on the
 interpreter and the VM, 233 under python3** (the http.client /
 urllib and lib/websocket.ny sections are Nython-only).
 
+Verified at the end: `tools/sweep.py` 470 runs, 0 not ok (with the API
+baseline check and cbp); `tools/ide_e2e.py` 463 passed, 0 failed; class
+check clean; vm_audit123 passed 28 times in a row under 4-8 parallel runs.
+
 Interop was checked outside the test as well (not in the suite: they need
 packages and tools the container lacks by default): curl 8.5 / nghttp2 1.59
 against h2.server (`--http2-prior-knowledge`, `--http2` over TLS with ALPN,
