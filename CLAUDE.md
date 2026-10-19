@@ -1826,7 +1826,7 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   the coroutine waited for another task); a lazily loaded prelude chunk is
   waited for by a second thread while the first loads it (`ensureMirror` /
   `load_mirror`: threads saw memoryview without members).
-## Round 86, part J: Python-language source behaves as CPython where Nython is lenient (see `HANDOFF.md` §0z)
+## Round 86, part J: Python-language source behaves as CPython where Nython is lenient (see `HANDOFF.md` §0z4)
 
 - **In Python-language source** (.py, `# nython: python`, code compiled
   from one, ast trees, a def opting in) valid Python means what CPython

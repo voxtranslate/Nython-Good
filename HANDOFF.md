@@ -7,9 +7,8 @@ Last updated: round 86, part G — **§0z** (CPython's audit events (PEP 578) ra
 Round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
 Round 86 (main session) — **§0z5** (program text never read as a path: an f-string field naming a file read it, one naming a directory hung the parser, `f"{...}"` hung on Windows; os.read/os.write on Windows' standard descriptors in binary; nylsp's stdin on Windows; nyaudit's path patterns on Windows; the round 86 suites under Wine; vm_audit125).
 Round 86, part I — **§0z3** (HTTP/2 and HPACK beyond CPython: lib/hpack.ny (RFC 7541), lib/h2/ (RFC 9113 sans-I/O H2Connection with h2's API, hyperframe's frames, RFC 9218 priorities and scheduler, asyncio client/server with ALPN, h2.sync for http.client/urllib http2=), permessage-deflate (RFC 7692) for websocket.ny and a new websocket_asyncio.ny; HPACK admission control; two engine fixes - awaiting a coroutine's own __await__, prelude chunks loaded under threads; vm_audit123)
+Round 86, part J — **§0z4** (Python-language source behaves as CPython where Nython is lenient: `is` identity, + with no str/non-str or list/tuple mixing, no int iteration, no dict keys as attributes, list.sort() None, literal spellings as names - one mark per node from the scope pass, read only on the lenient paths; strict ordering in sorted/min/max and CPython's messages everywhere; an int iterable wherever Nython code iterates; `--python-compat-report`; vm_audit124)
 Round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
-Round 86, part J — **§0z** (Python-language source behaves as CPython where Nython is lenient: `is` identity, + with no str/non-str or list/tuple mixing, no int iteration, no dict keys as attributes, list.sort() None, literal spellings as names - one mark per node from the scope pass, read only on the lenient paths; strict ordering in sorted/min/max and CPython's messages everywhere; an int iterable wherever Nython code iterates; `--python-compat-report`; vm_audit124)
-Last updated: round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
 Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
 Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
 Round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
@@ -437,7 +436,7 @@ window of 8 bits, as it says; we accept it - below).
   closed ("Exception in default exception handler"). CPython has the same
   window, rarely hit. A coroutine driven by hand still cannot wait for
   another task of its loop (engine change 1 covers the common shape only).
-## 0z. Round 86, part J — Python-language source behaves as CPython where Nython is lenient (vm_audit124)
+## 0z4. Round 86, part J — Python-language source behaves as CPython where Nython is lenient (vm_audit124)
 
 **The rule.** Round 85 (§0y2) gave Python-language source - a `.py` file,
 a file whose leading comments say `# nython: python`, code compile() /
@@ -646,6 +645,16 @@ container receiver whose read succeeded).
 check clean.
 
 ---
+
+
+**Merged with parts G, H and I** (main session): J's rewrite of the Nython
+literal words in Python-language lib files met G's and I's new code in seven
+files (array, http/client, shutil, socket, subprocess, threading,
+urllib/request); after the merge 101 lowercase `none`/`true`/`false` that G
+and I had written there were respelled by a token-aware pass (a literal word
+is a plain name in Python-language source now, so each would have been a
+NameError), and a scan of all 459 Python-language lib files found none left.
+**New code in a `# nython: python` file must spell `True`/`False`/`None`.**
 
 ## 0z5. Round 86 (main session) — program text is never a path, raw standard descriptors on Windows, the round 86 suites under Wine (vm_audit125)
 

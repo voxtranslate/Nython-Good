@@ -5826,7 +5826,7 @@ both engines and under python3).
 | ctypes: `strtod(b"3.25xyz", byref(end))` left `end` pointing at freed memory | a `bytes` argument was copied into a temporary C string freed after the call (CPython passes the bytes object's own buffer, which lives as long as the object) | C strings made from bytes are kept in a 512-entry cache keyed by their contents (`_cstr_cached`) |
 | ctypes: a `BigEndianStructure` subclass was laid out little-endian | its byte order was read from the class's own attributes only | read through the MRO |
 
-## Round 86, part J — Python-language source behaves as CPython where Nython is lenient
+## Round 86, part J — Python-language source behaves as CPython where Nython is lenient (`HANDOFF.md` §0z4)
 
 Full detail in `HANDOFF.md` §0z. New test: `vm_audit124` (both engines; its shared part under python3).
 
