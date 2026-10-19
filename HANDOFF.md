@@ -655,6 +655,10 @@ and I had written there were respelled by a token-aware pass (a literal word
 is a plain name in Python-language source now, so each would have been a
 NameError), and a scan of all 459 Python-language lib files found none left.
 **New code in a `# nython: python` file must spell `True`/`False`/`None`.**
+Verified merged (G, H, I, the main session's fixes and J): sweep 478 runs,
+0 not ok; `tools/ide_e2e.py` 463 passed; memory probe, lint, class check,
+cbp (80 units) and the API baseline clean; under Wine (64-bit) vm_audit124
+219, vm_audit119 85 and vm_audit125 14 pass on both engines.
 
 ## 0z5. Round 86 (main session) — program text is never a path, raw standard descriptors on Windows, the round 86 suites under Wine (vm_audit125)
 
