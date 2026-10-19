@@ -807,6 +807,10 @@ def plat(label, recs):
     for r in recs:
         if r and r[0] == "shutil.chown":
             continue
+        # CPython's Windows _execute_child audits the command line it made
+        # (list2cmdline), with no executable unless one was given
+        if r and r[0] == "subprocess.Popen" and len(r) > 1 and isinstance(r[1][1], list) and r[1][0] == r[1][1][0]:
+            r = (r[0], (None, subprocess.list2cmdline(r[1][1])) + tuple(r[1][2:]))
         if r and r[0] in ("os.system", "os.putenv", "os.unsetenv") and len(r) > 1:
             r = (r[0], tuple(a.decode() if isinstance(a, bytes) else a for a in r[1]))
         out.append(n(r))
@@ -867,6 +871,10 @@ if os.environ.get("NY121_DUMP"):
     sys.exit(0)
 
 check("the child ran every case", ["done" in got, proc.returncode], [True, 1])
+# what CPython records on Windows beyond spelling: a default browser is
+# always registered there, so webbrowser.open is audited (and vetoed here)
+if os.name == "nt":
+    EXPECTED["webbrowser.open"] = [("webbrowser.open", ("http://example.invalid/121",))]
 for label in EXPECTED:
     if not kept(label):
         continue

@@ -190,6 +190,11 @@ p_ibase = write("inc_base.ny", INC_BASE)
 p_imain = write("inc_main.ny", INC_MAIN)
 
 def uri(p):
+    # a file URI as clients write it: "/" separators, a drive as "/C%3A/"
+    # (VS Code's form; on POSIX "file://" + the path)
+    p = p.replace("\\", "/")
+    if len(p) > 1 and p[1] == ":":
+        p = "/" + p[0] + "%3A" + p[2:]
     return "file://" + p
 
 # the UTF-16 column of the nth `needle` on line `line` of a text (and the

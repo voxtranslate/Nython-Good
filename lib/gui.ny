@@ -16026,7 +16026,7 @@ class DebugPanel:
             var tx = self.rect.x + ti * tw
             if ti == self.active_tab:
                 renderer.fill_xywh(tx, self.rect.y + tab_h - 2, tw, 2, self.accent)
-                renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_bold, Color(ACC.r, ACC.g, ACC.b, 220) if false else Color(self.accent.r, self.accent.g, self.accent.b, 220))
+                renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_bold, Color(self.accent.r, self.accent.g, self.accent.b, 220))
             else:
                 renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_ui, _GC_100_102_140_160)
             renderer.draw_line(tx + tw - 1, self.rect.y + 6, tx + tw - 1, self.rect.y + tab_h - 6, self.border, 1)
