@@ -604,8 +604,22 @@ struct Walker {
     // ── expressions ──
     void exprs(const std::vector<node_ptr>& v, int s) { for (auto& n : v) expr(n.get(), s); }
 
+    // how deep the walk is: a tree deeper than this (`a + a + ... ` with
+    // thousands of terms) is not followed further, the C++ stack is not
+    // the tree's
+    int depth = 0;
+    struct Deeper {
+        int& d;
+        explicit Deeper(int& x) : d(x) { d++; }
+        ~Deeper() { d--; }
+        Deeper(const Deeper&) = delete;
+        Deeper& operator=(const Deeper&) = delete;
+    };
+    static constexpr int kMaxDepth = 2500;
+
     void expr(Node* n, int s) {
-        if (!n) return;
+        if (!n || depth > kMaxDepth) return;
+        Deeper deeper(depth);
         switch (n->type()) {
         case NodeType::VARIABLE: {
             auto* v = static_cast<VariableNode*>(n);
@@ -1227,7 +1241,8 @@ struct Walker {
     }
 
     void stmt(Node* n, int s, const Deco* dc_in = nullptr) {
-        if (!n) return;
+        if (!n || depth > kMaxDepth) return;
+        Deeper deeper(depth);
         Deco dc;
         if (dc_in) dc = *dc_in;
         int t0 = span0(n), t1 = span1(n);
