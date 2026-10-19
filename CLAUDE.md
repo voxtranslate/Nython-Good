@@ -1777,7 +1777,8 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   (`src/NyPreludeAudit.cpp`: the events' argument helpers, the excepthook/
   unraisablehook events, code.replace, types.FunctionType), loaded by the
   first `sys.addaudithook` before the hook is listed: anything that tests
-  `_ny_audit_hooks` / `audit_on()` finds it; startup is unchanged. **A new
+  `_ny_audit_hooks` / `audit_on()` finds it (`-c pass`: +1.6% instructions
+  over round 85 for the inline guards and stubs; +3.75% before). **A new
   event whose arguments need a helper**: `if _ny_audit_hooks:
   _ny_audit_fire(...)`, not `_ny_sys_audit(..., helper(x))` (that runs the
   helper with no hook, and the helper may not be loaded).

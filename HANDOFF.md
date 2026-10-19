@@ -239,6 +239,14 @@ the rest of CPython's, with its names and its arguments, on both engines.
   prelude that load it. With these in the startup prelude `-c pass` cost
   3.75% more instructions on both engines. An event whose arguments need a
   helper is written `if _ny_audit_hooks: _ny_audit_fire(...)`.
+- **Measured against the base (4406438)**: `tools/bench/run.py` (the work,
+  no hook) geomean 1.01x on the VM and 1.03x on the interpreter - noise on
+  a shared machine, every benchmark's result equal to python3's; callgrind
+  instructions: `-c pass` +1.6% (interpreter and VM: the startup prelude's
+  inline guards and stubs, all lexing and parsing), `-c "import os"` +3.1%
+  (the os chunk's audited wrappers and CPython's os.makedirs). Verified:
+  sweep 470 runs, 0 not ok; `tools/ide_e2e.py` 463 passed; ide_lint,
+  ide_memprobe, ny_classcheck, cbp (79 units) clean.
 - Engine-level events: builtins.id, builtins.input/result (a terminal only),
   compile (bytes, filename; a tree with None - before lib/ast.ny takes it),
   exec (the code object: a source is compiled first - `_ny_audit_exec`),
