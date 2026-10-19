@@ -643,7 +643,9 @@ class Server:
                     if self.ws.resolve_module(d.path, sub, im["level"]) is None:
                         out.append(self.diag(im.get("nameRange") or rng, 2, "unresolved-import-name",
                                              "cannot import name '" + nm + "' from '" + im["module"] + "'"))
-        if self.options.get("undefinedNames", True) and star_known:
+        # (not while something was cut out by the error recovery: a cut def's
+        # parameters would read as undefined in its island)
+        if self.options.get("undefinedNames", True) and star_known and a["recoveries"] == 0:
             seen = set()
             for u in a["unresolved"]:
                 n = u["name"]

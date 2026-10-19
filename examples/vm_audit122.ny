@@ -661,6 +661,48 @@ check("a new name must be an identifier", r["error"]["code"], -32602)
 r = c.request("textDocument/prepareRename", doc_pos(uri(p_app), 1, 9))
 check("a module cannot be renamed", r["error"]["message"], "renaming a module needs its file renamed")
 
+# ── scopes: what a rename follows, by each language's rule ──────────────────
+INTERP = "$" + "{total}"    # (written in two parts: this file is Nython, where it would interpolate)
+SCOPES_NY = ("total = 0\ndef add(n):\n    total = total + n\ndef local_one():\n    var total = 5\n    return total\n"
+             + "def outer():\n    count = 0\n    def inner():\n        nonlocal count\n        count = count + 1\n"
+             + "    inner()\n    return count\ndef g():\n    global total\n    total = 1\nclass K:\n    total = 3\n"
+             + "    def m(self):\n        return total\nsquares = [total for total in range(3)]\n"
+             + "fn = lambda total: total + 1\nprint(f\"{total}\", \"" + INTERP + "\")\n")
+SCOPES_PY = ("total = 0\ndef add(n):\n    total = n + 1\n    return total\ndef g():\n    global total\n    total = 1\n"
+             + "def outer():\n    count = 0\n    def inner():\n        nonlocal count\n        count += 1\n    return count\n"
+             + "squares = [total for total in range(3)]\nprint(f\"{total}\", \"" + INTERP + "\")\n")
+p_sny = write("scopes.ny", SCOPES_NY)
+p_spy = write("scopes_py.py", SCOPES_PY)
+open_doc(p_sny, SCOPES_NY)
+open_doc(p_spy, SCOPES_PY, "python")
+c.diagnostics(uri(p_sny))
+c.diagnostics(uri(p_spy))
+def spots(we):
+    return [[e[1], e[2]] for e in edits_of(we)]
+check("Nython's rule: the module's total is rebound by add (plain assignment), named by g (global), read by "
+      + "K.m (a class body is not a scope of its methods), in an f-string field and in a ${...}; not var local_one's, "
+      + "not the class attribute, not the comprehension's or the lambda's",
+      spots(rename(p_sny, 0, 0, "grand")), [[0, 0], [2, 4], [2, 12], [14, 11], [15, 4], [19, 15], [22, 9], [22, 21]])
+check("Python's rule: add's total is its local; ${...} is text in a Python string",
+      spots(rename(p_spy, 0, 0, "grand")), [[0, 0], [5, 11], [6, 4], [14, 9]])
+check("nonlocal: the enclosing function's count (.ny)", spots(rename(p_sny, 7, 4, "n")),
+      [[7, 4], [9, 17], [10, 8], [10, 16], [12, 11]])
+check("nonlocal: the enclosing function's count (.py, an augmented assignment)", spots(rename(p_spy, 8, 4, "n")),
+      [[8, 4], [10, 17], [11, 8], [12, 11]])
+check("the comprehension's own variable", spots(rename(p_sny, 20, 11, "t")), [[20, 11], [20, 21]])
+check("a lambda's parameter", spots(rename(p_sny, 21, 12, "t")), [[21, 12], [21, 19]])
+check("the class attribute", spots(rename(p_sny, 17, 4, "t")), [[17, 4]])
+
+# error recovery keeps the rest of a document whose def header is broken
+ISLAND = "def broken(a, :\n    inner = a + 1\n    return inner\n\nx = 1\n"
+p_isl = write("island.ny", ISLAND)
+open_doc(p_isl, ISLAND)
+d_isl = c.diagnostics(uri(p_isl))
+check("a broken header: one syntax error (where the parser finds it)", brief(d_isl["diagnostics"]), [[1, 10, 1, "syntax-error", "nython"]])
+check("... its block stays an island: its names and the rest are still there",
+      [s["name"] for s in c.req("textDocument/documentSymbol", {"textDocument": {"uri": uri(p_isl)}})], ["inner", "x"])
+check("... hover in the island", hover(p_isl, 2, 12), "```python\n(variable) inner\n```")
+
 # ── symbols ──────────────────────────────────────────────────────────────────
 ds = c.req("textDocument/documentSymbol", {"textDocument": {"uri": uri(p_geo)}})
 def tree(syms):

@@ -540,10 +540,12 @@ struct Walker {
     // the token of `name` that node n stands for (-1: the parser made it)
     int name_tok(const Node* n, const std::string& name) const {
         if (!n || name.empty()) return -1;
-        int s0 = span0(n);
-        if (name_tok_ok(s0, name)) return s0;
+        // the node's own token first: a span recorded around a lookahead
+        // can start at an earlier token of the same name
         int e = at_loc(n->tok());
         if (name_tok_ok(e, name)) return e;
+        int s0 = span0(n);
+        if (name_tok_ok(s0, name)) return s0;
         if (s0 >= 0) {
             int s1 = span1(n);
             for (int i = s0; i <= s1 && i < s0 + 64; i++) if (name_tok_ok(i, name)) return i;
@@ -615,8 +617,8 @@ struct Walker {
         case NodeType::ATTRIBUTE: {
             auto* a = static_cast<AttributeNode*>(n);
             expr(a->object.get(), s);
-            int t1 = span1(n);
-            int tk = name_tok_ok(t1, a->attr) ? t1 : -1;
+            int tk = at_loc(n->tok());
+            if (!name_tok_ok(tk, a->attr)) { int t1 = span1(n); tk = name_tok_ok(t1, a->attr) ? t1 : -1; }
             if (tk < 0) {   // after the object's last token
                 int o1 = span1(a->object.get());
                 if (o1 < 0) o1 = node_t0(a->object.get());
@@ -744,6 +746,9 @@ struct Walker {
             return;
         }
         if (k == "JoinedStr") {
+            // a Nython string with ${name}: its fields are located in the
+            // field's own text, so they are found in the string's token
+            interpolations(a, s);
             if (auto* parts = a->listOf("values"))
                 for (auto& p : *parts) {
                     if (!p || p->type() != NodeType::PY_AST) continue;
@@ -872,8 +877,8 @@ struct Walker {
         case NodeType::ATTRIBUTE: {
             auto* a = static_cast<AttributeNode*>(t);
             expr(a->object.get(), s);
-            int t1 = span1(t);
-            int tk = name_tok_ok(t1, a->attr) ? t1 : -1;
+            int tk = at_loc(t->tok());
+            if (!name_tok_ok(tk, a->attr)) { int t1 = span1(t); tk = name_tok_ok(t1, a->attr) ? t1 : -1; }
             if (tk < 0) {
                 int o1 = span1(a->object.get());
                 if (o1 < 0) o1 = node_t0(a->object.get());
@@ -883,7 +888,11 @@ struct Walker {
             attr_ev(s, a->object.get(), a->attr, tk, true, value);
             return;
         }
-        case NodeType::SELF: expr(t, s); return;
+        case NodeType::SELF: {   // `self = ...` in a plain function binds it
+            std::string nm = t->tok().value == "this" ? "this" : "self";
+            ev(s, nm, name_tok(t, nm), how, 'v', value, s0, s1, aug);
+            return;
+        }
         case NodeType::PY_AST: {
             auto* p = static_cast<PyAstNode*>(t);
             if (p->kind == "Starred") { for (auto& c : p->statements()) target(c.get(), s, how, nullptr, s0, s1); return; }
@@ -1000,8 +1009,8 @@ struct Walker {
         if (f->annotations && f->annotations->type() == NodeType::MAP)
             for (auto& e : static_cast<MapNode*>(f->annotations.get())->entries)
                 expr(static_cast<MapEntryNode*>(e.get())->val.get(), s);
-        int t0 = span0(n), t1 = span1(n);
-        if (t0 < 0) t0 = at_loc(n->tok());
+        int t0 = at_loc(n->tok()), t1 = span1(n);
+        if (t0 < 0) t0 = span0(n);
         int nt = find_tok(t0, -1, f->name);
         bool in_class = S(s).kind == 'c';
         bool is_setter = dc.setter && in_class && S(s).syms.count(f->name);
@@ -1070,8 +1079,8 @@ struct Walker {
             if (kv.second && kv.second->type() == NodeType::PY_AST) pyexpr(static_cast<PyAstNode*>(kv.second.get()), s);
             else expr(kv.second.get(), s);
         }
-        int t0 = span0(n), t1 = span1(n);
-        if (t0 < 0) t0 = at_loc(n->tok());
+        int t0 = at_loc(n->tok()), t1 = span1(n);
+        if (t0 < 0) t0 = span0(n);
         int nt = find_tok(t0, -1, c->name);
         ev(s, c->name, nt, 'd', 'c', nullptr, dc.t0 >= 0 ? dc.t0 : t0, t1);
         int sym = make_sym(s, c->name, 'c', nt);
@@ -2061,6 +2070,18 @@ bool cut_island(std::vector<std::string>& w, std::vector<char>& patched, int r, 
             && depth[(size_t)a] == 0 && depth[(size_t)b + 1] == depth[(size_t)n]) break;   // never closed: stop at the next statement
         b++;
     }
+    // a compound statement's header whose brackets never close (`def f(a, :`
+    // being typed): the header alone, so its block stays an island
+    if (b > a && depth[(size_t)n] > depth[(size_t)a]) {
+        std::string h = w[(size_t)a].substr(lead(w[(size_t)a]).size());
+        static const char* heads[] = {"def ", "class ", "if ", "elif ", "for ", "while ", "with ", "async ", "fn ",
+                                      "except", "try", "else", "match ", "case ", nullptr};
+        bool header = false;
+        for (int i = 0; heads[i]; i++) if (h.compare(0, strlen(heads[i]), heads[i]) == 0) header = true;
+        int nx2 = a + 1;
+        while (nx2 < n && blank(w[(size_t)nx2])) nx2++;
+        if (header && nx2 < n && indent_of(w[(size_t)nx2]) > ind) { b = a; r = a; }
+    }
     if (b < r) b = r;
     bool already = true;
     for (int i = a; i <= b; i++) if (!patched[(size_t)i]) already = false;
@@ -2376,6 +2397,18 @@ void engine_checks(Analysis& A) {
     if (A.engine_done) return;
     A.engine_done = true;
     double t0 = now_ms();
+    if (A.recoveries) {
+        // the ast-mode parse (Python's tree shape) refused what the engines'
+        // parse accepts (a Nython construct it does not shape, `{ ... }`
+        // blocks): what the engines run is not an error
+        std::string rep0;
+        ParseErr orig = parse_engine(A.text, A.fname, rep0);
+        if (orig.ok) {
+            std::vector<Diag> kept;
+            for (auto& g : A.diags) if (g.code != "syntax-error" && g.code != "indentation-error") kept.push_back(g);
+            A.diags = kept;
+        }
+    }
     {
         std::string report;
         ParseErr ee = parse_engine(A.recoveries ? A.work_text : A.text, A.fname, report);
@@ -3644,6 +3677,40 @@ std::string call(const std::vector<std::string>& a) {
     if (op == "call_at") { need(4); return op_call_at(d, to_ll(a[2]), to_ll(a[3])); }
     if (op == "context") { need(4); return op_context(d, to_ll(a[2]), to_ll(a[3])); }
     if (op == "folds") return op_folds(d);
+    if (op == "verify") {
+        // a self-check of the analysis: occurrences whose symbol has another
+        // name, and identifiers nothing accounts for (vm_audit122, tools)
+        Analysis& A = analysis_of(d);
+        J j;
+        j.obj().key("mismatch").arr();
+        long long unknown = 0, names = 0;
+        std::vector<std::string> sample;
+        for (size_t i = 0; i < A.toks.size(); i++) {
+            const Tk& k = A.toks[i];
+            if (A.occ[i] >= 0) {
+                names++;
+                const Sym& y = A.syms[(size_t)A.occ[i]];
+                if (y.name != k.val) {
+                    j.obj().key("row").num(k.row).key("col").num(k.col).key("tok").str(k.val).key("sym").str(y.name).end_obj();
+                }
+            } else if (i < A.nlex && k.type == TokenType::Identifier && A.attr_of_tok[i] < 0 && !g_builtins.count(k.val)
+                       && !A.patched[k.row]) {
+                unknown++;
+                // what comes next tells what it is: a keyword argument, a module path ...
+                std::string nx = i + 1 < A.nlex ? A.toks[i + 1].val : std::string();
+                std::string pv = i > 0 ? A.toks[i - 1].val : std::string();
+                if (a.size() > 2 && a[2] == "1" && nx != "=" && pv != "." && nx != ".")
+                    sample.push_back(std::to_string(k.row + 1) + ":" + k.val);
+            }
+        }
+        j.end_arr().key("names").num(names).key("unknown").num(unknown);
+        j.key("sample").arr();
+        for (size_t s = 0; s < sample.size() && s < 60; s++) j.str(sample[s]);
+        j.end_arr();
+        j.key("unresolved").num((long long)A.unresolved.size());
+        j.end_obj();
+        return j.s;
+    }
     if (op == "work_text") {
         // the text that parsed after error recovery ("" when it all did), and the rows cut out
         Analysis& A = analysis_of(d);
