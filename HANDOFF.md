@@ -229,6 +229,16 @@ the rest of CPython's, with its names and its arguments, on both engines.
   install_vm_builtin_bridge) converts the arguments (BridgeConv) and calls
   `VirtualMachine::bridge_audit_event`; the bridge lambda rethrows a
   `VMException` as it is (a hook's exception keeps its class).
+- **The prelude chunk "audit"** (`src/NyPreludeAudit.cpp`, a unit of its
+  own): what only a program with a hook needs - `_ny_audit_compile` /
+  `_exec` / `_open`, the os events' `_ny_audit_dirfd` / `_id` / `_fsenc`,
+  `_ny_audit_excepthook` / `_unraisable`, code.replace, `_ny_function_new`.
+  The first `sys.addaudithook` loads it before the hook is in the list, so
+  every caller that tests `_ny_audit_hooks` (or `audit_on()`) finds it
+  defined; code.replace and `_ny_function_new` have stubs in the startup
+  prelude that load it. With these in the startup prelude `-c pass` cost
+  3.75% more instructions on both engines. An event whose arguments need a
+  helper is written `if _ny_audit_hooks: _ny_audit_fire(...)`.
 - Engine-level events: builtins.id, builtins.input/result (a terminal only),
   compile (bytes, filename; a tree with None - before lib/ast.ny takes it),
   exec (the code object: a source is compiled first - `_ny_audit_exec`),

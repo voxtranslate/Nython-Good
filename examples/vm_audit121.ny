@@ -21,10 +21,10 @@
 # table itself, input()'s result on a terminal (a pty), and - Nython only -
 # lib/nyaudit.ny's policies and `nython --audit-policy` / `--audit-log`.
 #
-#     ./build/nython-cli examples/vm_audit121.ny        (108 checks)
+#     ./build/nython-cli examples/vm_audit121.ny        (109 checks)
 #     ./build/nython-cli --vm examples/vm_audit121.ny
-#     python3 examples/vm_audit121.ny                   (88 under 3.11, 90 under 3.12;
-#                                                        3.13's rglob raises pathlib.Path.glob too)
+#     python3 examples/vm_audit121.ny                   (89 under 3.11, 91 under 3.12,
+#                                                        89 under 3.13)
 try:
     true
     nython = True
@@ -756,6 +756,16 @@ EXPECTED = {
 # a module an older one only has
 SINCE = {"sys._getframemodulename": "3.12", "pathlib.Path.walk": "3.12"}
 UNTIL = {"telnetlib.Telnet.open": "3.12", "telnetlib.Telnet.write": "3.12"}
+# records a CPython version adds by its own implementation of a call, not
+# for the call itself (dropped there): 3.13's Path.rglob calls Path.glob
+# with a Path as the pattern
+IMPL_EXTRA = {"pathlib": [("3.13", ("pathlib.Path.glob", ("PosixPath", "PosixPath")))]}
+
+def impl_dropped(label, recs):
+    if NYTHON or label not in IMPL_EXTRA:
+        return recs
+    extra = [rec for since, rec in IMPL_EXTRA[label] if vkey(VER) >= vkey(since)]
+    return [r for r in recs if r not in extra]
 
 def vkey(v):
     return tuple(int(x) for x in v.split("."))
@@ -814,7 +824,7 @@ check("the child ran every case", ["done" in got, proc.returncode], [True, 1])
 for label in EXPECTED:
     if not kept(label):
         continue
-    check("audit: " + label, filtered(got.get(label, [])), filtered(EXPECTED[label]))
+    check("audit: " + label, filtered(impl_dropped(label, got.get(label, []))), filtered(EXPECTED[label]))
 for label in got:
     if label not in EXPECTED and label != "done":
         check("audit: unexpected case " + label, got[label], None)
@@ -869,6 +879,22 @@ def child_value(r):
 check("no hook, then hooks in order", [child_value(r), r.returncode],
       [[None, None, [], [("first.event", (1, "two"))], "expected str for argument 'event', not int",
         "audit() missing 1 required positional argument: 'event'", ["Stop", ((7,),)], ("stop.me", (7,))], 0])
+
+# ── with no hook: what the lazily loaded "audit" chunk holds (code.replace,
+# types.FunctionType) and the os calls whose events need it ──────────────
+r = run_py("nohook121.py", """import os, sys, types
+c = (lambda: 0).__code__.replace(co_name="renamed")
+f = types.FunctionType(compile("6 * 7", "f", "eval"), {})
+os.environ["NY_AUDIT_121B"] = "1"
+had = os.environ.get("NY_AUDIT_121B")
+del os.environ["NY_AUDIT_121B"]
+os.mkdir("nh121")
+os.rename("nh121", "nh121b")
+os.rmdir("nh121b")
+print(repr([c.co_name, f(), had, "NY_AUDIT_121B" in os.environ, os.path.exists("nh121b")]))
+""")
+check("code.replace, FunctionType, os and environ with no hook", [child_value(r), r.returncode],
+      [["renamed", 42, "1", False, False], 0])
 
 # ── the table ────────────────────────────────────────────────────────────
 evs = TABLE

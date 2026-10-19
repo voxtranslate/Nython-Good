@@ -6308,7 +6308,7 @@ private:
     void load_mirror(const std::string& chunk) {
         if(mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if(chunk!="base"&&chunk!="os"&&chunk!="buffer"&&chunk!="posix") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix")
+        if(chunk!="base"&&chunk!="os"&&chunk!="buffer"&&chunk!="posix"&&chunk!="audit") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix"; round 86: nor "audit")
         if(chunk=="dictview") load_mirror("dict");
         try {
             auto source=nython::reader::SourceCode(nyrt::builtin_mirror_chunk(chunk));

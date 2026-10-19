@@ -564,7 +564,7 @@ struct NythonExecutor {
         if (mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
         struct Loading { int& n; explicit Loading(int& c) : n(c) { n++; } ~Loading() { n--; } } loading(mirror_loading_);   // round 86
-        if (chunk != "base" && chunk != "os" && chunk != "buffer" && chunk != "posix") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix")
+        if (chunk != "base" && chunk != "os" && chunk != "buffer" && chunk != "posix" && chunk != "audit") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix"; round 86: nor "audit")
         if (chunk == "dictview") ensureMirror("dict");
         try {
             auto source = SourceCode(nyrt::builtin_mirror_chunk(chunk));

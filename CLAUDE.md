@@ -412,6 +412,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit122 | 169 | round 86 (part H): nylsp, the Language Server driven as an editor drives it (stdio JSON-RPC): lifecycle and errors, position encodings, incremental sync, diagnostics (syntax with recovery, NyScope, unbound reads, undefined names/modules, NyxAI rules), completion/resolve, hover, signature help, definition/references across files, scope-correct rename in .ny and .py files, symbols, folding, formatting, semantic tokens and deltas, code actions, inlay hints, cancellation, progress (Nython-only) |
 | vm_audit121 | NNN | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (passes under python3.11/3.12) |
 | vm_audit121 | 108 | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (88 pass under python3.11, 90 under 3.12, 87 of 88 under 3.13) |
+| vm_audit121 | 109 | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (89 pass under python3.11, 91 under 3.12, 89 under 3.13) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1772,6 +1773,14 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   engines' own identity for reprs is `_ny_id` / `vm_identity`, not `id()`.
   A native reached through the VM's bridge raises into the VM's hooks
   (`NythonExecutor::auditForward`).
+- **What only a hooked program needs is the prelude chunk "audit"**
+  (`src/NyPreludeAudit.cpp`: the events' argument helpers, the excepthook/
+  unraisablehook events, code.replace, types.FunctionType), loaded by the
+  first `sys.addaudithook` before the hook is listed: anything that tests
+  `_ny_audit_hooks` / `audit_on()` finds it; startup is unchanged. **A new
+  event whose arguments need a helper**: `if _ny_audit_hooks:
+  _ny_audit_fire(...)`, not `_ny_sys_audit(..., helper(x))` (that runs the
+  helper with no hook, and the helper may not be loaded).
 - **`lib/nyaudit.ny`**: allow/deny/log rules over event globs and argument
   patterns, default-deny capable, frozen once installed, `granted()` for a
   block, a policy file format, `derive(log)`; `nython --audit-policy FILE`,

@@ -32,6 +32,10 @@ const char* prelude_buffer_source();
 // posixmodule.c has and the "os" chunk below does not - is in
 // src/NyPreludePosix.cpp, loaded by the os chunk as the mirror chunk "posix".
 const char* prelude_posix_source();
+// (round 86) What only a program with an audit hook needs (the events'
+// argument helpers, code.replace, types.FunctionType) is src/NyPreludeAudit.cpp,
+// the chunk "audit": the first sys.addaudithook loads it.
+const char* prelude_audit_source();
 
 inline const char* prelude_source() {
     return R"NYPRELUDE(
@@ -1143,58 +1147,17 @@ class _NyFuncCode:
     def __repr__(self):
         return "<code object " + self.co_name + ", file \"" + self.co_filename + "\", line " + str(self.co_firstlineno) + ">"
 
-# (round 86) code.replace(**changes) on either kind of code object: a copy
-# with those attributes changed, audited as CPython's (code.__new__ with
-# the new code's co_code, file, name, argument counts, nlocals, stacksize
-# and flags). Nython's code objects describe the code; a replaced one runs
-# as the original (a compile() result keeps its source).
-_ny_code_fields = ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals", "co_stacksize",
-                   "co_flags", "co_firstlineno", "co_code", "co_consts", "co_names", "co_varnames",
-                   "co_freevars", "co_cellvars", "co_filename", "co_name", "co_qualname", "co_linetable",
-                   "co_exceptiontable")
+# (round 86) code.replace and types.FunctionType(code, globals, ...): the
+# "audit" chunk's (src/NyPreludeAudit.cpp), loaded on first use
 def _ny_code_replace(self, **changes):
-    for k in changes:
-        if k not in _ny_code_fields:
-            raise TypeError("replace() got an unexpected keyword argument '" + k + "'")
-    def now(k, d):
-        return changes[k] if k in changes else getattr(self, k, d)
-    _ny_sys_audit("code.__new__", now("co_code", b""), now("co_filename", "<unknown>"), now("co_name", "<module>"),
-                  now("co_argcount", 0), now("co_posonlyargcount", 0), now("co_kwonlyargcount", 0),
-                  now("co_nlocals", 0), now("co_stacksize", 0), now("co_flags", 0))
-    var c = object.__new__(type(self))
-    var d = vars(self)
-    for k in list(d.keys()):
-        setattr(c, k, d[k])
-    for k in changes:
-        setattr(c, k, changes[k])
-    return c
+    _ny_load_chunk("audit")
+    return _ny_code_replace(self, **changes)
 _NyCode.replace = _ny_code_replace
 _NyFuncCode.replace = _ny_code_replace
 
-def _ny_function_new(code, globals, name=None, argdefs=None, closure=None):
-    # (round 86) types.FunctionType(code, globals, ...): audited
-    # (function.__new__) after its arguments are checked, as CPython's
-    # func_new. Nython makes one from a code object compile() gave: calling
-    # it runs the code in globals (an "eval" code returns its value); a
-    # function's own __code__ cannot make another function here.
-    if type(code) is not _NyCode and type(code) is not _NyFuncCode:
-        raise TypeError("function() argument 'code' must be code, not " + type(code).__name__)
-    if not isinstance(globals, dict):
-        raise TypeError("function() argument 'globals' must be dict, not " + type(globals).__name__)
-    if name is not None and not isinstance(name, str):
-        raise TypeError("arg 3 (name) must be None or string")
-    _ny_sys_audit("function.__new__", code)
-    if type(code) is not _NyCode:
-        raise TypeError("Nython cannot make a function from another function's code object (only from compile()'s)")
-    var c = code
-    var g = globals
-    def _ny_made():
-        if c.mode == "eval":
-            return eval(c, g)
-        exec(c, g)
-    _ny_made.__name__ = name if name is not None else c.co_name
-    _ny_made.__qualname__ = _ny_made.__name__
-    return _ny_made
+def _ny_function_new(*args, **kw):
+    _ny_load_chunk("audit")
+    return _ny_function_new(*args, **kw)
 
 _ny_code_cache = {}
 def _ny_code_of(info):
@@ -1416,52 +1379,15 @@ def _ny_sys_addaudithook(hook):
         _ny_sys_audit("sys.addaudithook")
     except RuntimeError:
         return None
+    if not _ny_audit_hooks:
+        _ny_load_chunk("audit")   # (round 86) what the events need: src/NyPreludeAudit.cpp
     _ny_audit_hooks.append(hook)
     _ny_audit_enable()
 
-# (round 86) CPython's arguments for the events the engines raise around
-# compiling and running code: compile() and exec()/eval() of a source give
-# the source as bytes (CPython 3.11+ audits the encoded text) and its file
-# name - an ast tree with None -, then exec gets the code object run (a
-# source is compiled to one first, as CPython does)
-def _ny_audit_compile(source, filename):
-    if isinstance(source, str):
-        source = source.encode("utf-8", "surrogatepass")
-    elif isinstance(source, bytearray) or isinstance(source, memoryview):
-        source = bytes(source)
-    elif not isinstance(source, bytes):
-        filename = None
-    _ny_audit_fire("compile", (source, filename))
-
-def _ny_audit_exec(code, mode):
-    if isinstance(code, str) or isinstance(code, bytes) or isinstance(code, bytearray):
-        _ny_audit_compile(code, "<string>")
-        var src = code if isinstance(code, str) else bytes(code).decode("utf-8", "replace")
-        code = _NyCode(src, "<string>", mode)
-    _ny_audit_fire("exec", (code,))
-
 def _ny_audit_startup(policy, log):
-    # (round 86) nython --audit-policy FILE / --audit-log FILE: lib/nyaudit.ny's
-    # policy (or log), installed before the program's first statement
+    # (round 86) nython --audit-policy FILE / --audit-log FILE (lib/nyaudit.ny)
     import nyaudit
     nyaudit._cli_install(policy, log)
-
-def _ny_audit_dirfd(fd):
-    # (round 86) an os function's dir_fd as its audit event gives it: -1
-    # for none (CPython's DEFAULT_DIR_FD)
-    return -1 if fd is None else fd
-
-def _ny_audit_id(v):
-    # (round 86) a uid/gid as os.chown's event gives it: CPython's uid_t,
-    # so -1 (unchanged) is 4294967295
-    return v & 4294967295 if isinstance(v, int) and v < 0 else v
-
-def _ny_audit_fsenc(s):
-    # (round 86) an environment key/value or a command as CPython's POSIX
-    # audit events give them: encoded (os.fsencode)
-    if os_name != "nt" and isinstance(s, str):
-        return s.encode("utf-8", "surrogateescape")
-    return s
 
 def _ny_builtins_module():
     # round 84: the builtins module (lib/builtins.ny) - sys.modules["builtins"],
@@ -1806,11 +1732,6 @@ def _ny_open_flags(mode):
         f = 2 if plus else 0
     return f | 524288   # O_CLOEXEC, as CPython opens every file
 
-def _ny_audit_open(path, mode):
-    # the "open" event (round 84; round 86: the VM's native open() raises it
-    # here too): the mode without b/t, the flags CPython computes
-    _ny_audit_fire("open", (path, mode.replace("b", "").replace("t", ""), _ny_open_flags(mode)))
-
 def _ny_open_fd(path, mode, encoding, newline, closefd, opener):
     # open(fd) and open(path, opener=f) (round 80; the VM's open calls this
     # for them too)
@@ -1850,7 +1771,7 @@ def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=no
     if hasattr(path, "__fspath__"):
         path = path.__fspath__()
     if _ny_audit_hooks:
-        _ny_audit_open(path, mode)   # round 84, as CPython's
+        _ny_audit_open(path, mode)   # round 84, as CPython's (round 86: the "audit" chunk's)
     if (isinstance(path, int) and not isinstance(path, bool)) or opener is not none:
         return _ny_open_fd(path, mode, encoding, newline, closefd, opener)
     if "b" in mode and encoding != "utf-8" and encoding is not none:
@@ -2619,8 +2540,7 @@ def _ny_getframe(depth=0):
     return f
 
 def _ny_getframemodulename(depth=0):
-    # (round 86) sys._getframemodulename (3.12): the __name__ of the module
-    # the caller's frame (depth 0) runs in; None past the outermost frame
+    # (round 86) sys._getframemodulename (3.12)
     _ny_sys_audit("sys._getframemodulename", depth)
     var f = None
     try:
@@ -2631,15 +2551,12 @@ def _ny_getframemodulename(depth=0):
     return g.get("__name__") if g is not None else None
 
 def _ny_current_frames():
-    # (round 86) sys._current_frames(): {thread id: its topmost frame} - the
-    # calling thread's only (Nython makes frame objects for the running
-    # thread; another thread's frames are not reachable from here)
+    # (round 86) the calling thread's only (HANDOFF 0zG)
     _ny_sys_audit("sys._current_frames")
     return {thread_os_id(): _ny_frame_get(0)}
 
 def _ny_current_exceptions():
-    # (round 86) sys._current_exceptions(): {thread id: the exception it is
-    # handling}, the calling thread's only (as _current_frames)
+    # (round 86) the calling thread's only
     _ny_sys_audit("sys._current_exceptions")
     var e = _ny_exc_current()
     return {} if e is None else {thread_os_id(): e}
@@ -2741,16 +2658,8 @@ def _ny_format_uncaught(e):
     var s = _ny_sys_ref[0]
     if s is not None:
         var hook = getattr(s, "excepthook", None)
-        if hook is not None and _ny_audit_hooks:
-            # (round 86) as CPython's _PyErr_Display: a hook raising
-            # RuntimeError suppresses the report, another error is reported
-            # as unraisable and the hook still runs
-            try:
-                _ny_audit_fire("sys.excepthook", (hook, type(e), e, getattr(e, "__traceback__", None)))
-            except RuntimeError:
-                return None
-            except BaseException as ae:
-                _ny_stderr.write("Exception ignored in audit hook:\n" + _ny_format_exc(ae, True, [], {}))
+        if hook is not None and _ny_audit_hooks and _ny_audit_excepthook(hook, e):   # round 86
+            return None
         if hook is None:
             _ny_stderr.write("sys.excepthook is missing\n")
         elif hook is not _ny_excepthook:
@@ -2982,26 +2891,29 @@ def _ny_os_uname():
     var u = os_uname()
     return _ny_os_uname_result((u["sysname"], u["nodename"], u["release"], u["version"], u["machine"]))
 
-# (round 86) each audited as CPython's posixmodule.c audits it (sys.audit,
-# PEP 578): the path as given, -1 for a dir_fd not given
+# (round 86) audited as CPython's posixmodule.c
 def _ny_os_listdir(path=None):
     _ny_sys_audit("os.listdir", path)
     return _ny_os_call("listdir", "." if path is None else path)
 
 def _ny_os_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
-    _ny_sys_audit("os.rename", src, dst, _ny_audit_dirfd(src_dir_fd), _ny_audit_dirfd(dst_dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.rename", (src, dst, _ny_audit_dirfd(src_dir_fd), _ny_audit_dirfd(dst_dir_fd)))
     _ny_os_call("rename", src, dst)
 
 def _ny_os_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
-    _ny_sys_audit("os.rename", src, dst, _ny_audit_dirfd(src_dir_fd), _ny_audit_dirfd(dst_dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.rename", (src, dst, _ny_audit_dirfd(src_dir_fd), _ny_audit_dirfd(dst_dir_fd)))
     _ny_os_call("replace", src, dst)
 
 def _ny_os_mkdir(path, mode=511, *, dir_fd=None):
-    _ny_sys_audit("os.mkdir", path, mode, _ny_audit_dirfd(dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.mkdir", (path, mode, _ny_audit_dirfd(dir_fd)))
     _ny_os_call("mkdir", path, mode)
 
 def _ny_os_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
-    _ny_sys_audit("os.link", src, dst, _ny_audit_dirfd(src_dir_fd), _ny_audit_dirfd(dst_dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.link", (src, dst, _ny_audit_dirfd(src_dir_fd), _ny_audit_dirfd(dst_dir_fd)))
     _ny_os_call("link", src, dst)
 
 # Exception groups (PEP 654, Python 3.11; round 77): BaseExceptionGroup and
@@ -3871,15 +3783,8 @@ def _ny_unraisable(exc, err_msg, obj):
     if s is None:
         return False
     var h = getattr(s, "unraisablehook", None)
-    if _ny_audit_hooks:
-        # (round 86) the hook and its argument, as CPython's
-        # _PyErr_WriteUnraisableMsg; a hook raising is itself reported
-        try:
-            _ny_audit_fire("sys.unraisablehook", (h, _NyUnraisableHookArgs((type(exc), exc, getattr(exc, "__traceback__", None), err_msg, obj))))
-        except BaseException as ae:
-            _ny_unraisablehook(_NyUnraisableHookArgs((type(ae), ae, getattr(ae, "__traceback__", None),
-                                                      "Exception ignored in audit hook", None)))
-            return True
+    if _ny_audit_hooks and _ny_audit_unraisable(h, exc, err_msg, obj):   # round 86
+        return True
     if h is _ny_unraisablehook or h is None:
         return False
     try:
@@ -4124,14 +4029,16 @@ class _NyEnviron:
         var v = self._val(value)
         if k == "" or "=" in k:
             raise ValueError("illegal environment variable name")
-        _ny_sys_audit("os.putenv", _ny_audit_fsenc(k), _ny_audit_fsenc(v))   # round 86: os.putenv's
+        if _ny_audit_hooks:   # round 86: os.putenv's
+            _ny_audit_fire("os.putenv", (_ny_audit_fsenc(k), _ny_audit_fsenc(v)))
         os_setenv(k, v)
         self._data[k] = v
     def __delitem__(self, key):
         var k = self._key(key)
         if k not in self._data:
             raise KeyError(key)
-        _ny_sys_audit("os.unsetenv", _ny_audit_fsenc(k))   # round 86: os.unsetenv's
+        if _ny_audit_hooks:   # round 86: os.unsetenv's
+            _ny_audit_fire("os.unsetenv", (_ny_audit_fsenc(k),))
         os_unsetenv(k)
         del self._data[k]
     def __iter__(self):
@@ -5644,26 +5551,31 @@ def _ny_os_kill(pid, sig):
 # implement, audited as CPython's posixmodule.c audits them: the event,
 # then the native with the arguments as given
 def _ny_os_system(command):
-    _ny_sys_audit("os.system", _ny_audit_fsenc(command))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.system", (_ny_audit_fsenc(command),))
     return os_system(command)
 
 def _ny_os_remove(path, *, dir_fd=None):
-    _ny_sys_audit("os.remove", path, _ny_audit_dirfd(dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.remove", (path, _ny_audit_dirfd(dir_fd)))
     return os_unlink(path)
 
 def _ny_os_unlink(path, *, dir_fd=None):
-    _ny_sys_audit("os.remove", path, _ny_audit_dirfd(dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.remove", (path, _ny_audit_dirfd(dir_fd)))
     return os_unlink(path)
 
 def _ny_os_rmdir(path, *, dir_fd=None):
-    _ny_sys_audit("os.rmdir", path, _ny_audit_dirfd(dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.rmdir", (path, _ny_audit_dirfd(dir_fd)))
     return os_rmdir(path)
 
 def _ny_os_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
     if isinstance(path, int) and not isinstance(path, bool):
         _ny_sys_audit("os.chmod", path, mode, -1)
         return _ny_os_call("fchmod", path, _ny_os_fd(mode))
-    _ny_sys_audit("os.chmod", path, mode, _ny_audit_dirfd(dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.chmod", (path, mode, _ny_audit_dirfd(dir_fd)))
     return os_chmod(path, mode)
 
 def _ny_os_chdir(path):
@@ -5673,7 +5585,8 @@ def _ny_os_chdir(path):
     return os_chdir(path)
 
 def _ny_os_symlink(src, dst, target_is_directory=False, *, dir_fd=None):
-    _ny_sys_audit("os.symlink", src, dst, _ny_audit_dirfd(dir_fd))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.symlink", (src, dst, _ny_audit_dirfd(dir_fd)))
     return os_symlink(src, dst)
 
 def _ny_os_utime(path, *args, **kw):
@@ -5683,7 +5596,8 @@ def _ny_os_utime(path, *args, **kw):
     return os_utime(path, *args, **kw)
 
 def _ny_os_unsetenv(key):
-    _ny_sys_audit("os.unsetenv", _ny_audit_fsenc(key))
+    if _ny_audit_hooks:
+        _ny_audit_fire("os.unsetenv", (_ny_audit_fsenc(key),))
     return os_unsetenv(key)
 
 def _ny_os_makedirs(name, mode=0o777, exist_ok=False):
@@ -5719,7 +5633,8 @@ def _ny_os_cpu_count():
 # environment), one per program; this chunk only lists it (round 80)
 
 def _ny_os_putenv(key, value):
-    _ny_sys_audit("os.putenv", _ny_audit_fsenc(key), _ny_audit_fsenc(value))   # round 86
+    if _ny_audit_hooks:   # round 86
+        _ny_audit_fire("os.putenv", (_ny_audit_fsenc(key), _ny_audit_fsenc(value)))
     os_setenv(_ny_os_str(key), _ny_os_str(value))
 
 # ── os.path where the flat builtins differ from Python ───────────────────
@@ -5974,15 +5889,18 @@ def _ny_os_member_list():
             _ny_os_call("setpgid", _ny_os_fd(pid), _ny_os_fd(pgrp))
         # (round 86) os.chown / os.chmod events as CPython's: the ids as uid_t
         def chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True):
-            _ny_sys_audit("os.chown", path, _ny_audit_id(uid), _ny_audit_id(gid), _ny_audit_dirfd(dir_fd))
+            if _ny_audit_hooks:
+                _ny_audit_fire("os.chown", (path, _ny_audit_id(uid), _ny_audit_id(gid), _ny_audit_dirfd(dir_fd)))
             if isinstance(path, int) and not isinstance(path, bool):
                 return _ny_os_call("fchown", path, _ny_os_fd(uid), _ny_os_fd(gid))
             _ny_os_call("chown", _ny_os_str(path), _ny_os_fd(uid), _ny_os_fd(gid), follow_symlinks)
         def lchown(path, uid, gid):
-            _ny_sys_audit("os.chown", path, _ny_audit_id(uid), _ny_audit_id(gid), -1)
+            if _ny_audit_hooks:
+                _ny_audit_fire("os.chown", (path, _ny_audit_id(uid), _ny_audit_id(gid), -1))
             _ny_os_call("lchown", _ny_os_str(path), _ny_os_fd(uid), _ny_os_fd(gid))
         def fchown(fd, uid, gid):
-            _ny_sys_audit("os.chown", fd, _ny_audit_id(uid), _ny_audit_id(gid), -1)
+            if _ny_audit_hooks:
+                _ny_audit_fire("os.chown", (fd, _ny_audit_id(uid), _ny_audit_id(gid), -1))
             _ny_os_call("fchown", _ny_os_fd(fd), _ny_os_fd(uid), _ny_os_fd(gid))
         def fchmod(fd, mode):
             _ny_sys_audit("os.chmod", fd, mode, -1)
@@ -6123,6 +6041,7 @@ _ny_os_members = _ny_os_member_list()
 inline std::string builtin_mirror_chunk(const std::string& name) {
     if (name == "buffer") return prelude_buffer_source();   // (round 84) its own unit
     if (name == "posix") return prelude_posix_source();     // (round 85) its own unit
+    if (name == "audit") return prelude_audit_source();     // (round 86) its own unit
     static const std::string src = builtin_mirrors_source();
     const std::string mark = "#@ " + name + "\n";
     size_t b = src.find(mark);
