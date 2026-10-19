@@ -1120,12 +1120,13 @@ void* pool_code(int kind, int mask, int s) {
 }
 #elif defined(NY_FFI_X86)
 // round 84: callbacks without libffi on 32-bit x86: every argument is a
-// stack word (or two), read from the trampoline's 16 word parameters; a
+// stack word (or two), read from the trampoline's 32 word parameters (round
+// 85: 16 were too few for a 40-byte structure among others); a
 // cdecl caller pops them itself, a stdcall trampoline pops exactly its
 // signature's words (one instantiation per word count, 0-12). A structure
 // argument is its words copied onto the stack.
 const int POOL = 8;
-const int N_CBW = 16;
+const int N_CBW = 32;
 Callback* g_pool[3][14][POOL];   // [int, double, float result][0 cdecl, 1 + words: stdcall][slot]
 uint64_t pool_dispatch(int kind, int conv, int slot, const W32* w, double* dret) {
     Callback* cb = g_pool[kind][conv][slot];
@@ -1149,8 +1150,11 @@ uint64_t pool_dispatch(int kind, int conv, int slot, const W32* w, double* dret)
     const TI* t = type_of(rc);
     return (uint64_t)load_int(ret, t->size, is_signed_int(rc));
 }
-#  define NY_T32_PARAMS W32 w0, W32 w1, W32 w2, W32 w3, W32 w4, W32 w5, W32 w6, W32 w7, W32 w8, W32 w9, W32 w10, W32 w11, W32 w12, W32 w13, W32 w14, W32 w15
-#  define NY_T32_WORDS W32 w[N_CBW] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15}
+#  define NY_T32_PARAMS W32 w0, W32 w1, W32 w2, W32 w3, W32 w4, W32 w5, W32 w6, W32 w7, W32 w8, W32 w9, W32 w10, W32 w11, \
+        W32 w12, W32 w13, W32 w14, W32 w15, W32 w16, W32 w17, W32 w18, W32 w19, W32 w20, W32 w21, W32 w22, W32 w23, \
+        W32 w24, W32 w25, W32 w26, W32 w27, W32 w28, W32 w29, W32 w30, W32 w31
+#  define NY_T32_WORDS W32 w[N_CBW] = {w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15, \
+        w16, w17, w18, w19, w20, w21, w22, w23, w24, w25, w26, w27, w28, w29, w30, w31}
 template <int S> uint64_t tramp_i(NY_T32_PARAMS) { NY_T32_WORDS; double d; return pool_dispatch(0, 0, S, w, &d); }
 template <int S> double tramp_d(NY_T32_PARAMS) { NY_T32_WORDS; double d = 0; pool_dispatch(1, 0, S, w, &d); return d; }
 template <int S> float tramp_f(NY_T32_PARAMS) { NY_T32_WORDS; double d = 0; pool_dispatch(2, 0, S, w, &d); return (float)d; }
@@ -1421,7 +1425,7 @@ Ret b_callback(Engine& e, const Args& a) {
 #  else
         int words = 0;
         for (auto& s : cb->atypes) words += s[0] == '{' ? (int)((spec_size(s) + 3) / 4) : (type_of(s[0])->size > 4 ? 2 : 1);
-        if (words > N_CBW) raise("TypeError", "ctypes: callbacks of more than 16 argument words need libffi");
+        if (words > N_CBW) raise("TypeError", "ctypes: callbacks of more than " + std::to_string(N_CBW) + " argument words need libffi");
         int conv = 0;
         if (flags & F_STDCALL) {
 #    if defined(_WIN32)

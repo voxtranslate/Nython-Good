@@ -230,15 +230,16 @@ def roundtrip(fmt, values):
     for i in range(len(values)):
         x[i] = values[i]
     return x.tolist()
+PBITS = 8 * struct.calcsize("P")   # size_t / pointers: 32 bits on a 32-bit build
 check("items round-trip in every native format",
       [roundtrip("b", [-128, 127, 0]), roundtrip("B", [0, 255]), roundtrip("h", [-32768, 32767]), roundtrip("H", [65535]),
        roundtrip("i", [-2 ** 31, 2 ** 31 - 1]), roundtrip("I", [2 ** 32 - 1]), roundtrip("q", [-2 ** 63, 2 ** 63 - 1]),
-       roundtrip("Q", [2 ** 64 - 1, 2 ** 63]), roundtrip("n", [-5]), roundtrip("N", [2 ** 63 + 5]),
+       roundtrip("Q", [2 ** 64 - 1, 2 ** 63]), roundtrip("n", [-5]), roundtrip("N", [2 ** (PBITS - 1) + 5]),
        roundtrip("l", [-7]), roundtrip("L", [7]), roundtrip("P", [12345, -1]), roundtrip("?", [True, 0, 5, []]),
        roundtrip("c", [b"a", b"\xff"]), roundtrip("f", [0.1, 1e300, -2.5]), roundtrip("d", [0.1, -0.0])],
       [[-128, 127, 0], [0, 255], [-32768, 32767], [65535], [-2147483648, 2147483647], [4294967295],
        [-9223372036854775808, 9223372036854775807], [18446744073709551615, 9223372036854775808], [-5],
-       [9223372036854775813], [-7], [7], [12345, 18446744073709551615], [True, False, True, False], [b"a", b"\xff"],
+       [2 ** (PBITS - 1) + 5], [-7], [7], [12345, 2 ** PBITS - 1], [True, False, True, False], [b"a", b"\xff"],
        [0.10000000149011612, float("inf"), -2.5], [0.1, -0.0]])
 class Idx:
     def __index__(self):
@@ -675,7 +676,9 @@ check("ctypes formats (PEP 3118, as CPython's ctypes gives them)",
 # CPython 3.12 writes the padding of a structure into its format ("4x")
 SF = ("T{<i:x:4x<d:y:}" if (PY312 or nython) else "T{<i:x:<d:y:}").replace("<i", IF)
 PF3 = ("T{<c:a:3x<i:b:<h:c:2x}" if (PY312 or nython) else "T{<c:a:<i:b:<h:c:}").replace("<i", IF)
-QF = ("T{(3)<i:a:4xT{<i:x:4x<d:y:}:s:&<i:p:}" if (PY312 or nython) else "T{(3)<i:a:T{<i:x:<d:y:}:s:&<i:p:}").replace("<i", IF)
+# (with 4-byte pointers the structure ends in 4 bytes of padding to its 8-byte alignment)
+QF = ("T{(3)<i:a:4xT{<i:x:4x<d:y:}:s:&<i:p:" + ("4x" if PBITS == 32 else "") + "}" if (PY312 or nython)
+      else "T{(3)<i:a:T{<i:x:<d:y:}:s:&<i:p:}").replace("<i", IF)
 check("ctypes structure formats",
       [cinfo(S()), cinfo(P3())[0], cinfo(Q3())[:2], cinfo((S * 2)())[:4]],
       [[SF, 16, 0, (), (), 16, False], PF3, [QF, 40], [SF, 16, 1, (2,)]])

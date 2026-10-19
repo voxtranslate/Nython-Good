@@ -169,6 +169,16 @@ to a generator.
   has none), 119 85, 120 19 - all passing. The Windows build needed one fix:
   `_sig_pthread`'s lambda had no return statement in its `_WIN32` branch
   (src/NyConc.cpp; MinGW deduced `void` and the native table rejected it).
+- **Round 85 under 32-bit Wine** (`ARCH=i686`, both engines): vm_audit111 55,
+  112 133, 113 392, 114 215, 116 34, 117 33, 118 27, 119 85, 120 19 - all
+  passing. Two fixes: the libffi-less i686 callback trampolines read 32
+  argument words (16 were too few for vm_audit111's callback with a 40-byte
+  structure among five others; a cdecl callee only reads its arguments, the
+  caller pops them; stdcall stays at 12); vm_audit112's size_t/pointer values
+  and the trailing padding of a structure ending in a 4-byte pointer depend
+  on the pointer width (`PBITS`). The 32-bit link warns that one guard
+  section of `nyrt::class_dir_names()` is padded differently in core.o and
+  main.o (16 vs 12 bytes, the same 12-byte vector): harmless.
 
 ### Not done
 - AArch64 (qemu) and 32-bit Windows runs of rounds 84-85: not run this
