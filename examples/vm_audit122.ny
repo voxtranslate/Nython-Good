@@ -730,6 +730,25 @@ check("references across the include", refs(p_ibase, 4, 4), [["inc_base.ny", 4, 
 check("rename a base class's method across the include (the subclass's self.hello)",
       edits_of(rename(p_ibase, 1, 8, "greet")), [["inc_base.ny", 1, 8, 13, "greet"], ["inc_main.ny", 4, 20, 25, "greet"]])
 
+# ── NyScope's static checks: UnboundLocalError reads, nonlocal ──────────────
+def diag_of(name, text):
+    pth = write(name, text)
+    open_doc(pth, text)
+    return [[g["range"]["start"]["line"], g["range"]["start"]["character"], g["code"], g["message"]]
+            for g in c.diagnostics(uri(pth))["diagnostics"] if g["source"] == "nython"]
+check("a read before the function binds the name (.py): UnboundLocalError",
+      diag_of("unb.py", "def f():\n    print(n)\n    n = 1\n"),
+      [[1, 10, "unbound-local", "local variable 'n' is read before it is assigned (UnboundLocalError when this runs first)"]])
+check("... (.ny, no outer binding: the same)", [g[:3] for g in diag_of("unb.ny", "def f():\n    print(n)\n    n = 1\n")],
+      [[1, 10, "unbound-local"]])
+check("... (.ny with a module binding: Nython reads it there; the rules' difference noted)",
+      [g[:3] for g in diag_of("unb2.ny", "n = 0\ndef f():\n    print(n)\n    for n in range(2):\n        pass\n")],
+      [[2, 10, "nython-scope"]])
+check("... not when a loop binds it on an earlier iteration",
+      diag_of("unb3.py", "def f():\n    for i in range(3):\n        if i:\n            print(v)\n        v = i\n"), [])
+check("nonlocal without a binding (NyScope's SyntaxError)",
+      diag_of("nl.ny", "def f():\n    nonlocal q\n    q = 1\n"), [[1, 13, "nython-nonlocal", "no binding for nonlocal 'q' found"]])
+
 # ── the engines' module search; files changed on disk; `# nython: python` ───
 write("dual.ny", "def which():\n    return \"ny\"\n")
 write("dual.py", "def which():\n    return \"py\"\n")
