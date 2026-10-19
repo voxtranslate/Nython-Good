@@ -412,6 +412,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit121 | 109 | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (89 pass under python3.11, 91 under 3.12, 89 under 3.13) |
 | vm_audit122 | 169 | round 86 (part H): nylsp, the Language Server driven as an editor drives it (stdio JSON-RPC): lifecycle and errors, position encodings, incremental sync, diagnostics (syntax with recovery, NyScope, unbound reads, undefined names/modules, NyxAI rules), completion/resolve, hover, signature help, definition/references across files, scope-correct rename in .ny and .py files, symbols, folding, formatting, semantic tokens and deltas, code actions, inlay hints, cancellation, progress (Nython-only) |
 | vm_audit123 | 242 | round 86, part I: HPACK (RFC 7541 Appendix C byte for byte, the Huffman code, size updates, decoder errors, Nython's SmartIndexing on a header corpus), HTTP/2 frames byte for byte with hyperframe, two H2Connections in memory (SETTINGS, CONTINUATION, padding, flow control, RST_STREAM, GOAWAY, PING, push refused, malformed field blocks, connection/stream errors, RFC 9218), the RFC 9218 scheduler's order, h2.client/h2.server over localhost (multiplexing, flow control stopping and resuming, resets, graceful GOAWAY, TLS with ALPN h2), http.client/urllib with http2= (Nython-only), permessage-deflate (RFC 7692's examples, negotiation, takeover, window bits, RSV1, a bomb), websocket.ny (Nython-only) and websocket_asyncio.ny round trips (233 pass under python3) |
+| vm_audit124 | 233 | round 86 (part J): a Python-language probe as a `.py` module, a `# nython: python` module and exec(compile(src, "x.py")) - `is` identity, + with no str/non-str or list/tuple mixing, no int iterated anywhere, dict keys not attributes (d.a, getattr, hasattr, setattr, d.a = v), list.sort() None, assignment past a list's end, sum of strs, literal spellings and `elseif` as names, exec'd code's rule; every file: sorted/min/max/list.sort ordering's TypeErrors, `[1, 2]["0"]`, seq * non-int / list + int / str index / unpacking messages; Nython-only: Nython code unchanged, an int iterated by every consumer, `--python-compat-report` (151 pass under python3) |
 | vm_audit125 | 14 | round 86 (main session): program text is never read as a path - f-string and `${...}` fields naming a file or a directory in the working directory (one read the file, one hung the parser), `f"{...}"`, ast.parse of such fields, the editor's syntax check; os.read/os.write and subprocess move bytes as they are (Windows' standard descriptors in binary, subprocess pipes untranslated; text mode reads universal newlines) (11 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -458,7 +459,7 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 | Feature | Notes |
 |---|---|
 | `1..5` / `1...5` | half-open and inclusive ranges; `a..b..step` |
-| `is` / `is not` | membership: `1 is int`, `1 is Object`, `c is Base` (walks the chain) |
+| `is` / `is not` | membership: `1 is int`, `1 is Object`, `c is Base` (walks the chain) - Nython-language source only; identity, as CPython's, in Python-language source (round 86) |
 | `import X as Y` | binds a namespace; `from "m" import n` also works |
 | `catch` | alias for `except`, matching the existing `throw`/`raise` alias |
 | Located errors | `file:line:column`, source line, caret — both engines, including EOF. |
@@ -1825,6 +1826,41 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   the coroutine waited for another task); a lazily loaded prelude chunk is
   waited for by a second thread while the first loads it (`ensureMirror` /
   `load_mirror`: threads saw memoryview without members).
+## Round 86, part J: Python-language source behaves as CPython where Nython is lenient (see `HANDOFF.md` §0z)
+
+- **In Python-language source** (.py, `# nython: python`, code compiled
+  from one, ast trees, a def opting in) valid Python means what CPython
+  makes of it: `is` is identity (`1 is int` False); + joins no str with a
+  non-str and no list with a tuple (CPython's TypeErrors; `sum(["a",
+  "b"])` too); an int is not iterable (for, comprehensions, list, iter,
+  sorted, enumerate, zip, yield from ...); a plain dict's keys are not its
+  attributes (`d.a`, getattr/hasattr/setattr, `d.a = v`: AttributeError);
+  `xs.sort()`/`reverse()` give None; `xs[len(xs)] = v` is an IndexError;
+  `true`/`false`/`none`/`null`/`undefined`/`elseif` are ordinary names. `.ny`
+  code keeps every one of these conveniences.
+- **Mechanism**: NyScope sets `Node::py_src` (a byte in padding) on every
+  node under Python's rule and `FunctionNode/LambdaNode::py_rule`; the
+  interpreter reads the node's flag (or `pyCode()` in builtins: the
+  running lambda's rule, else `cur_stmt()`'s), the VM `VMCode::py` (the
+  top frame's: `vm_py()`), **only on the lenient paths** - no hot path
+  tests it, and no specialized VM form handles a lenient case, so
+  quickening keeps the distinction. **A new leniency must test the flag on
+  its slow path the same way** (`binaryOp(..., py)`, `getAttrValue(...,
+  py)`, `lookup_attr(..., py)`).
+- **Every file** (both engines): sorted/min/max/list.sort raise CPython's
+  TypeError for values Python cannot order (they ordered by type name,
+  then text); `[1, 2]["0"]` is a TypeError; CPython's messages for seq *
+  non-int, list + int, `"abc"[1.0]`, `a, b = 2`.
+- **An int is iterable wherever Nython code iterates** (every consumer of
+  an iterable, `*n`, yield from), not by `in` or unpacking; both engines.
+- The 65 Python-language library files that spelled `none`/`true`/`false`
+  were rewritten to `None`/`True`/`False` (4,709 tokens). In a
+  Python-language test file tell the engine by `sys.implementation.name`
+  (`true` is a NameError there).
+- **`nython --python-compat-report FILE...`**: a static portability lint -
+  each Nython-language construct whose meaning differs from Python's
+  (concat, int-iter, is-type, dict-attr, literal, sort-value, binding),
+  after Python 2.6's `-3` warnings.
 
 ## Transcripts
 

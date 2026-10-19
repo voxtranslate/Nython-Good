@@ -682,7 +682,13 @@ const std::vector<Token>& Lexer::tokenize() {   // round 82: the tokens in place
     reset();
     if(source.line_number()<0) source.read();
     python_strings = force_python_strings || python_string_mode(source.fileName(), source.sourceCode());   // round 83: forced by lib/ast.ny's parse
-    python_names = force_python_names || nython::scope::lexer_python(source.fileName(), source.sourceCode());   // round 86
+    // round 86 (the source is copied out only for a file that may be one:
+    // not for the engines' own text, "stdin")
+    python_names = force_python_names;
+    if (!python_names) {
+        std::string fn = source.fileName();
+        python_names = nython::scope::lexer_python(fn, fn == "stdin" ? std::string() : source.sourceCode());
+    }
     while (!source.isAtEnd()) { /// this->token.type() != TokenType::End
         this->read_token();
     }
@@ -1411,16 +1417,17 @@ void Lexer::read_token() {
         bool matched_kw = false;
         for(const auto& kw : Keywords()) {   // round 82: by reference (a string copied per keyword per identifier: 8% of the startup)
             if(this->token.value == kw.value) {
-                // round 86: in Python-language source Nython's literal
-                // spellings and `elseif` are ordinary names (`true = 3`,
-                // `def f(elseif=1)`), as they are to CPython; True / False /
-                // None stay the literals
-                if (python_names && is_nython_literal_word(kw.value)) break;
                 this->token.ident = kw.ident;
                 matched_kw = true;
                 break;
             }
         }
+        // round 86: in Python-language source Nython's literal spellings and
+        // `elseif` are ordinary names (`true = 3`, `def f(elseif=1)`), as they
+        // are to CPython; True / False / None stay the literals. (Tested after
+        // the loop: inside it the loop ran 0.9M more instructions at startup.)
+        if (matched_kw && __builtin_expect(python_names, 0) && is_nython_literal_word(this->token.value))
+            this->token.ident = TokenIdent(TokenType::Identifier, TokenKind::Identifier, TokenClass::Identifier);
         // Check dynamic tokens from DynamicLangRegistry
         if (!matched_kw) {
             auto& reg = nython::DynamicLangRegistry::instance();

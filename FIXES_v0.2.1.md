@@ -5826,6 +5826,23 @@ both engines and under python3).
 | ctypes: `strtod(b"3.25xyz", byref(end))` left `end` pointing at freed memory | a `bytes` argument was copied into a temporary C string freed after the call (CPython passes the bytes object's own buffer, which lives as long as the object) | C strings made from bytes are kept in a 512-entry cache keyed by their contents (`_cstr_cached`) |
 | ctypes: a `BigEndianStructure` subclass was laid out little-endian | its byte order was read from the class's own attributes only | read through the MRO |
 
+## Round 86, part J — Python-language source behaves as CPython where Nython is lenient
+
+Full detail in `HANDOFF.md` §0z. New test: `vm_audit124` (both engines; its shared part under python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| In a `.py` file `1 is int` / `"a" is str` were True, `"a" + 1` was "a1", `for x in 5` counted, `{"a": 1}.a` was 1, `sum(["a", "b"])` was "0ab", `[3, 1].sort()` gave the list, `true = 3` / `def f(elseif=1)` were syntax errors or the literal | Nython's conveniences applied to Python-language source | `Node::py_src` (NyScope marks Python-rule scopes; `VMCode::py` on the VM) read on each lenient path: CPython's results and messages there, Nython's unchanged in `.ny` code; the lexer leaves the literal spellings and `elseif` names |
+| `sorted([1, "a"])` sorted, `max("a", 1)` was "a", `[1, "a"].sort()` worked (both engines, every file) | sorted/min/max/list.sort fell back to type name, then text, for values Python cannot order | CPython's TypeError (`sortLess` / `sort_less`; min/max as CPython's `item < best` / `item > best`) |
+| `[1, 2]["0"]` was 1 (interpreter) | a list keeps its items under "0", "1" ...: the dict lookup found them | list/tuple indices other than ints are a TypeError |
+| `"a" * "b"` said "unsupported operand type(s) for *"; `[1] + 1` too; `"abc"[1.0]` said "... or slices, not float" on the VM; `a, b = 2` said "'int' object is not subscriptable" | generic messages | CPython's ("can't multiply sequence by non-int of type 'str'", "can only concatenate list (not "int") to list", "string indices must be integers, not 'float'", "cannot unpack non-iterable int object") |
+| `list(5)` raised on the interpreter and gave [0..4] on the VM; `iter(5)` the other way round | each engine's own rule | an int is iterable wherever Nython code iterates (both engines), never in Python-language source; `in` and unpacking stay TypeErrors |
+| `sorted(os.scandir(d), key=f)` ignored `key` (interpreter) | the iteration's `__next__` called a builtin (len), which took the call's keyword arguments | `iterableBuiltin` iterates under `KwScope(this, nullptr)` |
+| `lib/gui.ny`'s table sort compared "" (a missing cell) with numbers | relied on the lenient ordering | a `[rank, number, text]` key |
+| 65 Python-language library files spelled `none`/`true`/`false` | written as Nython | rewritten to `None`/`True`/`False` (4,709 tokens, token-aware) |
+
+New: `nython --python-compat-report FILE...` lists the Nython-language constructs whose meaning differs from Python's (concat, int-iter, is-type, dict-attr, literal, sort-value, binding).
+
 ## Round 85 — CPython's API measured and filled, Python's binding rule, what native code catches
 
 Full detail in `HANDOFF.md` §0y (part E), §0y2 (part F) and §0y3 (main session). New tests: `vm_audit118` (155), `vm_audit119` (85), `vm_audit120` (19); `tools/api_diff.py --check tools/api_baseline.json` in the sweep.

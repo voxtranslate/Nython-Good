@@ -15996,11 +15996,9 @@ private:
         const bool gt=op[0]=='>';
         if(x.is_num()&&y.is_num()){ int c=VMVal::num_compare(x,y); return gt?c==1:c==-1; }
         if(x.type==VMType::STRING&&y.type==VMType::STRING) return gt?x.s>y.s:x.s<y.s;
-        if(x.is_set()&&y.is_set()){   // proper subset / superset, as the operators
-            const VMVal& lo=gt?y:x; const VMVal& hi=gt?x:y;
-            return lo.list->size()<hi.list->size()&&set_subset(lo,hi);
-        }
-        if(x.type==VMType::LIST&&y.type==VMType::LIST&&x.list&&y.list&&!x.is_set()&&!y.is_set()&&x.b==y.b){
+        // two lists or two tuples item by item (two sets too, as before -
+        // not CPython's inclusion order)
+        if(x.type==VMType::LIST&&y.type==VMType::LIST&&x.list&&y.list&&x.b==y.b){
             size_t n=std::min(x.list->size(),y.list->size());
             for(size_t k=0;k<n;k++){
                 const VMVal& p=(*x.list)[k]; const VMVal& q=(*y.list)[k];

@@ -8,6 +8,8 @@ Round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the rea
 Round 86 (main session) — **§0z5** (program text never read as a path: an f-string field naming a file read it, one naming a directory hung the parser, `f"{...}"` hung on Windows; os.read/os.write on Windows' standard descriptors in binary; nylsp's stdin on Windows; nyaudit's path patterns on Windows; the round 86 suites under Wine; vm_audit125).
 Round 86, part I — **§0z3** (HTTP/2 and HPACK beyond CPython: lib/hpack.ny (RFC 7541), lib/h2/ (RFC 9113 sans-I/O H2Connection with h2's API, hyperframe's frames, RFC 9218 priorities and scheduler, asyncio client/server with ALPN, h2.sync for http.client/urllib http2=), permessage-deflate (RFC 7692) for websocket.ny and a new websocket_asyncio.ny; HPACK admission control; two engine fixes - awaiting a coroutine's own __await__, prelude chunks loaded under threads; vm_audit123)
 Round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
+Round 86, part J — **§0z** (Python-language source behaves as CPython where Nython is lenient: `is` identity, + with no str/non-str or list/tuple mixing, no int iteration, no dict keys as attributes, list.sort() None, literal spellings as names - one mark per node from the scope pass, read only on the lenient paths; strict ordering in sorted/min/max and CPython's messages everywhere; an int iterable wherever Nython code iterates; `--python-compat-report`; vm_audit124)
+Last updated: round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
 Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
 Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
 Round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
@@ -435,6 +437,161 @@ window of 8 bits, as it says; we accept it - below).
   closed ("Exception in default exception handler"). CPython has the same
   window, rarely hit. A coroutine driven by hand still cannot wait for
   another task of its loop (engine change 1 covers the common shape only).
+## 0z. Round 86, part J — Python-language source behaves as CPython where Nython is lenient (vm_audit124)
+
+**The rule.** Round 85 (§0y2) gave Python-language source - a `.py` file,
+a file whose leading comments say `# nython: python`, code compile() /
+exec() / eval() compile from one, an ast tree, a def opting in on its def
+line - Python's binding rule. This round gives it the rest of Python's
+semantics wherever Nython has a convenience. Valid Python now means there
+what CPython makes of it:
+
+| Python-language source | now (CPython's) | Nython-language source (unchanged) |
+|---|---|---|
+| `1 is int`, `"a" is str`, `obj is C` | identity: False | Nython's type test |
+| `"a" + 1`, `1 + "a"`, `"a" + None`, `True + "a"`, `"a" + obj`, `s += 1` | TypeError, CPython's messages (`can only concatenate str (not "int") to str`, `unsupported operand type(s) for +: 'int' and 'str'`) | concatenation of the text |
+| `[1] + (2,)`, `t += [2]` | TypeError (`can only concatenate list (not "tuple") to list`) | a list |
+| `sum(["a", "b"])` | TypeError (0 + "a") | `"0ab"` |
+| `for x in 5`, `[x for x in 5]`, `(x for x in 5)`, `list(5)`, `iter(5)`, `tuple/set/sorted/sum/max/any(5)`, `enumerate(5)`, `zip(5, 5)`, `map(f, 5)`, `yield from 5`, `xs.extend(5)` | TypeError: 'int' object is not iterable | range(n) |
+| `{"a": 1}.a`, `getattr(d, "a", x)`, `hasattr(d, "a")` | AttributeError / x / False | the key |
+| `d.a = 1`, `setattr(d, "a", 1)` | AttributeError: 'dict' object has no attribute 'a' | sets the key |
+| `xs.sort()`, `xs.reverse()` | None | the list (for chaining) |
+| `xs[len(xs)] = v` | IndexError: list assignment index out of range | the list grows |
+| `true = 3`, `none`, `null`, `undefined`, `false`, `def f(elseif=1)`, `f"{true}"` | ordinary names | literals / a keyword |
+
+and in **every** file (defects, both engines):
+- sorted / min / max / list.sort order only what Python orders: values it
+  cannot compare are CPython's TypeError ("'<' not supported between
+  instances of 'str' and 'int'"; min/max compare `item < best` / `item >
+  best` as CPython's min_max, so the operands are named in its order).
+  They fell back to type name, then text: `sorted([1, "a"])` sorted and
+  `max("a", 1)` answered. Bytes compare by their bytes; a NaN compares
+  false; two sets are compared item by item as before (CPython orders them
+  by inclusion - not done).
+- `[1, 2]["0"]` (and `(1, 2)["0"]`, `[1]["__len__"]`) is a TypeError on the
+  interpreter: it found the item the list keeps under the key "0".
+- Messages as CPython's: `"a" * "b"` / `[1] * 1.5` / `None * "a"` "can't
+  multiply sequence by non-int of type 'str'"; `[1] + 1` "can only
+  concatenate list (not "int") to list"; `"abc"[1.0]` "string indices must
+  be integers, not 'float'" on the VM; `a, b = 2` / `a, *b = None` "cannot
+  unpack non-iterable int object" (it said "'int' object is not
+  subscriptable").
+- Interpreter: `sorted(it, key=f)` over an object iterator (scandir's) lost
+  `key=` - a builtin `__next__` called (len) took the call's keyword
+  arguments (`iterableBuiltin` now runs the iteration under
+  `KwScope(this, nullptr)`). The lenient ordering had hidden it.
+
+**An int is iterable in Nython code wherever Nython iterates** (the
+decision this round was asked to make): `for i in n`, comprehensions,
+generator expressions and every builtin that consumes an iterable - list,
+tuple, set, frozenset, iter, sorted, sum, min, max, any, all, enumerate,
+zip, map, filter, list.extend, a list's `+=`, `*n` in displays and calls,
+`yield from`. The engines disagreed: the interpreter's `list(5)` raised and
+its `iter(5)` worked, the VM's the other way round. Not `x in n` (round
+77's TypeError stays) and not unpacking (`a, b = 2`, `for a, b in [2]`:
+CPython's TypeError on both, as for statements' targets already were): a
+fixed count of targets taken from a number is never meant. In
+Python-language source an int iterates nowhere.
+
+**Mechanism: one mark, set where the rule is known, read on the lenient
+paths only.**
+- NyScope's walk (`src/NyScope.cpp`) sets `Node::py_src = 1` - a byte in
+  what was padding after `Node::_type` (include/Node.hpp): no node grows -
+  on every node it walks in a scope under Python's rule, and
+  `FunctionNode::py_rule` / `LambdaNode::py_rule` to the body's own rule
+  (the def-line opt-in included).
+- Interpreter: the node's flag where the node is at hand - evalBinary's
+  `is` (identity) and `binaryOp(opc, l, r, ctx, py)` (1/0 from the node;
+  -1, the default, asks `pyCode()`), evalAugAssignment, evalFor's int
+  branch, comprehension clauses, generator expressions' clauses (NyGen's
+  `open(..., py)`), evalAttribute -> `getAttrValue(..., py)`, attribute
+  stores -> `dictAttrStoreCheck`. Builtins ask `pyCode()` - the running
+  lambda's `py_rule` (a lambda body has no statements), else the running
+  statement's `py_src` (`cur_stmt()`) - on their rare paths only:
+  iterItems' and NyGen `open`'s int case, sum's lenient +, list.sort /
+  reverse's result, setItem past the end, getattr / hasattr / setattr.
+  `callerPython()` (exec/compile's rule) asks it too.
+- VM: `VMCode::py`, set by the compiler from the root's / function's /
+  lambda's mark (`push_code` makes class bodies and comprehensions inherit
+  it), read as `vm_py()` (the top frame's code - a builtin's caller) on the
+  same rare paths: binop's str + non-str and list + tuple, BINARY_ADD's
+  str(instance), loop_iter / iter_items' int case, `get_attr` /
+  `lookup_attr` / `try_get_attr(..., py)` from LOAD_ATTR (the frame's
+  code) and getattr / hasattr, STORE_ATTR / setattr on a plain dict
+  (`dict_keys_hidden`), list.sort / reverse, set_sub past the end. `x is
+  <type word>` compiles to COMPARE_IS instead of COMPARE_IS_TYPE in
+  Python code - decided at compile time.
+- **The specializing VM keeps the distinction without a check of its
+  own**: no specialized form handles a lenient case (BINARY_ADD_NUM takes
+  numbers, LOAD_ATTR_* never a plain dict - its MAP form needs a class
+  name -, FOR_ITER_RANGE a range object, CALL_METHOD_BUILTIN calls the
+  method table, whose sort reads vm_py()), so a failed guard falls to the
+  generic path, which reads the code's flag. Same for the interpreter's
+  self-optimizing nodes (round 81): their fast paths are numbers and
+  instances' own fields.
+- Lexer: `Lexer::python_names` (`nython::scope::lexer_python`: this
+  thread's RuleScope - exec/compile from Python code -, else
+  python_source; never the prelude, "stdin") leaves `true`, `false`,
+  `none`, `null`, `undefined`, `elseif` Identifiers (tested after the
+  keyword loop: inside it the test cost the lexer 0.9M instructions at
+  startup). f-string fields' sub-lexers inherit it; `ast.parse` forces it
+  (CPython's parser: `ast.parse("true")` is a Name). `super` stays
+  Nython's, and the def-line opt-in cannot change tokens (the literal
+  spellings stay literals in such a function).
+
+**The libraries.** The 435 Python-language library files got all of this.
+65 of them spelled Nython's literals - 4,709 `none`/`true`/`false` tokens,
+rewritten to `None`/`True`/`False` by a token-aware pass (no f-string
+field or exec'd template used them). Their identity tests (`t is int`,
+`x is _empty`, `line is NeedMoreData`, `origin is tuple`) are identity
+now whatever the left operand holds (Nython's `is` made `x is C` a type
+test for an instance of C). The sweep found nothing else in them that
+relied on a leniency; the strict ordering found `lib/gui.ny`'s table sort
+(a key of "" for missing cells and numbers otherwise: now `[rank, number,
+text]`). `examples/vm_audit96.ny` and `vm_audit119.ny` (Python-language
+test files) tell the engine by `sys.implementation.name`: `true` is a
+NameError there now.
+
+**Innovation: `nython --python-compat-report FILE...`** - a static
+portability lint for Nython-language code meant to run under CPython too:
+for each file, every construct whose meaning differs from Python's, as
+`file:line:col: kind: message` - `concat` (a str joined with a value
+that is certainly not one: a number, a bool, None, a display, len(...),
+arithmetic), `int-iter` (`for i in 10`, `for i in len(xs)`, list/sorted/
+enumerate/zip/map of an int expression, a comprehension over one),
+`is-type` (`x is int` with a builtin type word and a value on the left),
+`dict-attr` (`conf.port` read or set where `conf` is bound only to dict
+displays in its scope), `literal` (true/false/none/null/undefined, checked
+against the source text so desugarings are not reported), `sort-value`
+(list.sort()/reverse()'s value used) and `binding` (the round-85 binding
+differences, from the same pass as --scope-report). Python-language parts
+(py_src) are skipped. The idea is Python 2.6's `-3` switch (PEP 361:
+warnings at the places where Python 3 would differ) and 2to3's fixer list,
+and the "differences from CPython" pages PyPy and Jython keep: the
+incompatibilities named and located instead of found by failures. Run
+over the 435 Python-language library files with their marker taken out it
+reports no concat/dict-attr/sort-value and only int-iter false positives
+(`max(0, i + n)` before the positional-argument count was checked) - which
+is how the lint itself was tuned.
+
+**Cost** (instructions, cachegrind; machine load does not enter): [TABLE]
+
+**Not done**
+- `[*5]` / `f(*5)` in Python-language source say "'int' object is not
+  iterable" (CPython: "Value after * must be an iterable, not int").
+- `d.f()` calling a function stored under a dict's key `f` still calls it
+  in Python-language source (CPython: AttributeError) - reads, stores,
+  getattr/hasattr/setattr are strict, the method call path is not.
+- `super` stays a hard keyword in Python-language source; the def-line
+  opt-in changes semantics, not tokens.
+- Two sets in sorted()/min()/max() are compared item by item (both
+  engines, as before), not by inclusion.
+- Found, not fixed: type names in messages are the module-qualified class
+  names (`can only concatenate str (not "m.Obj") to str`, `'m.Obj' object
+  has no attribute 'x'`) for a class defined in an imported module, on
+  both engines; CPython says `Obj`.
+
+---
 
 ## 0z5. Round 86 (main session) — program text is never a path, raw standard descriptors on Windows, the round 86 suites under Wine (vm_audit125)
 

@@ -316,7 +316,7 @@ check("what Python orders still sorts",
       [[True, 1.5, 2, 3], ["C", "a", "b"], [[1], [1, 9], [2, 1]], [(1, 5), (2,)], "b", 1, 1, [b"a", b"b"], "a"])
 nan = float("nan")
 check("a NaN compares false, no error", [len(sorted([nan, 1, 2])), max([1, 2]), min([nan]) != min([nan])], [3, 2, True])
-check("sets sort by inclusion", sorted([{1, 2}, {1}], key=lambda s: s), [{1}, {1, 2}])
+check("two sets sort", sorted([{1, 2}, {1}], key=lambda s: s), [{1}, {1, 2}])
 class Ord:
     def __init__(self, v):
         self.v = v

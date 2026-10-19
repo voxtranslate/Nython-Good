@@ -2350,12 +2350,11 @@ public:   // NythonExecutor is a struct: members default to public
     // type name, then text, so [1, "a"] sorted); a NaN compares false.
     bool sortLess(const Value& a, const Value& b, Context* ctx, const char* op = "<") {
         const bool lt = op[0] == '<';
-        // bytes by their bytes, sets by inclusion - as the operators order them
-        if (auto* ba = bytesOf(a)) if (auto* bb = bytesOf(b)) { int k = ba->s.compare(bb->s); return lt ? k < 0 : k > 0; }
-        if (setOf(a) && setOf(b)) { Value r; if (setBinary(lt ? OP_LT : OP_GT, a, b, ctx, r)) return isTruthy(r); }
         int c = 3;
-        if (orderValues(a, b, c, ctx)) return op[0] == '<' ? c < 0 : c > 0;
+        if (orderValues(a, b, c, ctx)) return lt ? c < 0 : c > 0;
         if (c == 2) return false;
+        // bytes by their bytes, as the operators order them (orderValues has no case for them)
+        if (auto* ba = bytesOf(a)) if (auto* bb = bytesOf(b)) { int k = ba->s.compare(bb->s); return lt ? k < 0 : k > 0; }
         pyRaise("TypeError", std::string("'") + op + "' not supported between instances of '" + order_fail_l_ + "' and '" + order_fail_r_ + "'");
     }
 
@@ -2944,7 +2943,8 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (kind == 2) {
             auto* attr = static_cast<AttributeNode*>((an->target).get());
             obj = evalNode(attr->object, ctx);
-            if (!getAttrValue(obj, attr->attr, ctx, old_val, true, attr->py_src)) old_val = missingAttribute(obj, attr->attr, an->target.get());   // round 86: py
+            if (!getAttrValue(obj, attr->attr, ctx, old_val) || (attr->py_src && pyDictKeyRead(obj, attr->attr)))   // round 86: py
+                old_val = missingAttribute(obj, attr->attr, an->target.get());
         } else {
             old_val = evalNode(an->target, ctx);
         }
@@ -10010,7 +10010,12 @@ public:
         // a class attribute or a method read as a value (round 81)
         if (astSpecOn() && !any_getattribute_ && obj.type == ValueType::USERDATA && obj.value.p
             && classLoadFast(an, obj, ctx, v)) return v;
-        if (getAttrValue(obj, an->attr, ctx, v, true, an->py_src)) return v;   // round 86: the node's rule
+        if (getAttrValue(obj, an->attr, ctx, v)) {
+            // round 86: Python-language source reads no dict key as an
+            // attribute ({"a": 1}.a is an AttributeError there)
+            if (__builtin_expect(an->py_src, 0) && pyDictKeyRead(obj, an->attr)) return missingAttribute(obj, an->attr, node.get());
+            return v;
+        }
         if (pend && !nypy::lenient_reads_log()) {   // round 82: missingAttribute's, by the flag
             pendExc("__exc__:AttributeError:" + attributeErrorText(obj, an->attr));
             return NONE_VALUE;
@@ -10170,11 +10175,18 @@ public:
     // getters and __getattr__ run, and what they raise propagates. `bind`
     // false: a builtin method (list.append ...) is left to the method call
     // that is about to happen instead of being read as a bound value.
-    // `py` (round 86): the read is Python-language source's (an attribute
-    // node's py_src, getattr / hasattr asking pyCode()) - a plain dict's keys
-    // are then not its attributes, as in CPython ({"a": 1}.a is an
-    // AttributeError); Nython reads the key.
-    bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true, bool py = false) {
+    // round 86: whether getAttrValue answered `obj.attr` with a plain dict's
+    // key - which Python-language source does not read as an attribute
+    // ({"a": 1}.a is an AttributeError in CPython; Nython reads the key).
+    // Asked after a read succeeded, only by Python code (the attribute
+    // node's py_src, getattr / hasattr's pyCode()); a dict's own methods win
+    // over its keys before that.
+    bool pyDictKeyRead(const Value& obj, const std::string& attr) {
+        Container* c = contOf(obj);
+        if (!c || isInstanceVal(obj) || !isPlainDict(c) || nyrt::is_dict_method_name(attr)) return false;
+        return c->container->find(attr) != c->container->end();
+    }
+    bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
         if (any_getattribute_) {
             // a class's __getattribute__ (round 77); object.__getattribute__
             // asks for the lookup below
@@ -10252,7 +10264,7 @@ public:
                     return false;
                 }
                 auto it = cont->container->find(attr);
-                if (it != cont->container->end() && !(py && isPlainDict(cont))) { out = it->second; return true; }   // round 86: py
+                if (it != cont->container->end()) { out = it->second; return true; }
                 // round 81: a module's __spec__ / __loader__, made when first
                 // read (the prelude's _ny_module_spec_attr); round 83: its
                 // __dict__, the live namespace vars(module) gives
@@ -16559,7 +16571,7 @@ public:
             std::string an = getStringValue(args[1]);
             if (name == "setattr") {
                 if (args.size() != 3) pyRaise("TypeError", "setattr expected 3 arguments, got " + std::to_string(args.size()));
-                if (pyCode()) dictAttrStoreCheck(args[0], an);   // round 86
+                if (contOf(args[0]) && pyCode()) dictAttrStoreCheck(args[0], an);   // round 86
                 setAttr(args[0], an, args[2]);
                 out = NONE_VALUE; return true;
             }
@@ -16572,7 +16584,11 @@ public:
                 pyRaise("TypeError", name + " expected " + (name == "hasattr" ? "2" : "at most 3") + " arguments, got " + std::to_string(args.size()));
             Value v;
             bool has;
-            try { has = getAttrValue(args[0], an, ctx, v, true, pyCode()); }   // round 86: a dict's keys are not its attributes to Python code
+            try {
+                has = getAttrValue(args[0], an, ctx, v);
+                // round 86: a dict's keys are not its attributes to Python code
+                if (has && contOf(args[0]) && pyCode() && pyDictKeyRead(args[0], an)) has = false;
+            }
             catch (std::string& e) {
                 // getattr(o, n) without a default raises the AttributeError a
                 // property's getter or __getattr__ raised (round 77)
