@@ -25,8 +25,21 @@
 # waiter); the closing handshake with status codes and reasons (validated:
 # 1005/1006/1015 never sent, the reason UTF-8 and the payload at most 125
 # bytes); failing the connection on protocol errors (1002), invalid UTF-8 in
-# text (1007), oversized messages (1009) and handler errors (1011). No
-# extensions are negotiated (permessage-deflate needs zlib).
+# text (1007), oversized messages (1009) and handler errors (1011).
+#
+# Compression (round 86): the permessage-deflate extension (RFC 7692,
+# lib/permessage_deflate.ny over the native zlib) is offered by connect()
+# and accepted by serve() by default (compression="deflate", as the
+# websockets package does; compression=None turns it off). Both ends'
+# parameters are negotiated - server_no_context_takeover,
+# client_no_context_takeover, server_max_window_bits, client_max_window_bits -
+# and extensions= takes factories configured otherwise
+# (permessage_deflate.ClientPerMessageDeflateFactory(...) /
+# ServerPerMessageDeflateFactory(...)). RSV1 is accepted only once the
+# extension is agreed, and only on the first frame of a data message;
+# max_size bounds a message after decompression. conn.extension is the
+# agreed PerMessageDeflate (or None). lib/websocket_asyncio.ny is the same
+# protocol for asyncio (async with connect(...) / serve(...)).
 #
 # Keepalive that adapts (new here): with ping_interval set, each pong is an
 # RTT sample for RFC 6298's estimator (SRTT, RTTVAR), and a ping is declared
@@ -40,6 +53,7 @@ import base64
 import hashlib
 import http.client
 import urllib.parse
+import permessage_deflate
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 OP_CONT = 0
@@ -277,11 +291,14 @@ def _read_head(reader):
 
 # ─── frames ─────────────────────────────────────────────────────────────────
 
-def encode_frame(fin, opcode, payload, mask):
-    # One frame, RFC 6455 5.2. mask: the client's side.
+def encode_frame(fin, opcode, payload, mask, rsv1=false):
+    # One frame, RFC 6455 5.2. mask: the client's side; rsv1: a compressed
+    # message's first frame (RFC 7692).
     var b0 = opcode
     if fin:
         b0 = b0 | 0x80
+    if rsv1:
+        b0 = b0 | 0x40
     var mbit = 0
     if mask:
         mbit = 0x80
@@ -338,8 +355,9 @@ class Connection:
     # recv() takes from it. send() and the reader's automatic pongs share one
     # write lock, so frames never interleave.
     def __init__(self, sock, reader, is_client, max_size=1048576, max_queue=16, ping_interval=none,
-                 ping_timeout=none, min_ping_timeout=0.05, close_timeout=10, fragment_size=none):
+                 ping_timeout=none, min_ping_timeout=0.05, close_timeout=10, fragment_size=none, extension=none):
         self.socket = sock
+        self.extension = extension
         self._rf = reader
         self.is_client = is_client
         self.max_size = max_size
@@ -397,7 +415,8 @@ class Connection:
         var opcode = b0 & 0x0F
         var masked = (b1 & 0x80) != 0
         var n = b1 & 0x7F
-        if (b0 & 0x70) != 0:
+        var rsv1 = (b0 & 0x40) != 0
+        if (b0 & 0x30) != 0 or (rsv1 and self.extension == none):
             raise _Failure(1002, "reserved bits must be 0")
         if not (opcode in _DATA_OPS) and not (opcode in _CTRL_OPS):
             raise _Failure(1002, "invalid opcode " + str(opcode))
@@ -422,6 +441,16 @@ class Connection:
         var payload = self._read_exact(n)
         if masked:
             payload = _ws_mask(payload, key)
+        if self.extension != none:
+            var limit = none
+            if self.max_size != none:
+                limit = self.max_size - self._frag_size
+            try:
+                payload = self.extension.decode_frame(opcode, fin, rsv1, payload, limit)
+            except permessage_deflate.PayloadTooBig as e:
+                raise _Failure(1009, str(e))
+            except permessage_deflate.ProtocolError as e:
+                raise _Failure(1002, str(e))
         return [fin, opcode, payload]
 
     def _deliver(self, opcode, data):
@@ -666,8 +695,13 @@ class Connection:
         with self._send_lock:
             if self.state != OPEN:
                 raise self._closed_error()
+            var rsv1 = false
+            if self.extension != none:
+                var enc = self.extension.encode_frame(opcode, fin, payload)
+                rsv1 = enc[0]
+                payload = enc[1]
             try:
-                self._write_locked(encode_frame(fin, opcode, payload, self.is_client))
+                self._write_locked(encode_frame(fin, opcode, payload, self.is_client, rsv1))
             except OSError:
                 raise self._closed_error()
 
@@ -726,12 +760,21 @@ class Connection:
                 raise self._closed_error()
             var n = len(parts)
             var i = 0
+            var total = 0
+            for p in parts:
+                total = total + len(p)
             try:
                 while i < n:
                     var fop = OP_CONT
                     if i == 0:
                         fop = op
-                    self._write_locked(encode_frame(i == n - 1, fop, parts[i], self.is_client))
+                    var data = parts[i]
+                    var rsv1 = false
+                    if self.extension != none:
+                        var enc = self.extension.encode_frame(fop, i == n - 1, data, total)
+                        rsv1 = enc[0]
+                        data = enc[1]
+                    self._write_locked(encode_frame(i == n - 1, fop, data, self.is_client, rsv1))
                     i = i + 1
             except OSError:
                 raise self._closed_error()
@@ -880,8 +923,10 @@ def parse_uri(uri):
 
 def connect(uri, origin=none, subprotocols=none, additional_headers=none, user_agent_header=USER_AGENT,
             open_timeout=10, ssl=none, server_hostname=none, sock=none, max_size=1048576, max_queue=16,
-            ping_interval=none, ping_timeout=none, close_timeout=10, fragment_size=none, compression=none):
+            ping_interval=none, ping_timeout=none, close_timeout=10, fragment_size=none, compression="deflate",
+            extensions=none):
     var u = parse_uri(uri)
+    var factories = _client_factories(compression, extensions)
     var secure = u[0]
     var host = u[1]
     var port = u[2]
@@ -912,6 +957,8 @@ def connect(uri, origin=none, subprotocols=none, additional_headers=none, user_a
             lines.append("Origin: " + origin)
         if subprotocols != none and len(subprotocols) > 0:
             lines.append("Sec-WebSocket-Protocol: " + ", ".join(subprotocols))
+        if len(factories) > 0:
+            lines.append("Sec-WebSocket-Extensions: " + permessage_deflate.build_extensions([(f.name, f.get_request_params()) for f in factories]))
         if additional_headers != none:
             for kv in Headers(additional_headers).items():
                 lines.append(kv[0] + ": " + kv[1])
@@ -944,15 +991,18 @@ def connect(uri, origin=none, subprotocols=none, additional_headers=none, user_a
             raise InvalidHeader("Sec-WebSocket-Accept")
         if acc != accept_key(key):
             raise InvalidHeader("Sec-WebSocket-Accept", acc)
-        if headers.get("Sec-WebSocket-Extensions") != none:
-            raise NegotiationError("no extensions supported")
+        var extension = none
+        var ext_values = headers.get_all("Sec-WebSocket-Extensions")
+        if len(ext_values) > 0:
+            extension = _client_accept(factories, ext_values)
         var proto = headers.get("Sec-WebSocket-Protocol")
         if proto != none:
             if subprotocols == none or not (proto in subprotocols):
                 raise NegotiationError("unsupported subprotocol: " + proto)
         sock.settimeout(none)
         var conn = ClientConnection(sock, reader, max_size=max_size, max_queue=max_queue, ping_interval=ping_interval,
-                                    ping_timeout=ping_timeout, close_timeout=close_timeout, fragment_size=fragment_size)
+                                    ping_timeout=ping_timeout, close_timeout=close_timeout, fragment_size=fragment_size,
+                                    extension=extension)
         conn.subprotocol = proto
         conn.request = request
         conn.response = Response(code, phrase, headers)
@@ -964,6 +1014,54 @@ def connect(uri, origin=none, subprotocols=none, additional_headers=none, user_a
             pass
         raise
 
+def _client_factories(compression, extensions):
+    var out = []
+    if extensions != none:
+        out = list(extensions)
+    if compression == "deflate":
+        if not any([f.name == permessage_deflate.EXTENSION_NAME for f in out]):
+            out.append(permessage_deflate.ClientPerMessageDeflateFactory())
+    elif compression != none:
+        raise ValueError("unsupported compression: " + str(compression))
+    return out
+
+def _client_accept(factories, values):
+    # The server's Sec-WebSocket-Extensions: each extension must be one we
+    # offered, with parameters RFC 7692 allows (NegotiationError otherwise).
+    var accepted = []
+    var parsed = none
+    try:
+        parsed = permessage_deflate.parse_extensions(values)
+    except permessage_deflate.NegotiationError as e:
+        raise NegotiationError(str(e))
+    for item in parsed:
+        var found = none
+        for f in factories:
+            if f.name == item[0]:
+                found = f
+        if found == none:
+            raise NegotiationError("unsupported extension: " + item[0])
+        try:
+            accepted.append(found.process_response_params(item[1], accepted))
+        except permessage_deflate.NegotiationError as e:
+            raise NegotiationError(str(e))
+    if len(accepted) > 1:
+        raise NegotiationError("more than one extension accepted")
+    if len(accepted) == 0:
+        return none
+    return accepted[0]
+
+def _server_factories(compression, extensions):
+    var out = []
+    if extensions != none:
+        out = list(extensions)
+    if compression == "deflate":
+        if not any([f.name == permessage_deflate.EXTENSION_NAME for f in out]):
+            out.append(permessage_deflate.ServerPerMessageDeflateFactory())
+    elif compression != none:
+        raise ValueError("unsupported compression: " + str(compression))
+    return out
+
 # ─── server ─────────────────────────────────────────────────────────────────
 
 class Server:
@@ -971,8 +1069,10 @@ class Server:
     # a thread of its own. serve_forever() until shutdown().
     def __init__(self, handler, sock, ssl=none, process_request=none, process_response=none, subprotocols=none,
                  select_subprotocol=none, origins=none, server_header=SERVER, open_timeout=10, max_size=1048576,
-                 max_queue=16, ping_interval=none, ping_timeout=none, close_timeout=10, fragment_size=none, logger=none):
+                 max_queue=16, ping_interval=none, ping_timeout=none, close_timeout=10, fragment_size=none, logger=none,
+                 compression="deflate", extensions=none):
         self.handler = handler
+        self.extensions = _server_factories(compression, extensions)
         self.socket = sock
         self.ssl = ssl
         self.process_request = process_request
@@ -1113,6 +1213,15 @@ class Server:
             hdrs["Sec-WebSocket-Accept"] = accept_key(req.headers.get("Sec-WebSocket-Key"))
             if proto != none:
                 hdrs["Sec-WebSocket-Protocol"] = proto
+            var extension = none
+            var offers = req.headers.get_all("Sec-WebSocket-Extensions")
+            if len(offers) > 0:
+                for f in self.extensions:
+                    var neg = f.negotiate(", ".join(offers))
+                    if neg[1] != none:
+                        hdrs["Sec-WebSocket-Extensions"] = neg[0]
+                        extension = neg[1]
+                        break
             var resp = Response(101, "Switching Protocols", hdrs)
             if self.process_response != none:
                 var r2 = self.process_response(none, req, resp)
@@ -1123,7 +1232,7 @@ class Server:
                 sock.close()
                 return
             sock.settimeout(none)
-            conn = ServerConnection(sock, reader, **self.conn_args)
+            conn = ServerConnection(sock, reader, extension=extension, **self.conn_args)
             conn.subprotocol = proto
             conn.request = req
             conn.response = resp

@@ -260,9 +260,6 @@ class DataFrame(Padding, Frame):
         super().__init__(stream_id, **kwargs)
         self.data = data
 
-    def _body_repr(self):
-        return "padded=%s, data=%s" % (self.pad_length, _raw_data_repr(self.data))
-
     def serialize_body(self):
         padding = b"\x00" * self.pad_length if "PADDED" in self.flags else b""
         return self.serialize_padding_data() + bytes(self.data) + padding

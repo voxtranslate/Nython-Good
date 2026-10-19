@@ -12,8 +12,8 @@
 #
 # serve(handler, host=None, port=0, ssl=None, settings=None, record=False,
 #       max_concurrent_streams=100) -> Server (listening). With ssl, the
-#       context is given ALPN ["h2"] and a connection that negotiates
-#       anything else is closed; without, connections speak h2c with prior
+#       context is given ALPN ["h2"] and a connection that does not
+#       negotiate it is closed; without, connections speak h2c with prior
 #       knowledge. Each request stream runs handler(request) as a task of its
 #       own, so streams are served concurrently; the handler returns a
 #       Response (body: bytes, str or an async iterator of chunks) or None
@@ -227,7 +227,8 @@ class Server:
         if self.ssl is not None:
             so = writer.get_extra_info("ssl_object")
             alpn = so.selected_alpn_protocol() if so is not None else None
-            if alpn is not None and alpn != "h2":
+            if alpn != "h2":
+                # HTTP/2 over TLS is negotiated with ALPN (RFC 9113 3.2)
                 writer.close()
                 return
         if self._closing:
