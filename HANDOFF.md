@@ -6,6 +6,8 @@ this file describes it **as it actually is**, including the traps.
 Last updated: round 86, part G — **§0z** (CPython's audit events (PEP 578) raised where CPython raises them, with its names and arguments, on both engines and in the library - a table generated from CPython's docs and probes (tools/audit_events.json), the prelude-caller rule for engine audit points, events from natives behind the VM's bridge; lib/nyaudit.ny audit policies, `--audit-policy` / `--audit-log`; vm_audit121)
 Round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
 Round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
+Round 86, part I — **§0z** (HTTP/2 and HPACK beyond CPython: lib/hpack.ny (RFC 7541), lib/h2/ (RFC 9113 sans-I/O H2Connection with h2's API, hyperframe's frames, RFC 9218 priorities and scheduler, asyncio client/server with ALPN, h2.sync for http.client/urllib http2=), permessage-deflate (RFC 7692) for websocket.ny and a new websocket_asyncio.ny; HPACK admission control; two engine fixes - awaiting a coroutine's own __await__, prelude chunks loaded under threads; vm_audit123)
+Last updated: round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
 Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
 Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
 Round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
@@ -299,6 +301,135 @@ the rest of CPython's, with its names and its arguments, on both engines.
   import system's own open/compile/exec events for a module's file (Nython's
   import raises `import` only), input() reading a replaced sys.stdin (it
   reads the process's stdin whatever sys.stdin is - found, not fixed).
+## 0z. Round 86, part I — HTTP/2, HPACK and WebSocket compression (vm_audit123)
+
+Beyond CPython's standard library (it has none of this): the RFCs are the
+spec, the python-hyper packages' API shapes (`hpack`, `h2`, hyperframe) and
+the websockets package's (permessage-deflate factories, asyncio
+connect/serve) where an API was needed. Every sans-I/O module is written in
+the subset of the language CPython also runs, so vm_audit123 loads them in
+python3 with a `sys.meta_path` finder (SourceFileLoader over the `.ny`
+files) and runs the same checks there: **241 checks; 241 pass on the
+interpreter, the VM and python3** (232 under python3: the http.client /
+urllib and lib/websocket.ny sections are Nython-only).
+
+Interop was checked outside the test as well (not in the suite: they need
+packages and tools the container lacks by default): curl 8.5 / nghttp2 1.59
+against h2.server (`--http2-prior-knowledge`, `--http2` over TLS with ALPN,
+uploads, 300 KB downloads, `-Z` parallel streams); h2.client against the
+`h2` 4.4.1 package's server; frames byte for byte against hyperframe 6.1.0
+(which serializes an ExtensionFrame with a zero length - ours is right);
+websocket.ny with deflate against websockets 17.2 both ways (it refuses a
+window of 8 bits, as it says; we accept it - below).
+
+### Modules
+
+- **`lib/hpack.ny`** — RFC 7541: static table, FIFO dynamic table with O(1)
+  lookups by insertion number, integers, the Huffman code (Appendix B's
+  lengths only - the code is canonical, the codes are rebuilt and checked
+  against the RFC's table), a nibble-at-a-time decoder table (nghttp2's
+  approach) built on first use, every representation, table size updates
+  (the smallest since the last block, then the final, 4.2), the decoder's
+  limits and errors. Encoder output equals Appendix C byte for byte (the
+  hpack package's choices: static table first, incremental indexing,
+  never-indexed when sensitive). huffman=True codes a string only when that
+  does not make it longer.
+- **`lib/h2/`** — `connection` (H2Connection: the whole RFC 9113 state
+  machine, sans I/O; the module header lists what is enforced), `frame`
+  (hyperframe's API, + RFC 9218's PRIORITY_UPDATE), `events`, `errors`,
+  `exceptions`, `settings`, `config`, `stream`, `utilities` (field
+  validation, RFC 9113 8.2/8.3), `priority` (RFC 9218: Structured Fields
+  dictionary parsing, the scheduler), `_aio` (the asyncio driver both sides
+  share: a read task, a write task that asks the scheduler which stream
+  sends the next frame, flow control waits counted as `blocked`), `client`
+  (connect/request; TLS with ALPN "h2" or prior-knowledge h2c), `server`
+  (serve(handler): one task per stream; graceful close by RFC 9113 6.8's two
+  GOAWAYs and a PING), `sync` (a blocking session for http.client).
+- **http.client / urllib.request** — `HTTPSConnection(..., http2=True)`
+  offers ALPN h2,http/1.1 and speaks HTTP/2 when it is selected
+  (`HTTP2Response`, `version` 20, trailers); `HTTPConnection(...,
+  http2="prior_knowledge")`; `urlopen(..., http2=...)`,
+  `HTTPSHandler(http2=)`, `HTTPHandler(http2=)`. Off by default.
+- **`lib/permessage_deflate.ny`** — RFC 7692: the extension header grammar,
+  client and server factories (every parameter, the answer checked), the
+  per-message codec over raw DEFLATE with Z_SYNC_FLUSH, context takeover,
+  BFINAL streams, RSV1 rules, max_size enforced while inflating.
+- **`lib/websocket.ny`** — permessage-deflate negotiated by default
+  (`compression="deflate"`, as the websockets package; `compression=None`,
+  `extensions=[...]`), `conn.extension`.
+- **`lib/websocket_asyncio.ny`** — the asyncio client and server
+  (`async with connect(...)`, `async with serve(...)`), same protocol rules,
+  deflate included.
+
+### Beyond the packages (the innovations)
+
+- **HPACK: what to index** (`hpack.SmartIndexing`, opt-in). RFC 7541 fixes
+  the FIFO eviction but leaves admission to the encoder: short credentials
+  never indexed (7.1.1/7.1.3), a "cache on second hit" doorkeeper for values
+  predicted to be one-hit wonders (high character entropy, or a name whose
+  values rarely repeat - Maggs & Sitaraman 2015, TinyLFU's doorkeeper), and
+  7.1.2's penalty for names with many distinct values (no longer compared
+  with nor added to the table). `compression_report()` on vm_audit123's
+  browsing-session corpus: requests 5223 -> 5039 octets (4 KiB table),
+  10662 -> 5542 (1 KiB); responses 8205 -> 7337 (1 KiB) but 6174 -> 6324
+  (+2.4%) with 4 KiB - a table with room loses little to one-off entries and
+  a literal without indexing names a static entry past 14 in two octets.
+- **RFC 9218 server scheduling** (`h2.priority.PriorityScheduler`, used by
+  h2.server): urgency strictly first; within an urgency the non-incremental
+  responses one at a time in stream order and the incremental ones round
+  robin - with the non-incremental queue taking part in the round robin as
+  ONE member, so neither kind starves the other (RFC 9218 10 warns about it
+  and leaves it open). The server announces SETTINGS_NO_RFC7540_PRIORITIES;
+  PRIORITY_UPDATE received before its stream is buffered (7.1). vm_audit123
+  watches the order on the wire: `BCDECDECDEFA` for u=5, u=1, u=3 i, u=3 i,
+  u=3, u=3.
+- **permessage-deflate with 8-bit windows**: zlib cannot compress with a
+  256-byte raw window; asked for 8, the compressor runs at 9 bits, whose
+  matches never reach back more than 2^9 - 262 = 250 bytes (MAX_DIST), so
+  the peer's 256-byte window holds them all.
+- **CONTINUATION flood** (the 2024 vulnerability class): a field block
+  growing past 4x the header-list limit is ENHANCE_YOUR_CALM.
+
+### Engine changes (all marked "round 86")
+
+1. `include/NyPrelude.hpp`, `_ny_await_iter`: an `__await__` that returns a
+   coroutine's own `__await__()` (a `_NyCoroWrapper` over a coroutine not
+   started yet) is awaited as that coroutine. It was driven by hand
+   (`_ny_drive_await`), and a hand-driven coroutine's native waits park the
+   task without letting the loop run - a wait for another task never ended
+   (`await connect(...)` of websocket_asyncio, the websockets package's
+   shape). Both engines (the prelude is theirs).
+2. `include/NythonExecutor.hpp` (`ensureMirror`, `mirrors_loading_`,
+   `MirrorLoading`) and `include/VirtualMachine.hpp` (`load_mirror`, the
+   same): a lazily loaded prelude chunk was marked loaded before its
+   definitions ran; with threads the GIL can change hands during the load,
+   and another thread then used memoryview without members ("object of type
+   'memoryview' has no len()", half the runs of the http.client test, whose
+   server runs on another thread). A thread finding a chunk being loaded by
+   another waits for it (GIL released, 200 us steps); the loading thread
+   carries on as before.
+
+### Not done
+
+- Server push from h2.server (the sans-I/O push_stream exists; the client
+  refuses pushes, as the brief asked); the h2c upgrade's HTTP/1.1 half
+  (RFC 9113 removed it; the HTTP/2 half, initiate_upgrade_connection, is
+  there); RFC 8441's extended CONNECT (WebSockets over HTTP/2) beyond
+  validating `:protocol`; RFC 7540 dependency-tree scheduling (PRIORITY is
+  parsed and reported only, as RFC 9113 allows); ALTSVC is sent and
+  reported, not acted on.
+- http.client keeps its one-request-at-a-time model on HTTP/2 (h2.sync can
+  multiplex; http.client does not expose it); urllib's opener opens one
+  connection per request as for HTTP/1.1.
+- websocket.ny's sync code was not rebuilt on a sans-I/O core shared with
+  websocket_asyncio.ny: the two implement the same rules twice.
+- Found, not fixed: a TLS server's handshake can still be completing when
+  asyncio.run shuts down (Nython's TLS handshakes finish later than
+  CPython's); the client_connected_cb task it then starts is not among the
+  tasks asyncio.run cancels, and its done callback runs once the loop is
+  closed ("Exception in default exception handler"). CPython has the same
+  window, rarely hit. A coroutine driven by hand still cannot wait for
+  another task of its loop (engine change 1 covers the common shape only).
 
 ## 0y3. Round 85 (main session) — exceptions native code swallows, generators as weak references and keys, the harness under Wine, the round 84 suites on Windows (vm_audit120)
 

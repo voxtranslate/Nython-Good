@@ -6305,9 +6305,27 @@ private:
     // natives are given the payload (vm_call). The mirrors are loaded per
     // type, on first need (load_mirror).
     EpochSet<std::string> mirrors_loaded_;   // (round 80: EpochSet)
+    // (round 86) the chunks being loaded and by which thread: a chunk is
+    // marked loaded before its definitions have run, and the GIL can change
+    // hands while they run - another thread arriving then used memoryview
+    // with no members yet. It waits for the load now.
+    std::unordered_map<std::string, std::thread::id> mirrors_loading_;
+    struct MirrorLoading {
+        VirtualMachine* vm; std::string chunk;
+        ~MirrorLoading() { vm->mirrors_loading_.erase(chunk); }
+    };
     void load_mirror(const std::string& chunk) {
-        if(mirrors_loaded_.count(chunk)) return;
+        if(mirrors_loaded_.count(chunk)) {
+            for(;;) {                                   // round 86
+                auto it=mirrors_loading_.find(chunk);
+                if(it==mirrors_loading_.end()||it->second==std::this_thread::get_id()) return;
+                nyconc::GilRelease unlocked;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }
         mirrors_loaded_.insert(chunk);
+        mirrors_loading_[chunk]=std::this_thread::get_id();   // round 86
+        MirrorLoading loading{this,chunk};
         if(chunk!="base"&&chunk!="os"&&chunk!="buffer"&&chunk!="posix"&&chunk!="audit") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix"; round 86: nor "audit")
         if(chunk=="dictview") load_mirror("dict");
         try {

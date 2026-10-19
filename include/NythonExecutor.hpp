@@ -560,10 +560,29 @@ struct NythonExecutor {
     // __dict__ read: a program that never does pays nothing for them.
     std::unordered_set<std::string> mirrors_loaded_;
     int mirror_loading_ = 0;   // (round 86) a chunk runs: the prelude's own (preludeCaller)
+    // (round 86) the chunks being loaded and by which thread: a chunk is
+    // marked loaded before its definitions have run, and the GIL can change
+    // hands while they run - another thread arriving then used memoryview
+    // with no members yet ("object of type 'memoryview' has no len()"). It
+    // waits for the load now (the loading thread itself carries on).
+    std::unordered_map<std::string, std::thread::id> mirrors_loading_;
+    struct MirrorLoading {
+        NythonExecutor* E; std::string chunk;
+        ~MirrorLoading() { E->mirrors_loading_.erase(chunk); }
+    };
     void ensureMirror(const std::string& chunk) {
-        if (mirrors_loaded_.count(chunk)) return;
+        if (mirrors_loaded_.count(chunk)) {
+            for (;;) {                                  // round 86
+                auto it = mirrors_loading_.find(chunk);
+                if (it == mirrors_loading_.end() || it->second == std::this_thread::get_id()) return;
+                nyconc::GilRelease unlocked;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }
         mirrors_loaded_.insert(chunk);
         struct Loading { int& n; explicit Loading(int& c) : n(c) { n++; } ~Loading() { n--; } } loading(mirror_loading_);   // round 86
+        mirrors_loading_[chunk] = std::this_thread::get_id();   // round 86
+        MirrorLoading mloading{this, chunk};
         if (chunk != "base" && chunk != "os" && chunk != "buffer" && chunk != "posix" && chunk != "audit") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix"; round 86: nor "audit")
         if (chunk == "dictview") ensureMirror("dict");
         try {

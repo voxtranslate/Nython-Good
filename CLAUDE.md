@@ -411,6 +411,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit120 | 19 | round 85 (main session): exceptions the runtime catches and carries on from are freed (for loops, list()/sorted()/unpacking, `__getitem__` iteration, hasattr/getattr/next defaults, `__getattribute__` -> `__getattr__`, yield from, a generator closed inside an except clause), weak references to generators and WeakSets of them (passes under python3) |
 | vm_audit121 | 109 | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (89 pass under python3.11, 91 under 3.12, 89 under 3.13) |
 | vm_audit122 | 169 | round 86 (part H): nylsp, the Language Server driven as an editor drives it (stdio JSON-RPC): lifecycle and errors, position encodings, incremental sync, diagnostics (syntax with recovery, NyScope, unbound reads, undefined names/modules, NyxAI rules), completion/resolve, hover, signature help, definition/references across files, scope-correct rename in .ny and .py files, symbols, folding, formatting, semantic tokens and deltas, code actions, inlay hints, cancellation, progress (Nython-only) |
+| vm_audit123 | 241 | round 86, part I: HPACK (RFC 7541 Appendix C byte for byte, the Huffman code, size updates, decoder errors, Nython's SmartIndexing on a header corpus), HTTP/2 frames byte for byte with hyperframe, two H2Connections in memory (SETTINGS, CONTINUATION, padding, flow control, RST_STREAM, GOAWAY, PING, push refused, malformed field blocks, connection/stream errors, RFC 9218), the RFC 9218 scheduler's order, h2.client/h2.server over localhost (multiplexing, flow control stopping and resuming, resets, graceful GOAWAY, TLS with ALPN h2), http.client/urllib with http2= (Nython-only), permessage-deflate (RFC 7692's examples, negotiation, takeover, window bits, RSV1, a bomb), websocket.ny (Nython-only) and websocket_asyncio.ny round trips (232 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1785,6 +1786,32 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   block, a policy file format, `derive(log)`; `nython --audit-policy FILE`,
   `nython --audit-log FILE` (JSON lines), `nython -m nyaudit derive LOG`.
 - `sys.audit` checks nothing while no hook exists, as CPython's.
+## Round 86, part I: HTTP/2, HPACK, WebSocket compression (see `HANDOFF.md` §0z)
+
+- Beyond CPython's library, with the python-hyper packages' API shapes:
+  **`lib/hpack.ny`** (RFC 7541), **`lib/h2/`** (RFC 9113: `h2.connection`'s
+  sans-I/O H2Connection and its events, `h2.frame` = hyperframe's frames,
+  settings/errors/exceptions/config, `h2.priority` = RFC 9218,
+  `h2.client`/`h2.server` over asyncio with TLS ALPN "h2" or prior-knowledge
+  h2c, `h2.sync` for http.client), **`lib/permessage_deflate.ny`** (RFC 7692)
+  used by `lib/websocket.ny` (deflate negotiated by default, as the
+  websockets package) and the new **`lib/websocket_asyncio.ny`**
+  (`async with connect()/serve()`). `http.client.HTTPSConnection(...,
+  http2=True)`, `HTTPConnection(..., http2="prior_knowledge")`,
+  `urlopen(..., http2=...)` speak HTTP/2 when it is agreed (opt-in).
+- The sans-I/O modules (hpack, h2 except client/server/sync/_aio,
+  permessage_deflate, websocket_asyncio) are written in the subset CPython
+  runs: vm_audit123 loads them in python3 through a `sys.meta_path` finder.
+- Innovations: HPACK admission control (`SmartIndexing`: short credentials
+  never indexed, a second-hit doorkeeper for one-hit wonders, RFC 7541
+  7.1.2's per-name penalty; `compression_report()`), an RFC 9218 scheduler
+  whose non-incremental queue is one round-robin member (no starvation
+  either way), 8-bit deflate windows served by a 9-bit compressor.
+- Engines: an `__await__` returning a coroutine's own `__await__()` is
+  awaited as that coroutine (prelude `_ny_await_iter`; it deadlocked when
+  the coroutine waited for another task); a lazily loaded prelude chunk is
+  waited for by a second thread while the first loads it (`ensureMirror` /
+  `load_mirror`: threads saw memoryview without members).
 
 ## Transcripts
 

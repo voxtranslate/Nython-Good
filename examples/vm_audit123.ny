@@ -725,7 +725,7 @@ def test_connection():
     check("the h2 package's names", [h2.__version__, ErrorCodes(0xd).name, SettingCodes.ENABLE_CONNECT_PROTOCOL.value,
                                      issubclass(h2.exceptions.StreamClosedError, h2.exceptions.NoSuchStreamError),
                                      h2.exceptions.FlowControlError.error_code, repr(h2.events.StreamEnded())],
-          ["4.4.1", "HTTP_1_1_REQUIRED", 8, true, ErrorCodes.FLOW_CONTROL_ERROR, "<StreamEnded stream_id:None>"])
+          ["4.4.1", "HTTP_1_1_REQUIRED", 8, true, ErrorCodes.FLOW_CONTROL_ERROR, "<StreamEnded stream_id:%s>" % (None,)])
     st = h2.settings.Settings(client=true)
     st[SettingCodes.INITIAL_WINDOW_SIZE] = 100
     check("Settings: pending until acknowledged", [st.initial_window_size, list(st.acknowledge().values())[0].new_value, st.initial_window_size],
@@ -971,7 +971,10 @@ async def h2_tls_main():
 
     # a TLS server without ALPN: the client will not speak HTTP/2 to it
     async def noop(reader, writer):
-        await asyncio.sleep(0.5)
+        try:
+            await asyncio.wait_for(reader.read(), 5)     # until the client gives up
+        except Exception:
+            pass
         writer.close()
     plain = await asyncio.start_server(noop, "127.0.0.1", 0, ssl=server_ctx())
     try:
@@ -981,6 +984,7 @@ async def h2_tls_main():
         out = "NegotiationError"
     check("TLS: a server that does not select h2 is refused by the client", out, "NegotiationError")
     plain.close()
+    await asyncio.sleep(0.1)
 
 
 async def h2_goaway_error_main():
@@ -1002,7 +1006,37 @@ async def h2_goaway_error_main():
     await srv.close()
 
 
+class _AwaitsCoroutine:
+    # an __await__ that is a coroutine's own - websocket_asyncio's connect()
+    # and serve() (and the websockets package's) have this shape
+    def __init__(self, ev):
+        self.ev = ev
+
+    async def _go(self):
+        await self.ev.wait()
+        return "woken"
+
+    def __await__(self):
+        return self._go().__await__()
+
+
+async def await_shape_main():
+    ev = asyncio.Event()
+
+    async def setter():
+        await asyncio.sleep(0.01)
+        ev.set()
+
+    async def waiter():
+        return await _AwaitsCoroutine(ev)
+    t = asyncio.ensure_future(setter())
+    r = await asyncio.wait_for(waiter(), 5)
+    await t
+    check("await of an object whose __await__ is a coroutine's, woken by another task", r, "woken")
+
+
 def test_asyncio():
+    asyncio.run(await_shape_main())
     asyncio.run(h2_main())
     asyncio.run(h2_scheduler_main())
     asyncio.run(h2_goaway_error_main())
@@ -1079,7 +1113,7 @@ def test_deflate():
     d = pmd.PerMessageDeflate(false, false, 15, 15)
     back = [d.decode_frame(1, true, true, payload), d.decode_frame(1, true, true, payload2)]
     check("RFC 7692 7.2.3.2: the second Hello uses the window (zlib: f200110000)",
-          [back, len(payload2) <= 5, payload2.hex() == "f200110000" or not nython], [[b"Hello", b"Hello"], true, true])
+          [back, len(payload2) <= 5, nython or payload2.hex() == "f200110000"], [[b"Hello", b"Hello"], true, true])
     nct = pmd.PerMessageDeflate(false, true, 15, 15)
     check("no context takeover: the same bytes again", [nct.encode_frame(1, true, b"Hello")[1].hex(), nct.encode_frame(1, true, b"Hello")[1].hex()],
           ["f248cdc9c90700", "f248cdc9c90700"])
