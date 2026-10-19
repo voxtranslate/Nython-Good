@@ -681,6 +681,35 @@ class _SubprocessPipeOut:
         return false
 
 
+def _audit_popen(args, executable, shell, cwd, env):
+    # (round 86) the subprocess.Popen audit event, with the arguments
+    # CPython's _execute_child gives it: on POSIX the argument list (the
+    # shell's in front for shell=True) and the program it runs; on Windows
+    # the command line
+    if os_name == "nt":
+        if not isinstance(args, (str, bytes)):
+            args = list2cmdline(args)
+        if shell:
+            args = os_getenv("COMSPEC", "cmd.exe") + ' /c "' + args + '"'
+        _ny_sys_audit("subprocess.Popen", executable, args, cwd, env)
+        return
+    if isinstance(args, (str, bytes)):
+        args = [args]
+    elif hasattr(args, "__fspath__"):
+        if shell:
+            raise TypeError("path-like args is not allowed when shell is true")
+        args = [args]
+    else:
+        args = list(args)
+    if shell:
+        args = ["/bin/sh", "-c"] + args
+        if executable:
+            args[0] = executable
+    if executable is none:
+        executable = args[0]
+    _ny_sys_audit("subprocess.Popen", executable, args, cwd, env)
+
+
 class Popen:
     """ Execute a child program in a new process.
 
@@ -725,6 +754,8 @@ class Popen:
         self._eof = false
         self._communication_started = false
         self._delivered = false
+        if _ny_audit_hooks:
+            _audit_popen(args, executable, shell, cwd, env)   # round 86
         var cmd = _native_cmd(args, shell)
         var kw = _native_opts(self._plan, cwd, env)
         if self._plan.keep_stdin:

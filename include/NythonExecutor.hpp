@@ -3099,6 +3099,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
     Node* object_class_node_ = nullptr;
     void setAttr(const Value& obj, const std::string& name, const Value& val) {
+        if (__builtin_expect(nyrt::audit_on(), 0)) auditAttrStore(obj, name, &val);   // round 86
         if (isInstanceValue(obj) && instanceAttrHook(obj, 0)) {
             std::vector<Value> a{makeStringValue(name), val};
             Value o = obj;
@@ -3303,7 +3304,14 @@ public:   // NythonExecutor is a struct: members default to public
             return methodNew(args[0], args[1], ctx);
         }
         if (n == "zip" || n == "map" || n == "filter" || n == "enumerate") return callBuiltinKw(n, args, kw, ctx);
-        if (n == "function") pyRaise("TypeError", "function() missing required argument 'code' (pos 1)");
+        // (round 86) types.FunctionType(code, globals, name, argdefs, closure):
+        // the prelude's _ny_function_new (it raises function.__new__)
+        if (n == "function") {
+            std::vector<Value> a = args;
+            Value fnew = global_ctx->getByName("_ny_function_new");
+            if (fnew.type == ValueType::USERDATA) return callFunctionValue(fnew, a, ctx, kw);
+            pyRaise("TypeError", "function() missing required argument 'code' (pos 1)");
+        }
         pyRaise("TypeError", "cannot create '" + n + "' instances");
         return NONE_VALUE;
     }
@@ -4319,7 +4327,7 @@ public:   // NythonExecutor is a struct: members default to public
     // the address id(v) gives, as reprs show it (round 81)
     std::string idHex(const Value& v, Context* c) {
         std::vector<Value> ia{v};
-        Value idv = callBuiltin("id", ia, c);
+        Value idv = callBuiltin("_ny_id", ia, c);   // (round 86: the identity without id()'s audit event)
         int64_t id = 0;
         if (idv.type == ValueType::INTEGER) bigint_fits_i64(idv.value.i, id);
         char buf[40];
@@ -10646,6 +10654,11 @@ public:
                 && (attr == "__defaults__" || attr == "__kwdefaults__" || attr == "__code__" || attr == "__qualname__"
                     || attr == "__module__" || attr == "__globals__")
                 && isPlainFunction(obj)) {
+                // (round 86) __code__, __defaults__ and __kwdefaults__ reads are
+                // audited (object.__getattr__), as CPython's function getters
+                if (__builtin_expect(nyrt::audit_on(), 0) && (attr == "__code__" || attr == "__defaults__" || attr == "__kwdefaults__")
+                    && !preludeCaller(ctx))
+                    auditEvent("object.__getattr__", {obj, makeStringValue(attr)}, ctx);
                 std::vector<Value> a{obj, makeStringValue(attr)};
                 out = callFunctionValue(global_ctx->getByName("_ny_fn_attr"), a, ctx);
                 return true;
@@ -14867,6 +14880,7 @@ public:
     // AttributeError. (A deleted field used to stay, holding undefined.)
     void delAttrValue(const Value& obj, const std::string& name) {
         if (name == "__class__" && isInstanceValue(obj)) pyRaise("TypeError", "can't delete __class__ attribute");   // round 79
+        if (__builtin_expect(nyrt::audit_on(), 0)) auditAttrStore(obj, name, nullptr);   // round 86
         if (isInstanceValue(obj) && instanceAttrHook(obj, 1)) {
             std::vector<Value> a{makeStringValue(name)};
             Value o = obj;
@@ -15463,20 +15477,91 @@ public:
     }
     // round 84: an audit event (PEP 578) - the prelude's _ny_audit_fire runs
     // the hooks sys.addaudithook added; nothing is made while there are none
+    // (round 86) set by the VM's builtin bridge (src/main.cpp): an event a
+    // native raises while the VM runs the program goes to the VM's hooks
+    // (this interpreter is then only the bridge, with hooks of its own none)
+    static std::function<void(const char*, std::vector<Value>&)>& auditForward() {
+        static std::function<void(const char*, std::vector<Value>&)> f;
+        return f;
+    }
     void auditEvent(const char* event, std::vector<Value> args, Context* ctx) {
         if (__builtin_expect(!nyrt::audit_on(), 1)) return;
+        if (auditForward()) { auditForward()(event, args); return; }   // round 86
         Value fn = global_ctx->getByName("_ny_audit_fire");
         if (fn.type == ValueType::NONE || fn.type == ValueType::UNDEFINED) return;
         std::vector<Value> a{makeStringValue(event), makeListValue(args, true)};
         callFunctionValue(fn, a, ctx);
     }
+    // (round 86) the running code is the prelude's (its scope chain reaches
+    // prelude_ctx_): an engine audit point raises for a program and the
+    // library - the Python code CPython's audits see - and not for the
+    // prelude's own calls (id() in a repr, a generator's frame read by an
+    // async generator), which stand where CPython's C code does
+    bool preludeCaller(Context* ctx) const {
+        if (!prelude_ctx_) return false;
+        for (Context* c = ctx; c; c = c->parent) if (c == prelude_ctx_) return true;
+        return false;
+    }
+    // (round 86) the running function's scope (the module's at top level),
+    // for an audit point reached without one
+    Context* auditCtx() {
+        auto& PF = py_frames();
+        return PF.empty() || !PF.back().ctx ? global_ctx : PF.back().ctx;
+    }
+    // (round 86) --audit-policy / --audit-log (nyrt::audit_startup): the
+    // policy installed (the prelude's _ny_audit_startup, lib/nyaudit.ny),
+    // then the cpython.run_* event of the program's start raised to it -
+    // once, before the program's first statement (src/main.cpp)
+    void auditStartup() {
+        auto& st = nyrt::audit_startup();
+        if (st.done) return;
+        st.done = true;
+        if (!st.policy.empty() || !st.log.empty()) {
+            Value fn = global_ctx->getByName("_ny_audit_startup");
+            if (fn.type == ValueType::USERDATA) {
+                std::vector<Value> a{st.policy.empty() ? NONE_VALUE : makeStringValue(st.policy),
+                                     st.log.empty() ? NONE_VALUE : makeStringValue(st.log)};
+                callFunctionValue(fn, a, global_ctx);
+            }
+        }
+        if (nyrt::audit_on() && !st.event.empty()) {
+            std::vector<Value> args;
+            if (st.has_arg) args.push_back(makeStringValue(st.arg));
+            auditEvent(st.event.c_str(), args, global_ctx);
+        }
+    }
+    // (round 86) a prelude audit helper (_ny_audit_exec, _ny_audit_compile)
+    // called with these arguments, once a hook exists
+    void auditHelper(const char* fname, std::vector<Value> args, Context* ctx) {
+        if (__builtin_expect(!nyrt::audit_on(), 1)) return;
+        Value fn = global_ctx->getByName(fname);
+        if (fn.type == ValueType::NONE || fn.type == ValueType::UNDEFINED) return;
+        callFunctionValue(fn, args, ctx);
+    }
+    // (round 86) obj.name = *val (del when val is null) of an attribute
+    // CPython audits: a function's __code__ / __defaults__ / __kwdefaults__
+    // (object.__setattr__ / __delattr__) and a class's __bases__, __name__,
+    // __qualname__, __module__, __doc__ (its special-attribute setters);
+    // __class__ is the prelude's _ny_set_class's
+    void auditAttrStore(const Value& obj, const std::string& name, const Value* val) {
+        if (name.size() < 7 || name[0] != '_' || name[1] != '_') return;
+        bool fn_attr = name == "__code__" || name == "__defaults__" || name == "__kwdefaults__";
+        bool cls_attr = val && (name == "__bases__" || name == "__name__" || name == "__qualname__" || name == "__module__" || name == "__doc__");
+        if (!fn_attr && !cls_attr) return;
+        if (fn_attr && (!isPlainFunction(obj) || (!val && name == "__code__"))) return;
+        if (!fn_attr && !classNodeOfValue(obj)) return;
+        Context* ctx = auditCtx();
+        if (preludeCaller(ctx)) return;
+        if (val) auditEvent("object.__setattr__", {obj, makeStringValue(name), *val}, ctx);
+        else auditEvent("object.__delattr__", {obj, makeStringValue(name)}, ctx);
+    }
     Value evalExecBuiltin(bool is_exec, std::vector<Value>& args, Context* ctx) {
         const char* who = is_exec ? "exec" : "eval";
         if (args.empty()) pyRaise("TypeError", std::string(who) + "() missing required argument 'source' (pos 1)");
-        if (nyrt::audit_on()) {   // round 84: as CPython - a source is compiled first; eval's too
-            if (isStringValue(args[0]) || bytesOf(args[0])) auditEvent("compile", {args[0], makeStringValue("<string>")}, ctx);
-            auditEvent("exec", {args[0]}, ctx);
-        }
+        // round 84: as CPython - a source is compiled first; eval's too
+        // (round 86: CPython's arguments - the source as bytes, then the code
+        // object it gave: the prelude's _ny_audit_exec; not for the prelude's own)
+        if (nyrt::audit_on() && !preludeCaller(ctx)) auditHelper("_ny_audit_exec", {args[0], makeStringValue(is_exec ? "exec" : "eval")}, ctx);
         if (any_payload_) { Value p; if (payloadOf(args[0], p)) args[0] = p; }   // a str subclass (round 81: exec is payload-transparent)
         std::string mode = is_exec ? "exec" : "eval", fname = "<string>";
         int crule = -1;
@@ -15630,6 +15715,9 @@ public:
             if (args.size() == 1 && kw.count("filename")) args.push_back(kw["filename"]);
             if (args.size() == 2 && kw.count("mode")) args.push_back(kw["mode"]);
             if (kw.count("flags") && kw["flags"].type == ValueType::INTEGER) flags = (long long)bigint_to_i64(kw["flags"].value.i);
+            // round 84 (round 86: CPython's arguments - the source as bytes, a
+            // tree with None - and before a tree goes to lib/ast.ny)
+            if (nyrt::audit_on() && args.size() >= 2 && !preludeCaller(ctx)) auditHelper("_ny_audit_compile", {args[0], args[1]}, ctx);
             bool tree = !args.empty() && isInstanceValue(args[0]) && shownClassName(instanceClassName(args[0])) != "_NyCode";
             if (tree || (flags & 0x400)) {
                 std::vector<Value> a{args[0], args.size() > 1 ? args[1] : makeStringValue("<unknown>"),
@@ -15638,7 +15726,6 @@ public:
             }
         }
         if (args.size() < 3) pyRaise("TypeError", "compile() missing required argument (source, filename, mode)");
-        if (nyrt::audit_on()) auditEvent("compile", {args[0], args[1]}, ctx);   // round 84
         std::string fname = getStringValue(args[1]), mode = getStringValue(args[2]);
         if (mode != "exec" && mode != "eval" && mode != "single") pyRaise("ValueError", "compile() mode must be 'exec', 'eval' or 'single'");
         std::string m2 = mode, f2 = fname;

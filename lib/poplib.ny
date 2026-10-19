@@ -5,7 +5,7 @@
 # uidl, utf8, capa, stls) and POP3_SSL, error_proto - over lib/socket.ny
 # and lib/ssl.ny.
 #
-# sys.audit events are raised only where the runtime has sys.audit.
+# CPython's sys.audit events (PEP 578) are raised, with its arguments.
 
 """A POP3 client class.
 
@@ -43,7 +43,7 @@ import socket
 import sys
 
 def _sys_audit(*args):
-    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    # sys.audit (PEP 578) where the runtime has it (Nython's since round 84)
     a = getattr(sys, "audit", None)
     if a is not None:
         a(*args)

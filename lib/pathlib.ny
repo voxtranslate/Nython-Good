@@ -1004,6 +1004,7 @@ class _ConcretePath(PurePath):
         """Iterate over this subtree and yield all existing files (of any
         kind, including directories) matching the given relative pattern.
         """
+        _ny_sys_audit("pathlib.Path.glob", self, pattern)   # round 86: CPython's events
         var parts = self._glob_parts(pattern)
         if case_sensitive is none:
             case_sensitive = not self._windows
@@ -1017,6 +1018,7 @@ class _ConcretePath(PurePath):
         directories) matching the given relative pattern, anywhere in
         this subtree.
         """
+        _ny_sys_audit("pathlib.Path.rglob", self, pattern)
         var parts = self._glob_parts(pattern)
         if case_sensitive is none:
             case_sensitive = not self._windows
@@ -1027,6 +1029,7 @@ class _ConcretePath(PurePath):
 
     def walk(self, top_down=true, on_error=none, follow_symlinks=false):
         """Walk the directory tree from this directory, similar to os.walk()."""
+        _ny_sys_audit("pathlib.Path.walk", self, on_error, follow_symlinks)
         var paths = [self]
         while paths:
             var path = paths.pop()

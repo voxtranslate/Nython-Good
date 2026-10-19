@@ -115,6 +115,7 @@ class mmap:
                     access = ACCESS_READ
             else:
                 raise ValueError("mmap invalid access parameter.")
+            _ny_sys_audit("mmap.__new__", fileno, length, access, offset)   # round 86: CPython's event
             if fileno == -1 and length == 0:
                 raise OSError(22, "Invalid argument")
             var r = _mmap_new(fileno, length, flags, prot, access, offset, None)
@@ -138,6 +139,7 @@ class mmap:
                 raise OverflowError("memory mapped offset must be positive")
             if access not in (ACCESS_DEFAULT, ACCESS_READ, ACCESS_WRITE, ACCESS_COPY):
                 raise ValueError("mmap invalid access parameter.")
+            _ny_sys_audit("mmap.__new__", fileno, length, access, offset)   # round 86: CPython's event
             var r = _mmap_new(fileno, length, 0, 0, access, offset, tagname)
             self._h = r[0]
             self._size = r[1]

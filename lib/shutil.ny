@@ -5,7 +5,7 @@
 #     copyfileobj, copyfile, copymode, copystat, copy, copy2, ignore_patterns,
 #     copytree (symlinks, ignore, copy_function, ignore_dangling_symlinks,
 #     dirs_exist_ok), rmtree (ignore_errors, onerror, onexc), move, which,
-#     disk_usage, chown (POSIX names only: raises), get_terminal_size,
+#     disk_usage, chown (round 86: over os.chown), get_terminal_size,
 #     make_archive / unpack_archive / get_archive_formats / get_unpack_formats
 #     / register_archive_format / register_unpack_format (format "tar"),
 #     Error, SameFileError, SpecialFileError, ExecError, ReadError,
@@ -216,6 +216,7 @@ def copyfile(src, dst, follow_symlinks=true):
     If follow_symlinks is not set and src is a symbolic link, a new
     symlink will be created instead of copying the file it points to.
     """
+    _ny_sys_audit("shutil.copyfile", src, dst)   # round 86: CPython's events
     src = _fspath(src)
     dst = _fspath(dst)
     if _samefile(src, dst):
@@ -254,6 +255,7 @@ def copyfile(src, dst, follow_symlinks=true):
 
 def copymode(src, dst, follow_symlinks=true):
     """Copy mode bits from src to dst."""
+    _ny_sys_audit("shutil.copymode", src, dst)
     src = _fspath(src)
     dst = _fspath(dst)
     if not follow_symlinks and _islink(src) and _islink(dst):
@@ -266,6 +268,7 @@ def copymode(src, dst, follow_symlinks=true):
 def copystat(src, dst, follow_symlinks=true):
     """Copy file metadata: permission bits, last access time and last
     modification time (and nothing else: no flags or extended attributes)."""
+    _ny_sys_audit("shutil.copystat", src, dst)
     src = _fspath(src)
     dst = _fspath(dst)
     var follow = follow_symlinks or not (_islink(src) and _islink(dst))
@@ -386,6 +389,7 @@ def copytree(src, dst, symlinks=false, ignore=none, copy_function=none,
 
     If exception(s) occur, an Error is raised with a list of reasons.
     """
+    _ny_sys_audit("shutil.copytree", src, dst)
     src = _fspath(src)
     dst = _fspath(dst)
     if copy_function is none:
@@ -430,6 +434,7 @@ def rmtree(path, ignore_errors=false, onerror=none, onexc=none, dir_fd=none):
     exception is raised. onerror is deprecated and only for backwards
     compatibility with onexc.
     """
+    _ny_sys_audit("shutil.rmtree", path, dir_fd)
     if onerror is not none and onexc is not none:
         raise TypeError("You cannot provide both onerror and onexc")
     if dir_fd is not none:
@@ -505,6 +510,7 @@ def move(src, dst, copy_function=none):
     semantics. If the destination is on another file system, src is copied
     (with copy_function, copy2 by default) and then removed.
     """
+    _ny_sys_audit("shutil.move", src, dst)
     if copy_function is none:
         copy_function = copy2
     src = _fspath(src)
@@ -547,10 +553,52 @@ def disk_usage(path):
 
 
 def chown(path, user=none, group=none):
-    """Change owner user and group of the given path."""
+    """Change owner user and group of the given path.
+
+    user and group can be the uid/gid or the user/group names, and in that case,
+    they are converted to their respective uid/gid.
+    """
+    # (round 86) CPython's, over os.chown (POSIX; round 85) - audited
+    _ny_sys_audit("shutil.chown", path, user, group)
     if user is none and group is none:
         raise ValueError("user and/or group must be set")
-    raise NotImplementedError("chown is not available in Nython (no os.chown)")
+    var _user = user
+    var _group = group
+    if user is none:
+        _user = -1
+    elif isinstance(user, str):
+        _user = _get_uid(user)
+        if _user is none:
+            raise LookupError("no such user: " + repr(user))
+    if group is none:
+        _group = -1
+    elif not isinstance(group, int):
+        _group = _get_gid(group)
+        if _group is none:
+            raise LookupError("no such group: " + repr(group))
+    os.chown(path, _user, _group)
+
+
+def _get_gid(name):
+    """Returns a gid, given a group name."""
+    if name is none:
+        return none
+    try:
+        import grp
+        return grp.getgrnam(name)[2]
+    except (ImportError, KeyError):
+        return none
+
+
+def _get_uid(name):
+    """Returns an uid, given a user name."""
+    if name is none:
+        return none
+    try:
+        import pwd
+        return pwd.getpwnam(name)[2]
+    except (ImportError, KeyError):
+        return none
 
 
 def get_terminal_size(fallback=(80, 24)):
@@ -809,6 +857,7 @@ def make_archive(base_name, format, root_dir=none, base_dir=none, verbose=0,
     archive; 'base_dir' is the directory where we start archiving from
     (relative to root_dir).
     """
+    _ny_sys_audit("shutil.make_archive", base_name, format, root_dir, base_dir)
     base_name = _fspath(base_name)
     if format not in _ARCHIVE_FORMATS:
         raise ValueError("unknown archive format '" + str(format) + "'")
@@ -976,6 +1025,7 @@ def unpack_archive(filename, extract_dir=none, format=none, filter=none):
     target directory (the current directory by default). `format` is the
     archive format; when not given, it is guessed from the extension.
     """
+    _ny_sys_audit("shutil.unpack_archive", filename, extract_dir, format)
     if extract_dir is none:
         extract_dir = os_getcwd()
     extract_dir = _fspath(extract_dir)

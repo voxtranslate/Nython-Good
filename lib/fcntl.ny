@@ -66,9 +66,19 @@ def _int_arg(v):
     return v
 
 
-def fcntl(fd, cmd, arg=0, /):
+# (round 86) CPython's audit events: fd as an int, an argument not given as None
+class _FcntlNoArg:
+    def __repr__(self):
+        return "0"
+_NOARG = _FcntlNoArg()
+
+
+def fcntl(fd, cmd, arg=_NOARG, /):
     """Perform the operation `cmd` on file descriptor fd."""
     fd = _fd(fd)
+    _ny_sys_audit("fcntl.fcntl", fd, cmd, None if arg is _NOARG else arg)
+    if arg is _NOARG:
+        arg = 0
     if isinstance(arg, str):
         arg = arg.encode()
     if isinstance(arg, (bytes, bytearray)):
@@ -78,9 +88,12 @@ def fcntl(fd, cmd, arg=0, /):
     return _sys_fcntl(fd, _int_arg(cmd), _int_arg(arg))
 
 
-def ioctl(fd, request, arg=0, mutate_flag=True, /):
+def ioctl(fd, request, arg=_NOARG, mutate_flag=True, /):
     """Perform the operation `request` on file descriptor `fd`."""
     fd = _fd(fd)
+    _ny_sys_audit("fcntl.ioctl", fd, request, None if arg is _NOARG else arg)
+    if arg is _NOARG:
+        arg = 0
     if isinstance(arg, str):
         arg = arg.encode()
     if isinstance(arg, bytearray) and mutate_flag:
@@ -96,9 +109,17 @@ def ioctl(fd, request, arg=0, mutate_flag=True, /):
 
 def flock(fd, operation, /):
     """Perform the lock operation `operation` on file descriptor `fd`."""
-    _sys_flock(_fd(fd), _int_arg(operation))
+    fd = _fd(fd)
+    _ny_sys_audit("fcntl.flock", fd, operation)
+    _sys_flock(fd, _int_arg(operation))
 
 
-def lockf(fd, cmd, len=0, start=0, whence=0, /):
+def lockf(fd, cmd, len=_NOARG, start=_NOARG, whence=0, /):
     """A wrapper around the fcntl() locking calls."""
-    _sys_lockf(_fd(fd), _int_arg(cmd), _int_arg(len), _int_arg(start), _int_arg(whence))
+    fd = _fd(fd)
+    _ny_sys_audit("fcntl.lockf", fd, cmd, None if len is _NOARG else len, None if start is _NOARG else start, whence)
+    if len is _NOARG:
+        len = 0
+    if start is _NOARG:
+        start = 0
+    _sys_lockf(fd, _int_arg(cmd), _int_arg(len), _int_arg(start), _int_arg(whence))

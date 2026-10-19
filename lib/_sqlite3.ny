@@ -458,6 +458,7 @@ class Connection:
                  autocommit=LEGACY_TRANSACTION_CONTROL):
         self._h = None
         self._initialized = False
+        _ny_sys_audit("sqlite3.connect", database)   # round 86: CPython's events
         if hasattr(database, "__fspath__"):
             database = database.__fspath__()
         if not isinstance(database, (str, bytes)):
@@ -478,6 +479,7 @@ class Connection:
                 _sql_close(r[1])
             raise exc
         self._h = r[1]
+        _ny_sys_audit("sqlite3.connect/handle", self)
         _sql_busy_timeout(self._h, int(timeout * 1000))
         self._isolation = level
         self._autocommit = mode
@@ -1043,12 +1045,14 @@ class Connection:
             raise self._error()
 
     def enable_load_extension(self, enable, /):
+        _ny_sys_audit("sqlite3.enable_load_extension", self, bool(enable))
         self._check()
         rc = _sql_enable_load_extension(self._h, enable)
         if rc != 0:
             raise OperationalError("Error enabling load extension")
 
     def load_extension(self, name, /, *, entrypoint=None):
+        _ny_sys_audit("sqlite3.load_extension", self, name)
         self._check()
         r = _sql_load_extension(self._h, name, entrypoint)
         if r[0] != 0:

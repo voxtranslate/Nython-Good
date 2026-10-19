@@ -263,6 +263,11 @@ class socket:
         self.type = type
         self.proto = proto
         self._closed = false
+        self._h = none
+        # (round 86) CPython's audit events (socketmodule.c): socket.__new__
+        # for every socket made - accept()'s and socketpair()'s too
+        if _ny_audit_hooks:
+            _ny_audit_fire("socket.__new__", (self, int(family), int(type), int(proto)))
         if _handle is not none:
             self._h = _handle
         elif fileno is none:
@@ -280,6 +285,7 @@ class socket:
         return _net_fileno(self._h)
 
     def bind(self, address):
+        _ny_sys_audit("socket.bind", self, address)
         _net_bind(self._h, address)
 
     def listen(self, backlog=128):
@@ -290,9 +296,11 @@ class socket:
         return (_from_handle(r[0], self.family, self.type), _addr(r[1]))
 
     def connect(self, address):
+        _ny_sys_audit("socket.connect", self, address)
         _net_connect(self._h, address)
 
     def connect_ex(self, address):
+        _ny_sys_audit("socket.connect", self, address)
         return _net_connect_ex(self._h, address)
 
     def send(self, data, flags=0):
@@ -302,6 +310,7 @@ class socket:
         _net_sendall(self._h, _bl(data), flags)
 
     def sendto(self, data, flags_or_address, address=none):
+        _ny_sys_audit("socket.sendto", self, flags_or_address if address is none else address)
         if address is none:
             return _net_sendto(self._h, _bl(data), flags_or_address, 0)
         return _net_sendto(self._h, _bl(data), address, flags_or_address)
@@ -373,6 +382,7 @@ class socket:
     # timeout, a parked async task); POSIX only. sendmsg's address (an
     # unconnected datagram socket's destination) is not supported.
     def sendmsg(self, buffers, ancdata=(), flags=0, address=none):
+        _ny_sys_audit("socket.sendmsg", self, address)
         if address is not none:
             raise NotImplementedError("sendmsg(): a destination address is not supported here")
         var data = b"".join([bytes(_bl(b)) if not isinstance(b, str) else b.encode() for b in buffers])
@@ -429,6 +439,7 @@ def socketpair(family=none, type=SOCK_STREAM, proto=0):
     return (_from_handle(hs[0], fam, type), _from_handle(hs[1], fam, type))
 
 def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    _ny_sys_audit("socket.getaddrinfo", host, port, int(family), int(type), int(proto))
     var out = []
     for r in _net_getaddrinfo(host, port, family, type, proto, flags):
         out.append((r[0], r[1], r[2], r[3], _addr(r[4])))
@@ -481,12 +492,15 @@ def sys_platform():
     return os_platform() if os_platform() != "windows" else "win32"
 
 def gethostname():
+    _ny_sys_audit("socket.gethostname")
     return _net_gethostname()
 
 def gethostbyname(name):
+    _ny_sys_audit("socket.gethostbyname", name)
     return _net_gethostbyname(name)
 
 def gethostbyaddr(ip):
+    _ny_sys_audit("socket.gethostbyaddr", ip)
     return _net_gethostbyaddr(ip)
 
 # round 83: the services database (/etc/services where there is one, else
@@ -525,6 +539,7 @@ def _services_table():
     return table
 
 def getservbyname(servicename, protocolname=none):
+    _ny_sys_audit("socket.getservbyname", servicename, protocolname)
     for e in _services_table():
         if e[0] == servicename and (protocolname is none or e[2] == protocolname):
             return e[1]
@@ -533,12 +548,14 @@ def getservbyname(servicename, protocolname=none):
 def getservbyport(port, protocolname=none):
     if not (0 <= port <= 65535):
         raise OverflowError("getservbyport: port must be 0-65535.")
+    _ny_sys_audit("socket.getservbyport", port, protocolname)
     for e in _services_table():
         if e[1] == port and (protocolname is none or e[2] == protocolname):
             return e[0]
     raise OSError("port/proto not found")
 
 def getnameinfo(sockaddr, flags=0):
+    _ny_sys_audit("socket.getnameinfo", sockaddr)
     return _net_getnameinfo(sockaddr, flags)
 
 def getfqdn(name=""):
@@ -613,6 +630,7 @@ def fromfd(fd, family, type, proto=0):
     return socket(family, type, proto, dup(fd))
 
 def gethostbyname_ex(hostname):
+    _ny_sys_audit("socket.gethostbyname", hostname)
     return _ny_os_call("gethostbyname_ex", hostname)
 
 def getprotobyname(protocolname):
@@ -641,7 +659,7 @@ def if_indextoname(index):
     return _ny_os_call("if_indextoname", _sint(index))
 
 def sethostname(name):
-    _ny_sys_audit("socket.sethostname", name)
+    _ny_sys_audit("socket.sethostname", name.encode("utf-8", "surrogateescape") if isinstance(name, str) else name)   # (round 86: as CPython, encoded)
     _ny_os_call("sethostname", name)
 
 def CMSG_LEN(length):

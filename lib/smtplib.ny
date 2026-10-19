@@ -8,7 +8,7 @@
 # TCP or a Unix socket), quotedata, and the SMTP*Error classes - over
 # lib/socket.ny and lib/ssl.ny.
 #
-# sys.audit events are raised only where the runtime has sys.audit.
+# CPython's sys.audit events (PEP 578) are raised, with its arguments.
 
 #! /usr/bin/python3.12
 
@@ -67,7 +67,7 @@ import sys
 from email.base64mime import body_encode as encode_base64
 
 def _sys_audit(*args):
-    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    # sys.audit (PEP 578) where the runtime has it (Nython's since round 84)
     a = getattr(sys, "audit", None)
     if a is not None:
         a(*args)

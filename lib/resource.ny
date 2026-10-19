@@ -64,11 +64,13 @@ def getrlimit(resource, /):
 
 
 def setrlimit(resource, limits, /):
+    _ny_sys_audit("resource.setrlimit", resource, limits)   # round 86: CPython's events
     var t = _limits(limits)
     _sys_setrlimit(resource, t[0], t[1])
 
 
 def prlimit(pid, resource, limits=None, /):
+    _ny_sys_audit("resource.prlimit", pid, resource, limits)
     if limits is None:
         return tuple(_sys_prlimit(pid, resource, 0, 0, 0))
     var t = _limits(limits)

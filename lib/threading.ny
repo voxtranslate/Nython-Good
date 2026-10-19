@@ -103,6 +103,9 @@ class Thread:
     def start(self):
         if self._started:
             raise RuntimeError("threads can only be started once")
+        # (round 86) as CPython 3.12's start(): _thread.start_new_thread's
+        # audit event (a hook raising leaves the thread unstarted)
+        _ny_sys_audit("_thread.start_new_thread", self._bootstrap, (), None)
         self._started = true
         if self._name != none:
             self._ident = thread_create_named(self._name, self._bootstrap)

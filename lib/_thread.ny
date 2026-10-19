@@ -51,6 +51,7 @@ def start_new_thread(function, args, kwargs=None):
         raise TypeError("optional 3rd arg must be a dictionary")
     if not callable(function):
         raise TypeError("first arg must be callable")
+    _ny_sys_audit("_thread.start_new_thread", function, args, kwargs)   # round 86: CPython 3.12's event
     var kw = kwargs if kwargs is not None else {}
     def boot():
         try:

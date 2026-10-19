@@ -33,6 +33,15 @@
 # without it a built-in caller handles scalar arguments and results on
 # x86-64, AArch64 (Linux) and 32/64-bit Windows - _ffi_backend() says which.
 #
+# CPython's audit events (round 86): ctypes.dlopen (name), ctypes.dlsym
+# (library, name), ctypes.addressof (obj), ctypes.cdata (address: from_address,
+# from_buffer, in_dll), ctypes.cdata/buffer (pointer, size, offset),
+# ctypes.create_string_buffer / create_unicode_buffer (init, size),
+# ctypes.string_at / wstring_at (ptr, size), ctypes.get_errno / set_errno
+# (get_last_error / set_last_error on Windows) - as CPython raises them; not
+# ctypes.call_function / dlsym/handle (only CPython's private _ctypes
+# functions raise those).
+#
 # The buffer protocol (round 84): memoryview(obj) is a view of the object's
 # memory with CPython 3.12's PEP 3118 format; from_buffer takes any writable
 # buffer (bytearray, mmap, array.array, memoryview, ctypes objects) and
@@ -192,6 +201,7 @@ class _CData:
 
     @classmethod
     def from_address(cls, address):
+        _ny_sys_audit("ctypes.cdata", address)   # round 86
         var o = cls.__new__(cls)
         o._ny_view(address, None)
         return o
@@ -217,8 +227,8 @@ class _CData:
             mv.release()
             raise ValueError("Buffer size too small (" + str(n) + " instead of at least " +
                              str(offset + cls._size_) + " bytes)")
-        if hasattr(_sys, "audit"):
-            _sys.audit("ctypes.cdata/buffer", mv._ny_a, mv.nbytes, offset)
+        _ny_sys_audit("ctypes.cdata/buffer", mv._ny_a, mv.nbytes, offset)
+        _ny_sys_audit("ctypes.cdata", mv._ny_a + offset)   # (round 86: as CPython's PyCData_AtAddress)
         var o = cls.__new__(cls)
         o._ny_view(mv._ny_a + offset, None)
         object.__setattr__(o, "_objects", mv)
@@ -226,6 +236,13 @@ class _CData:
 
     @classmethod
     def from_buffer_copy(cls, source, offset=0):
+        if _ny_audit_hooks:
+            # (round 86) the source buffer's address and size, as CPython's
+            var smv = memoryview(source)
+            var at = smv._ny_a
+            var nb = smv.nbytes
+            smv.release()
+            _ny_audit_fire("ctypes.cdata/buffer", (at, nb, offset))
         var data = _ny_bytes_like(source)
         if offset < 0:
             raise ValueError("offset cannot be negative")
@@ -601,6 +618,7 @@ def byref(obj, offset=0):
 def addressof(obj):
     if not isinstance(obj, _CData):
         raise TypeError("invalid type")
+    _ny_sys_audit("ctypes.addressof", obj)   # round 86
     return obj._b_addr
 
 def sizeof(obj):
@@ -1224,10 +1242,12 @@ def create_string_buffer(init, size=None):
     if isinstance(init, (bytes, bytearray)):
         if size is None:
             size = len(init) + 1
+        _ny_sys_audit("ctypes.create_string_buffer", init, size)   # round 86
         var buf = (c_char * size)()
         buf.raw = bytes(init)[:size]
         return buf
     if isinstance(init, int):
+        _ny_sys_audit("ctypes.create_string_buffer", None, init)
         return (c_char * init)()
     raise TypeError(repr(init))
 
@@ -1237,21 +1257,25 @@ def create_unicode_buffer(init, size=None):
     if isinstance(init, str):
         if size is None:
             size = len(_ffi_wencode(init)) // _SIZES["u"] + 1
+        _ny_sys_audit("ctypes.create_unicode_buffer", init, size)   # round 86
         var buf = (c_wchar * size)()
         buf.value = init
         return buf
     if isinstance(init, int):
+        _ny_sys_audit("ctypes.create_unicode_buffer", None, init)
         return (c_wchar * init)()
     raise TypeError(repr(init))
 
 def string_at(ptr, size=-1):
     var a = _address_of_param(ptr)[0]
+    _ny_sys_audit("ctypes.string_at", a, size)   # round 86
     if size < 0:
         size = _ffi_strlen(a)
     return _ffi_read(a, size)
 
 def wstring_at(ptr, size=-1):
     var a = _address_of_param(ptr)[0]
+    _ny_sys_audit("ctypes.wstring_at", a, size)   # round 86
     if size < 0:
         size = _ffi_wcslen(a)
     return _ffi_wdecode(_ffi_read(a, size * _SIZES["u"]))
@@ -1264,16 +1288,20 @@ def memset(dst, c, count):
 
 # ── errno ──────────────────────────────────────────────────────────────────
 def get_errno():
+    _ny_sys_audit("ctypes.get_errno")   # round 86
     return _ffi_errno(False, 0)
 
 def set_errno(value):
+    _ny_sys_audit("ctypes.set_errno", value)
     return _ffi_errno(True, value)
 
 if _WIN:
     def get_last_error():
+        _ny_sys_audit("ctypes.get_last_error")   # round 86
         return _ffi_last_error(False, 0)
 
     def set_last_error(value):
+        _ny_sys_audit("ctypes.set_last_error", value)
         return _ffi_last_error(True, value)
 
     def GetLastError():
@@ -1387,6 +1415,7 @@ class _CFuncPtr(_CData, metaclass=PyCFuncPtrType):
         elif isinstance(a, tuple):
             var name = a[0]
             var dll = a[1]
+            _ny_sys_audit("ctypes.dlsym", dll, name)   # round 86
             var addr = _ffi_dlsym(dll._handle, name) if isinstance(name, str) else None
             if addr is None:
                 raise AttributeError("function '" + str(name) + "' not found")
@@ -1637,6 +1666,7 @@ class CDLL:
                 m = RTLD_LOCAL | 2
             elif not _WIN:
                 m = mode | 2         # RTLD_NOW
+            _ny_sys_audit("ctypes.dlopen", name)   # round 86
             self._handle = _ffi_dlopen(name, m)
         else:
             self._handle = handle
@@ -1652,6 +1682,7 @@ class CDLL:
         return func
 
     def __getitem__(self, name_or_ordinal):
+        _ny_sys_audit("ctypes.dlsym", self, name_or_ordinal)   # round 86
         if isinstance(name_or_ordinal, int):
             raise AttributeError("function ordinal " + str(name_or_ordinal) + " not found")
         var addr = _ffi_dlsym(self._handle, name_or_ordinal, True)

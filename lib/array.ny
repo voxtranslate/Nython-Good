@@ -189,6 +189,7 @@ class array:
     _ny_ctype = true      # (a C type in CPython: pickle names it as one)
 
     def __init__(self, typecode, initializer=none):
+        _ny_sys_audit("array.__new__", typecode, initializer)   # round 86: CPython's event
         _check_typecode(typecode)
         self._tc = typecode
         self._b = bytearray()

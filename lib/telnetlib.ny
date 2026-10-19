@@ -8,7 +8,7 @@
 # the context manager) and the telnet command constants; selectors-based
 # waits.
 #
-# sys.audit events are raised only where the runtime has sys.audit.
+# CPython's sys.audit events (PEP 578) are raised, with its arguments.
 
 r"""TELNET client class.
 
@@ -52,7 +52,7 @@ from time import monotonic as _time
 import warnings
 
 def _sys_audit(*args):
-    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    # sys.audit (PEP 578) where the runtime has it (Nython's since round 84)
     a = getattr(sys, "audit", None)
     if a is not None:
         a(*args)

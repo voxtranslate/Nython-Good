@@ -181,6 +181,8 @@ def _iglob(pathname, root_dir, dir_fd, recursive, dironly, include_hidden=false)
 
 def iglob(pathname, root_dir=none, dir_fd=none, recursive=false, include_hidden=false):
     """Return an iterator which yields the paths matching a pathname pattern."""
+    _ny_sys_audit("glob.glob", pathname, recursive)   # round 86: CPython's events
+    _ny_sys_audit("glob.glob/2", pathname, recursive, root_dir, dir_fd)
     pathname = _fspath(pathname)
     if dir_fd is not none:
         raise NotImplementedError("glob: dir_fd is not supported (no directory file descriptors)")

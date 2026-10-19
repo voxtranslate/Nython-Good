@@ -291,6 +291,7 @@ int run_program(const Program& prog, bool show_ast = false) {
             }
         }
         try {
+            exec.auditStartup();   // (round 86) --audit-policy / --audit-log, cpython.run_*
             exec.execute(ast);
         } catch (std::string& s) {
             // Reported before the program's threads are waited for, as
@@ -727,6 +728,9 @@ void repl() {
     auto vm_ptr = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
     NythonExecutor exec((Runnable*)vm_ptr.get());
     struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
+    // (round 86) --audit-policy / --audit-log, and cpython.run_stdin
+    try { exec.auditStartup(); }
+    catch (std::string& s) { std::cerr << exc_text(s) << "\n"; return; }
     // Not a terminal (a pipe, a file): the whole input is one program -
     // unless -i asked for the prompt anyway (Python's: values echoed).
     if (!isatty(STDIN_FILENO) && !g_inspect) {
@@ -1033,6 +1037,16 @@ void install_vm_builtin_bridge(Runnable* runner) {
         for (auto& kv : ex->builtin_ptrs) out.push_back(kv.first);
         return out;
     };
+    // (round 86) an audit event a native raises (time.sleep ...) goes to the
+    // VM's hooks: this interpreter is only the bridge
+    NythonExecutor::auditForward() = [ex, vm](const char* event, std::vector<Value>& args) {
+        BridgeConv conv(*ex);
+        conv.vm = vm;
+        std::vector<VMVal> va;
+        va.reserve(args.size());
+        for (auto& v : args) va.push_back(conv.to_vm(v));
+        vm->bridge_audit_event(event, std::move(va));
+    };
     nython::vm::VirtualMachine::bridge_call() =
         [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             BridgeConv conv(*ex);
@@ -1070,6 +1084,10 @@ void install_vm_builtin_bridge(Runnable* runner) {
             // an instance of the builtin exception type.
             try {
                 r = ex->callBuiltin(n, args, ex->globalContext());
+            } catch (nython::vm::VMException&) {
+                // (round 86) the VM's own exception - an audit hook's, raised
+                // while the native ran (auditForward) - goes on as it is
+                throw;
             } catch (std::string& s) {
                 std::string type, msg;
                 nyrt::parse_exc(s, type, msg);
@@ -1327,6 +1345,8 @@ static void print_usage() {
         << "      --trace OUT   record each executed statement to OUT (JSON lines)\n"
         << "      --debug-port N  run the program under the live debug server (lib/ide_debugserver.ny),\n"
         << "                    listening on 127.0.0.1:N for a client (0: any port, printed)\n"
+        << "      --audit-policy FILE  install an audit policy (lib/nyaudit.ny) before the program runs\n"
+        << "      --audit-log FILE     write every audit event the program raises to FILE (JSON lines)\n"
         << "  --cli, --repl     the interactive prompt (no IDE)\n"
         << "  --ide             NythonIDE\n"
         << "  -V, -v, --version the version          -h, --help     this text\n\n"
@@ -1409,6 +1429,20 @@ int main(int argc, char** argv, char** env) {
                     }
                     if (debug_port.empty() || debug_port.find_first_not_of("0123456789") != std::string::npos)
                         return bad("--debug-port needs a port number");
+                }
+                // (round 86) lib/nyaudit.ny: an audit policy (or a log of the
+                // events) installed before the program runs
+                else if (a == "--audit-policy" || a.rfind("--audit-policy=", 0) == 0 || a == "--audit-log" || a.rfind("--audit-log=", 0) == 0) {
+                    bool pol = a.rfind("--audit-policy", 0) == 0;
+                    size_t eq = a.find('=');
+                    std::string v;
+                    if (eq != std::string::npos) v = a.substr(eq + 1);
+                    else {
+                        if (i + 1 >= argc) return bad(std::string(pol ? "--audit-policy" : "--audit-log") + " needs a file");
+                        v = argv[++i];
+                    }
+                    if (v.empty()) return bad(std::string(pol ? "--audit-policy" : "--audit-log") + " needs a file");
+                    (pol ? nyrt::audit_startup().policy : nyrt::audit_startup().log) = v;
                 }
                 else return bad("unknown option " + a);
                 continue;
@@ -1530,6 +1564,15 @@ int main(int argc, char** argv, char** env) {
             nyrt::set_command_line("-", argc, argv, i);
         }
         g_inspect = inspect;
+        // (round 86) the cpython.run_* event the start of the program raises
+        // to an --audit-policy (CPython's names and arguments)
+        {
+            auto& st = nyrt::audit_startup();
+            if (mode == "file") { st.event = "cpython.run_file"; st.arg = target; }
+            else if (mode == "cmd") { st.event = "cpython.run_command"; st.arg = target; }
+            else if (mode == "module") { st.event = "cpython.run_module"; st.arg = target; }
+            else if (mode == "stdin") { st.event = "cpython.run_stdin"; st.has_arg = false; }
+        }
         if (!tool.empty()) {
             if (mode.empty()) return bad("-" + tool.substr(0, 1) + " needs a program");
             if (tool == "check") return check_program(prog, use_vm);
@@ -1567,6 +1610,8 @@ int main(int argc, char** argv, char** env) {
 #endif
             nyrt::set_command_line("", argc, argv, argc);
             if (quiet) setenv_quiet();
+            nyrt::audit_startup().event = "cpython.run_stdin";   // (round 86) the prompt reads stdin
+            nyrt::audit_startup().has_arg = false;
             if (use_vm) repl_vm(); else repl();
             cm.restoreConsole();
             return g_repl_exit >= 0 ? g_repl_exit : 0;

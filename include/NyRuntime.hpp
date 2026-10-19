@@ -179,6 +179,18 @@ inline int& recursion_limit() { static int n = 1000; return n; }
 // cleared: hooks cannot be removed). The engines' audit points test it
 // first and call the prelude's _ny_audit_fire only then.
 inline bool& audit_on() { static bool on = false; return on; }
+// (round 86) `nython --audit-policy FILE` / `--audit-log FILE` (src/main.cpp):
+// lib/nyaudit.ny's policy, installed before the program runs (the engines'
+// auditStartup / audit_startup, through the prelude's _ny_audit_startup),
+// and the cpython.run_* event of the way the program was given (run_file,
+// run_command, run_module, run_stdin) raised then to it - as CPython raises
+// those to the hooks an embedding application installed before startup.
+struct AuditStartup {
+    std::string policy, log;      // the files given ("" none)
+    std::string event, arg;       // cpython.run_file and its filename ...
+    bool has_arg = true, done = false;
+};
+inline AuditStartup& audit_startup() { static AuditStartup s; return s; }
 // locals() / globals() (round 80): a program's variable named like a dunder
 // (__x__, __all__, __version__) is listed; the engines' own names
 // (__parent_class__ ...) and the parser's temporaries (__exc3__, __cmp0__:

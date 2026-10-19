@@ -1650,6 +1650,12 @@ bool attr(NythonExecutor& E, const Value& obj, const std::string& name, Value& o
               && g->delegate.type != ValueType::UNDEFINED ? g->delegate : NONE_VALUE;
         return true;
     }
+    // (round 86) gi_frame and gi_code are audited (object.__getattr__), as
+    // CPython's generator getters - not when the prelude reads them
+    if (nyrt::audit_on() && (name == "gi_frame" || name == "gi_code")) {
+        Context* actx = E.auditCtx();
+        if (!E.preludeCaller(actx)) E.auditEvent("object.__getattr__", {obj, E.makeStringValue(name)}, actx);
+    }
     if (name == "gi_frame") {
         // None once it has finished; else a frame whose f_lineno is the
         // statement it is paused at (the def line before it starts)

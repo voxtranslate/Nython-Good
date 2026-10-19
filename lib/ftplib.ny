@@ -8,7 +8,7 @@
 # error_reply/error_temp/error_perm/error_proto classes - over
 # lib/socket.ny and lib/ssl.ny.
 #
-# sys.audit events are raised only where the runtime has sys.audit.
+# CPython's sys.audit events (PEP 578) are raised, with its arguments.
 
 """An FTP client class and some helper functions.
 
@@ -53,7 +53,7 @@ import socket
 from socket import _GLOBAL_DEFAULT_TIMEOUT
 
 def _sys_audit(*args):
-    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    # sys.audit (PEP 578) where the runtime has it (Nython's since round 84)
     a = getattr(sys, "audit", None)
     if a is not None:
         a(*args)

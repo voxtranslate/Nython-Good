@@ -16,7 +16,9 @@
 # LOG_MASK(pri), LOG_UPTO(pri); the LOG_* priorities, facilities and options
 # of the platform (<syslog.h>, natively).
 #
-# Not here: the sys.audit events CPython raises.
+# The sys.audit events CPython raises (round 86): syslog.openlog (ident,
+# logoption, facility), syslog.syslog (priority, message), syslog.setlogmask
+# (maskpri), syslog.closelog ().
 
 if not _sys_platform_posix():
     raise ModuleNotFoundError("No module named 'syslog'", name="syslog")
@@ -45,6 +47,7 @@ def openlog(ident=None, logoption=0, facility=LOG_USER):
         var argv = getattr(_sys, "argv", None)
         if argv and isinstance(argv[0], str) and argv[0]:
             ident = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
+    _ny_sys_audit("syslog.openlog", ident, logoption, facility)
     _sys_openlog(ident, logoption, facility)
     _opened = True
 
@@ -65,6 +68,7 @@ def syslog(*args):
         raise TypeError("'" + type(priority).__name__ + "' object cannot be interpreted as an integer")
     if not isinstance(message, str):
         raise TypeError("syslog() argument must be str, not " + type(message).__name__)
+    _ny_sys_audit("syslog.syslog", priority, message)
     if not _opened:
         openlog()
     _sys_syslog(priority, message)
@@ -73,6 +77,7 @@ def syslog(*args):
 def closelog():
     """Reset the syslog module values and call the system library closelog()."""
     global _opened
+    _ny_sys_audit("syslog.closelog")
     if _opened:
         _sys_closelog()
         _opened = False
@@ -80,6 +85,7 @@ def closelog():
 
 def setlogmask(maskpri, /):
     """Set the priority mask to maskpri and return the previous mask value."""
+    _ny_sys_audit("syslog.setlogmask", maskpri)
     return _sys_setlogmask(maskpri)
 
 

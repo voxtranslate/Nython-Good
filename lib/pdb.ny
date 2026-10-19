@@ -207,6 +207,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
     def __init__(self, completekey="tab", stdin=None, stdout=None, skip=None, nosigint=False, readrc=True):
         bdb.Bdb.__init__(self, skip=skip)
         cmd.Cmd.__init__(self, completekey, stdin, stdout)
+        _ny_sys_audit("pdb.Pdb")   # round 86: CPython's event
         if stdout:
             self.use_rawinput = 0
         self.prompt = "(Pdb) "

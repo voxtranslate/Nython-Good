@@ -338,6 +338,8 @@ class OpenerDirector:
             var pre = protocol + "_request"
             if hasattr(h, pre):
                 req = getattr(h, pre)(req)
+        # (round 86) CPython's audit event, once the request is pre-processed
+        _ny_sys_audit("urllib.Request", req.full_url, req.data, req.headers, req.get_method())
         var response = self._open(req)
         for h in self.handlers:
             var post = protocol + "_response"

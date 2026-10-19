@@ -4112,7 +4112,7 @@ public:
             // for the program's threads (as Python prints the traceback first):
             // Python's frames (round 77), then the [VMError] line. The atexit
             // handlers run after the threads are done (round 77).
-            try { run_loop(); } catch(VMReturn&) {}
+            try { audit_startup(); run_loop(); } catch(VMReturn&) {}   // (round 86: audit_startup - once, the prompt's first chunk too)
             catch(VMException& ve) {
                 // a program's sys.excepthook reported it: nothing more (round 80)
                 bool hooked=!session&&print_uncaught_traceback(ve.value);
@@ -4520,6 +4520,14 @@ public:
             if(v.type==VMType::MAP&&v.map&&v.class_name=="__kwargs__")
                 for(auto& kv:*v.map) conv(kv.second);
         }
+    }
+
+    // (round 86) an audit event a native raised through the builtin bridge
+    // (src/main.cpp: NythonExecutor::auditForward) - not for the prelude's
+    // own calls, as the engine's own audit points
+    void bridge_audit_event(const char* event, std::vector<VMVal> args) {
+        if(prelude_running()) return;
+        audit_event(event, std::move(args));
     }
 
     [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
@@ -5123,6 +5131,10 @@ private:
             out=gs.in_yield_from&&!gs.running&&!gs.saved_stack.empty()?gs.saved_stack.back():VMVal::make_none();
             return true;
         }
+        // (round 86) gi_frame and gi_code are audited (object.__getattr__), as
+        // CPython's generator getters - not when the prelude reads them
+        if(nyrt::audit_on()&&(attr=="gi_frame"||attr=="gi_code")&&!prelude_running())
+            audit_event("object.__getattr__",{g,VMVal::make_str(attr)});
         if(attr=="gi_frame"){
             if(gs.done||!gs.code){ out=VMVal::make_none(); return true; }
             // A generator function's: its real frame object (round 78) -
@@ -5177,8 +5189,11 @@ private:
                 std::vector<VMVal> a{VMVal::make_str(gs.code->file),VMVal::make_str(gs.name)};
                 out=vm_call(load_var("_NyCodeInfo"),a,std::nullopt,nullptr);
             } else {
-                std::vector<VMVal> a{f,VMVal::make_str("__code__")};
-                out=vm_call(load_var("_ny_fn_attr"),a,std::nullopt,nullptr);
+                // (round 86: _ny_code_of(_ny_fn_info(f)) - what f.__code__ gives,
+                // without its audit event)
+                std::vector<VMVal> a{f};
+                std::vector<VMVal> ci{vm_call(load_var("_ny_fn_info"),a,std::nullopt,nullptr)};
+                out=vm_call(load_var("_ny_code_of"),ci,std::nullopt,nullptr);
             }
             return true;
         }
@@ -6057,10 +6072,9 @@ private:
             if(lookup_attr(cls,"__qualname__",q)&&q.type==VMType::STRING) qn=q.s;
         } catch(VMException&) {}
         unsigned long long id=0;
-        VMVal idf=load_var("id");
-        if(idf.type==VMType::NATIVE&&idf.native){
+        if(vm_identity_fn_){   // (round 86: the identity without id()'s audit event)
             std::vector<VMVal> a{v};
-            VMVal r=idf.native(a);
+            VMVal r=vm_identity(a);
             if(r.type==VMType::INT&&r.s.empty()) id=(unsigned long long)r.i;
         }
         char buf[40];
@@ -6570,13 +6584,60 @@ private:
         std::vector<VMVal> a{VMVal::make_str(event), VMVal::make_tuple(std::move(args))};
         vm_call(fn, a, std::nullopt);
     }
+    // (round 86) id()'s value (the native's body; id() itself audits it)
+    std::function<VMVal(std::vector<VMVal>&)> vm_identity_fn_;
+    VMVal vm_identity(std::vector<VMVal>& a){ return vm_identity_fn_(a); }
+    // (round 86) --audit-policy / --audit-log, as the interpreter's
+    // auditStartup: the policy, then the cpython.run_* event - once, before
+    // the program's first instruction (run)
+    void audit_startup(){
+        auto& st=nyrt::audit_startup();
+        if(st.done) return;
+        st.done=true;
+        if(!st.policy.empty()||!st.log.empty()){
+            VMVal fn=load_var("_ny_audit_startup");
+            if(fn.type==VMType::FUNCTION){
+                std::vector<VMVal> a{st.policy.empty()?VMVal::make_none():VMVal::make_str(st.policy),
+                                     st.log.empty()?VMVal::make_none():VMVal::make_str(st.log)};
+                vm_call(fn,a,std::nullopt);
+            }
+        }
+        if(nyrt::audit_on()&&!st.event.empty()){
+            std::vector<VMVal> args;
+            if(st.has_arg) args.push_back(VMVal::make_str(st.arg));
+            audit_event(st.event.c_str(), std::move(args));
+        }
+    }
+    // (round 86) a prelude audit helper (_ny_audit_exec, _ny_audit_compile)
+    // called with these arguments, as the interpreter's auditHelper
+    void audit_helper(const char* fname, std::vector<VMVal> args){
+        if(__builtin_expect(!nyrt::audit_on(),1)) return;
+        VMVal fn=load_var(fname);
+        if(fn.type==VMType::NONE||fn.type==VMType::UNDEFINED) return;
+        vm_call(fn, args, std::nullopt);
+    }
+    // (round 86) obj.attr = *val (del when null) of an attribute CPython
+    // audits, as the interpreter's auditAttrStore: a function's __code__ /
+    // __defaults__ / __kwdefaults__, a class's __bases__, __name__,
+    // __qualname__, __module__, __doc__ (__class__ is _ny_set_class's)
+    void audit_attr_store(const VMVal& obj, const std::string& attr, const VMVal* val){
+        if(attr.size()<7||attr[0]!='_'||attr[1]!='_') return;
+        bool fn_attr=attr=="__code__"||attr=="__defaults__"||attr=="__kwdefaults__";
+        bool cls_attr=val&&(attr=="__bases__"||attr=="__name__"||attr=="__qualname__"||attr=="__module__"||attr=="__doc__");
+        if(!fn_attr&&!cls_attr) return;
+        if(fn_attr&&(obj.type!=VMType::FUNCTION||(!val&&attr=="__code__"))) return;
+        if(!fn_attr&&obj.type!=VMType::CLASS) return;
+        if(prelude_running()) return;
+        if(val) audit_event("object.__setattr__",{obj,VMVal::make_str(attr),*val});
+        else audit_event("object.__delattr__",{obj,VMVal::make_str(attr)});
+    }
     VMVal vm_eval_exec(bool is_exec, std::vector<VMVal>& a) {
         const char* who=is_exec?"exec":"eval";
         if(a.empty()) raise_native_exception("TypeError",std::string(who)+"() missing required argument 'source' (pos 1)");
-        if(nyrt::audit_on()){   // round 84: as CPython - a source is compiled first; eval's too
-            if(a[0].type==VMType::STRING||a[0].type==VMType::BYTES) audit_event("compile",{a[0],VMVal::make_str("<string>")});
-            audit_event("exec",{a[0]});
-        }
+        // round 84: as CPython - a source is compiled first; eval's too
+        // (round 86: CPython's arguments - the source as bytes, then the code
+        // object it gave: the prelude's _ny_audit_exec; not for the prelude's own)
+        if(nyrt::audit_on()&&!prelude_running()) audit_helper("_ny_audit_exec",{a[0],VMVal::make_str(is_exec?"exec":"eval")});
         a[0]=unwrap_payload(a[0]);   // a str subclass (round 81: exec is payload-transparent)
         std::string mode=is_exec?"exec":"eval", fname="<string>";
         int crule=-1;
@@ -6776,6 +6837,9 @@ private:
                 if(a.size()==2&&g("mode")) a.push_back(*g("mode"));
                 if(const VMVal* f=g("flags")) if(f->type==VMType::INT) flags=f->i;
             }
+            // round 84 (round 86: CPython's arguments - the source as bytes, a
+            // tree with None - and before a tree goes to lib/ast.ny)
+            if(nyrt::audit_on()&&a.size()>=2&&!prelude_running()) audit_helper("_ny_audit_compile",{a[0],a[1]});
             bool tree=!a.empty()&&a[0].type==VMType::INSTANCE&&nyrt::shown_class_name(a[0].class_name)!="_NyCode";
             if(tree||(flags&0x400)){
                 std::vector<VMVal> ca{a[0],a.size()>1?a[1]:VMVal::make_str("<unknown>"),a.size()>2?a[2]:VMVal::make_str("exec"),VMVal::make_int(flags)};
@@ -6783,7 +6847,6 @@ private:
             }
         }
         if(a.size()<3) raise_native_exception("TypeError","compile() missing required argument (source, filename, mode)");
-        if(nyrt::audit_on()) audit_event("compile",{a[0],a[1]});   // round 84
         std::string fname=a[1].to_string(), mode=a[2].to_string();
         if(mode!="exec"&&mode!="eval"&&mode!="single") raise_native_exception("ValueError","compile() mode must be 'exec', 'eval' or 'single'");
         std::string m2=mode, f2=fname;
@@ -7676,7 +7739,13 @@ private:
             auto g=globals_.find(n);
             if(g!=globals_.end()&&g->second.type==VMType::NATIVE) return vm_call(g->second, a, std::nullopt, has_kw?&kw:nullptr);
         }
-        if(n=="function") raise_native_exception("TypeError","function() missing required argument 'code' (pos 1)");
+        // (round 86) types.FunctionType(code, globals, ...): the prelude's
+        // _ny_function_new (it raises function.__new__), as the interpreter's
+        if(n=="function"){
+            VMVal fnew=load_var("_ny_function_new");
+            if(fnew.type==VMType::FUNCTION) return vm_call(fnew, a, std::nullopt, has_kw?&kw:nullptr);
+            raise_native_exception("TypeError","function() missing required argument 'code' (pos 1)");
+        }
         raise_native_exception("TypeError","cannot create '"+n+"' instances");
         return VMVal::make_none();
     }
@@ -10476,6 +10545,7 @@ private:
     }
     // _ny_settrace(fn) / _ny_setprofile(fn)
     VMVal vm_set_hook(std::vector<VMVal>& a, bool trace) {
+        if(nyrt::audit_on()&&!prelude_running()) audit_event(trace?"sys.settrace":"sys.setprofile",{});   // round 86
         VMVal fn=a.empty()?VMVal::make_none():a[0];
         if(!hook_set(fn)&&!vm_hooks()) return VMVal::make_none();
         VMHookFns& h=pyhooks_[std::this_thread::get_id()];
@@ -12252,6 +12322,10 @@ private:
             // _ny_fn_info (fn_info), as on the interpreter.
             if(obj.code&&(attr=="__defaults__"||attr=="__kwdefaults__"||attr=="__code__"||attr=="__qualname__"
                           ||attr=="__module__"||attr=="__globals__")){
+                // (round 86) __code__, __defaults__ and __kwdefaults__ reads are
+                // audited (object.__getattr__), as CPython's function getters
+                if(__builtin_expect(nyrt::audit_on(),0)&&(attr=="__code__"||attr=="__defaults__"||attr=="__kwdefaults__")&&!prelude_running())
+                    audit_event("object.__getattr__",{obj,VMVal::make_str(attr)});
                 std::vector<VMVal> a{obj, VMVal::make_str(attr)};
                 out=vm_call(load_var("_ny_fn_attr"), a, std::nullopt, nullptr);
                 return true;
@@ -12684,6 +12758,7 @@ private:
     }
     void del_attr(const VMVal& obj, const std::string& attr) {
         if(attr=="__class__"&&obj.type==VMType::INSTANCE) raise_native_exception("TypeError","can't delete __class__ attribute");   // round 79
+        if(__builtin_expect(nyrt::audit_on(),0)) audit_attr_store(obj, attr, nullptr);   // round 86
         {
             VMVal m;
             if(instance_attr_hook(obj,1,m)){
@@ -12721,6 +12796,7 @@ private:
         throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(obj,attr))}));
     }
     void set_attr(VMVal& obj, const std::string& attr, VMVal val) {
+        if(__builtin_expect(nyrt::audit_on(),0)) audit_attr_store(obj, attr, &val);   // round 86
         {
             VMVal m;
             if(instance_attr_hook(obj,0,m)){
@@ -15220,7 +15296,11 @@ private:
                 raise_native_exception(err.type,err.msg);
             }
             if(!ok) raise_native_exception("EOFError","EOF when reading a line");
-            return VMVal::make_str(line);});
+            VMVal res=VMVal::make_str(line);
+            // (round 86) the line read, as CPython's input() reports it when it
+            // read the terminal (its readline path; not a pipe or a file)
+            if(nyrt::audit_on()&&isatty(0)&&isatty(1)) audit_event("builtins.input/result",{res});
+            return res;});
         globals_["langevin_step"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             // langevin_step(x, grad, step_size) -> x - step_size*grad + noise
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list) return VMVal::make_list();
@@ -16676,7 +16756,11 @@ private:
                 raise_native_exception(err.type,err.msg);
             }
             if(!ok) raise_native_exception("EOFError","EOF when reading a line");
-            return VMVal::make_str(line);});
+            VMVal res=VMVal::make_str(line);
+            // (round 86) the line read, as CPython's input() reports it when it
+            // read the terminal (its readline path; not a pipe or a file)
+            if(nyrt::audit_on()&&isatty(0)&&isatty(1)) audit_event("builtins.input/result",{res});
+            return res;});
         globals_["chr"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_str(""):VMVal::make_str(std::string(1,(char)a[0].i));});
         globals_["ord"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
@@ -17072,7 +17156,16 @@ private:
         globals_["contains_key"]=globals_["has_key"];
         globals_["copy"]=globals_["deepcopy"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_none():a[0];});
-        globals_["id"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["id"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // (round 86) builtins.id with the identity, as CPython's id() - not
+            // for the prelude's own calls
+            if(nyrt::audit_on()&&!prelude_running()){
+                VMVal r=vm_identity(a);
+                audit_event("builtins.id",{r});
+                return r;
+            }
+            return vm_identity(a);});
+        vm_identity_fn_=[](std::vector<VMVal>& a)->VMVal{
             // Only checked a[0].list, so id() on anything but a LIST (a map,
             // instance, function, string, int...) fell through to a null
             // shared_ptr and always returned 0. Use whichever backing
@@ -17094,7 +17187,7 @@ private:
             }
             if(raw) return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
             uint64_t h=std::hash<std::string>{}(v.to_string()+"|"+std::to_string((int)v.type));
-            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
+            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));};
         // As the interpreter's (pycore.cpp B_HASH): nypy::hash_of_key; an
         // object's __hash__, else its identity.
         globals_["hash"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{

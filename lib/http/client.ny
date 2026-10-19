@@ -572,6 +572,7 @@ class HTTPConnection:
             raise OSError("Tunnel connection failed: " + str(r.status) + " " + r.reason)
 
     def connect(self):
+        _ny_sys_audit("http.client.connect", self, self.host, self.port)   # round 86: CPython's events
         var h = self.host
         var p = self.port
         self.sock = socket.create_connection((h, p), self.timeout, self.source_address)
@@ -604,9 +605,11 @@ class HTTPConnection:
             while len(chunk) > 0:
                 if isinstance(chunk, "str"):
                     chunk = chunk.encode("utf-8")
+                _ny_sys_audit("http.client.send", self, chunk)
                 self.sock.sendall(chunk)
                 chunk = data.read(self.blocksize)
             return
+        _ny_sys_audit("http.client.send", self, data)
         if isinstance(data, "bytes") or isinstance(data, "bytearray"):
             self.sock.sendall(data)
             return

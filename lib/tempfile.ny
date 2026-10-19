@@ -181,6 +181,7 @@ def mkstemp(suffix=none, prefix=none, dir=none, text=false):
     """
     var ps = _sanitize_params(prefix, suffix, dir)
     var path = os_mkstemp(ps[0], ps[1], ps[2])
+    _ny_sys_audit("tempfile.mkstemp", path)   # round 86: CPython's event (the file made)
     var fd = file_open_or_raise(path, "r+" if text else "r+b")
     return (fd, os_path_abspath(path))
 
@@ -198,6 +199,7 @@ def mkdtemp(suffix=none, prefix=none, dir=none):
         seq = seq + 1
         var file = os_path_join(ps[2], ps[0] + _random_name() + ps[1])
         if mkdir(file):
+            _ny_sys_audit("tempfile.mkdtemp", file)   # round 86: CPython's event (the directory made)
             if not _WINDOWS:
                 os_chmod(file, 0o700)
             return os_path_abspath(file)
@@ -351,6 +353,7 @@ def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=none,
     _open_mode_ok(mode)
     var ps = _sanitize_params(prefix, suffix, dir)
     var path = os_path_abspath(os_mkstemp(ps[0], ps[1], ps[2]))
+    _ny_sys_audit("tempfile.mkstemp", path)   # round 86: CPython's event (its _mkstemp_inner's)
     var m = mode
     if "w" in m:
         # the file exists already (created exclusively): open it without
@@ -390,6 +393,7 @@ def TemporaryFile(mode="w+b", buffering=-1, encoding=none,
     _open_mode_ok(mode)
     var ps = _sanitize_params(prefix, suffix, dir)
     var path = os_path_abspath(os_mkstemp(ps[0], ps[1], ps[2]))
+    _ny_sys_audit("tempfile.mkstemp", path)   # round 86: CPython's event (its _mkstemp_inner's)
     var m = mode
     if "w" in m:
         m = m.replace("w", "r")

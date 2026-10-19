@@ -563,6 +563,9 @@ Value dispatch_os_time(NythonExecutor& E,
         return Value(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count());
     }
     if (name == "time_sleep" || name == "sleep_ms") {
+        // (round 86) time.sleep(secs) is audited, as CPython 3.13's
+        if (nyrt::audit_on() && name == "time_sleep" && !E.preludeCaller(ctx))
+            E.auditEvent("time.sleep", {args.empty() ? NONE_VALUE : args[0]}, ctx);
         // The concurrency runtime's sleep (src/NyConc.cpp): releases the GIL,
         // is cancellable and suspends only the current async task.
         return E.callBuiltin(name == "sleep_ms" ? "thread_sleep" : "sleep", args, ctx);

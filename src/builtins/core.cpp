@@ -889,8 +889,14 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "_ny_frame_globals") return E.frameGlobals(args);
         if (name == "_ny_builtins_dict") return E.builtinsDict();
         // sys.settrace / sys.setprofile and f_locals write-through (round 79)
-        if (name == "_ny_settrace" || name == "sys.settrace") return E.pySetHook(args, true);
-        if (name == "_ny_setprofile" || name == "sys.setprofile") return E.pySetHook(args, false);
+        if (name == "_ny_settrace" || name == "sys.settrace") {
+            if (nyrt::audit_on() && !E.preludeCaller(ctx)) E.auditEvent("sys.settrace", {}, ctx);   // round 86
+            return E.pySetHook(args, true);
+        }
+        if (name == "_ny_setprofile" || name == "sys.setprofile") {
+            if (nyrt::audit_on() && !E.preludeCaller(ctx)) E.auditEvent("sys.setprofile", {}, ctx);   // round 86
+            return E.pySetHook(args, false);
+        }
         if (name == "_ny_gettrace" || name == "sys.gettrace") return E.pyGetHook(true);
         if (name == "_ny_getprofile" || name == "sys.getprofile") return E.pyGetHook(false);
         if (name == "_ny_frame_local_set") return E.frameLocalSet(args);
@@ -905,7 +911,14 @@ Value dispatch_core(NythonExecutor& E,
         // module and returned UNDEFINED, which reads as 0. The method form
         // obj.id()/obj.hash() (objectProtocol) already worked; this gives
         // the global function the same behaviour instead of nothing.
-        if (name == "id") {
+        // (round 86) builtins.id with the identity, as CPython's id() - not
+        // for the engine's own (a repr's address: _ny_id) nor the prelude's
+        if (name == "id" && nyrt::audit_on() && !E.preludeCaller(ctx)) {
+            Value r = dispatch_core(E, "_ny_id", args, ctx);
+            E.auditEvent("builtins.id", {r}, ctx);
+            return r;
+        }
+        if (name == "id" || name == "_ny_id") {
             if (args.empty()) return Value(bigint((long long)0));
             Value& v = args[0];
             // Heap-allocated values (class instances, containers): identity
@@ -1055,7 +1068,11 @@ Value dispatch_core(NythonExecutor& E,
                 throw std::string("__exc__:" + err.type + ":" + err.msg);
             }
             if (!ok) E.pyRaise("EOFError", "EOF when reading a line");
-            return E.makeStringValue(line);
+            Value res = E.makeStringValue(line);
+            // (round 86) the line read, as CPython's input() reports it when it
+            // read the terminal (its readline path; not a pipe or a file)
+            if (nyrt::audit_on() && isatty(0) && isatty(1)) E.auditEvent("builtins.input/result", {res}, ctx);
+            return res;
         }
 
     return UNDEFINED_VALUE;  // not handled by this module

@@ -7,7 +7,7 @@
 # IMAP4_stream (over a subprocess), Internaldate2tuple, Int2AP, ParseFlags,
 # Time2Internaldate - over lib/socket.ny and lib/ssl.ny.
 #
-# sys.audit events are raised only where the runtime has sys.audit.
+# CPython's sys.audit events (PEP 578) are raised, with its arguments.
 
 """IMAP4 client.
 
@@ -47,7 +47,7 @@ from datetime import datetime, timezone, timedelta
 from io import DEFAULT_BUFFER_SIZE
 
 def _sys_audit(*args):
-    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    # sys.audit (PEP 578) where the runtime has it (Nython's since round 84)
     a = getattr(sys, "audit", None)
     if a is not None:
         a(*args)

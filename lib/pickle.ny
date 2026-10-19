@@ -1407,6 +1407,7 @@ class Unpickler:
                               + "function was specified.")
 
     def find_class(self, module, name):
+        _ny_sys_audit("pickle.find_class", module, name)   # round 86: CPython's event
         if self.proto < 3 and self.fix_imports:
             var r = _NAME_MAPPING.get((module, name))
             if r is not none:

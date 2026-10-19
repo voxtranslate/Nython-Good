@@ -315,6 +315,7 @@ def _float_text(x):
 
 def dumps(value, version=version, /):
     """Return the bytes object that would be written to a file by dump(value, file)."""
+    _ny_sys_audit("marshal.dumps", value, version)   # round 86: CPython's events
     w = _Writer(version)
     w.count(value)
     w.w_object(value, True)
@@ -503,7 +504,9 @@ def loads(data, /, *, allow_code=True):
     """Convert the bytes-like object to a value."""
     if isinstance(data, str):
         raise TypeError("a bytes-like object is required, not 'str'")
-    r = _Reader(bytes(data), allow_code)
+    data = bytes(data)
+    _ny_sys_audit("marshal.loads", data)
+    r = _Reader(data, allow_code)
     v = r.r_object()
     if v is _NullMark:
         raise TypeError("NULL object in marshal data for object")
@@ -512,6 +515,7 @@ def loads(data, /, *, allow_code=True):
 
 def load(file, /, *, allow_code=True):
     """Read one value from the open file and return it."""
+    _ny_sys_audit("marshal.load")
     data = file.read()
     r = _Reader(bytes(data), allow_code)
     v = r.r_object()

@@ -215,6 +215,7 @@ def _ny_px_device_encoding(fd):
     return None
 
 def _ny_px_fchdir(fd):
+    _ny_sys_audit("os.chdir", fd)   # round 86
     _ny_os_call("fchdir", _ny_px_fildes(fd))
 
 def _ny_px_fdatasync(fd):
@@ -565,9 +566,11 @@ def _ny_px_spawnvef(mode, file, args, env, func):
         raise OSError("Not stopped, signaled or exited???")
 
 def _ny_px_execv(path, args):
+    _ny_sys_audit("os.exec", path, args, None)   # round 86
     _sys_execv(_ny_os_str(path), [_ny_os_str(a) for a in args], None)
 
 def _ny_px_execve(path, args, env):
+    _ny_sys_audit("os.exec", path, args, env)   # round 86
     _sys_execv(_ny_os_str(path), [_ny_os_str(a) for a in args],
                [_ny_os_str(k) + "=" + _ny_os_str(env[k]) for k in env])
 
