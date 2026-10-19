@@ -391,7 +391,8 @@ begin = c.wait_note("$/progress", lambda p: p["value"]["kind"] == "begin")
 end = c.wait_note("$/progress", lambda p: p["value"]["kind"] == "end", 60)
 create = [m for m in c.server_requests if m["method"] == "window/workDoneProgress/create"]
 check("window/workDoneProgress/create first", [len(create), create[0]["params"]["token"] if create else None], [1, "nylsp-index"])
-check("progress begin", [begin["token"], begin["value"]["title"], begin["value"]["percentage"]], ["nylsp-index", "Indexing the workspace", 0])
+check("progress begin (after the client answered create)",
+      [begin["token"], begin["value"]["title"], 0 <= begin["value"]["percentage"] <= 100], ["nylsp-index", "Indexing the workspace", True])
 check("progress end", end["value"], {"kind": "end", "message": "indexed 10 files"})
 
 # ── didOpen and diagnostics ──────────────────────────────────────────────────

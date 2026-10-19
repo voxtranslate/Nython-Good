@@ -26,11 +26,10 @@ SEMANTIC_TOKEN_TYPES = ["namespace", "type", "class", "enum", "interface", "stru
 SEMANTIC_TOKEN_MODIFIERS = ["declaration", "definition", "readonly", "static", "deprecated", "abstract",
                             "async", "modification", "documentation", "defaultLibrary"]
 
-# LSP's CompletionItemKind / SymbolKind for the native half's symbol kinds
+# LSP's CompletionItemKind for the native half's symbol kinds (its SymbolKinds
+# are the native half's: lsp_kind in nylsp.cpp)
 _COMPLETION_KIND = {"v": 6, "k": 21, "p": 6, "f": 3, "M": 2, "c": 7, "m": 9, "n": 6, "F": 5, "A": 5,
                     "e": 13, "E": 20, "I": 8, "N": 9, "u": 5}
-_SYMBOL_KIND = {"v": 13, "k": 14, "p": 13, "f": 12, "M": 6, "c": 5, "m": 2, "n": 13, "F": 8, "A": 8,
-                "e": 10, "E": 22, "I": 11, "N": 3, "u": 8}
 _KIND_WORD = {"v": "variable", "k": "constant", "p": "parameter", "f": "function", "M": "method", "c": "class",
               "m": "module", "n": "import", "F": "field", "A": "attribute", "e": "enum", "E": "enum member",
               "I": "interface", "N": "namespace", "u": "attribute"}
@@ -492,12 +491,23 @@ class Server:
         self.index_started = time_ms()
         window = self.client_caps.get("window") or {}
         if self.indexing and window.get("workDoneProgress"):
-            token = "nylsp-index"
+            # the token is used once the client has answered (LSP: "Server Initiated Progress")
+            self.request("window/workDoneProgress/create", {"token": "nylsp-index"}, self.on_progress_created)
+
+    def on_progress_created(self, result, error):
+        if error is not None:
+            return
+        token = "nylsp-index"
+        done = self.progress_total - len(self.ws.pending)
+        self.notify("$/progress", {"token": token, "value": {
+            "kind": "begin", "title": "Indexing the workspace", "cancellable": False,
+            "message": str(done) + "/" + str(self.progress_total) + " files",
+            "percentage": int(done * 100 / self.progress_total) if self.progress_total else 0}})
+        if self.indexing:
             self.progress_token = token
-            self.request("window/workDoneProgress/create", {"token": token})
+        else:
             self.notify("$/progress", {"token": token, "value": {
-                "kind": "begin", "title": "Indexing the workspace", "cancellable": False,
-                "message": "0/" + str(n) + " files", "percentage": 0}})
+                "kind": "end", "message": "indexed " + str(self.progress_total) + " files"}})
 
     def on_shutdown(self, p):
         self.shutdown_requested = True
@@ -673,12 +683,8 @@ class Server:
                         star_known = False
                 continue
             if im["name"] == "*" or im["quoted"]:
-                te = self.ws.entry(target)
-                if te.star or te.has_getattr:
+                if not self.star_names_into(target, im["quoted"], star_names, set(), 0):
                     star_known = False
-                for n in te.exports:
-                    if not n.startswith("_") or im["quoted"]:
-                        star_names.add(n)
                 continue
             if im["from"]:
                 te = self.ws.entry(target)
@@ -689,6 +695,10 @@ class Server:
                     if self.ws.resolve_module(d.path, sub, im["level"]) is None:
                         out.append(self.diag(im.get("nameRange") or rng, 2, "unresolved-import-name",
                                              "cannot import name '" + nm + "' from '" + im["module"] + "'"))
+        # a file another one includes (`import "file"`) runs in the includer's
+        # scope: what the includer and its other includes bind is defined here too
+        if star_known and not self.includer_names_into(d.path, star_names, set(), 0):
+            star_known = False
         # (not while something was cut out by the error recovery: a cut def's
         # parameters would read as undefined in its island)
         if self.options.get("undefinedNames", True) and star_known and a["recoveries"] == 0:
@@ -706,6 +716,66 @@ class Server:
             for f in self.review(d):
                 out.append(self.review_diag(d, f))
         return out
+
+    def includer_names_into(self, path, names, seen, depth):
+        """The names the files that include `path` bind in the scope it runs in;
+        False when they cannot all be known."""
+        if depth > 6:
+            return False
+        ok = True
+        for inc in self.ws.importers_of(path):
+            if inc in seen:
+                continue
+            e = self.ws.entry(inc)
+            includes = False
+            for im in e.imports:
+                if im["quoted"] and self.ws.resolve_import(inc, im) == path:
+                    includes = True
+            if not includes:
+                continue
+            seen.add(inc)
+            for n in e.exports:
+                names.add(n)
+            for im in e.imports:
+                if im["name"] != "*" and not im["quoted"]:
+                    continue
+                t = self.ws.resolve_import(inc, im)
+                if t is None:
+                    if not (im["level"] == 0 and (im["module"] in BUILTIN_MODULES or self.builtin_module(im["module"]))):
+                        ok = False
+                    continue
+                if not self.star_names_into(t, im["quoted"], names, set([path]), 0):
+                    ok = False
+            if not self.includer_names_into(inc, names, seen, depth + 1):
+                ok = False
+        return ok
+
+    def star_names_into(self, path, quoted, names, seen, depth):
+        """The names a star / quoted import of `path` brings (its own star and
+        quoted imports' too); False when they cannot all be known."""
+        if path in seen:
+            return True
+        if depth > 8:
+            return False
+        seen.add(path)
+        te = self.ws.entry(path)
+        if te.has_getattr or te.error is not None:
+            return False
+        for n in te.exports:
+            if quoted or not n.startswith("_"):
+                names.add(n)
+        ok = True
+        for im in te.imports:
+            if im["name"] != "*" and not im["quoted"]:
+                continue
+            t = self.ws.resolve_import(path, im)
+            if t is None:
+                if not (im["level"] == 0 and (im["module"] in BUILTIN_MODULES or self.builtin_module(im["module"]))):
+                    ok = False
+                continue
+            if not self.star_names_into(t, quoted and im["quoted"], names, seen, depth + 1):
+                ok = False
+        return ok
 
     def diag(self, rng, severity, code, message, source="nython"):
         return {"range": rng, "severity": severity, "code": code, "source": source, "message": message}
@@ -897,9 +967,7 @@ class Server:
                 return (d.path, s)
             if s["kind"] == "u":
                 # a member defined nowhere in this file: a base class of another module's
-                found = self.member_in_bases(d, s)
-                if found is not None:
-                    return found
+                return self.member_in_bases(d, s)
             return (d.path, s)
         ext = info.get("ext")
         if ext is not None:

@@ -37,6 +37,11 @@
 //                  around a position, the completion context, folding
 //                  extras, a module's exports and imports
 #include "platform_compat.hpp"
+// The records below are plain structs with default member initializers;
+// -Weffc++ would ask each implicit constructor for an initializer list.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Weffc++"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cstring>
