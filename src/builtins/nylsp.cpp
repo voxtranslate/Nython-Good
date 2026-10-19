@@ -2859,6 +2859,13 @@ std::vector<uint32_t> semantic_data(Analysis& A) {
         if (k.type == TokenType::Regex) { push(k.row, k.col, k.ecol, T_REGEXP, 0); continue; }
         if (k.type == TokenType::At && decos.count((int)i)) { push(k.row, k.col, k.ecol, T_DECORATOR, 0); continue; }
         if (!is_word(k.val)) continue;
+        // a string's prefix (f"...", rb'...'): the lexer reads it as a name of its own
+        if (k.val.size() <= 2 && i + 1 < A.nlex && (A.toks[i + 1].type == TokenType::String || A.toks[i + 1].type == TokenType::Bytes)
+            && A.toks[i + 1].row == k.row && A.toks[i + 1].col == k.ecol && A.occ[i] < 0) {
+            bool prefix = true;
+            for (char ch : k.val) if (!strchr("fFrRbBuU", ch)) prefix = false;
+            if (prefix) { push(k.row, k.col, k.ecol, T_STRING, 0); continue; }
+        }
         int sym = A.occ[i];
         if (sym >= 0) {
             const Sym& y = A.syms[(size_t)sym];
