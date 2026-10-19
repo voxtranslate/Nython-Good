@@ -114,23 +114,51 @@ def _ny_code_replace(self, **changes):
         setattr(c, k, changes[k])
     return c
 
-# types.FunctionType(code, globals, ...): audited (function.__new__) after
-# its arguments are checked, as CPython's func_new. Nython makes one from a
-# code object compile() gave: calling it runs the code in globals (an
-# "eval" code returns its value); a function's own __code__ cannot make
-# another function here.
-def _ny_function_new(code, globals, name=None, argdefs=None, closure=None):
+# types.FunctionType(code, globals, name=None, argdefs=None, closure=None):
+# CPython 3.12's func_new - its argument clinic's checks and messages, in
+# their order (the count, the required ones, then keywords left over), the
+# converters', func_new_impl's -, audited (function.__new__) once they pass.
+# Nython makes one from a code object compile() gave: calling it runs the
+# code in globals (an "eval" code returns its value); a function's own
+# __code__ cannot make another function here.
+_ny_fn_params = ("code", "globals", "name", "argdefs", "closure")
+def _ny_function_new(*args, **kw):
+    var n = len(args) + len(kw)
+    if n > 5:
+        raise TypeError("function() takes at most 5 " + ("" if args else "keyword ") + "arguments (" + str(n) + " given)")
+    var v = list(args) + [None] * (5 - len(args))
+    var left = len(kw)
+    for i in range(len(args), 5):
+        var p = _ny_fn_params[i]
+        if p in kw:
+            v[i] = kw[p]
+            left -= 1
+        elif i < 2:
+            raise TypeError("function() missing required argument '" + p + "' (pos " + str(i + 1) + ")")
+    if left:
+        for k in kw:
+            if k in _ny_fn_params[:len(args)]:
+                raise TypeError("argument for function() given by name ('" + k + "') and position ("
+                                + str(_ny_fn_params.index(k) + 1) + ")")
+            if k not in _ny_fn_params:
+                raise TypeError("'" + k + "' is an invalid keyword argument for function()")
+    var code = v[0]
+    var name = v[2]
     if type(code) is not _NyCode and type(code) is not _NyFuncCode:
         raise TypeError("function() argument 'code' must be code, not " + type(code).__name__)
-    if not isinstance(globals, dict):
-        raise TypeError("function() argument 'globals' must be dict, not " + type(globals).__name__)
+    if not isinstance(v[1], dict):
+        raise TypeError("function() argument 'globals' must be dict, not " + type(v[1]).__name__)
     if name is not None and not isinstance(name, str):
         raise TypeError("arg 3 (name) must be None or string")
+    if v[3] is not None and not isinstance(v[3], tuple):
+        raise TypeError("arg 4 (defaults) must be None or tuple")
+    if v[4] is not None and not isinstance(v[4], tuple):
+        raise TypeError("arg 5 (closure) must be None or tuple")
     _ny_sys_audit("function.__new__", code)
     if type(code) is not _NyCode:
         raise TypeError("Nython cannot make a function from another function's code object (only from compile()'s)")
     var c = code
-    var g = globals
+    var g = v[1]
     def _ny_made():
         if c.mode == "eval":
             return eval(c, g)

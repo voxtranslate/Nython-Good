@@ -891,10 +891,22 @@ del os.environ["NY_AUDIT_121B"]
 os.mkdir("nh121")
 os.rename("nh121", "nh121b")
 os.rmdir("nh121b")
-print(repr([c.co_name, f(), had, "NY_AUDIT_121B" in os.environ, os.path.exists("nh121b")]))
+errs = []
+code = compile("1", "f", "eval")
+for a, k in (((), {}), ((code,), {}), ((code, {}), {"code": code}), ((5, {}), {}), ((code, {}), {"name": 5}),
+             ((code, {}), {"argdefs": [1]})):
+    try:
+        types.FunctionType(*a, **k)
+        errs.append("no error")
+    except TypeError as e:
+        errs.append(str(e))
+print(repr([c.co_name, f(), had, "NY_AUDIT_121B" in os.environ, os.path.exists("nh121b"), errs]))
 """)
 check("code.replace, FunctionType, os and environ with no hook", [child_value(r), r.returncode],
-      [["renamed", 42, "1", False, False], 0])
+      [["renamed", 42, "1", False, False,
+        ["function() missing required argument 'code' (pos 1)", "function() missing required argument 'globals' (pos 2)",
+         "argument for function() given by name ('code') and position (1)", "function() argument 'code' must be code, not int",
+         "arg 3 (name) must be None or string", "arg 4 (defaults) must be None or tuple"]], 0])
 
 # ── the table ────────────────────────────────────────────────────────────
 evs = TABLE
