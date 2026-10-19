@@ -183,6 +183,11 @@ write("pkg/__init__.ny", PKG_INIT)
 p_util = write("pkg/util.ny", PKG_UTIL)
 p_uses = write("uses.ny", USES)
 p_fmt = write("fmt.ny", FORMAT)
+# Nython's include: `import "file"` runs the file in the importer's scope
+INC_BASE = "class Base:\n    def hello(self):\n        return 1\n\ndef helper2():\n    \"\"\"Two.\"\"\"\n    return 2\n"
+INC_MAIN = "import \"inc_base.ny\"\n\nclass Main(Base):\n    def run(self):\n        return self.hello() + helper2()\n"
+p_ibase = write("inc_base.ny", INC_BASE)
+p_imain = write("inc_main.ny", INC_MAIN)
 
 def uri(p):
     return "file://" + p
@@ -387,7 +392,7 @@ end = c.wait_note("$/progress", lambda p: p["value"]["kind"] == "end", 60)
 create = [m for m in c.server_requests if m["method"] == "window/workDoneProgress/create"]
 check("window/workDoneProgress/create first", [len(create), create[0]["params"]["token"] if create else None], [1, "nylsp-index"])
 check("progress begin", [begin["token"], begin["value"]["title"], begin["value"]["percentage"]], ["nylsp-index", "Indexing the workspace", 0])
-check("progress end", end["value"], {"kind": "end", "message": "indexed 8 files"})
+check("progress end", end["value"], {"kind": "end", "message": "indexed 10 files"})
 
 # ── didOpen and diagnostics ──────────────────────────────────────────────────
 def open_doc(p, text, lang="nython"):
@@ -702,6 +707,27 @@ check("a broken header: one syntax error (where the parser finds it)", brief(d_i
 check("... its block stays an island: its names and the rest are still there",
       [s["name"] for s in c.req("textDocument/documentSymbol", {"textDocument": {"uri": uri(p_isl)}})], ["inner", "x"])
 check("... hover in the island", hover(p_isl, 2, 12), "```python\n(variable) inner\n```")
+
+# ── through Nython's include (a quoted import) ─────────────────────────────
+open_doc(p_imain, INC_MAIN)
+check("an include's names are no undefined names", c.diagnostics(uri(p_imain))["diagnostics"], [])
+check("definition of a name an include brings", defn("textDocument/definition", p_imain, 4, col(INC_MAIN, 4, "helper2")),
+      [["inc_base.ny", 4, 4]])
+check("... of a method of a base class it brings (self.hello)", defn("textDocument/definition", p_imain, 4, col(INC_MAIN, 4, "hello")),
+      [["inc_base.ny", 1, 8]])
+check("... hover", hover(p_imain, 4, col(INC_MAIN, 4, "helper2")), "```python\n(function) def helper2()\n```\n---\nTwo.")
+change(p_imain, 2, [[4, 15, 4, 15, "self. + "]])
+items = complete(p_imain, 4, 20)
+check("completion: the class's own members and its base's through the include", [n in labels(items) for n in ["hello", "run"]],
+      [True, True])
+change(p_imain, 3, [[4, 15, 4, 23, ""]])
+t = c.req("nython/documentText", {"textDocument": {"uri": uri(p_imain)}})
+check("... the line is back", t["text"], INC_MAIN)
+open_doc(p_ibase, INC_BASE)
+c.diagnostics(uri(p_ibase))
+check("references across the include", refs(p_ibase, 4, 4), [["inc_base.ny", 4, 4], ["inc_main.ny", 4, col(INC_MAIN, 4, "helper2")]])
+check("rename a base class's method across the include (the subclass's self.hello)",
+      edits_of(rename(p_ibase, 1, 8, "greet")), [["inc_base.ny", 1, 8, 13, "greet"], ["inc_main.ny", 4, 20, 25, "greet"]])
 
 # ── symbols ──────────────────────────────────────────────────────────────────
 ds = c.req("textDocument/documentSymbol", {"textDocument": {"uri": uri(p_geo)}})

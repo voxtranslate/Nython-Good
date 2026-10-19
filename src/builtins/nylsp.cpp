@@ -308,6 +308,7 @@ struct Doc {
     // edited lines' text (analysis_typing)
     bool same_lines = true;
     std::set<long long> typed_rows;
+    long long generation = 0;   // full analyses so far (what a cache of answers keys on)
     // semantic tokens sent last (for /delta)
     std::vector<uint32_t> last_tokens;
     long long last_tokens_id = 0;
@@ -2455,6 +2456,7 @@ Analysis& analysis_of(Doc& d) {
         d.dirty = false;
         d.same_lines = true;
         d.typed_rows.clear();
+        d.generation++;
     }
     return *d.an;
 }
@@ -3073,11 +3075,19 @@ void members_into(Analysis& A, Resolver& R, int cls, std::set<std::string>& seen
          .key("detail").str(y.detail).key("from").str(c.name).key("property").boolean(y.is_property)
          .key("static").boolean(y.is_static).key("classmethod").boolean(y.is_classm).end_obj();
     }
-    for (Node* b : A.syms[(size_t)cls].base_nodes) {
-        Sym::TyV t = R.type_of(b, A.syms[(size_t)cls].scope, 0);
+    const auto& bases = A.syms[(size_t)cls].base_nodes;
+    for (size_t i = 0; i < bases.size(); i++) {
+        Sym::TyV t = R.type_of(bases[i], A.syms[(size_t)cls].scope, 0);
         if (t.k == 'c' && t.sym != cls) members_into(A, R, t.sym, seen, j, ext_bases, depth + 1);
         else if (t.k == 'x') ext_bases.push_back(t);
         else if (t.k == 'B') ext_bases.push_back(t);
+        else if (!t.k && i < A.syms[(size_t)cls].base_texts.size()) {
+            // a name this file does not bind (a star or quoted import's): by its text
+            Sym::TyV u;
+            u.k = '?';
+            u.text = A.syms[(size_t)cls].base_texts[i];
+            ext_bases.push_back(u);
+        }
     }
 }
 
@@ -3662,6 +3672,7 @@ std::string call(const std::vector<std::string>& a) {
     if (op == "pieces") return std::to_string(d.pt.ps.size());
     if (op == "analyze") return op_analyze(d);
     if (op == "dirty") return d.dirty ? "1" : "0";
+    if (op == "generation") return std::to_string(d.generation);
     if (op == "symbols") return op_symbols(d);
     if (op == "tokens") return op_tokens(d);
     if (op == "tokens_delta") { need(3); return op_tokens_delta(d, a[2]); }
@@ -3721,6 +3732,16 @@ std::string call(const std::vector<std::string>& a) {
         return j.s;
     }
     if (op == "find") { need(3); return op_find(d, a[2]); }
+    if (op == "owner") {
+        // the def / class symbol whose body scope `a[2]` is
+        need(3);
+        Analysis& A = analysis_typing(d);
+        long long sc = to_ll(a[2], -1);
+        if (sc < 0 || sc >= (long long)A.scopes.size() || A.scopes[(size_t)sc].owner < 0) return "null";
+        J j;
+        sym_json(j, A, A.scopes[(size_t)sc].owner);
+        return j.s;
+    }
     if (op == "find_member") { need(4); return op_find_member(d, a[2], a[3]); }
     throw std::runtime_error("_ny_lsp: unknown operation '" + op + "'");
 }

@@ -40,6 +40,9 @@ _NY_KEYWORDS = ["var", "let", "const", "enum", "struct", "interface", "namespace
                 "repeat", "unless", "until", "fn", "new", "throw", "catch"]
 
 
+_DIGITS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+
 class LspError(Exception):
     def __init__(self, code, message, data=None):
         Exception.__init__(self, message)
@@ -58,12 +61,34 @@ class Raw:
         self.text = text
 
 
+# the time spent in each native operation (nython/stats)
+NATIVE_MS = {}
+
+
 def L(*args):
-    return _ny_lsp(*args)
+    t0 = time_ms()
+    r = _ny_lsp(*args)
+    _account(args[0], time_ms() - t0)
+    return r
 
 
 def J(*args):
-    return json_decode(_ny_lsp(*args))
+    t0 = time_ms()
+    r = _ny_lsp(*args)
+    t1 = time_ms()
+    v = json_decode(r)
+    _account(args[0], t1 - t0, time_ms() - t1)
+    return v
+
+
+def _account(op, ms, decode_ms=0.0):
+    a = NATIVE_MS.get(op)
+    if a is None:
+        a = [0, 0.0, 0.0]
+        NATIVE_MS[op] = a
+    a[0] += 1
+    a[1] += ms
+    a[2] += decode_ms
 
 
 def _utf16_len(s):
@@ -76,6 +101,13 @@ def _utf16_len(s):
 def _identifier(s):
     import keyword
     return isinstance(s, str) and s.isidentifier() and not keyword.iskeyword(s)
+
+
+class _Ref:
+    """A file target_of() can look at (as a Document: its path and handle)."""
+    def __init__(self, path, h):
+        self.path = path
+        self.h = h
 
 
 class Document:
@@ -145,6 +177,9 @@ class Server:
         self.builtins = {}          # name -> value (the runtime's builtins)
         self.stats = {"requests": 0, "notifications": 0, "cancelled": 0}
         self.timings = {}           # method -> [count, total ms, max ms]
+        self.member_cache = {}      # (file, class symbol, on the class) -> (stamp, completion items)
+        self.completion_key = None  # the last completion's question, and its answer (JSON)
+        self.completion_result = None
         self._load_builtins()
         self.requests = {
             "initialize": self.on_initialize,
@@ -820,9 +855,11 @@ class Server:
         return (path, s)
 
     def location(self, path, s):
+        zero = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
         if s is None:
-            return {"uri": self.uri_of(path), "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}}
-        return {"uri": self.uri_of(path), "range": s["range"]}
+            return {"uri": self.uri_of(path), "range": zero}
+        # (a binding the parser made has no name token: its statement)
+        return {"uri": self.uri_of(path), "range": s.get("range") or s.get("full") or zero}
 
     def target_of(self, d, info):
         """The definition a position means: (file, symbol), (file, None) for a module, or None."""
@@ -858,6 +895,11 @@ class Server:
             return self.follow_ext(d.path, ext)
         if info.get("importedFrom") is not None:
             return self.follow_import(d.path, info["importedFrom"], info["importedName"], 0)
+        if info.get("sym", -1) < 0 and info.get("objType") is None and not info.get("keyword"):
+            # a name this file does not bind: a star or quoted import's
+            r = self.star_target(d.path, info["name"])
+            if r is not None:
+                return r
         return None
 
     def member_in_bases(self, d, s):
@@ -865,22 +907,73 @@ class Server:
         cls = J("sym", d.h, self.class_sym(d, s))
         if cls is None:
             return None
-        for bt in cls.get("baseTypes") or []:
+        return self.bases_member(d.path, self.handle_of(d.path), cls, s["name"], 0)
+
+    def bases_member(self, path, h, cls, attr, depth):
+        """`attr` as one of class `cls`'s bases defines it, across files: (file, member) or None."""
+        if depth > 12 or h is None:
+            return None
+        bts = cls.get("baseTypes") or []
+        texts = cls.get("bases") or []
+        for i in range(len(bts)):
+            bt = bts[i]
+            r = None
             if bt["k"] == "x" and bt["sym"] >= 0 and not bt["text"]:
-                b = J("sym", d.h, bt["sym"])
-                r = self.follow_import(d.path, b["imod"], b["iname"], b["ilevel"])
-                if r is not None and r[1] is not None:
-                    m = J("find_member", self.handle_of(r[0]), r[1]["name"], s["name"])
-                    if m is not None:
-                        return (r[0], m)
+                b = J("sym", h, bt["sym"])
+                r = self.follow_import(path, b["imod"], b["iname"], b["ilevel"])
+            elif bt["k"] == "c" and bt["sym"] >= 0:
+                r = (path, J("sym", h, bt["sym"]))
+            elif bt["k"] == "0" and i < len(texts) and texts[i].isidentifier():
+                r = self.star_target(path, texts[i])
+            if r is None or r[1] is None or r[1]["kind"] not in ("c", "e", "I", "N"):
+                continue
+            found = self.member_deep(r[0], r[1], attr, depth + 1)
+            if found is not None:
+                return found
+        return None
+
+    def member_deep(self, path, cls, attr, depth=0):
+        """`attr` of class `cls` (a symbol of `path`), its bases in any file included."""
+        h = self.handle_of(path)
+        if h is None or depth > 12:
+            return None
+        if cls.get("scope", 0) == 0:
+            m = J("find_member", h, cls["name"], attr)
+            if m is not None:
+                return (path, m)
+        return self.bases_member(path, h, cls, attr, depth)
+
+    def star_target(self, path, name, depth=0, seen=None):
+        """What `name` is in `path` when a star import or a quoted import (Nython's
+        include: the file runs in the importer's scope) brings it: (file, symbol)."""
+        if seen is None:
+            seen = set()
+        if depth > 8 or path in seen:
+            return None
+        seen.add(path)
+        e = self.ws.files.get(path)
+        if e is None or e.export_key is None:
+            e = self.ws.entry(path)
+        for im in e.imports:
+            if im["name"] != "*" and not im["quoted"]:
+                continue
+            t = self.ws.resolve_import(path, im)
+            if t is None:
+                continue
+            te = self.ws.entry(t)
+            s = te.exports.get(name)
+            if s is not None and s["kind"] not in ("u",) and (im["quoted"] or not name.startswith("_")):
+                return self.deref(t, s)
+            if te.star:
+                r = self.star_target(t, name, depth + 1, seen)
+                if r is not None:
+                    return r
         return None
 
     def class_sym(self, d, s):
         """The class symbol a member's scope belongs to."""
-        for e in J("exports", d.h):
-            if e["body"] == s["scope"]:
-                return e["id"]
-        return -1
+        o = J("owner", d.h, s["scope"])
+        return o["id"] if o is not None else -1
 
     # ── completion ──
     def on_completion(self, p):
@@ -890,6 +983,14 @@ class Server:
         if cx.get("none") or cx["inComment"] or cx["inString"] or cx.get("naming"):
             return {"isIncomplete": False, "items": []}
         prefix = cx["prefix"]
+        # the same question about the same analysis: the answer kept (typing in a
+        # line keeps the analysis, so `self.` asked again costs nothing)
+        gen = L("generation", d.h)
+        rt = cx.get("receiverType") or {}
+        key = (d.uri, gen, cx.get("import"), cx.get("module"), cx.get("receiver"), rt.get("k"), rt.get("sym"),
+               rt.get("text"), prefix, cx.get("scope"), line if cx.get("receiver") is None else -1)
+        if key == self.completion_key:
+            return self.completion_result
         items = []
         imp = cx.get("import")
         if imp is not None:
@@ -900,7 +1001,10 @@ class Server:
             items = self.complete_names(d, line, ch)
         items = self.rank(items, prefix)
         items.sort(key=lambda it: it["sortText"])
-        return {"isIncomplete": False, "items": items}
+        result = Raw(json_encode({"isIncomplete": False, "items": items}))
+        self.completion_key = key
+        self.completion_result = result
+        return result
 
     def rank(self, items, prefix):
         if not prefix:
@@ -922,8 +1026,7 @@ class Server:
     def sort_key(self, it, exact, k):
         group = it.pop("_group", 5)
         lab = it["label"]
-        priv = 1 if lab.startswith("__") else 0
-        return str(exact) + str(group) + str(priv) + str(1000000 + k)[1:] + lab
+        return _DIGITS[exact] + _DIGITS[group] + ("1" if lab.startswith("__") else "0") + str(1000000 + k) + lab
 
     def item(self, label, kind, detail="", data=None, group=5):
         it = {"label": label, "kind": kind, "_group": group}
@@ -1006,7 +1109,30 @@ class Server:
             items = self.builtin_type_items(t["text"])
         return items
 
-    def class_items(self, d, h, cls_id, path, on_class):
+    def stamp(self, path):
+        """What changes when a file's text does: an open document's edit count, else its mtime."""
+        for od in self.docs.values():
+            if od.path == path:
+                return ("doc", od.edits)
+        try:
+            return ("file", os.stat(path).st_mtime)
+        except OSError:
+            return ("gone", 0)
+
+    def class_items(self, d, h, cls_id, path, on_class, depth=0):
+        # another file's class: its members as they were, while that file is unchanged
+        key = None
+        if path != d.path:
+            key = (path, cls_id, on_class)
+            hit = self.member_cache.get(key)
+            if hit is not None and hit[0] == self.stamp(path):
+                return [dict(it) for it in hit[1]]
+        items = self.class_items_now(d, h, cls_id, path, on_class, depth)
+        if key is not None:
+            self.member_cache[key] = (self.stamp(path), [dict(it) for it in items])
+        return items
+
+    def class_items_now(self, d, h, cls_id, path, on_class, depth):
         items = []
         m = J("members", h, cls_id)
         seen = set()
@@ -1022,7 +1148,7 @@ class Server:
                 b = J("sym", h, bt["sym"])
                 r = self.follow_import(path, b["imod"], b["iname"], b["ilevel"])
                 if r is not None and r[1] is not None:
-                    for it in self.class_items(d, self.handle_of(r[0]), r[1]["id"], r[0], on_class):
+                    for it in self.class_items(d, self.handle_of(r[0]), r[1]["id"], r[0], on_class, depth + 1):
                         if it["label"] not in seen:
                             seen.add(it["label"])
                             it["_group"] = 2
@@ -1032,6 +1158,14 @@ class Server:
                     if it["label"] not in seen:
                         seen.add(it["label"])
                         items.append(it)
+            elif bt["k"] == "?":
+                r = self.star_target(path, bt["text"])
+                if r is not None and r[1] is not None and r[1]["kind"] in ("c", "e", "I", "N") and depth < 12:
+                    for it in self.class_items(d, self.handle_of(r[0]), r[1]["id"], r[0], on_class, depth + 1):
+                        if it["label"] not in seen:
+                            seen.add(it["label"])
+                            it["_group"] = 2
+                            items.append(it)
         return items
 
     def module_items(self, d, mod, path=None):
@@ -1218,6 +1352,10 @@ class Server:
             return None
         if s is None:
             b = info.get("builtin")
+            if info.get("objType") is None:
+                r0 = self.star_target(d.path, info["name"])
+                if r0 is not None and r0[1] is not None:
+                    return self.md(self.hover_head(r0[1], r0[0]), r0[1].get("doc", ""))
             if b is not None:
                 name = info["name"]
                 v = self.builtins.get(name)
@@ -1528,6 +1666,39 @@ class Server:
                 e = self.ws.entry(od.path, od.edits)
                 if tpath in e.deps:
                     users.add(od.path)
+        # the files a star or quoted import (Nython's include) brings tpath's
+        # names into, transitively: their reads of the name that they do not bind
+        star_users = self.star_importers(tpath)
+        users |= star_users
+        for upath in sorted(star_users):
+            self.check_cancel()
+            h = self.handle_of(upath)
+            if h is None or upath == tpath:
+                continue
+            if cls_name is None:
+                for u in J("analyze", h)["unresolved"]:
+                    if u["name"] == ts["name"]:
+                        add(upath, u["range"])
+        # members read through self in subclasses of other files ('C': this
+        # file defines no such member) whose bases lead to the class
+        if cls_name is not None:
+            for upath in sorted(users | set(od.path for od in self.docs.values())):
+                if upath == tpath:
+                    continue
+                h = self.handle_of(upath)
+                if h is None:
+                    continue
+                ref = _Ref(upath, h)
+                for x in J("ext", h):
+                    if x["rk"] != "C" or x["attr"] != ts["name"]:
+                        continue
+                    mem = J("at", h, x["range"]["start"]["line"], x["range"]["start"]["character"])
+                    if mem is None or mem.get("sym", -1) < 0:
+                        continue
+                    r = self.target_of(ref, mem)
+                    if r is not None and r[0] == tpath and r[1] is not None and r[1]["id"] == ts["id"]:
+                        for rr in J("refs", h, mem["sym"]):
+                            add(upath, rr["range"])
         for upath in sorted(users):
             self.check_cancel()
             if upath == tpath:
@@ -1575,6 +1746,24 @@ class Server:
                                             else:
                                                 add(upath, x["range"])
         return [out, tpath, ts]
+
+    def star_importers(self, tpath):
+        """The files that import tpath by a star or quoted import, and those that
+        import one of them so, and so on."""
+        out = set()
+        todo = [tpath]
+        while todo:
+            p = todo.pop()
+            for imp in self.ws.importers_of(p):
+                if imp in out or imp == tpath:
+                    continue
+                e = self.ws.entry(imp)
+                for im in e.imports:
+                    if (im["name"] == "*" or im["quoted"]) and self.ws.resolve_import(imp, im) == p:
+                        out.add(imp)
+                        todo.append(imp)
+                        break
+        return out
 
     def kwarg_refs(self, tpath, param, add):
         fn = self.module_symbol(tpath, param.get("container") or "")
@@ -1624,7 +1813,7 @@ class Server:
         """[range, placeholder] or raises LspError: what a rename at a position renames."""
         if info is None or info.get("keyword"):
             raise LspError(protocol.RequestFailed, "There is no symbol to rename here")
-        if info.get("sym", -1) < 0 and info.get("ext") is None:
+        if info.get("sym", -1) < 0 and info.get("ext") is None and self.star_target(d.path, info["name"]) is None:
             if info.get("builtin") is not None:
                 raise LspError(protocol.RequestFailed, "'" + info["name"] + "' is a builtin and cannot be renamed")
             raise LspError(protocol.RequestFailed, "'" + info["name"] + "' cannot be resolved, so it cannot be renamed")
@@ -1686,6 +1875,14 @@ class Server:
         names = [s[0] for s in syms]
         if q:
             idx = fuzzy_rank(q, names, 200)
+            # the name itself first, then names it starts, then the fuzzy order
+            ql = q.lower()
+            order = {}
+            for k in range(len(idx)):
+                order[idx[k]] = k
+            idx = sorted(idx, key=lambda i: (0 if names[i] == q else 1 if names[i].lower() == ql else
+                                             2 if names[i].startswith(q) else 3 if names[i].lower().startswith(ql) else 4,
+                                             order[i]))
         else:
             idx = list(range(min(200, len(names))))
         out = []
@@ -1881,7 +2078,11 @@ class Server:
             a = d.analyze()
             docs.append({"uri": d.uri, "lines": a["lines"], "msParse": a["msParse"], "msTotal": a["msTotal"],
                          "recoveries": a["recoveries"], "pieces": int(L("pieces", d.h))})
-        return {"documents": docs, "indexed": len(self.ws.files), "pending": len(self.ws.pending),
+        native = {}
+        for op in NATIVE_MS:
+            v = NATIVE_MS[op]
+            native[op] = {"calls": v[0], "ms": round(v[1], 2), "decodeMs": round(v[2], 2)}
+        return {"documents": docs, "indexed": len(self.ws.files), "pending": len(self.ws.pending), "native": native,
                 "indexMs": self.index_ms, "requests": self.stats, "timings": self.timings,
                 "encoding": self.encoding, "roots": self.ws.roots}
 
