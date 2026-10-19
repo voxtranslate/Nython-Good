@@ -125,6 +125,8 @@ def hook(event, args):
 sys.addaudithook(hook)
 
 def case(label, want, fn, veto=(), fix=None):
+    if os.name == "nt" and label in POSIX_ONLY:
+        return
     state["label"] = label
     state["want"] = want
     state["veto"] = veto
@@ -391,7 +393,8 @@ def sh():
     shutil.copytree("sd1", "sd2")
     shutil.move("sd2", "sd3")
     shutil.rmtree("sd3")
-    shutil.chown("s1.txt", os.getuid())
+    if hasattr(os, "getuid"):
+        shutil.chown("s1.txt", os.getuid())
     a = shutil.make_archive("arch121", "tar", ".", "sd1")
     shutil.unpack_archive(a, "out121", "tar", filter="data")
     return sorted(os.listdir("out121"))
@@ -406,7 +409,7 @@ case("tempfile", ("tempfile.*",), tf,
      fix=lambda e, a: (os.path.dirname(a[0]) == T, os.path.basename(a[0])[0], a[0][-2:]))
 
 # ── os ───────────────────────────────────────────────────────────────────
-case("os.system", ("os.system",), lambda: os.system("true"))
+case("os.system", ("os.system",), lambda: os.system("exit 0"))
 def ls():
     return [sorted(os.listdir("."))[:1], sorted(os.listdir())[:1], sorted(e.name for e in os.scandir("."))[:1]]
 case("os.listdir/scandir", ("os.listdir", "os.scandir"), ls)
@@ -716,7 +719,7 @@ EXPECTED = {
     'pathlib.Path.walk': [('pathlib.Path.walk', ('PosixPath', None, False)), ('=', 1)],
     'shutil': [('shutil.copyfile', ('f.txt', 's1.txt')), ('shutil.copymode', ('f.txt', 's1.txt')), ('shutil.copystat', ('f.txt', 's1.txt')), ('shutil.copyfile', ('f.txt', 's2.txt')), ('shutil.copymode', ('f.txt', 's2.txt')), ('shutil.copyfile', ('f.txt', 's3.txt')), ('shutil.copystat', ('f.txt', 's3.txt')), ('shutil.copytree', ('sd1', 'sd2')), ('shutil.copystat', ('sd1', 'sd2')), ('shutil.move', ('sd2', 'sd3')), ('shutil.rmtree', ('sd3', None)), ('shutil.chown', ('s1.txt', -1, None)), ('shutil.make_archive', ('arch121', 'tar', '.', 'sd1')), ('shutil.unpack_archive', ('T/arch121.tar', 'out121', 'tar')), ('=', ['sd1'])],
     'tempfile': [('tempfile.mkstemp', (True, 'p', '.s')), ('tempfile.mkdtemp', (True, 'q', '.d')), ('=', [True, True])],
-    'os.system': [('os.system', (b'true',)), ('=', 0)],
+    'os.system': [('os.system', (b'exit 0',)), ('=', 0)],
     'os.listdir/scandir': [('os.listdir', ('.',)), ('os.listdir', (None,)), ('os.scandir', ('.',)), ('=', [['arch121.tar'], ['arch121.tar'], ['arch121.tar']])],
     'os.mkdir/rmdir': [('os.mkdir', ('od', 511, -1)), ('os.mkdir', ('od2', 511, -1)), ('os.mkdir', ('od2/x', 511, -1)), ('os.rmdir', ('od2/x', -1)), ('os.rmdir', ('od2', -1)), ('os.rmdir', ('od', -1)), ('=', False)],
     'os.rename': [('os.rename', ('o1', 'o2', -1, -1)), ('os.rename', ('o2', 'o3', -1, -1)), ('os.rename', ('o3', 'o4', -1, -1)), ('=', True)],
@@ -770,7 +773,50 @@ def impl_dropped(label, recs):
 def vkey(v):
     return tuple(int(x) for x in v.split("."))
 
+# (round 86) cases Windows has no call for (CPython neither): fork/exec/
+# spawn, signals to a process (os.kill(pid, 0) is TerminateProcess there),
+# chown, fd-relative calls, symlinks without the privilege, fcntl/resource/
+# syslog/pty, POSIX paths in a file URL, libc, sendmsg
+POSIX_ONLY = {"signal.pthread_kill", "resource", "fcntl", "syslog", "syslog.closelog", "pty.spawn",
+              "os.chmod/chown/truncate/utime/lockf", "os.link/symlink/remove", "os.chdir", "os.fwalk",
+              "os.kill/killpg", "os.fork", "os.forkpty", "os.exec", "os.execve", "os.spawnv", "os.posix_spawn",
+              "subprocess.Popen", "urllib.Request", "ctypes", "socket"}
+# cases a library the host may lack decides (sqlite3: libsqlite3)
+def have_module(m):
+    try:
+        __import__(m)
+        return True
+    except ImportError:
+        return False
+NEEDS = {"sqlite3": "sqlite3"}
+
+def plat(label, recs):
+    # what CPython itself reports differently on Windows: "\\" in paths,
+    # WindowsPath, a command and the environment as str, no shutil.chown
+    if os.name != "nt":
+        return recs
+    def n(x):
+        if isinstance(x, str):
+            return x.replace("\\", "/").replace("WindowsPath", "PosixPath")
+        if isinstance(x, tuple):
+            return tuple(n(a) for a in x)
+        if isinstance(x, list):
+            return [n(a) for a in x]
+        return x
+    out = []
+    for r in recs:
+        if r and r[0] == "shutil.chown":
+            continue
+        if r and r[0] in ("os.system", "os.putenv", "os.unsetenv") and len(r) > 1:
+            r = (r[0], tuple(a.decode() if isinstance(a, bytes) else a for a in r[1]))
+        out.append(n(r))
+    return out
+
 def kept(label):
+    if os.name == "nt" and label in POSIX_ONLY:
+        return False
+    if label in NEEDS and not have_module(NEEDS[label]):
+        return False
     if NYTHON:
         return True
     if label in SINCE and vkey(VER) < vkey(SINCE[label]):
@@ -808,7 +854,7 @@ ENGINE = ["--vm"] if NYTHON and "--vm" in getattr(sys, "orig_argv", []) else []
 T = tempfile.mkdtemp(prefix="ny121_%d_" % os.getpid())
 child = os.path.join(T, "child121.py")
 with open(child, "w") as f:
-    f.write(CHILD)
+    f.write("POSIX_ONLY = %r; " % (sorted(POSIX_ONLY),) + CHILD)   # (on its first line: the child's lines stay)
 proc = subprocess.run([sys.executable] + ENGINE + [child, T], input="typed\n", capture_output=True, text=True, timeout=600)
 got, order = parse_lines(proc.stdout)
 
@@ -824,7 +870,7 @@ check("the child ran every case", ["done" in got, proc.returncode], [True, 1])
 for label in EXPECTED:
     if not kept(label):
         continue
-    check("audit: " + label, filtered(impl_dropped(label, got.get(label, []))), filtered(EXPECTED[label]))
+    check("audit: " + label, plat(label, filtered(impl_dropped(label, got.get(label, [])))), plat(label, filtered(EXPECTED[label])))
 for label in got:
     if label not in EXPECTED and label != "done":
         check("audit: unexpected case " + label, got[label], None)
@@ -1019,7 +1065,11 @@ allow os.*
     # an installed policy, in a child (hooks cannot be removed)
     r = run_py("policy121.py", """import nyaudit, os, sys
 p = nyaudit.Policy(default="allow", keep=50)
-p.deny("os.system").deny("open", path="/etc/*", mode="w*")
+# (a directory of the test's own: were the rule not to match, the file is
+# made there, never in a system directory)
+locked = os.path.join(os.getcwd(), "locked121")
+os.mkdir(locked)
+p.deny("os.system").deny("open", path=os.path.join(locked, "*"), mode="w*")
 p.install()
 out = []
 try:
@@ -1028,7 +1078,7 @@ try:
 except PermissionError as e:
     out.append([type(e).__name__, str(e)])
 try:
-    open("/etc/nyaudit_121_never", "w")
+    open(os.path.join(locked, "never"), "w")
     out.append("opened")
 except PermissionError as e:
     out.append(type(e).__name__)

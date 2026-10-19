@@ -37,7 +37,10 @@
 # (positional patterns) or of its documented name (named ones: open's path,
 # mode, flags - tools/audit_events.json's names, in _EVENT_ARGS below) and
 # is a glob string (matched against the argument as text: a str or path as
-# itself, made absolute when the pattern starts with "/" or "~"; bytes
+# itself, made absolute when the pattern is a path - it starts with "/" or
+# "~", or is absolute on Windows ("C:\\data\\*"); there a pattern written
+# with "/" names the current drive's paths, either separator and any case
+# matching, as the file system does; bytes
 # decoded; a (host, port) pair as "host:port"; numbers, None, True as
 # their str), a callable predicate, a type (isinstance), a tuple of
 # patterns (element by element) or ANY. A denied event raises AuditDenied
@@ -197,7 +200,27 @@ def _abs(s):
     import os.path
     if s.startswith("~"):
         s = os.path.expanduser(s)
-    return os.path.normpath(os.path.abspath(s))
+    return os.path.normcase(os.path.normpath(os.path.abspath(s)))
+
+
+def _is_path_pattern(pat):
+    import os
+    if pat.startswith("/") or pat.startswith("~"):
+        return True
+    return os.name == "nt" and (pat.startswith("\\") or (len(pat) > 2 and pat[1] == ":" and pat[2] in "\\/"))
+
+
+def _path_pattern(pat):
+    # (round 86) the pattern in the argument's form: on POSIX as written
+    # ("~" expanded), on Windows also absolute and case-folded with "\\"
+    # separators (os.path.normcase): "/etc/*" then matches "Z:\\etc\\x" there
+    import os
+    import os.path
+    if pat.startswith("~"):
+        return _abs(pat)
+    if os.name == "nt":
+        return os.path.normcase(os.path.abspath(pat))
+    return pat
 
 
 def _match_value(pat, a):
@@ -214,10 +237,10 @@ def _match_value(pat, a):
         return True
     if isinstance(pat, str):
         var t = _text(a)
-        if pat.startswith("/") or pat.startswith("~"):
+        if _is_path_pattern(pat):
             if t.startswith("<"):
                 return False
-            return _fnmatch.fnmatchcase(_abs(t), _abs(pat) if pat.startswith("~") else pat)
+            return _fnmatch.fnmatchcase(_abs(t), _path_pattern(pat))
         return _fnmatch.fnmatchcase(t, pat)
     if callable(pat):
         return bool(pat(a))
