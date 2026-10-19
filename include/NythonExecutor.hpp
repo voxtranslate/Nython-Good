@@ -701,6 +701,7 @@ public:   // NythonExecutor is a struct: members default to public
             "ny_facts",      // round 82: per-function facts from the real parser (lib/nyxai)
             "_ny_ast",       // round 83: Python's tree from the real parser (lib/ast.ny)
             "_ny_vm_code",   // round 83: the VM's code objects (lib/dis.ny)
+            "_ny_lsp",       // round 86: lib/nylsp's natives, _ny_lsp(op, ...) (src/builtins/nylsp.cpp)
             // ── GUI builtins — value-returning ──────────────────────────────
             "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_video_driver","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             "gui_wait_events","gui_set_min_size","gui_set_fullscreen","gui_is_fullscreen","gui_show_open_dialog","gui_show_save_dialog","gui_set_text_input_area","gui_draw_arc","gui_draw_text_wrapped","gui_wrap_text","gui_font_metrics","gui_image_size","gui_free_image","gui_push_clip","gui_pop_clip","gui_push_offset","gui_pop_offset","gui_ticks","gui_next_event","gui_event_get",

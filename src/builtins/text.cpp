@@ -51,6 +51,7 @@
 #include "NythonExecutor.hpp"
 #include "NyFuzzy.hpp"
 #include "builtins/text.hpp"
+#include "builtins/nylsp.hpp"   // round 86: lib/nylsp's natives
 
 using namespace nython;
 using namespace nython::kernel;
@@ -3955,6 +3956,20 @@ Value dispatch_text(NythonExecutor& E, const std::string& name, std::vector<Valu
             break;
         case '_':
             if (name == "_ny_ast") return ny_ast(E, args);   // round 83: lib/ast.ny's parse
+            if (name == "_ny_lsp") {   // round 86: lib/nylsp's natives (nylsp.cpp) - text in, text out
+                std::vector<std::string> a;
+                a.reserve(args.size());
+                for (auto& v : args) {
+                    if (v.type == ValueType::INTEGER) a.push_back(std::to_string(bigint_to_i64(v.value.i)));
+                    else if (v.type == ValueType::BOOLEAN) a.push_back(v.value.b ? "1" : "0");
+                    else if (v.type == ValueType::NONE || v.type == ValueType::UNDEFINED) a.push_back(std::string());
+                    else a.push_back(E.getStringValue(v));
+                }
+                std::string out;
+                try { out = nylsp::call(a); }
+                catch (std::exception& e) { throw std::string("__exc__:ValueError:") + e.what(); }
+                return E.makeStringValue(out);
+            }
             break;
         case 'f':
             if (name == "fs_list_files") return fs_list_files(E, args);
