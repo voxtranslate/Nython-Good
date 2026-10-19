@@ -411,7 +411,10 @@ check("@review: fixable ones", [f.rule for f in rv.findings if f.fixable()],
       ["unused-import", "mutable-default", "inconsistent-return", "unused-variable", "none-comparison", "unreachable-code", "bare-except", "missing-self"])
 fx = agent.fix("lint/bad.ny")
 nl = string_split(fx.new_text, "\n")
-check("@fix: the diff is shown before anything is written", [read_file(os.path.join(ROOT, "lint/bad.ny")) == BAD, string_startswith(fx.diff, "--- a/lint/bad.ny\n+++ b/lint/bad.ny\n")], [true, true])
+# (read back in text mode, as written: on Windows the file holds "\r\n")
+with open(os.path.join(ROOT, "lint/bad.ny")) as fh:
+    bad_now = fh.read()
+check("@fix: the diff is shown before anything is written", [bad_now == BAD, string_startswith(fx.diff, "--- a/lint/bad.ny\n+++ b/lint/bad.ny\n")], [true, true])
 check("@fix: the fixed lines", nl[0:16],
       ["import json", "", "", "def collect(item, bucket=None):", "    if bucket is None:", "        bucket = []", "    bucket.append(item)",
        "    return bucket", "", "", "def check(x):", "    if x is None:", "        return None", "    return x * 2", "", ""])

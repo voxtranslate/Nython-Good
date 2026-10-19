@@ -669,12 +669,14 @@ vm_audit121 87 passed (the POSIX-only cases skipped), vm_audit122 169,
 vm_audit123 235, vm_audit125 14 - 122 had never finished there (the
 f-string hang, then nylsp's stdin, then the test's URIs) and 121 stopped at
 `os.kill(pid, 0)`. The 24 other suites that start processes, run on this
-build and on round 85's under Wine: no regression; vm_audit105 fails on
-both (its `@fix` check reads the fixture back with `read_file` and gets
-another text), and vm_audit104 fails about one run in two on both with a
-false `DeadlockError` in its `task_api` section (asyncio.to_thread,
-run_coroutine_threadsafe from a thread, wait() with a sleep pending) -
-both pre-existing, both open (round 87).
+build and on round 85's under Wine: no regression; vm_audit105 failed on
+both - its `@fix` check wrote the fixture in text mode (`"\r\n"` on
+Windows, as CPython writes it) and read it back with the raw `read_file`;
+it reads it back in text mode now and passes there (118) - and vm_audit104
+fails about one run in two on both with a false `DeadlockError` in its
+`task_api` section (asyncio.to_thread, run_coroutine_threadsafe from a
+thread, wait() with a sleep pending): pre-existing, open (round 87, part
+K).
 
 `examples/vm_audit125.ny` (14 checks) passes on both engines and under
 python3 (11 there; the rest are Nython-only) and under Wine; on the round 85 binary the

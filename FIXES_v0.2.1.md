@@ -5882,6 +5882,7 @@ Full detail in `HANDOFF.md` §0z (part G), §0z2 (part H), §0z3 (part I), §0z5
 | Windows: `subprocess.run(..., capture_output=True).stdout` had "\n" where the child wrote "\r\n" | the process layer translated every capture's line ends (round 77, for os_exec and the IDE) | `os_spawn`/`os_run(raw_output=True)` from subprocess and asyncio; text mode translates in lib/subprocess.ny (main session) |
 | Windows: vm_audit122 never finished; vm_audit121's child stopped halfway | the `f"{...}"` hang above, nylsp's stdin, the test's `file://Z:\\...` URIs; `os.kill(pid, 0)` is TerminateProcess there | fixed above; the tests write file URIs as clients do and skip the calls Windows does not have (main session) |
 | Windows: a nyaudit rule `deny open path=/etc/*` never matched, and a policy derived from a log denied the program's own files | the argument was made absolute (`Z:\\etc\\x`) and the pattern not; a drive-letter pattern was not a path pattern | both case-folded and absolute (`os.path.normcase`); drive-letter and UNC patterns are paths (main session) |
+| Windows: vm_audit105's `@fix` check failed | it wrote the fixture in text mode ("\r\n" there) and read it back raw (`read_file`) | read back in text mode (main session) |
 | vm_audit121's installed-policy check made `/etc/nyaudit_121_never` on the host when the rule did not match (under Wine) | the check opened a file in /etc for writing | a directory of the test's own (main session) |
 
 ## Round 84, part 0 — the semantic gaps rounds 82-83 found
