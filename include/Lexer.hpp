@@ -35,14 +35,27 @@ inline std::ostream& operator<<(std::ostream& os,LexerInfoLevel level);
 using token_list = std::vector<Token>;
 using lexer_ptr  = std::shared_ptr<Lexer>;
 
-struct Lexer extends ILexer{
+struct Lexer final extends ILexer{   // round 82: final (direct calls)
 
     SourceCode& source;
     Token token;
+    Location token_start;   // where the token being read began (reset_token)
+    int token_start_off = 0;   // round 83: ... and its byte offset in the source
     char first_indet_char         = 0;
     int level_                    = 0;
     int tab                       = TabSize;/// default tabulation.
     int errors                    = 0;/// number of errors
+    /// round 80: `${...}` in a quoted string is Python's text, not Nython's
+    /// interpolation (python_string_mode: a .py file, `# nython: module`,
+    /// `# nython: python`); such string tokens - and raw strings anywhere -
+    /// are made with TokenClass::Default instead of Literal.
+    bool python_strings           = false;
+    bool force_python_strings     = false;   // round 83: always (ast.parse: Python's semantics)
+    /// round 86: Python-language source (nython::scope::lexer_python: a .py
+    /// file, `# nython: python`, code compiled from one): Nython's literal
+    /// spellings true/false/none/null/undefined and `elseif` are names.
+    bool python_names             = false;
+    bool force_python_names       = false;   // (an f-string field's lexer: its file's)
     int warnings                  = 0;/// number of errors
     int indent                    = 0;///  current indent level is the number of spaces in the last indent.
     /// Open ( [ { count. Indentation is meaningless inside a bracketed
@@ -68,11 +81,16 @@ public:
     void statistics();
     void reset();
     void dump();
-    Token next();
-    Token prev();
-    Token curr();
-    Token peek(int i);
-    std::vector<Token> tokenize();
+    const Token& next();   // round 82: by reference (the vector is not changed while it is read)
+    const Token& prev();
+    // round 82: the common case inline (the parser asks at every see/have)
+    inline const Token& curr() {
+        if (__builtin_expect(current >= 0 && current < int(tokens.size()), 1)) return tokens[current];
+        return curr_edge();
+    }
+    const Token& curr_edge();
+    const Token& peek(int i);
+    const std::vector<Token>& tokenize();
     std::string code();
     std::string fileName();
     std::string toString();
@@ -107,6 +125,15 @@ public:
     void consume_cplx();
     void consume_regex(char first);
     void consume_string(char first);
+    // round 84: PEP 701 - the string after an `f` prefix is read with its
+    // replacement fields copied as they are written (nested strings of any
+    // quote, nested f-strings, brackets, a format spec), so a field may use
+    // the f-string's own quote: f"{", ".join(xs)}"
+    bool fstring_next_ = false;
+    void read_fstring_field(std::stringstream& out, char first);
+    void read_nested_string(std::stringstream& out, char q, bool fstr);
+    void consume_raw_string(char quote);
+    void consume_bytes(char quote, bool raw);
     void consume_comment();
     void consume_multiline_comment();
     void consume_ident();
@@ -142,6 +169,10 @@ private:
     }
 
 };
+
+// The spellings of the keyword table (KeywordTokens), in table order - what
+// lib/keyword.ny's nykwlist is derived from (_ny_keywords, round 77).
+std::vector<std::string> keyword_spellings();
 
 }
 

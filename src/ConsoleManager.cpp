@@ -4,7 +4,6 @@
 #define  _CRT_SECURE_NO_WARNINGS 1
 #include <windows.h>
 #else
-#include <termios.h>
 #include <unistd.h>
 #endif // _WIN32
 
@@ -18,69 +17,53 @@
 #endif // ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #endif // _WIN32
 
+// The process-wide console setup: ANSI colour on a real console, nothing
+// else. Two things this used to do, and why it no longer does:
+//
+//  - It called exit(GetLastError()) when stdin or stdout was not a console.
+//    On Windows that is every run whose output is redirected - `nython s.ny >
+//    out.txt`, an IDE or build tool capturing output, the IDE's own Run
+//    command - which all exited at once with code 6 (ERROR_INVALID_HANDLE)
+//    and no output. Now a handle that is not a console is simply left alone.
+//  - It put stdin in no-echo, unbuffered mode for every run and restored it
+//    only on the REPL's way out, so `input()` in a script ran without echo
+//    and a script left the terminal that way. The REPL sets and restores its
+//    own raw mode (NythonREPL.hpp); input is not touched here.
 namespace nython
 {
-#ifdef ENABLE_VIRTUAL_TERMINAL_PROCESSING
-    static HANDLE stdoutHandle, stdinHandle;
-    static DWORD outModeInit, inModeInit;
+#ifdef _WIN32
+    static HANDLE stdoutHandle = INVALID_HANDLE_VALUE;
+    static DWORD outModeInit = 0;
+    static bool outIsConsole = false;
 
     void ConsoleManager::setupConsole() {
-        DWORD outMode = 0, inMode = 0;
         stdoutHandle = GetStdHandle(STD_OUTPUT_HANDLE);
-        stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
-
-        if(stdoutHandle == INVALID_HANDLE_VALUE || stdinHandle == INVALID_HANDLE_VALUE) {
-            exit(GetLastError());
-        }
-
-        if(!GetConsoleMode(stdoutHandle, &outMode) || !GetConsoleMode(stdinHandle, &inMode)) {
-            exit(GetLastError());
-        }
-
-        outModeInit = outMode;
-        inModeInit = inMode;
-
-        // Enable ANSI escape codes
-        outMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-
-        // Set stdin as no echo and unbuffered
-        inMode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
-
-        if(!SetConsoleMode(stdoutHandle, outMode) || !SetConsoleMode(stdinHandle, inMode)) {
-            exit(GetLastError());
-        }
-    }
-
-    void ConsoleManager::restoreConsole(void) {
-        // Reset colors
-        printf("\x1b[0m");
-
-        // Reset console mode
-        if(!SetConsoleMode(stdoutHandle, outModeInit) || !SetConsoleMode(stdinHandle, inModeInit)) {
-            exit(GetLastError());
-        }
-    }
-#else
-
-    static struct termios orig_term;
-    static struct termios new_term;
-
-    void ConsoleManager::setupConsole() {
-        tcgetattr(STDIN_FILENO, &orig_term);
-        new_term = orig_term;
-
-        new_term.c_lflag &= ~(ICANON | ECHO);
-
-        tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+        DWORD mode = 0;
+        outIsConsole = stdoutHandle != nullptr && stdoutHandle != INVALID_HANDLE_VALUE &&
+                       GetConsoleMode(stdoutHandle, &mode);
+        if (!outIsConsole) return;          // a pipe or a file: nothing to set up
+        outModeInit = mode;
+        // Enable ANSI escape codes; a console too old to have them keeps its mode.
+        SetConsoleMode(stdoutHandle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
 
     void ConsoleManager::restoreConsole() {
-        // Reset colors
-        printf("\x1b[0m");
-
-        // Reset console mode
-        tcsetattr(STDIN_FILENO, TCSANOW, &orig_term);
+        if (!outIsConsole) return;
+        printf("\x1b[0m");                  // reset colours
+        fflush(stdout);
+        SetConsoleMode(stdoutHandle, outModeInit);
     }
-#endif // ENABLE_VIRTUAL_TERMINAL_PROCESSING
-}
+#else
+    void ConsoleManager::setupConsole() {
+        // Terminals interpret ANSI escapes already; nothing to set up.
+    }
 
+    void ConsoleManager::restoreConsole() {
+        // Reset colours - on a terminal only, never into a pipe or a file.
+        if (isatty(STDOUT_FILENO)) {
+            printf("\x1b[0m");
+            fflush(stdout);
+        }
+    }
+#endif // _WIN32
+}

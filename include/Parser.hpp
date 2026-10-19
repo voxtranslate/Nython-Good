@@ -3,6 +3,8 @@
 
 #include <map>
 #include <vector>
+#include <deque>
+#include <unordered_map>
 #include "IParser.hpp"
 
 using nython::node::Node;
@@ -19,6 +21,7 @@ namespace nython {
 namespace lexer{
 extern std::map<TokenType,std::string> TokenTypeNames;
 }
+namespace node { struct CallNode; }
 }
 
 namespace nython::parser {
@@ -26,7 +29,7 @@ namespace nython::parser {
 using nython::lexer::TokenTypeNames;
 
 /// class that defines a parser that converts a list of tokens into a list of nodes
-class Parser extends IParser {
+class Parser final extends IParser {   // round 82: final - its own token()/see() calls are direct
 public:
     Parser(const Parser&) = delete;
     Parser& operator=(const Parser&) = delete;
@@ -42,25 +45,94 @@ private:
 
     /// Temporary storage for parameter default values during function parsing
     std::vector<node_ptr> param_defaults_;
+    size_t param_posonly_ = 0;   // paramList: parameters before a bare `/`
+    // Annotations (round 77). The kind of scope each statement is parsed in
+    // ('c' a class body, 'f' a function body; empty: the module); whether a
+    // class body / the module stored an annotation (it then starts with
+    // `var __annotations__ = {}`); `from __future__ import annotations`
+    // (annotations stay strings); paramList's parameter annotations.
+    std::vector<char> ann_scope_;
+    std::vector<bool> class_ann_used_;
+    bool module_ann_used_ = false;
+    bool future_annotations_ = false;
+    std::vector<std::pair<std::string, node_ptr>> param_ann_;
+    // Per function being parsed: the names it declared `global`/`nonlocal`.
+    std::vector<std::vector<std::string>> outer_decls_;
+    std::vector<std::vector<std::string>> global_decls_;   // `global` only, per function
+    // Per function being parsed: whether its body yields (an `async def`
+    // that yields is an async generator).
+    std::vector<bool> yield_seen_;
+    // The scopes around the definition being parsed, for __qualname__
+    // (round 77): a class's name, or a function's qualname + ".<locals>".
+    std::vector<std::string> qual_stack_;
+    std::string qualOf(const std::string& name) const {
+        return qual_stack_.empty() ? name : qual_stack_.back() + "." + name;
+    }
+    // The comprehension clause haveCompFor() just consumed was `async for`.
+    bool comp_async_ = false;
     // Set when a statement was terminated by ';' rather than a newline.
     // Statement parsers consume the semicolon themselves, so blockOrStmt()
     // cannot otherwise tell that an inline suite continues.
     bool consumed_semi_ = false;
 
-	inline Token next(){
-        return scanner->next();
+    // Private name mangling (round 78; CPython's _Py_Mangle): inside a class
+    // body - its methods, nested functions, lambdas and comprehensions
+    // included - an identifier `__name` (two leading underscores, not
+    // ending in two, no dot) reads as `_Class__name`, the class's name
+    // stripped of its leading underscores (no mangling when it is all
+    // underscores: an empty entry). Done on the tokens the parser reads, so
+    // both engines get it; the innermost class wins. Call keywords
+    // (`f(__x=1)`) and the names __name__/__qualname__ report stay as
+    // written, as in CPython (rawToken / the raw name).
+    std::vector<std::string> mangle_stack_;
+    // `@staticmethod` precedes the def being parsed (round 78: an async def
+    // in a class body is a method otherwise, async_def_desugar)
+    bool next_def_static_ = false;
+    static bool manglable(const std::string& v){
+        return v.size() > 2 && v[0] == '_' && v[1] == '_'
+               && !(v[v.size()-1] == '_' && v[v.size()-2] == '_') && v.find('.') == std::string::npos;
+    }
+    // round 82: the parser reads tokens by reference (they were copied -
+    // two strings each - at every token()/see()/have(): ~40% of the
+    // startup's instructions, the prelude's parse). The lexer's token
+    // vector does not change while a parse runs; a mangled identifier is a
+    // copy kept here for the parse (a deque: its address stays), made once
+    // per token and class name.
+    std::deque<Token> mangled_;
+    const Token* mangled_src_ = nullptr;
+    std::string mangled_cls_;
+    inline const Token& mg(const Token& t) {
+        if(ast_mode_ || mangle_stack_.empty() || mangle_stack_.back().empty() || t.type() != TokenType::Identifier
+           || !manglable(t.value))
+            return t;
+        if(mangled_src_ == &t && !mangled_.empty() && mangled_cls_ == mangle_stack_.back())
+            return mangled_.back();
+        mangled_.push_back(t);
+        mangled_.back().value = "_" + mangle_stack_.back() + t.value;
+        mangled_src_ = &t;
+        mangled_cls_ = mangle_stack_.back();
+        return mangled_.back();
+    }
+    std::string mangled(const std::string& n) const {
+        if(!mangle_stack_.empty() && !mangle_stack_.back().empty() && manglable(n)) return "_" + mangle_stack_.back() + n;
+        return n;
+    }
+    inline const Token& rawToken(){ return scanner->curr(); }
+
+	inline const Token& next(){
+        return mg(scanner->next());
     }
 
-    inline Token prev(){
-        return scanner->prev();
+    inline const Token& prev(){
+        return mg(scanner->prev());
     }
 
-    inline Token peek(int pos = 1){
-        return scanner->peek(pos);
+    inline const Token& peek(int pos = 1){
+        return mg(scanner->peek(pos));
     }
 
-    inline Token token(){
-        return scanner->curr();
+    inline const Token& token(){
+        return mg(scanner->curr());
     }
 
     inline int line(){
@@ -102,7 +174,7 @@ private:
     }
 
     inline bool see(TokenType type){
-        return token().type() == type;
+        return scanner->curr().type() == type;   // round 82: mangling never changes a type
     }
 
     inline bool have(TokenType type){
@@ -127,7 +199,7 @@ private:
             throw report<SyntaxError>(next().location(), fmt::format("Expected {}, but found {}", type, next().type()));
     }
 
-    inline Token consume(TokenType type, std::string context = ""){
+    inline const Token& consume(TokenType type, std::string context = ""){
         if(see(type)){
             return next();
         } else if (!context.empty())
@@ -150,6 +222,30 @@ private:
 
     std::string identifier();
     std::string dottedName();
+    // Soft keywords (round 77): the word at the start of a statement is a
+    // name when usedAsName(); var/let/const/ref declare when declFollows().
+    bool usedAsName(int k = 1);
+    bool declFollows();
+    // Binding positions (assignment, del, walrus targets): `self`/`this`
+    // there are the names, not the Nython self-reference (round 77).
+    node_ptr asTarget(node_ptr t);
+    // `this` reads as self only inside a def whose first parameter is
+    // self/this; elsewhere it is the ordinary name (round 77).
+    std::vector<bool> self_scope_;
+    // A statement that starts with `{` is a dict/set display when the
+    // brace is followed by more of an expression (`{}["x"]`, `{1} | s`)
+    // rather than a block (round 77).
+    bool braceIsExpression();
+    // star_expressions: `1, 2`, `*a, b` (a tuple display) or one expression
+    node_ptr exprList(Token tok, std::vector<node_ptr>* items = nullptr, node_ptr first = nullptr);
+    // del target lists: `del a, (b, [c])` (round 77)
+    void delTargets(node_ptr t, std::vector<node_ptr>& out);
+    // lambda parameters before a bare `/`
+    size_t lambda_posonly_ = 0;
+    // Binding a value to a (tuple/list/starred) target, into `block`
+    std::string unpackTemp();
+    void bindTarget(const Token& op, node_ptr t, node_ptr value, node_ptr block);
+    void bindTargets(const Token& op, const std::vector<node_ptr>& ts, int star, const std::string& src, node_ptr block);
 
     bool isCompoundStatement();
     bool isFlowStatement();
@@ -168,29 +264,63 @@ private:
     node_ptr script();
     node_ptr stmt();
 
+    // round 83: ast mode (lib/ast.ny, Parser.cpp's "ast mode"): each of these
+    // records the span of the node it returns - its first token through the
+    // last one read - when ast_mode_ is set; otherwise it is the plain call.
+    int lastTok() const;
+    void spanSet(const Node* n, int t0);
+#define NY_AST_SPANNED(fn) \
+    node_ptr fn##_(); \
+    inline node_ptr fn(){ \
+        if(__builtin_expect(!ast_mode_, 1)) return fn##_(); \
+        int t0__ = scanner->current; node_ptr n__ = fn##_(); spanSet(n__.get(), t0__); return n__; \
+    }
+    NY_AST_SPANNED(statement)
+    NY_AST_SPANNED(assignment)
+    NY_AST_SPANNED(ternary)
+    NY_AST_SPANNED(coalesce)
+    NY_AST_SPANNED(rangeExpr)
+    NY_AST_SPANNED(logicalOr)
+    NY_AST_SPANNED(logicalAnd)
+    NY_AST_SPANNED(bitwiseOr)
+    NY_AST_SPANNED(bitwiseXor)
+    NY_AST_SPANNED(bitwiseAnd)
+    NY_AST_SPANNED(comparison)
+    NY_AST_SPANNED(shift)
+    NY_AST_SPANNED(addition)
+    NY_AST_SPANNED(multiplication)
+    NY_AST_SPANNED(power)
+    NY_AST_SPANNED(unary)
+    NY_AST_SPANNED(postfix)
+    NY_AST_SPANNED(primary)
+    NY_AST_SPANNED(atom)
+    NY_AST_SPANNED(lambdaExpr)
+    NY_AST_SPANNED(starElem)
+    NY_AST_SPANNED(listLiteral)
+    NY_AST_SPANNED(mapLiteral)
+#undef NY_AST_SPANNED
+    // ast mode's own forms of these statements (round 83)
+    node_ptr importAst();
+    node_ptr tryAst();
+    // round 83: where each byte of an f-string's value is in the source - as
+    // the start of a part (r, c) and as the end of one (er, ec)
+    struct FPos { uint32_t r = 0, c = 0, er = 0, ec = 0; };
+    using FPositions = std::vector<FPos>;
+    node_ptr fstringAst(const Token& str_tok, const std::string& raw, const FPositions* at = nullptr);
+    bool fstrPositions(const Token& str_tok, const std::string& raw, FPositions& at);
+
     // Expression parsing (Pratt-style precedence climbing)
     node_ptr expression();
-    node_ptr assignment();
-    node_ptr ternary();
-    node_ptr rangeExpr();
-    node_ptr logicalOr();
-    node_ptr logicalAnd();
-    node_ptr bitwiseOr();
-    node_ptr bitwiseXor();
-    node_ptr bitwiseAnd();
     node_ptr equality();
-    node_ptr comparison();
-    node_ptr shift();
-    node_ptr addition();
-    node_ptr multiplication();
-    node_ptr power();
-    node_ptr unary();
-    node_ptr postfix();
-    node_ptr primary();
-    node_ptr atom();
+    // postfix() pieces, shared by `.`/`[`/`(` and their optional forms
+    void parseCallArgs(std::shared_ptr<nython::node::CallNode> call);
+    node_ptr parseSubscriptTail(Token tok, node_ptr expr);
+    std::string memberName();
+    bool postfixOther(node_ptr& expr);
+    // f"..." / `...${}...` interpolation: literal parts and fields, joined by +
+    node_ptr fstringNode(const Token& str_tok, const std::string& raw);
 
     // Statement parsing
-    node_ptr statement();
     node_ptr expressionStmt();
     node_ptr varDecl(bool is_const = false, bool is_let = false);
     node_ptr ifStmt();
@@ -208,11 +338,39 @@ private:
     node_ptr raiseStmt();
     node_ptr assertStmt();
     node_ptr switchStmt();
+    // `match` (Python's structural pattern matching): the patterns parse into
+    // MatchPat and the statement desugars into an if-chain over a subject
+    // temporary - see switchStmt().
+    struct MatchPat {
+        enum Kind { WILD, CAPTURE, VALUE, OR, SEQ, CLASS, MAP } kind = WILD;
+        std::string name;                 // CAPTURE
+        std::string as_name;              // `pattern as name`, any kind
+        node_ptr value;                   // VALUE: the expression; CLASS: the class
+        std::vector<std::shared_ptr<MatchPat>> subs;   // OR / SEQ / CLASS positional
+        int star = -1;                    // SEQ: index of the starred item
+        std::string star_name;            // SEQ: its name ("" or "_" binds nothing)
+        std::vector<std::pair<std::string, std::shared_ptr<MatchPat>>> kw;  // CLASS keywords
+        std::vector<std::pair<node_ptr, std::shared_ptr<MatchPat>>> items; // MAP
+        std::string rest;                 // MAP: **rest
+        // round 83: token spans (ast mode) - the pattern's, and with its
+        // `as name`
+        int t0 = -1, t1 = -1, as_t0 = -1, as_t1 = -1;
+    };
+    std::shared_ptr<MatchPat> matchPattern();        // open sequence at the top
+    std::shared_ptr<MatchPat> matchOrPattern();
+    std::shared_ptr<MatchPat> matchClosedPattern();
+    std::shared_ptr<MatchPat> matchClosedPattern_();   // round 83: matchClosedPattern() records its span
+    node_ptr patAst(const std::shared_ptr<MatchPat>& p);   // round 83: Python's pattern nodes
+    node_ptr matchStmt(Token tok, node_ptr subject);
     node_ptr enumDecl();
-    node_ptr lambdaExpr();
     node_ptr deleteStmt();
     node_ptr yieldStmt();
-    node_ptr withStmt();
+    node_ptr withStmt(bool is_async = false);
+    node_ptr wrap_call(const std::string& helper, node_ptr arg);
+    std::string tokenText(int from, int to);                  // source text of tokens [from, to)
+    node_ptr annotationValue(node_ptr expr, int from, int to); // what __annotations__ stores
+    node_ptr annotationsDecl(const Token& t);                 // `var __annotations__ = {}`
+    bool haveCompFor();
     node_ptr repeatStmt();
     node_ptr loopStmt();
     node_ptr blockStmt();
@@ -224,8 +382,17 @@ private:
     std::vector<node_ptr> paramList();
     std::vector<node_ptr> lambdaParamList();
     std::vector<node_ptr> argList();
-    node_ptr listLiteral();
-    node_ptr mapLiteral();
+    // Starred elements in displays (round 77): [*a, b], (*a, b), {*a},
+    // {**d, k: v}. Outside an assignment target they become calls of the
+    // prelude's _ny_list_cat / _ny_dict_merge; inside one they stay
+    // UnaryNode("*") targets.
+    node_ptr catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap);
+    bool in_assign_target_ = false;
+    // After the first `for` of a comprehension: its clauses.
+    node_ptr comprehension(Token tok, int kind, node_ptr elt, node_ptr value);
+    node_ptr compTarget();
+    node_ptr compTargetOne();
+    node_ptr starTargetSpec(node_ptr& target);   // round 84
     node_ptr tupleLiteral();
 
 
@@ -234,6 +401,34 @@ public:
     // Constructor
     Parser(Reporter* reporter, Runnable* runner, Lexer* lexer);
     node_ptr parse();
+
+    // ── ast mode (round 83; lib/ast.ny through _ny_ast, src/builtins/text.cpp)
+    // The parser keeps Python's tree shape (PyAstNode where it would
+    // desugar), does not mangle private names, runs no scope checks and
+    // records spans; the tree is for lib/ast.ny only, never executed.
+    bool ast_mode_ = false;
+    // a node's tokens: [first, last] indexes into the lexer's tokens
+    std::unordered_map<const Node*, std::pair<int,int>> ast_spans_;
+    // an expression written in parentheses: the span with them ({-2, -2}:
+    // parenthesised inside an f-string field)
+    std::unordered_map<const Node*, std::pair<int,int>> ast_outer_;
+    // "async" (AsyncFor, an async comprehension clause's iterable), "star"
+    // (TryStar), "inclusive" (a...b)
+    std::unordered_map<const Node*, std::string> ast_flags_;
+    // the expressions of f-string fields (their positions are the f-string's)
+    std::vector<node_ptr> fstr_nodes_;
+    // exact positions inside an f-string (CPython 3.12's): the tokens of its
+    // fields' expressions, moved to the source's coordinates - a field
+    // node's span indexes them from kAstExtra; off in a field's own parser
+    // (an f-string nested in a field is located at itself); the source and
+    // its line starts, made on first need
+    static constexpr int kAstExtra = 1 << 28;
+    std::vector<Token> ast_extra_toks_;
+    bool ast_fstr_exact_ = true;
+    std::string ast_src_;
+    std::vector<size_t> ast_line_starts_;
+    node_ptr parseAst(const std::string& mode);   // "exec", "eval", "single", "func_type"
+    const Lexer* lexer() const { return scanner; }
 
 };
 

@@ -1,10 +1,4 @@
-import nytorch
-import "lib/nytorch/activations.ny"
-import "lib/nytorch/reinforcement.ny"
-import "lib/nytorch/convnets.ny"
-import "lib/nytorch/neural_ode.ny"
-import "lib/nytorch/sequence.ny"
-import "lib/nytorch/compute.ny"
+import "lib/nytorch.ny"
 
 print "=== NYTORCH17 DEVICE-AGNOSTIC AI TEST SUITE ==="
 print ""
@@ -101,9 +95,9 @@ var stripped = ws.extract_text("<h1>Hello</h1><p>World</p>")
 assert_true("WS strip removes tags", not string_contains(stripped, "<h1>"))
 assert_true("WS strip keeps text", string_contains(stripped, "Hello"))
 
-# ── KnowledgeBase ──────────────────────────────────────────────────────────
-var kb = KnowledgeBase(32)
-assert_eq("KB name", kb.get_name(), "KnowledgeBase")
+# ── VectorKnowledgeBase ──────────────────────────────────────────────────────────
+var kb = VectorKnowledgeBase(32)
+assert_eq("KB name", kb.get_name(), "VectorKnowledgeBase")
 kb.add_document("doc1", "Deep learning is a subset of machine learning.", {"topic": "AI"})
 kb.add_document("doc2", "NyTorch enables GPU-accelerated tensor operations.", {"topic": "framework"})
 kb.add_document("doc3", "Natural language processing handles text data.", {"topic": "NLP"})
@@ -137,9 +131,9 @@ assert_eq("TR es status", en_es["status"], "ok")
 var unsupported = tr.translate("hello", "en", "zh")
 assert_eq("TR unsupported status", unsupported["status"], "unsupported")
 
-# ── CodeAnalyzer ───────────────────────────────────────────────────────────
-var ca = CodeAnalyzer()
-assert_eq("CA name", ca.get_name(), "CodeAnalyzer")
+# ── SourceCodeAnalyzer ───────────────────────────────────────────────────────────
+var ca = SourceCodeAnalyzer()
+assert_eq("CA name", ca.get_name(), "SourceCodeAnalyzer")
 var py_code = "import numpy as np\nclass MyModel:\n    def __init__(self):\n        pass\n    def forward(self, x):\n        return x\n\ndef train(model, data):\n    for batch in data:\n        loss = model.forward(batch)\n    return loss\n"
 var analysis = ca.analyze(py_code)
 assert_true("CA lang python or nython", analysis["language"] == "python" or analysis["language"] == "nython")
@@ -176,9 +170,9 @@ var summary = al.summarize()
 assert_eq("AL summary agent", summary["agent"], "TestLearner")
 assert_gt("AL summary docs > 0", summary["docs"], 0)
 
-# ── CodeGenerator ──────────────────────────────────────────────────────────
-var cg = CodeGenerator("python", none)
-assert_eq("CG name", cg.get_name(), "CodeGenerator")
+# ── TemplateCodeGenerator ──────────────────────────────────────────────────────────
+var cg = TemplateCodeGenerator("python", none)
+assert_eq("CG name", cg.get_name(), "TemplateCodeGenerator")
 var sort_code = cg.from_description("sort a list of numbers")
 assert_true("CG sort contains def", string_contains(sort_code, "def ") or string_contains(sort_code, "sort"))
 var neural_code = cg.from_description("neural network model")
@@ -298,8 +292,20 @@ assert_eq("MO quant bits", q8["bits"], 8)
 assert_eq("MO quant compression", q8["compression"], 4.0)
 assert_eq("MO quant size", len(q8["weights"]), 64)
 var pruned = mo.prune(weights, 0.5)
-assert_gt("MO prune sparsity > 0", pruned["sparsity"], 0.0)
-assert_gt("MO params removed >= 0", pruned["n_params_removed"], -1)
+assert_eq("MO prune sparsity is exactly the target", pruned["sparsity"], 0.5)
+assert_eq("MO prune removes exactly 32 of 64", pruned["n_params_removed"], 32)
+var n_zero = 0
+var kept_min = 1e30
+var removed_max = 0.0
+for i in range(0, 64):
+    if pruned["weights"][i] == 0.0:
+        n_zero = n_zero + 1
+        removed_max = max(removed_max, abs(weights[i]))
+    else:
+        kept_min = min(kept_min, abs(weights[i]))
+assert_eq("MO prune zeroes 32 weights", n_zero, 32)
+assert_true("MO prune removes the smallest magnitudes", removed_max <= kept_min)
+assert_eq("MO prune 0.25 of 64 removes 16", mo.prune(weights, 0.25)["n_params_removed"], 16)
 var logits_t = tensor_randn([8])
 var logits_s = tensor_randn([8])
 var kl = mo.distill(logits_t, logits_s, 2.0)
@@ -320,9 +326,9 @@ var sp_stats = sp.stats()
 assert_eq("SP total ingested", sp_stats["total"], 12)
 assert_gt("SP windows counted", sp_stats["windows"], 0)
 
-# ── DataAugmentor ──────────────────────────────────────────────────────────
-var da = DataAugmentor("universal")
-assert_eq("DA name", da.get_name(), "DataAugmentor")
+# ── MultimodalAugmentor ──────────────────────────────────────────────────────────
+var da = MultimodalAugmentor("universal")
+assert_eq("DA name", da.get_name(), "MultimodalAugmentor")
 var orig = tensor_randn([16])
 var noisy = da.augment_tensor(orig, ["noise"])
 assert_eq("DA noise same size", len(noisy), 16)
@@ -334,9 +340,9 @@ var batch_in = [orig, tensor_randn([16]), tensor_randn([16])]
 var batch_out = da.batch_augment(batch_in, ["noise"], 1)
 assert_eq("DA batch size doubles", len(batch_out), 6)
 
-# ── ExperimentTracker ──────────────────────────────────────────────────────
-var et = ExperimentTracker("NyTorch_Experiment", "/tmp")
-assert_eq("ET name", et.get_name(), "ExperimentTracker")
+# ── ExperimentLogger ──────────────────────────────────────────────────────
+var et = ExperimentLogger("NyTorch_Experiment", "/tmp")
+assert_eq("ET name", et.get_name(), "ExperimentLogger")
 et.start_run("run_001", {"lr": 0.001, "epochs": 10, "batch_size": 32})
 assert_true("ET current run set", et.current_run != none)
 et.log_metric("loss", 1.5, 0)
@@ -380,9 +386,9 @@ assert_eq("MMAI fused dim", len(fused), 32)
 var answer = mmai.answer("What is NyTorch?", [text_emb, img_emb], none)
 assert_true("MMAI answer not none", answer != none)
 
-# ── FederatedLearner ───────────────────────────────────────────────────────
-var fl = FederatedLearner(4, 16)
-assert_eq("FL name", fl.get_name(), "FederatedLearner")
+# ── FedAvgSimulator ───────────────────────────────────────────────────────
+var fl = FedAvgSimulator(4, 16)
+assert_eq("FL name", fl.get_name(), "FedAvgSimulator")
 assert_eq("FL n_clients", fl.n_clients, 4)
 assert_eq("FL global model dim", len(fl.global_model), 16)
 var local_data = [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6]]
@@ -459,6 +465,51 @@ assert_true("AGI converse has thought", "thought" in converse_result)
 var final_status = agi.status()
 assert_gt("AGI tasks done > 0", final_status["tasks_done"], 0)
 assert_gt("AGI episodes > 0", final_status["episodes"], 0)
+
+# ── Values and invariants ──────────────────────────────────────────────────
+print "--- invariants ---"
+torch.manual_seed(17)
+# OptimizedLayer is x W^T + b
+var ol2 = OptimizedLayer(3, 2, "cpu")
+var ox = [0.5, -1.0, 2.0]
+var oy = ol2.forward(ox).data
+var ow = ol2.linear.weight.data
+var ob = ol2.linear.bias.data
+assert_true("OptimizedLayer computes x W^T + b", abs(oy[1] - (ow[3] * 0.5 - ow[4] + ow[5] * 2.0 + ob[1])) < 0.000000001)
+assert_eq("OptimizedLayer fused batch", ol2.fused_forward([[0.5, -1.0, 2.0], [1.0, 1.0, 1.0]]).shape, [2, 2])
+# the hashed-feature knowledge base ranks the lexically matching document first
+var kb2 = VectorKnowledgeBase(64)
+kb2.add_document("a", "Deep learning is a subset of machine learning.", {})
+kb2.add_document("b", "The recipe needs flour, sugar and eggs.", {})
+kb2.add_document("c", "Stock markets fell sharply on Tuesday.", {})
+assert_eq("KB: learning query finds the learning document", kb2.search("machine learning models", 1)[0]["id"], "a")
+assert_eq("KB: baking query finds the recipe", kb2.search("sugar and flour", 1)[0]["id"], "b")
+# quantisation error is at most half a step
+var qw = [0.9, -0.33, 0.1, -1.0]
+var q4 = mo.quantize(qw, 4)
+var qerr = 0.0
+for i in range(0, 4):
+    qerr = max(qerr, abs(q4["weights"][i] - qw[i]))
+assert_true("4-bit quantisation error <= step / 2", qerr <= 0.5 / q4["scale"] + 0.000000001)
+assert_eq("4-bit compression", q4["compression"], 8.0)
+# float16 rounding
+var hd = TensorDevice([1.0, 0.1, 3.14159], "cpu").half()
+assert_eq("half keeps exact values", hd.data[0], 1.0)
+assert_true("half rounds to 11 significant bits", abs(hd.data[1] - 0.0999755859375) < 0.000000000001)
+assert_eq("half dtype", hd.dtype, "float16")
+# FedAvg is the sample-weighted mean of the client models
+var fl2 = FedAvgSimulator(2, 2)
+fl2.client_models = [[1.0, 2.0], [3.0, 6.0]]
+fl2.client_samples = [1, 3]
+assert_eq("FedAvg weights clients by their samples", fl2.fedavg([0, 1]), [2.5, 5.0])
+fl2.distribute_global_model()
+assert_eq("clients restart from the global model", fl2.client_models[1], [2.5, 5.0])
+var dp = fl2.privacy_noise([30.0, 40.0], 1000000.0, 1.0)
+assert_true("DP noise clips the update to norm 1", abs(dp[0] - 0.6) < 0.001 and abs(dp[1] - 0.8) < 0.001)
+# multimodal pooling
+var mm2 = MultimodalAI(2)
+var pe = mm2.encode([1.0, 1.0, 3.0, 3.0], "image")
+assert_true("image pooling averages halves", abs(pe[1] / pe[0] - 3.0) < 0.000000001)
 
 print "Results: " + str(passed) + " passed, " + str(failed) + " failed"
 if failed == 0:

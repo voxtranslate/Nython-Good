@@ -20,6 +20,13 @@ struct Script;
 struct Node extends INode, public std::enable_shared_from_this<Node> {
 
     NodeType _type;
+    // round 86: 1 when the node is Python-language source's (a .py file, a
+    // file marked `# nython: python`, code compiled from one, a function
+    // that opts in): NyScope marks every node it walks under Python's rule,
+    // and both engines take CPython's path for it where Nython is lenient
+    // (str + non-str, an int iterated, `x is int`, a dict's keys read as
+    // attributes). In what was padding: no node grows.
+    uint8_t  py_src = 0;
     Token    _token;
 	static Script* root;
 
@@ -32,13 +39,18 @@ struct Node extends INode, public std::enable_shared_from_this<Node> {
     virtual ~Node(){
     }
 
-    virtual NodeType type(){
+    // final (round 81): no node overrides them, and a call through a Node
+    // pointer is then a field read instead of a virtual call.
+    NodeType type() final {
     	return _type;
     }
 
-	virtual Token token(){
+	Token token() final {
 		return _token;
 	}
+	// The token without copying it (round 81): token() returns a copy, two
+	// strings and all, which the interpreter made on hot paths.
+	const Token& tok() const { return _token; }
 
 	virtual node_ptr get(int index){
     	if(index>=int(statements().size())) exception::IndexOutOfRangeError(location(), utils::format("The index you have provided is out of range: maximun value should be ", size()-1));

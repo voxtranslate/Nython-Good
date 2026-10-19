@@ -27,7 +27,12 @@ namespace nython::reader {
         return create(file);
     }
 
-	SourceCode::SourceCode(const std::string & filename):_eof{false},code{},nb{-1},current{0},in{},source_lines_{},current_char{'\0'},location{},frame{},isfile{nython::utils::FileExists(filename)} {
+	// A path to a program file. A string that names no regular file is read
+	// as program text - so program text must never come here: text that
+	// happened to name a file (f"{x}" beside a file x) read that file, and
+	// text naming a directory (f"{lib}") hung the reader. Program text goes
+	// through from_text (round 86).
+	SourceCode::SourceCode(const std::string & filename):_eof{false},code{},nb{-1},current{0},in{},source_lines_{},current_char{'\0'},location{},frame{},isfile{nython::utils::IsRegularFile(filename)} {
         if(isfile) {
 			in                = std::ifstream(filename);
 			location.filename = filename;
@@ -39,7 +44,21 @@ namespace nython::reader {
         }
     }
 
-    SourceCode::SourceCode(const SourceCode& that): SourceCode(that.location.filename) {
+    // A copy reads the same file again; a copy of program text keeps the
+    // text (it used to become the text of its name, "stdin").
+    SourceCode::SourceCode(const SourceCode& that):_eof{false},code{},nb{-1},current{0},in{},source_lines_{},current_char{'\0'},location{},frame{},isfile{that.isfile} {
+        location.filename = that.location.filename;
+        if (isfile) in = std::ifstream(that.location.filename);
+        else code = that.code;
+    }
+
+    SourceCode SourceCode::from_text(const std::string& text, const std::string& name) {
+        SourceCode s{std::string()};
+        s.isfile = false;
+        s.code = text;
+        s.location.filename = name;
+        file_name = name;
+        return s;
     }
 
     SourceCode::~SourceCode() {
@@ -65,7 +84,9 @@ namespace nython::reader {
             do{
                 c = in.get();
                 line.push_back(c);
-                 if(in.eof()){
+                // (round 86) a stream that failed (a file that could not be
+                // opened) never reaches eof: stop at either
+                if(!in){
                     break;
                 }
                 if(c =='\n' || c == '\x0c') nb++;
@@ -87,7 +108,7 @@ namespace nython::reader {
         }
         std::string buff{};
         nb = 0;
-        while(!(_eof||in.eof())) {
+        while(!_eof && in) {
             buff += line();
         }
         in.close();

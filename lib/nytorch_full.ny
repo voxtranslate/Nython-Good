@@ -8,22 +8,8 @@
 # pointing at the missing import as the cause. All seventeen submodules were
 # present the whole time; only this aggregator was absent.
 #
-# Order matters: activations.ny defines Tensor, which the rest build on.
+# One aggregator: this file loads exactly what lib/nytorch.ny loads (it used
+# to list a subset of the submodules in its own order, so a program's
+# behaviour depended on which of the three names it imported).
 
-import "lib/nytorch/activations.ny"
-import "lib/nytorch/compute.ny"
-import "lib/nytorch/layers.ny"
-import "lib/nytorch/losses.ny"
-import "lib/nytorch/optimizers.ny"
-import "lib/nytorch/attention.ny"
-import "lib/nytorch/convnets.ny"
-import "lib/nytorch/sequence.ny"
-import "lib/nytorch/vision.ny"
-import "lib/nytorch/data.ny"
-import "lib/nytorch/storage.ny"
-import "lib/nytorch/memory.ny"
-import "lib/nytorch/advanced.ny"
-import "lib/nytorch/neural_ode.ny"
-import "lib/nytorch/reinforcement.ny"
-import "lib/nytorch/distributed.ny"
-import "lib/nytorch/serving.ny"
+import "lib/nytorch.ny"

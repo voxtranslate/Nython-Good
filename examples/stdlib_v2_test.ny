@@ -18,12 +18,12 @@ t("chr_z", chr(122), "z")
 t("ord_z", ord("z"), 122)
 
 print "=== SORTING COMPREHENSIVE ==="
-t("sort_str", str(sorted(["banana", "apple", "cherry", "date"])), "[apple, banana, cherry, date]")
+t("sort_str", str(sorted(["banana", "apple", "cherry", "date"])), "['apple', 'banana', 'cherry', 'date']")
 t("sort_neg", str(sorted([5, -3, 0, -7, 2, 8, -1])), "[-7, -3, -1, 0, 2, 5, 8]")
 t("sort_dup", str(sorted([3, 1, 4, 1, 5, 9, 2, 6])), "[1, 1, 2, 3, 4, 5, 6, 9]")
 t("sort_single", str(sorted([42])), "[42]")
 t("sort_empty", str(sorted([])), "[]")
-t("method_sort", str(["z","a","m"].sort()), "[a, m, z]")
+t("method_sort", str(["z","a","m"].sort()), "['a', 'm', 'z']")
 
 print "=== RANDOM ADVANCED ==="
 import random
@@ -48,16 +48,19 @@ t("year_format", len(formatted), 4)
 
 print "=== OS ADVANCED ==="
 import os
-os_mkdir("/tmp/ny_test_dir")
-t("mkdir", os_isdir("/tmp/ny_test_dir"), true)
-write_file("/tmp/ny_test_dir/hello.txt", "Hello Nython!")
-var files = os_listdir("/tmp/ny_test_dir")
+# In the system's temporary directory, under a per-run name, and removed
+# with os_rmdir: "/tmp" and a shelled-out rmdir are POSIX-only.
+var tdir = os_path_join(os_gettempdir(), "ny_test_dir_" + str(os_getpid()))
+os_mkdir(tdir)
+t("mkdir", os_isdir(tdir), true)
+write_file(os_path_join(tdir, "hello.txt"), "Hello Nython!")
+var files = os_listdir(tdir)
 t("dir_file", "hello.txt" in files, true)
-var abs_path = os_path_abs("/tmp")
+var abs_path = os_path_abs(os_gettempdir())
 t("abs_path", len(abs_path) > 0, true)
-os_remove("/tmp/ny_test_dir/hello.txt")
-os_exec("rmdir /tmp/ny_test_dir")
-t("cleanup", os_isdir("/tmp/ny_test_dir"), false)
+os_remove(os_path_join(tdir, "hello.txt"))
+os_rmdir(tdir)
+t("cleanup", os_isdir(tdir), false)
 
 print "=== REGEX ADVANCED ==="
 import re
@@ -65,10 +68,10 @@ t("re_ipv4", re_test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$", "192.168.1.1"), true
 t("re_email", re_test("^[a-zA-Z0-9.]+@[a-zA-Z0-9.]+$", "user@example.com"), true)
 var csv = "name,age,city"
 var fields = re_split(",", csv)
-t("csv_split", str(fields), "[name, age, city]")
+t("csv_split", str(fields), "['name', 'age', 'city']")
 t("re_sub", re_replace("\\d+", "X", "abc123def456"), "abcXdefX")
 var dates = re_findall("[0-9]{4}-[0-9]{2}-[0-9]{2}", "Born 1990-05-15, Married 2020-06-20")
-t("dates", str(dates), "[1990-05-15, 2020-06-20]")
+t("dates", str(dates), "['1990-05-15', '2020-06-20']")
 
 print "=== JSON ROUNDTRIP ==="
 import json
@@ -106,7 +109,7 @@ t("mtx_lock", mutex_lock(mtx), true)
 t("mtx_unlock", mutex_unlock(mtx), true)
 var sem = semaphore_create(1)
 t("sem1_acq", semaphore_acquire(sem), true)
-t("sem1_block", semaphore_acquire(sem), false)
+t("sem1_block", semaphore_try_acquire(sem), false)   # blocking acquire would wait forever (round 74)
 semaphore_release(sem)
 t("sem1_reacq", semaphore_acquire(sem), true)
 

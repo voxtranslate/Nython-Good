@@ -87,10 +87,10 @@ assert_eq("all true", all([true, true, true]), true)
 assert_eq("all false", all([true, false, true]), false)
 
 print "--- map / filter / reduce ---"
-var doubled = map(lambda x: x * 2, [1, 2, 3])
+var doubled = list(map(lambda x: x * 2, [1, 2, 3]))
 assert_eq("map result", doubled, [2, 4, 6])
 
-var evens = filter(lambda x: x % 2 == 0, [1, 2, 3, 4, 5, 6])
+var evens = list(filter(lambda x: x % 2 == 0, [1, 2, 3, 4, 5, 6]))
 assert_eq("filter result", evens, [2, 4, 6])
 
 var total = reduce(lambda a, b: a + b, [1, 2, 3, 4, 5])

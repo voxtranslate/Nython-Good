@@ -1,10 +1,11 @@
-import nytorch
-import "lib/nytorch_all.ny"
+import "lib/nytorch.ny"
 
 print "=== NyTorch v3.0 Agent I/O Test Suite ==="
 
 # --- StorageManager ---
-var sm = StorageManager("/tmp/ny_test_storage")
+# per run: the sweep runs this file on both engines at once
+var P = os_path_join(os_gettempdir(), "ny9_" + str(os_getpid()) + "_")
+var sm = StorageManager((P + "test_storage"))
 sm.setup()
 var t1 = tensor([1.0, 2.0, 3.0, 4.0])
 var ok = sm.save_tensor("test_t1", t1)
@@ -16,7 +17,7 @@ print "StorageManager list_models OK"
 print "StorageManager.PASS"
 
 # --- KnowledgeBase ---
-var kb = KnowledgeBase("/tmp/ny_test_kb.kv")
+var kb = KnowledgeBase((P + "test_kb.kv"))
 kb.remember("color", "red")
 kb.remember("shape", "circle")
 kb.remember("size", "large")
@@ -32,7 +33,7 @@ print "KnowledgeBase forget: " + str(has_size)
 print "KnowledgeBase.PASS"
 
 # --- DataLogger ---
-var logger = DataLogger("/tmp/ny_logs", "test_agent")
+var logger = DataLogger((P + "logs"), "test_agent")
 logger.info("Test started")
 logger.warn("Test warning")
 logger.log_metric("accuracy", 0.95)
@@ -41,8 +42,8 @@ print "DataLogger logged: " + str(len(logs) > 0)
 print "DataLogger.PASS"
 
 # --- CSVReader ---
-write_file("/tmp/ny_test.csv", "name,score,grade\nalice,95,A\nbob,82,B\ncarol,91,A\n")
-var csv = CSVReader("/tmp/ny_test.csv")
+write_file((P + "test.csv"), "name,score,grade\nalice,95,A\nbob,82,B\ncarol,91,A\n")
+var csv = CSVReader((P + "test.csv"))
 csv.load()
 print "CSVReader rows: " + str(csv.row_count())
 print "CSVReader cols: " + str(csv.col_count())
@@ -53,34 +54,34 @@ print "CSVReader row0[0]: " + row0[0]
 print "CSVReader.PASS"
 
 # --- BinaryBlob ---
-var blob = BinaryBlob("/tmp/ny_test.bin")
+var blob = BinaryBlob((P + "test.bin"))
 blob.data = [72, 101, 108, 108, 111]
 blob.write()
-var blob2 = BinaryBlob("/tmp/ny_test.bin")
+var blob2 = BinaryBlob((P + "test.bin"))
 blob2.read()
 print "BinaryBlob size: " + str(blob2.size())
 print "BinaryBlob byte0: " + str(blob2.get_byte(0))
 print "BinaryBlob.PASS"
 
 # --- KV Store builtins ---
-kv_set("/tmp/ny_kvtest.kv", "x", "42")
-kv_set("/tmp/ny_kvtest.kv", "y", "hello")
-kv_set("/tmp/ny_kvtest.kv", "z", "3.14")
-var xv = kv_get("/tmp/ny_kvtest.kv", "x")
+kv_set((P + "kvtest.kv"), "x", "42")
+kv_set((P + "kvtest.kv"), "y", "hello")
+kv_set((P + "kvtest.kv"), "z", "3.14")
+var xv = kv_get((P + "kvtest.kv"), "x")
 print "kv_get x: " + xv
-var kv_ks = kv_keys("/tmp/ny_kvtest.kv")
+var kv_ks = kv_keys((P + "kvtest.kv"))
 print "kv_keys count: " + str(len(kv_ks))
-kv_del("/tmp/ny_kvtest.kv", "z")
-var zv = kv_get("/tmp/ny_kvtest.kv", "z")
+kv_del((P + "kvtest.kv"), "z")
+var zv = kv_get((P + "kvtest.kv"), "z")
 print "kv_del z: " + str(zv == none)
-var allkv = kv_all("/tmp/ny_kvtest.kv")
+var allkv = kv_all((P + "kvtest.kv"))
 print "kv_all OK"
 print "KV Store.PASS"
 
 # --- tensor_save / tensor_load ---
 var t2 = tensor([10.0, 20.0, 30.0])
-tensor_save(t2, "/tmp/ny_t2.nyt")
-var t2l = tensor_load("/tmp/ny_t2.nyt")
+tensor_save(t2, (P + "t2.nyt"))
+var t2l = tensor_load((P + "t2.nyt"))
 print "tensor_save/load sum: " + str(tensor_sum(t2l))
 print "tensor_save/load.PASS"
 
@@ -88,13 +89,13 @@ print "tensor_save/load.PASS"
 var p1 = tensor([1.0, 2.0])
 var p2 = tensor([3.0, 4.0])
 var params = [p1, p2]
-model_save(params, "/tmp/ny_model.nym")
-var loaded_params = model_load("/tmp/ny_model.nym")
+model_save(params, (P + "model.nym"))
+var loaded_params = model_load((P + "model.nym"))
 print "model_save/load count: " + str(len(loaded_params))
 print "model_save/load.PASS"
 
 # --- ModelStore ---
-var mstore = ModelStore("/tmp/ny_models")
+var mstore = ModelStore((P + "models"))
 mstore.save("agent1_v1", params, "accuracy=0.98 epoch=10")
 var info = mstore.info("agent1_v1")
 print "ModelStore info: " + info
@@ -105,12 +106,12 @@ print "ModelStore exists: " + str(exists)
 print "ModelStore.PASS"
 
 # --- fs_stat / fs_walk / fs_mkdirs ---
-fs_mkdirs("/tmp/ny_fs_test/sub")
-write_file("/tmp/ny_fs_test/sub/a.txt", "hello")
-var st = fs_stat("/tmp/ny_fs_test/sub/a.txt")
+fs_mkdirs((P + "fs_test/sub"))
+write_file((P + "fs_test/sub/a.txt"), "hello")
+var st = fs_stat((P + "fs_test/sub/a.txt"))
 print "fs_stat exists: " + str(st.exists)
 print "fs_stat is_file: " + str(st.is_file)
-var walked = fs_walk("/tmp/ny_fs_test/sub")
+var walked = fs_walk((P + "fs_test/sub"))
 print "fs_walk count: " + str(len(walked))
 print "fs_stat/walk.PASS"
 
@@ -152,7 +153,7 @@ print "AgentMemory episodes: " + str(mem.episode_count())
 print "AgentMemory.PASS"
 
 # --- NyMind ---
-var mind = NyMind("alpha", "/tmp/ny_mind")
+var mind = NyMind("alpha", (P + "mind"))
 mind.learn("sky_color", "blue")
 mind.learn("grass_color", "green")
 mind.observe("it is daytime")
@@ -164,8 +165,8 @@ print "NyMind summary: " + mind.summarize()
 print "NyMind.PASS"
 
 # --- NySensor ---
-write_file("/tmp/ny_sensor_data.txt", "42.5")
-var sensor = NySensor("temp", "/tmp/ny_sensor_data.txt")
+write_file((P + "sensor_data.txt"), "42.5")
+var sensor = NySensor("temp", (P + "sensor_data.txt"))
 sensor.read_file_sensor()
 sensor.read_file_sensor()
 var latest = sensor.latest()
@@ -174,13 +175,13 @@ print "NySensor readings: " + str(sensor.readings)
 print "NySensor.PASS"
 
 # --- NyActuator ---
-var act = NyActuator("mover", "/tmp/ny_actuator")
-act.write_output("/tmp/ny_act_out.txt", "action_taken")
+var act = NyActuator("mover", (P + "actuator"))
+act.write_output((P + "act_out.txt"), "action_taken")
 print "NyActuator total_actions: " + str(act.total_actions())
 print "NyActuator.PASS"
 
 # --- AgentWorld ---
-var world = AgentWorld("sandbox", "/tmp/ny_world")
+var world = AgentWorld("sandbox", (P + "world"))
 world.set("step", "0")
 world.set("reward", "0.0")
 var step_val = world.get("step")
@@ -192,7 +193,7 @@ print "AgentWorld events logged: " + str(len(events) > 0)
 print "AgentWorld.PASS"
 
 # --- AgentBuilder: BaseAgent ---
-var agent = AgentBuilder().id("ny_agent_1").storage("/tmp/ny_agents").network_port(9100).with_goal("explore", 5).build()
+var agent = AgentBuilder().id("ny_agent_1").storage((P + "agents")).network_port(9100).with_goal("explore", 5).build()
 agent.remember("home", "/tmp")
 var home = agent.recall("home")
 print "BaseAgent recall home: " + home
@@ -203,7 +204,7 @@ agent.save_state()
 print "BaseAgent.PASS"
 
 # --- AgentBuilder: ReactiveAgent ---
-var bot = AgentBuilder().id("bot_1").storage("/tmp/ny_agents").network_port(9101).as_reactive().build()
+var bot = AgentBuilder().id("bot_1").storage((P + "agents")).network_port(9101).as_reactive().build()
 bot.add_rule("hello", "hi there!")
 bot.add_rule("bye", "goodbye!")
 var r1 = bot.run_once("hello")
@@ -213,7 +214,7 @@ print "ReactiveAgent bye: " + r2
 print "ReactiveAgent.PASS"
 
 # --- AgentBuilder: LearningAgent ---
-var learner = AgentBuilder().id("learner_1").storage("/tmp/ny_agents").network_port(9102).as_learner(4, 2).build()
+var learner = AgentBuilder().id("learner_1").storage((P + "agents")).network_port(9102).as_learner(4, 2).build()
 learner.step()
 var state = tensor([0.1, 0.2, 0.3, 0.4])
 var action = learner.act(state)
@@ -224,7 +225,7 @@ print "LearningAgent epsilon: " + str(learner.epsilon)
 print "LearningAgent.PASS"
 
 # --- AgentBuilder: SwarmAgent ---
-var swarm_a = AgentBuilder().id("swarm_a").storage("/tmp/ny_agents").network_port(9103).as_swarm().build()
+var swarm_a = AgentBuilder().id("swarm_a").storage((P + "agents")).network_port(9103).as_swarm().build()
 swarm_a.set_role("scout")
 swarm_a.update_score(5.0)
 print "SwarmAgent score: " + str(swarm_a.score)
@@ -233,3 +234,10 @@ print "SwarmAgent.PASS"
 
 print ""
 print "=== ALL NYTORCH9 AGENT TESTS PASSED ==="
+
+# leave nothing behind
+for f in os_glob(P + "*"):
+    if os_isdir(f):
+        os_rmtree(f)
+    else:
+        os_remove(f)

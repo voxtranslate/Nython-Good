@@ -27,6 +27,10 @@ struct YieldSignal  { Value value; YieldSignal(Value v)  : value(v) {}  };
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct IntegerNode : Node {
+    // The interpreter's value of the literal, made on its first evaluation
+    // (round 81; an int holds no heap reference).
+    Value made_value{};
+    bool made = false;
     IntegerNode(Token t) : Node(t, NodeType::INTEGER) {}
     Value eval(Context* ctx) override {
         auto& v = _token.value;
@@ -38,21 +42,28 @@ struct IntegerNode : Node {
             }
             long long val = std::stoll(v);
             if (val >= INT_MIN && val <= INT_MAX) return Value((int)val);
-            return Value((long int)val);
+            return Value(nython::kernel::bigint(val));   // not (long): 32 bits on Windows
         } catch(...) { return Value(0); }
     }
     void writeToStdOut(PrettyPrinter p) { p.printf("<Integer value=\"%s\" line=\"%d\"/>\n", _token.value.c_str(), line()); }
 };
 
 struct FloatNode : Node {
+    Value made_value{};   // round 81, as IntegerNode's
+    bool made = false;
     FloatNode(Token t) : Node(t, NodeType::FLOAT) {}
     Value eval(Context* ctx) override {
-        try { return Value(std::stod(_token.value)); } catch(...) { return Value(0.0); }
+        return Value(std::strtod(_token.value.c_str(), nullptr));   // 5e-324 / 1e400 (stod threw)
     }
     void writeToStdOut(PrettyPrinter p) { p.printf("<Float value=\"%s\" line=\"%d\"/>\n", _token.value.c_str(), line()); }
 };
 
 struct StringNode : Node {
+    // The interpreter's string for this literal, made once (strings are
+    // immutable, so every evaluation can share it). `interned_by` is the
+    // executor that owns it.
+    Value interned{};
+    const void* interned_by = nullptr;
     StringNode(Token t) : Node(t, NodeType::STRING) {}
     Value eval(Context* ctx) override {
         Runnable* r = ctx ? getRunner(ctx) : nullptr;
@@ -61,11 +72,17 @@ struct StringNode : Node {
     void writeToStdOut(PrettyPrinter p) { p.printf("<String value=\"%s\" line=\"%d\"/>\n", _token.value.c_str(), line()); }
 };
 
+// b"...": the token's value holds the bytes (round 77).
+struct BytesNode : Node {
+    BytesNode(Token t) : Node(t, NodeType::BYTES) {}
+    void writeToStdOut(PrettyPrinter p) { p.printf("<Bytes size=\"%zu\" line=\"%d\"/>\n", _token.value.size(), line()); }
+};
+
 struct ComplexNode : Node {
     std::vector<node_ptr> items;
     ComplexNode(Token t) : Node(t, NodeType::COMPLEX), items{} {}
     Value eval(Context* ctx) override {
-        try { return Value(std::stod(_token.value)); } catch(...) { return Value(0.0); }
+        return Value(std::strtod(_token.value.c_str(), nullptr));
     }
 };
 
@@ -90,8 +107,41 @@ struct UndefinedNode : Node {
 // VARIABLE / IDENTIFIER
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Round 81: the interpreter's cache for reading a name through the scope
+// chain (NythonExecutor::lookupName): the name's hash, computed once, and
+// the scope depth and slot it was found at last (checked - the key still in
+// that slot - before use; the scopes before it are searched as ever).
+struct NameCache {
+    uint64_t hash = 0;
+    bool hashed = false;
+    uint8_t depth = 0xFF;
+    uint32_t slot = 0;
+};
+
 struct VariableNode : Node {
     std::string name;
+    // Declared `global` in the enclosing function: read and assigned at
+    // module level (created there by an assignment), whatever an enclosing
+    // function binds.
+    bool global_ref = false;
+    // A read of a name its own function binds (set by NyScope): bound
+    // nowhere when read, it is CPython's UnboundLocalError, not a NameError
+    // (round 81; the flag is looked at only where a NameError would be).
+    bool local_read = false;
+    // Python's binding rule (round 85, set by NyScope for Python-language
+    // source): 1 - a local of the function it is in, because that function
+    // binds the name somewhere (CPython's LOAD_FAST / STORE_FAST /
+    // DELETE_FAST): read from the function's own scope only (unbound: an
+    // UnboundLocalError, whatever an enclosing function or the module
+    // binds), assigned and deleted there; 2 - a write at the top level of
+    // code exec'd in a Python-language function (exec cannot change the
+    // function's locals): bound in the code's own scope, read as usual.
+    uint8_t py_bind = 0;
+    NameCache nc;   // round 81: reading it (NythonExecutor::lookupName)
+    // ... and for assigning it: whether it is one of the builtins' names,
+    // as of the executor's version of that set (base_names_ver_).
+    uint32_t base_ver = 0;
+    bool base_hit = false;
     VariableNode(Token t) : Node(t, NodeType::VARIABLE), name(t.value) {}
     std::string value() override { return name; }
     Value eval(Context* ctx) override {
@@ -102,6 +152,8 @@ struct VariableNode : Node {
 };
 
 struct SelfNode : Node {
+    NameCache nc_self, nc_this;   // round 81: the interpreter's caches for reading self / this
+    int8_t is_this = -1;          // ... and whether it is spelled `this` (-1: not looked yet)
     SelfNode(Token t) : Node(t, NodeType::SELF) {}
     Value eval(Context* ctx) override { return ctx ? ctx->getByName("self") : NONE_VALUE; }
 };
@@ -205,6 +257,7 @@ struct UnaryNode : Node {
 
 struct BinaryNode : Node {
     node_ptr left, right; std::string op;
+    int8_t opc = -1;   // round 81: the interpreter's code for `op`, worked out on first use
     BinaryNode(Token t, node_ptr l, node_ptr r) : Node(t, NodeType::BINARY), left(l), right(r), op(t.value) {}
     Value eval(Context* ctx) override {
         // Short-circuit
@@ -229,6 +282,44 @@ struct BinaryNode : Node {
 
 struct AttributeNode : Node {
     node_ptr object; std::string attr;
+    uint32_t slot_hint = 0;   // round 81: the interpreter's cache of the field's slot (NythonExecutor::fieldAt)
+    // Round 81: whether `attr` is a name some class holds a data descriptor
+    // under, as of the executor's version of that set ...
+    uint32_t dd_ver = 0;
+    bool dd_hit = false;
+    // ... and, for `obj.attr = v` on instances, the interpreter's inline
+    // cache (NythonExecutor::storeFast): per receiver class, the class
+    // namespaces of its MRO, none of which holds `attr` (so no descriptor,
+    // property or class hook applies), each with the version of its keys.
+    struct StoreIC {
+        void* cls = nullptr;            // the receiver's class node; nullptr: empty
+        uint64_t epoch = 0;
+        const void* by = nullptr;
+        std::vector<std::pair<Context*, uint32_t>> ns;
+    };
+    static constexpr int kStoreWays = 2;
+    std::unique_ptr<StoreIC[]> sic;
+    uint8_t sic_next = 0, sic_skip = 0, sic_backoff = 0;
+    uint32_t store_hint = 0;            // the field's slot in the instance's scope
+    // Round 81: for reads of `attr` that a class namespace answers (a class
+    // attribute, a method read as a value), the interpreter's cache
+    // (NythonExecutor::classLoadFast): the receiver's class, whether the
+    // receiver is an instance of it or the class itself, the namespace and
+    // slot that held `attr`, and the namespaces before it in the MRO (none
+    // holding it) with their keys' versions. Owns no reference; valid while
+    // the executor's specialization epoch is the one it was made in.
+    struct LoadIC {
+        void* cls = nullptr;            // nullptr: empty
+        bool inst = false;
+        uint64_t epoch = 0;
+        const void* by = nullptr;
+        Node* owner = nullptr;
+        Context* owner_ctx = nullptr;
+        uint32_t owner_slot = 0;
+        std::vector<std::pair<Context*, uint32_t>> prefix;
+    };
+    std::unique_ptr<LoadIC> lic;
+    uint8_t lic_skip = 0, lic_backoff = 0;
     AttributeNode(Token t, node_ptr o, const std::string& a) : Node(t, NodeType::ATTRIBUTE), object(o), attr(a) {}
     Value eval(Context* ctx) override {
         Value obj = object->eval(ctx);
@@ -242,6 +333,7 @@ struct AttributeNode : Node {
 
 struct SubscriptNode : Node {
     node_ptr object, index;
+    int8_t slot_off = 0;   // round 81: where a list's item sits relative to its index, as last seen
     SubscriptNode(Token t, node_ptr o, node_ptr i) : Node(t, NodeType::SUBSCRIPT), object(o), index(i) {}
     Value eval(Context* ctx) override {
         Value obj = object->eval(ctx);
@@ -281,6 +373,8 @@ struct AssignmentNode : Node {
 
 struct AugAssignNode : Node {
     node_ptr target, value_node; std::string op;
+    int8_t opc = -1;          // round 81: the interpreter's code for op's operator, worked out on first use
+    bool plain_op = false;    // ... and whether op is an arithmetic one (not ~= or @=)
     AugAssignNode(Token t, node_ptr tgt, node_ptr val) : Node(t, NodeType::ASSIGNMENT_AUG), target(tgt), value_node(val), op(t.value) {}
     Value eval(Context* ctx) override {
         Value old_val = target->eval(ctx);
@@ -299,6 +393,11 @@ struct AugAssignNode : Node {
 
 struct VarDeclNode : Node {
     std::string name; node_ptr init; bool is_const, is_let;
+    // The hidden temporary of an unpacking assignment (a, b = rhs), which the
+    // targets then index: n targets (-1 with a starred one). A generator or
+    // iterator on the right is read into a list first (both engines); -2 for
+    // any other declaration.
+    int unpack = -2;
     VarDeclNode(Token t, const std::string& n, node_ptr i, bool c=false, bool l=false) : Node(t, NodeType::VARIABLE_DECL), name(n), init(i), is_const(c), is_let(l) {}
     Value eval(Context* ctx) override {
         Value val = init ? init->eval(ctx) : NONE_VALUE;
@@ -340,6 +439,37 @@ struct RangeNode : Node {
 
 struct CallNode : Node {
     node_ptr callee; std::vector<node_ptr> args;
+    int8_t plain_args = -1;   // round 81: 1 when every argument is a plain positional one (no name=, * or **)
+    // Round 81: the interpreter's polymorphic inline cache for `obj.m(...)`
+    // on instances (NythonExecutor::methodFast): per receiver class, the
+    // plain method the call resolves to and where its class namespace holds
+    // it. Nothing here owns a reference: an entry is valid only while the
+    // executor's specialization epoch is the one it was made in, and every
+    // use checks the namespaces still hold what it says.
+    struct MethodIC {
+        void* cls = nullptr;            // the receiver's class node; nullptr: empty
+        uint64_t epoch = 0;
+        const void* by = nullptr;       // the executor that made it
+        Node* fn = nullptr;             // the method's FunctionNode
+        Node* owner = nullptr;          // the class in the MRO that defines it
+        void* m_p = nullptr;            // the method value's identity ...
+        void* m_o = nullptr;            // ... and its heap object
+        Context* owner_ctx = nullptr;   // the owner's namespace
+        uint32_t owner_slot = 0;        // the method's slot in it
+        // the namespaces before the owner in the MRO (none holds the name),
+        // each with the version of its keys then (OrderedMap::version)
+        std::vector<std::pair<Context*, uint32_t>> prefix;
+        const Value* parent_name = nullptr;   // the interned name of the owner's first base (__parent_class__)
+        bool append_ok = false;          // the scope's names are distinct: appended, no lookups
+    };
+    static constexpr int kMethodWays = 4;   // receiver classes per site (Hölzle et al. 1991)
+    std::unique_ptr<MethodIC[]> mic;        // made on first use
+    uint8_t mic_next = 0;                   // the way the next new class takes
+    uint8_t mic_skip = 0;                   // calls left before trying to fill again
+    uint8_t mic_backoff = 0;                // how many fills found nothing to cache
+    // Round 81: for `x.m(...)`, the builtin kinds (str, dict, list) whose
+    // method table has m (NythonExecutor::builtinMethodKinds); 0 = not yet known.
+    uint8_t bm_kinds = 0;
     CallNode(Token t, node_ptr c) : Node(t, NodeType::CALL), callee(c), args{} {}
     Node* add(node_ptr n) override { args.push_back(n); return this; }
     std::vector<node_ptr> statements() override { return args; }
@@ -452,9 +582,26 @@ struct BlockNode : Node {
     Value eval(Context* ctx) override { Value r=NONE_VALUE; for(auto& s:stmts) r=s->eval(ctx); return r; }
 };
 
+// [e for t in it if c ...], {e ...}, {k: v ...}, (e ...): every for/if
+// clause in order, and the scope the clause targets live in is the
+// comprehension's own (they no longer leak into the enclosing one).
+struct ComprehensionNode : Node {
+    enum Kind { LIST = 0, SET = 1, DICT = 2, GEN = 3 };
+    struct Clause { node_ptr target; node_ptr iter; std::vector<node_ptr> conds; };
+    int kind;
+    node_ptr elt, value;            // value: the dict comprehension's value (elt is the key)
+    std::vector<Clause> clauses;
+    ComprehensionNode(Token t, int k) : Node(t, NodeType::COMPREHENSION), kind(k), elt{}, value{}, clauses{} {}
+    Value eval(Context*) override { return NONE_VALUE; }
+};
+
 struct IfNode : Node {
     node_ptr condition, then_branch, else_branch;
     std::vector<node_ptr> elseif_branches;
+    // True for the expression forms (`a if c else b`, `c ? a : b`), whose
+    // value is used; false for an `if` statement, whose branches are
+    // statements and leave nothing behind (the VM compiles the two apart).
+    bool is_expr = false;
     IfNode(Token t, node_ptr c, node_ptr tb) : Node(t, NodeType::IF), condition(c), then_branch(tb), else_branch{}, elseif_branches{} {}
     Value eval(Context* ctx) override {
         if(condition->eval(ctx).isTrue()) return then_branch->eval(ctx);
@@ -491,6 +638,8 @@ struct ForNode : Node {
     node_ptr var, iterable, body;
     std::vector<node_ptr> unpack_vars;
     node_ptr else_branch; // for tuple unpacking: for k, v in ...
+    bool rebinds = false; // the loop variable was declared global/nonlocal
+    uint32_t var_hint = 0; // round 81: the interpreter's cache of the loop variable's slot
     ForNode(Token t, node_ptr v, node_ptr i, node_ptr b) : Node(t, NodeType::FOR), var(v), iterable(i), body(b), unpack_vars{}, else_branch{} {}
     Value eval(Context* ctx) override {
         Value iter_val = iterable->eval(ctx);
@@ -552,6 +701,7 @@ struct YieldFromNode : Node {
 struct WalrusNode : Node {
     std::string name;
     node_ptr init;
+    bool global_ref = false;     // `name` was declared `global` (set by NyScope)
     WalrusNode(Token t, std::string n, node_ptr e) : Node(t, NodeType::WALRUS), name(std::move(n)), init(e) {}
     Value eval(Context* ctx) override { return init ? init->eval(ctx) : NONE_VALUE; }
 };
@@ -594,6 +744,20 @@ struct SwitchNode : Node {
 
 struct ExceptNode : Node {
     std::string name, alias; node_ptr body;
+    // What the clause catches and what it binds, resolved by the parser:
+    // `types` empty = catch everything; `var` empty = bind nothing.
+    //   except:                 types {}      var ""
+    //   except e:               types {}      var "e"   (lower-case name)
+    //   except ValueError:      types {VE}    var ""    (a type name)
+    //   except ValueError as e: types {VE}    var "e"
+    //   except (A, B) as e:     types {A, B}  var "e"
+    // `name`/`alias` keep their historical spelling for older consumers.
+    std::vector<std::string> types; std::string var;
+    bool var_global = false;     // `var` was declared `global` (set by NyScope)
+    // round 81: the names `except <expression> as e` clauses bind inside the
+    // catch-all the parser lowers them to (with whether each is `global`),
+    // unbound with `var` when the clause ends, as CPython deletes them
+    std::vector<std::pair<std::string, bool>> unbind_names;
     ExceptNode(Token t, const std::string& n, const std::string& a, node_ptr b) : Node(t, NodeType::EXCEPT), name(n), alias(a), body(b) {}
     Value eval(Context* ctx) override { return body->eval(ctx); }
 };
@@ -620,6 +784,7 @@ struct TryNode : Node {
 
 struct RaiseNode : Node {
     node_ptr expr;
+    node_ptr cause;   // `raise X from Y`: Y (becomes X.__cause__)
     RaiseNode(Token t, node_ptr e=nullptr) : Node(t, NodeType::RAISE), expr(e) {}
     Value eval(Context* ctx) override {
         std::string msg = expr ? expr->eval(ctx).toString() : "Exception raised";
@@ -645,7 +810,26 @@ struct AssertNode : Node {
 
 struct FunctionNode : Node {
     std::string name; std::vector<node_ptr> params; node_ptr body; bool is_method;
+    std::string doc; bool has_doc = false;   // its docstring (__doc__, round 77)
     std::vector<node_ptr> defaults; // default values for parameters
+    size_t posonly = 0;   // how many parameters precede a bare `/` (PEP 570): never bound by keyword
+    // Its parameter and return annotations, a dict display evaluated when the
+    // def runs (each value through _ny_ann: a name not defined yet gives the
+    // annotation's source text). Null when it has none (round 77).
+    node_ptr annotations;
+    // For inspect / __code__ / __qualname__ (round 77): Python's qualified
+    // name ("C.m", "f.<locals>.g"), and whether it was an `async def` (the
+    // parser rewrites its body - async_def_desugar - so nothing else says).
+    std::string qualname;
+    bool is_async = false, is_async_gen = false;
+    int first_line = 0;   // a decorated def: its first decorator's line (co_firstlineno)
+    // What the interpreter's call fast path needs, worked out on first use
+    // (round 81): whether every parameter is a plain name, their names, and
+    // whether the body yields (-1: not known yet).
+    int8_t simple_sig = -1, body_yields = -1;
+    bool names_distinct = false;   // (with simple_sig) no parameter name twice
+    bool py_rule = false;          // round 86: its body is Python-language source's (NyScope)
+    std::vector<std::string> param_names;
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {
@@ -661,6 +845,15 @@ struct FunctionNode : Node {
 struct LambdaNode : Node {
     std::vector<node_ptr> params; node_ptr body;
     std::vector<node_ptr> defaults; // default values for parameters
+    std::string qualname;   // "<lambda>", "f.<locals>.<lambda>" (round 77)
+    size_t posonly = 0;     // parameters before a bare `/` (round 77)
+    // The interpreter binds a lambda's arguments as a def's
+    // (bindParamsImpl): this FunctionNode carries its signature (round 77).
+    node_ptr sig;
+    int8_t simple_sig = -1;                  // round 81, as FunctionNode's
+    bool names_distinct = false;
+    bool py_rule = false;                    // round 86, as FunctionNode's
+    std::vector<std::string> param_names;
     LambdaNode(Token t, node_ptr b) : Node(t, NodeType::LAMBDA), params{}, body(b), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {
@@ -671,6 +864,19 @@ struct LambdaNode : Node {
 
 struct ClassNode : Node {
     std::string name; std::vector<node_ptr> bases; node_ptr body;
+    std::string doc; bool has_doc = false;   // its docstring (__doc__, round 77)
+    // A class of a module imported by name is named "module.Class" (its
+    // identity: both engines key classes by name) and bound as "Class"
+    // (nython::scope::qualify_module_classes, round 77).
+    std::string bind_name;
+    // Its __qualname__ (round 79): "Outer.Inner" for a class in a class,
+    // "f.<locals>.C" for one in a function; its name at the top level.
+    std::string qualname;
+    // `class C(Base, metaclass=M, flag=1)`: the keywords, evaluated when the
+    // class statement runs - metaclass picks the metaclass, the rest go to
+    // __init_subclass__ (round 77). A base that is not a (dotted) name -
+    // Generic[T], namedtuple("P", "x y") - is kept as its expression node.
+    std::vector<std::pair<std::string, node_ptr>> keywords;
     ClassNode(Token t, const std::string& n, node_ptr b) : Node(t, NodeType::CLASS), name(n), bases{}, body(b) {}
     Value eval(Context* ctx) override {
         Runnable* r = getRunner(ctx);
@@ -724,6 +930,7 @@ struct EnumNode : Node {
 
 struct ImportNode : Node {
     std::string module_name, alias; std::vector<std::string> names;
+    bool quoted = false;   // `import "path"`: the lexer drops the quotes from module_name
     ImportNode(Token t, const std::string& m) : Node(t, NodeType::IMPORT), module_name(m), alias{}, names{} {}
     Value eval(Context* ctx) override { return NONE_VALUE; /* module loading not yet implemented */ }
 };
@@ -746,15 +953,24 @@ struct PackageNode : Node {
 
 struct PrintNode : Node {
     std::vector<node_ptr> args;
+    // print(a, b, sep=..., end=...): the call form, parsed as an argument
+    // list. Before, `print("x", y)` was the statement form applied to one
+    // tuple, so the interpreter printed ('x', 6) and the VM flattened every
+    // tuple, printing print((1, 2)) as "1 2".
+    node_ptr sep;
+    node_ptr end;
+    bool call_form = false;
     PrintNode(Token t) : Node(t, NodeType::PRINT), args{} {}
     Node* add(node_ptr n) override { args.push_back(n); return this; }
     std::vector<node_ptr> statements() override { return args; }
     Value eval(Context* ctx) override {
+        std::string s = sep ? sep->eval(ctx).toString() : " ";
+        std::string e = end ? end->eval(ctx).toString() : "\n";
         for(size_t i=0;i<args.size();i++){
-            if(i>0) std::cout<<" ";
+            if(i>0) std::cout<<s;
             std::cout<<args[i]->eval(ctx).toString();
         }
-        std::cout<<std::endl;
+        std::cout<<e<<std::flush;
         return NONE_VALUE;
     }
 };
@@ -767,12 +983,14 @@ struct DeleteNode : Node {
 
 struct GlobalNode : Node {
     std::string name;
-    GlobalNode(Token t, const std::string& n) : Node(t, NodeType::GLOBAL), name(n) {}
+    bool is_nonlocal = false;   // `nonlocal name` (else `global name`); read by NyScope
+    GlobalNode(Token t, const std::string& n, bool nl = false) : Node(t, NodeType::GLOBAL), name(n), is_nonlocal(nl) {}
     Value eval(Context* ctx) override { return NONE_VALUE; }
 };
 
 struct WithNode : Node {
     node_ptr expr; std::string alias; node_ptr body;
+    bool alias_global = false;   // the alias was declared `global` (set by NyScope)
     WithNode(Token t, node_ptr e, const std::string& a, node_ptr b) : Node(t, NodeType::WITH), expr(e), alias(a), body(b) {}
     Value eval(Context* ctx) override {
         Value val = expr->eval(ctx);
@@ -803,6 +1021,107 @@ struct DynBinopNode : Node {
         : Node(t, NodeType::DYN_BINOP), op_symbol(sym), lhs(std::move(l)), rhs(std::move(r)) {}
     Value eval(Context* ctx) override { return NONE_VALUE; } // handled in executor
 };
+
+// ── Optional chaining: a?.b  a?[k]  a?.[k]  a?.m(x)  f?.(x) ──────────────
+// The parser turns `recv ?<link> rest...` into an OptChainNode:
+//   recv   the receiver expression (anything left of the `?`)
+//   link   the one optional step: an attribute, an index, a method call, a
+//          slice or a call of recv itself
+//   rest   the postfix chain after the link, written against `hole`, a
+//          placeholder for the link's value (null when the chain ends there)
+// The link is ABSENT when recv is none/undefined, or when the attribute /
+// key / index it names does not exist; an absent link makes the whole
+// chain none without evaluating anything further (its arguments, indices
+// and the rest). A present link behaves exactly like `.`/`[]`/`()`, and so
+// does every plain step in `rest`. Nested optional links nest OptChainNodes
+// (recv of the outer is the inner chain).
+//
+// A HoleNode is always the leftmost leaf of the expression that reads it
+// (the receiver of a postfix chain is evaluated first on both engines), so
+// the interpreter keeps its value in the node: it is set immediately before
+// that expression runs and read before anything else can run. The VM
+// compiles a hole to nothing - the value is already on the stack.
+struct HoleNode : Node {
+    Value slot{};
+    HoleNode(Token t) : Node(t, NodeType::CHAIN_HOLE) {}
+    Value eval(Context*) override { return slot; }
+};
+
+struct OptChainNode : Node {
+    enum Kind { ATTR = 0, INDEX = 1, METHOD = 2, SLICE = 3, CALL = 4 };
+    node_ptr recv;
+    int kind = ATTR;
+    std::string name;                     // ATTR / METHOD: the member
+    node_ptr index;                       // INDEX: the key or index
+    node_ptr call;                        // METHOD / SLICE / CALL: a CallNode on recv_hole
+    std::shared_ptr<HoleNode> recv_hole;  // stands for recv inside `call`
+    node_ptr rest;                        // may be null
+    std::shared_ptr<HoleNode> hole;       // stands for the link's value inside `rest`
+    OptChainNode(Token t, node_ptr r) : Node(t, NodeType::OPT_CHAIN), recv(std::move(r)),
+        name(), index(), call(), recv_hole(std::make_shared<HoleNode>(t)), rest(), hole(std::make_shared<HoleNode>(t)) {}
+    Value eval(Context*) override { return NONE_VALUE; } // handled in executor
+};
+
+// Whether a parsed program is one expression: the prompt shows its value,
+// eval() accepts it (round 77; main.cpp's, shared).
+// round 83: a node of Python's own tree shape, made by the parser in ast
+// mode only (Parser::ast_mode_, for lib/ast.ny through _ny_ast in
+// src/builtins/text.cpp) where it would otherwise desugar - a Compare, a
+// Slice, a JoinedStr, an ImportFrom ... The engines never see one.
+struct PyAstNode : Node {
+    std::string kind;
+    std::vector<std::pair<std::string, node_ptr>> kids;                // one child each (may be null)
+    std::vector<std::pair<std::string, std::vector<node_ptr>>> lists;  // lists of children (null items allowed)
+    std::vector<std::pair<std::string, std::string>> strs;              // strings (absent: None)
+    std::vector<std::pair<std::string, std::vector<std::string>>> strlists;
+    std::vector<std::pair<std::string, long long>> ints;
+    PyAstNode(Token t, std::string k) : Node(t, NodeType::PY_AST), kind(std::move(k)) {}
+    PyAstNode* kid(const char* f, node_ptr n) { kids.emplace_back(f, std::move(n)); return this; }
+    PyAstNode* list(const char* f, std::vector<node_ptr> v) { lists.emplace_back(f, std::move(v)); return this; }
+    PyAstNode* str(const char* f, std::string v) { strs.emplace_back(f, std::move(v)); return this; }
+    PyAstNode* strl(const char* f, std::vector<std::string> v) { strlists.emplace_back(f, std::move(v)); return this; }
+    PyAstNode* num(const char* f, long long v) { ints.emplace_back(f, v); return this; }
+    node_ptr kidOf(const std::string& f) const { for (auto& k : kids) if (k.first == f) return k.second; return nullptr; }
+    const std::vector<node_ptr>* listOf(const std::string& f) const { for (auto& l : lists) if (l.first == f) return &l.second; return nullptr; }
+    const std::string* strOf(const std::string& f) const { for (auto& s : strs) if (s.first == f) return &s.second; return nullptr; }
+    const std::vector<std::string>* strlOf(const std::string& f) const { for (auto& s : strlists) if (s.first == f) return &s.second; return nullptr; }
+    long long numOf(const std::string& f, long long d = 0) const { for (auto& i : ints) if (i.first == f) return i.second; return d; }
+    std::vector<node_ptr> statements() override {
+        std::vector<node_ptr> out;
+        for (auto& k : kids) if (k.second) out.push_back(k.second);
+        for (auto& l : lists) for (auto& n : l.second) if (n) out.push_back(n);
+        return out;
+    }
+    Value eval(Context*) override { return NONE_VALUE; }
+};
+
+inline bool is_expression_program(const node_ptr& ast) {
+    node_ptr n = ast;
+    for (int depth = 0; n && depth < 4; depth++) {
+        NodeType t = n->type();
+        if (t == NodeType::SCRIPT || t == NodeType::STATEMENTS || t == NodeType::BLOCK || t == NodeType::STATEMENT) {
+            auto st = n->statements();
+            if (st.size() != 1) return false;
+            n = st[0];
+            continue;
+        }
+        switch (t) {
+            case NodeType::TUPLE: case NodeType::LIST: case NodeType::MAP: case NodeType::FLOAT:
+            case NodeType::INTEGER: case NodeType::STRING: case NodeType::TRUE: case NodeType::FALSE:
+            case NodeType::NONE: case NodeType::CALL: case NodeType::INTERVAL: case NodeType::COMPLEX:
+            case NodeType::SLICE: case NodeType::RANGE: case NodeType::VARIABLE: case NodeType::ATTRIBUTE:
+            case NodeType::SUBSCRIPT: case NodeType::LAMBDA: case NodeType::UNARY: case NodeType::BINARY:
+            case NodeType::BINARY_OP: case NodeType::BINARY_RE: case NodeType::DYN_BINOP:
+            case NodeType::COMPREHENSION: case NodeType::OPT_CHAIN: case NodeType::BYTES: case NodeType::SELF:
+                return true;
+            case NodeType::IF:   // `a if c else b` (round 79: eval() said "invalid syntax")
+                return static_cast<IfNode*>(n.get())->is_expr;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
 
 } // namespace nython::node
 #endif

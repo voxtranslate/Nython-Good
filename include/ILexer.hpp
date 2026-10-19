@@ -15,11 +15,13 @@ enum{
 struct ILexer{
 
     virtual ~ILexer(){}
-    virtual std::vector<Token> tokenize()= 0;/// read the source code in a certain way to provide tokens.
+    // round 82: the tokens by reference (they were copied - two strings each -
+    // at every read: most of the startup's parse)
+    virtual const std::vector<Token>& tokenize()= 0;/// read the source code in a certain way to provide tokens.
     virtual void dump()                  = 0;/// prints the tokens.
-    virtual Token next()                 = 0;/// the next token.
-    virtual Token prev()                 = 0;/// the previous token.
-    virtual Token peek(int i)            = 0;/// the token at position i.
+    virtual const Token& next()          = 0;/// the next token.
+    virtual const Token& prev()          = 0;/// the previous token.
+    virtual const Token& peek(int i)     = 0;/// the token at position i.
     virtual std::string code()           = 0;/// the source code.
     virtual std::string fileName()       = 0;/// the file name of the source code.
     virtual bool isKeyWord(const std::string word)   = 0;/// true if word is a key word.
