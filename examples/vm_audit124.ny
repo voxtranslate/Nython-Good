@@ -444,7 +444,16 @@ if nython:
                 "label = \"k\" + 5\n"
                 "q = [i for i in 3]\n"
                 "def ok(n):\n"
-                "    return \"n=\" + n\n")
+                "    return \"n=\" + n\n"
+                # classes compared by identity are not reported: a name bound
+                # to type(...), a loop over an __mro__, a name held by classes
+                "t = type(p)\n"
+                "if t is int:\n"
+                "    pass\n"
+                "def g(cls):\n"
+                "    return cls is object\n"
+                "for c in int.__mro__:\n"
+                "    print(c is object)\n")
     r = subprocess.run([sys.executable, "--python-compat-report", src], capture_output=True, text=True)
     lines = [ln.replace(src, "lint.ny") for ln in r.stdout.splitlines()]
     check("--python-compat-report: status", r.returncode, 0)

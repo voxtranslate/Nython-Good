@@ -921,7 +921,9 @@ struct Compat {
     struct Item { uint32_t row, col; std::string kind, msg; };
     std::vector<Item> items;
     std::vector<std::string> lines;          // the source, for literal spellings
-    std::vector<std::map<std::string, int>> scopes;   // name -> 1 bound only to dict displays, 0 otherwise
+    // name -> 1 bound only to dict displays, 2 only to classes (type(x),
+    // x.__class__, a builtin type's word, a loop over an __mro__), 0 otherwise
+    std::vector<std::map<std::string, int>> scopes;
 
     // where an expression begins: its leftmost operand's token (a call's or
     // an attribute's own token is its bracket or dot)
@@ -1031,39 +1033,79 @@ struct Compat {
         }
         return 0;
     }
+    bool bound(const std::string& name) {
+        for (auto& sc : scopes) if (sc.count(name)) return true;
+        return false;
+    }
+    static const std::set<std::string>& type_words() {
+        static const std::set<std::string> words = {"int", "float", "str", "bool", "list", "dict", "tuple", "set",
+            "frozenset", "bytes", "bytearray", "complex", "object", "Object", "string", "map", "array", "function",
+            "Integer", "String", "Float", "List", "Map", "Dict", "Array", "Function", "Any", "any"};
+        return words;
+    }
+    // what a value bound to a name is: 1 a dict display, 2 a class, 0 else
+    static int value_kind(Node* v) {
+        if (!v) return 0;
+        if (v->type() == NodeType::MAP) return 1;
+        if (callee_name(v) == "type" && static_cast<CallNode*>(v)->args.size() == 1) return 2;
+        if (v->type() == NodeType::ATTRIBUTE && static_cast<AttributeNode*>(v)->attr == "__class__") return 2;
+        if (v->type() == NodeType::VARIABLE && type_words().count(v->value())) return 2;
+        return 0;
+    }
+    // a name that by convention holds a class (cls, tp, base, C, member_type,
+    // thisclass, a field _member_type_ ...): Python code compares such names
+    // with `is` by identity, and so does Nython when they hold a class
+    static bool typeish_name(std::string n) {
+        while (!n.empty() && n.back() == '_') n.pop_back();
+        while (!n.empty() && n.front() == '_') n.erase(0, 1);
+        static const std::set<std::string> names = {"cls", "klass", "kls", "typ", "tp", "type", "mcs", "mcls",
+            "metacls", "metaclass", "base", "origin", "kind"};
+        if (names.count(n)) return true;
+        if (n.size() == 1 && std::isupper((unsigned char)n[0])) return true;
+        auto ends = [&](const std::string& suf) { return n.size() >= suf.size() && n.compare(n.size() - suf.size(), suf.size(), suf) == 0; };
+        return ends("type") || ends("class") || ends("cls") || ends("Type") || ends("Class");
+    }
     // the names a scope binds and whether only dict displays: its own
     // statements, not those of the functions and classes it defines
     void bindings(Node* n, std::map<std::string, int>& m) {
         if (!n) return;
-        auto put = [&](const std::string& name, bool dict) {
+        auto put = [&](const std::string& name, int kind) {
             auto f = m.find(name);
-            if (f == m.end()) m[name] = dict ? 1 : 0;
-            else if (!dict) f->second = 0;
+            if (f == m.end()) m[name] = kind;
+            else if (f->second != kind) f->second = 0;
         };
         switch (n->type()) {
-        case NodeType::FUNCTION: put(static_cast<FunctionNode*>(n)->name, false); return;
-        case NodeType::CLASS: put(static_cast<ClassNode*>(n)->name, false); return;
+        case NodeType::FUNCTION: put(static_cast<FunctionNode*>(n)->name, 0); return;
+        case NodeType::CLASS: put(static_cast<ClassNode*>(n)->name, 0); return;
         case NodeType::LAMBDA: return;
         case NodeType::ASSIGNMENT: {
             auto* a = static_cast<AssignmentNode*>(n);
             if (a->target && a->target->type() == NodeType::VARIABLE)
-                put(a->target->value(), a->value_node && a->value_node->type() == NodeType::MAP);
+                put(a->target->value(), value_kind(a->value_node.get()));
             return;
         }
         case NodeType::VARIABLE_DECL: {
             auto* d = static_cast<VarDeclNode*>(n);
-            put(d->name, d->init && d->init->type() == NodeType::MAP);
+            put(d->name, value_kind(d->init.get()));
             return;
         }
         case NodeType::ASSIGNMENT_AUG: {
             auto* a = static_cast<AugAssignNode*>(n);
-            if (a->target && a->target->type() == NodeType::VARIABLE) put(a->target->value(), false);
+            if (a->target && a->target->type() == NodeType::VARIABLE) put(a->target->value(), 0);
             return;
         }
         case NodeType::FOR: {
             auto* f = static_cast<ForNode*>(n);
-            if (f->var) put(f->var->value(), false);
-            for (auto& u : f->unpack_vars) if (u) put(u->value(), false);
+            // a loop over a class's __mro__ / __bases__ / mro() / __subclasses__() binds classes
+            int k = 0;
+            Node* it = f->iterable.get();
+            if (it && it->type() == NodeType::CALL) it = static_cast<CallNode*>(it)->callee.get();
+            if (it && it->type() == NodeType::ATTRIBUTE) {
+                const std::string& at = static_cast<AttributeNode*>(it)->attr;
+                if (at == "__mro__" || at == "__bases__" || at == "mro" || at == "__subclasses__") k = 2;
+            }
+            if (f->var) put(f->var->value(), f->unpack_vars.empty() ? k : 0);
+            for (auto& u : f->unpack_vars) if (u) put(u->value(), 0);
             bindings(f->body.get(), m); bindings(f->else_branch.get(), m);
             return;
         }
@@ -1089,14 +1131,14 @@ struct Compat {
         }
         case NodeType::WITH: {
             auto* w = static_cast<WithNode*>(n);
-            if (!w->alias.empty()) put(w->alias, false);
+            if (!w->alias.empty()) put(w->alias, 0);
             bindings(w->body.get(), m);
             return;
         }
         case NodeType::IMPORT: {
             auto* im = static_cast<ImportNode*>(n);
-            if (!im->alias.empty()) put(im->alias, false);
-            for (auto& nm : im->names) put(nm, false);
+            if (!im->alias.empty()) put(im->alias, 0);
+            for (auto& nm : im->names) put(nm, 0);
             return;
         }
         default:
@@ -1129,18 +1171,18 @@ struct Compat {
             return;
         }
         if ((b->op == "is" || b->op == "is not" || b->op == "instanceof") && b->right && b->right->type() == NodeType::VARIABLE) {
-            static const std::set<std::string> words = {"int", "float", "str", "bool", "list", "dict", "tuple", "set",
-                "frozenset", "bytes", "bytearray", "complex", "object", "Object", "string", "map", "array", "function",
-                "Integer", "String", "Float", "List", "Map", "Dict", "Array", "Function", "Any", "any"};
             const std::string& tn = b->right->value();
             // a builtin type's word: with a value on the left, Nython's type
             // test (a class of the program's: the same, but `x is C` is most
-            // often a sentinel compared, identity in both - not reported)
-            if (!words.count(tn)) return;
-            // a type on the left - type(x), x.__class__ - is compared by identity in both
+            // often a sentinel compared, identity in both - not reported; nor
+            // a type word the program binds, which `is` compares as a value)
+            if (!type_words().count(tn) || bound(tn)) return;
+            // a class on the left is compared by identity in both: type(x),
+            // x.__class__, a name bound only to classes or named as one is
             Node* l = b->left.get();
-            if (callee_name(l) == "type") return;
-            if (l && l->type() == NodeType::ATTRIBUTE && static_cast<AttributeNode*>(l)->attr == "__class__") return;
+            if (value_kind(l) == 2) return;
+            if (l && l->type() == NodeType::VARIABLE && (dict_only(l->value()) == 2 || typeish_name(l->value()))) return;
+            if (l && l->type() == NodeType::ATTRIBUTE && typeish_name(static_cast<AttributeNode*>(l)->attr)) return;
             add(b, "is-type", "`" + b->op + " " + tn + "` of a value is Nython's type test: Python compares identity ("
                 + (b->op == "is not" ? "True" : "False") + ") - write isinstance(...)");
         }
@@ -1149,7 +1191,7 @@ struct Compat {
         if (!a->object || a->object->type() != NodeType::VARIABLE) return;
         const std::string& nm = a->object->value();
         if (nyrt::is_dict_method_name(a->attr) || a->attr.rfind("__", 0) == 0) return;
-        if (dict_only(nm) != 1) return;
+        if (dict_only(nm) != 1) return;   // bound only to dict displays
         add(a, "dict-attr", std::string(store ? "sets" : "reads") + " the dict's key '" + a->attr + "' as an attribute:"
             " Python raises AttributeError - write " + nm + "[\"" + a->attr + "\"]" + (store ? " = ..." : ""));
     }

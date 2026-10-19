@@ -504,8 +504,10 @@ paths only.**
   `is` (identity) and `binaryOp(opc, l, r, ctx, py)` (1/0 from the node;
   -1, the default, asks `pyCode()`), evalAugAssignment, evalFor's int
   branch, comprehension clauses, generator expressions' clauses (NyGen's
-  `open(..., py)`), evalAttribute -> `getAttrValue(..., py)`, attribute
-  stores -> `dictAttrStoreCheck`. Builtins ask `pyCode()` - the running
+  `open(..., py)`), evalAttribute / evalAugAssignment's attribute read
+  (after a read succeeded, `pyDictKeyRead(obj, attr)`: was it a plain
+  dict's key? - a test inside getAttrValue cost deltablue 3.3M
+  instructions), attribute stores -> `dictAttrStoreCheck`. Builtins ask `pyCode()` - the running
   lambda's `py_rule` (a lambda body has no statements), else the running
   statement's `py_src` (`cur_stmt()`) - on their rare paths only:
   iterItems' and NyGen `open`'s int case, sum's lenient +, list.sort /
@@ -559,7 +561,12 @@ for each file, every construct whose meaning differs from Python's, as
 that is certainly not one: a number, a bool, None, a display, len(...),
 arithmetic), `int-iter` (`for i in 10`, `for i in len(xs)`, list/sorted/
 enumerate/zip/map of an int expression, a comprehension over one),
-`is-type` (`x is int` with a builtin type word and a value on the left),
+`is-type` (`x is int` with a builtin type word the program does not bind,
+and on the left what is not known to be a class - not `type(x)`,
+`x.__class__`, a name bound only to those, to a type word or by a loop
+over an `__mro__`/`__bases__`, nor a name or field named as classes are:
+`cls`, `tp`, `typ`, `base`, `origin`, a capital letter, `*type`,
+`*class`; Nython's `is` compares classes by identity too),
 `dict-attr` (`conf.port` read or set where `conf` is bound only to dict
 displays in its scope), `literal` (true/false/none/null/undefined, checked
 against the source text so desugarings are not reported), `sort-value`
@@ -569,10 +576,15 @@ differences, from the same pass as --scope-report). Python-language parts
 warnings at the places where Python 3 would differ) and 2to3's fixer list,
 and the "differences from CPython" pages PyPy and Jython keep: the
 incompatibilities named and located instead of found by failures. Run
-over the 435 Python-language library files with their marker taken out it
-reports no concat/dict-attr/sort-value and only int-iter false positives
-(`max(0, i + n)` before the positional-argument count was checked) - which
-is how the lint itself was tuned.
+over the 435 Python-language library files with their marker taken out
+(so the lint sees them as Nython code) it reports the 68 binding cases
+round 85 counted and 6 is-type lines, all false positives (a variable
+holding a class or a function: `tf is str` for sqlite3's text_factory,
+`parse_float is float`, `possible is object`) - and nothing else. That is
+how the lint was tuned: before, `max(0, i + n)` was an int-iter (only
+positional arguments count now) and 112 more identity tests of class
+variables (`t is int` after `t = type(v)`, `for b in cls.__mro__: if b is
+object`, `member_type is int`) were is-type lines.
 
 **Cost** (instructions, cachegrind; machine load does not enter): [TABLE]
 
