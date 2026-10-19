@@ -163,7 +163,12 @@ to a generator.
   no `os.readv`/`os.writev` (os.write is checked instead), and `ctypes.c_int`
   is `c_long` where int and long have one size (CPython's ctypes/__init__.py),
   so its PEP 3118 format is `<l` (`<L` for c_uint).
-- WINE_LINE
+- **Round 85 under Wine** (both engines, 64-bit): vm_audit111 55, 112 133,
+  113 392, 114 215, 116 34, 117 33, 118 27 (its posix-only checks are skipped
+  on Windows; `ssl.RAND_*` too when no libcrypto is loaded - a bare Wine prefix
+  has none), 119 85, 120 19 - all passing. The Windows build needed one fix:
+  `_sig_pthread`'s lambda had no return statement in its `_WIN32` branch
+  (src/NyConc.cpp; MinGW deduced `void` and the native table rejected it).
 
 ### Not done
 - AArch64 (qemu) and 32-bit Windows runs of rounds 84-85: not run this

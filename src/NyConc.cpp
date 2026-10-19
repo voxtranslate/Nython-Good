@@ -4295,6 +4295,7 @@ static void register_signal_builtins(std::unordered_map<std::string, Handler>& T
 #ifdef _WIN32
         (void)e; (void)a;
         raise("OSError", "[Errno 40] Function not implemented");
+        return Ret::none();   // (round 85) gives the lambda its return type on Windows
 #else
         std::string op = a.size() > 0 ? a.as_str(0) : std::string();
         int64_t ident = a.size() > 1 && a.is_number(1) ? a.as_int(1) : 0;

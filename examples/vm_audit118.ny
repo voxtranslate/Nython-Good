@@ -674,10 +674,18 @@ check("is_tracked", [gc.is_tracked([]), gc.is_tracked({}), gc.is_tracked({"a": 1
 
 # ── ssl, hashlib, functools, locale, codecs, _sqlite3 ────────────────────────
 import ssl
-check("ssl.RAND_*", [len(ssl.RAND_bytes(16)), type(ssl.RAND_bytes(1)).__name__, ssl.RAND_bytes(0), ssl.RAND_status(),
-                     ssl.RAND_add(b"entropy", 1.0), ssl.RAND_add("text", 0.5), raises(ssl.RAND_bytes, -1)],
-      [16, "bytes", b"", True, None, None, ["ValueError", "num must be positive"]])
-if hasattr(ssl, "RAND_pseudo_bytes"):
+# RAND_* need libcrypto: Nython loads it at run time (none in a bare Wine
+# prefix, where ssl's natives raise SSLError) - skipped there
+try:
+    ssl.RAND_bytes(1)
+    HAVE_CRYPTO = True
+except ssl.SSLError:
+    HAVE_CRYPTO = False
+if HAVE_CRYPTO:
+    check("ssl.RAND_*", [len(ssl.RAND_bytes(16)), type(ssl.RAND_bytes(1)).__name__, ssl.RAND_bytes(0), ssl.RAND_status(),
+                         ssl.RAND_add(b"entropy", 1.0), ssl.RAND_add("text", 0.5), raises(ssl.RAND_bytes, -1)],
+          [16, "bytes", b"", True, None, None, ["ValueError", "num must be positive"]])
+if HAVE_CRYPTO and hasattr(ssl, "RAND_pseudo_bytes"):
     import warnings
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
