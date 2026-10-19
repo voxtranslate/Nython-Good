@@ -412,6 +412,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit121 | 109 | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (89 pass under python3.11, 91 under 3.12, 89 under 3.13) |
 | vm_audit122 | 169 | round 86 (part H): nylsp, the Language Server driven as an editor drives it (stdio JSON-RPC): lifecycle and errors, position encodings, incremental sync, diagnostics (syntax with recovery, NyScope, unbound reads, undefined names/modules, NyxAI rules), completion/resolve, hover, signature help, definition/references across files, scope-correct rename in .ny and .py files, symbols, folding, formatting, semantic tokens and deltas, code actions, inlay hints, cancellation, progress (Nython-only) |
 | vm_audit123 | 242 | round 86, part I: HPACK (RFC 7541 Appendix C byte for byte, the Huffman code, size updates, decoder errors, Nython's SmartIndexing on a header corpus), HTTP/2 frames byte for byte with hyperframe, two H2Connections in memory (SETTINGS, CONTINUATION, padding, flow control, RST_STREAM, GOAWAY, PING, push refused, malformed field blocks, connection/stream errors, RFC 9218), the RFC 9218 scheduler's order, h2.client/h2.server over localhost (multiplexing, flow control stopping and resuming, resets, graceful GOAWAY, TLS with ALPN h2), http.client/urllib with http2= (Nython-only), permessage-deflate (RFC 7692's examples, negotiation, takeover, window bits, RSV1, a bomb), websocket.ny (Nython-only) and websocket_asyncio.ny round trips (233 pass under python3) |
+| vm_audit125 | 14 | round 86 (main session): program text is never read as a path - f-string and `${...}` fields naming a file or a directory in the working directory (one read the file, one hung the parser), `f"{...}"`, ast.parse of such fields, the editor's syntax check; os.read/os.write and subprocess move bytes as they are (Windows' standard descriptors in binary, subprocess pipes untranslated; text mode reads universal newlines) (11 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1670,6 +1671,18 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   blocks around it survive.
 - nylsp.cpp includes only the parser/lexer/NyScope headers: keep it so (it
   compiles in seconds).
+
+## Round 86 (main session): program text is never a path (see `HANDOFF.md` §0z5)
+
+- **`SourceCode(string)` takes a file name**: a string naming no regular file
+  is read as text, so program text passed there was read as a *file* when it
+  named one (an f-string field `{x}` beside a file `x` ran that file; `{lib}`
+  beside a directory hung the parser; `{...}` hung on Windows). **Program
+  text goes through `SourceCode::from_text(text, name)`**, always.
+- Windows: os.read/os.write on fds 0-2 are binary for the call (CPython's
+  standard descriptors are binary); nylsp reads stdin in a thread there
+  (select takes sockets only); nyaudit's path patterns are case-folded and
+  absolute on both sides.
 
 ## Round 85 (main session): what native code catches, generators, Windows (see `HANDOFF.md` §0y3)
 

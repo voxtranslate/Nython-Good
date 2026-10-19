@@ -5,6 +5,7 @@ this file describes it **as it actually is**, including the traps.
 
 Last updated: round 86, part G — **§0z** (CPython's audit events (PEP 578) raised where CPython raises them, with its names and arguments, on both engines and in the library - a table generated from CPython's docs and probes (tools/audit_events.json), the prelude-caller rule for engine audit points, events from natives behind the VM's bridge; lib/nyaudit.ny audit policies, `--audit-policy` / `--audit-log`; vm_audit121)
 Round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
+Round 86 (main session) — **§0z5** (program text never read as a path: an f-string field naming a file read it, one naming a directory hung the parser, `f"{...}"` hung on Windows; os.read/os.write on Windows' standard descriptors in binary; nylsp's stdin on Windows; nyaudit's path patterns on Windows; the round 86 suites under Wine; vm_audit125).
 Round 86, part I — **§0z3** (HTTP/2 and HPACK beyond CPython: lib/hpack.ny (RFC 7541), lib/h2/ (RFC 9113 sans-I/O H2Connection with h2's API, hyperframe's frames, RFC 9218 priorities and scheduler, asyncio client/server with ALPN, h2.sync for http.client/urllib http2=), permessage-deflate (RFC 7692) for websocket.ny and a new websocket_asyncio.ny; HPACK admission control; two engine fixes - awaiting a coroutine's own __await__, prelude chunks loaded under threads; vm_audit123)
 Round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
 Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
@@ -434,6 +435,98 @@ window of 8 bits, as it says; we accept it - below).
   closed ("Exception in default exception handler"). CPython has the same
   window, rarely hit. A coroutine driven by hand still cannot wait for
   another task of its loop (engine change 1 covers the common shape only).
+
+## 0z5. Round 86 (main session) — program text is never a path, raw standard descriptors on Windows, the round 86 suites under Wine (vm_audit125)
+
+Verified with G, H and I merged and this: sweep 476 runs, 0 not ok;
+`tools/ide_e2e.py` 463 passed; memory probe, lint, class check, cbp (80
+units) and the API baseline clean. **Windows (Wine, 64-bit)**, both engines:
+vm_audit121 87 passed (the POSIX-only cases skipped), vm_audit122 169,
+vm_audit123 235, vm_audit125 14 - 122 had never finished there (the
+f-string hang, then nylsp's stdin, then the test's URIs) and 121 stopped at
+`os.kill(pid, 0)`. The 24 other suites that start processes, run on this
+build and on round 85's under Wine: no regression; vm_audit105 fails on
+both (its `@fix` check reads the fixture back with `read_file` and gets
+another text), and vm_audit104 fails about one run in two on both with a
+false `DeadlockError` in its `task_api` section (asyncio.to_thread,
+run_coroutine_threadsafe from a thread, wait() with a sleep pending) -
+both pre-existing, both open (round 87).
+
+`examples/vm_audit125.ny` (14 checks) passes on both engines and under
+python3 (11 there; the rest are Nython-only) and under Wine; on the round 85 binary the
+interpreter reads the file named `total` beside the test as an f-string
+field's expression and raises its `1 / 0`.
+
+- **Program text was read as a file when it named one** (both engines,
+  every platform). `SourceCode(const std::string&)` takes a file name and
+  decided "file or text?" by asking the file system whether the string
+  named something. The parser reads an f-string's replacement field (and
+  a Nython string's `${...}`) with a lexer of its own over the field's
+  text, built through that constructor: `f"{x}"` in a directory holding a
+  file named `x` read and ran that file as the field's expression (a
+  file there named `total` holding `1 / 0` raised ZeroDivisionError from
+  `f"{total}"`), and a field naming a directory - `f"{lib}"`, `f"{src}"`
+  run from the repository root - hung the parser: the stream never reached
+  its end (`SourceCode::read` waited for eof on a stream that had failed).
+  On Windows `f"{...}"` hung wherever it was parsed (Win32 strips a path's
+  trailing dots, so `...` names the current directory): that was
+  vm_audit122's hang under Wine (the `${...}` in a check's name). The same
+  constructor read the text of the prelude and its mirror chunks (both
+  engines), the builtin exception classes' source, `lang_eval`'s code and
+  the editor's syntax check / def-use / facts (text.cpp carried a band-aid
+  appending "\n" when the text named a path). Every text caller now goes
+  through `SourceCode::from_text`; the constructor takes a string as a file
+  only when it names a regular file (`utils::IsRegularFile`), and
+  `line()`/`read()` stop when the stream fails. **Never pass program text
+  to `SourceCode(string)`.**
+- **os.read / os.write on fds 0-2 move bytes as they are on Windows.**
+  CPython puts the standard descriptors in binary mode at startup
+  (`config_init_stdio`); Nython left the CRT's text mode on them, so
+  `os.read(0, n)` turned "\r\n" into "\n" and `os.write(1, b)` turned "\n"
+  into "\r\n" - a Language Server's `Content-Length` headers could not be
+  read, nor its replies parsed. `RawStdFd` (src/builtins/os_fd.cpp) switches
+  such a descriptor to binary for the call; Nython's own text streams keep
+  text mode (print's "\n" is "\r\n" on Windows, as CPython's sys.stdout
+  writes it).
+- **subprocess reads the child's bytes as written on Windows.** The
+  Windows process layer turned every captured "\r\n" and lone "\r" into
+  "\n" (round 77, so os_exec's and the IDE's captured lines did not end in
+  "\r"), so `subprocess.run(..., capture_output=True).stdout` was not what
+  the child wrote. `os_spawn`/`os_run` take `raw_output=True`; subprocess
+  (and asyncio's subprocesses, through `_native_opts`) pass it, and text
+  mode translates newlines in lib/subprocess.ny as before. Other callers
+  keep the translation. A Windows test that expected "\n" from a child's
+  print now sees "\r\n", as under CPython.
+- **nylsp on Windows**: `StdioTransport` waited for stdin with
+  `select()`, which takes sockets only there (CPython's select raises
+  WSAENOTSOCK for a pipe); a thread now reads the input and hands chunks
+  over through a queue (lib/nylsp/protocol.ny). src/builtins/nylsp.cpp
+  names the lexer's `TokenType` (winnt.h declares one of its own).
+- **lib/nyaudit.ny path patterns on Windows**: a pattern written with "/"
+  (`deny open path=/etc/* mode=w*`) never matched there - the argument was
+  made absolute (`Z:\etc\x`), the pattern not - and a pattern `derive()`
+  wrote from a log (`Z:\...\*`) was not recognised as a path at all, so the
+  derived policy denied the program's own files. Both sides are now
+  absolute and case-folded with "\\" separators on Windows
+  (`os.path.normcase`); a drive-letter or UNC pattern is a path pattern.
+  The installed-policy test used to open `/etc/nyaudit_121_never` for
+  writing to show the deny rule working; when the rule did not match (as
+  under Wine) the file was made in the host's /etc. It opens a file in a
+  directory of the test's own now.
+- **vm_audit122 on Windows**: its client wrote `"file://" + path`, not a
+  URI on Windows (`file://Z:\tmp\...` - nylsp read `Z:` as a host and
+  indexed nothing); it writes `file:///Z%3A/...` now, VS Code's form (the
+  same string as before on POSIX).
+- **vm_audit121 on Windows**: the child skips the cases Windows has no
+  call for, in CPython too (`POSIX_ONLY`: fork/exec/spawn/posix_spawn,
+  `os.kill(pid, 0)` - TerminateProcess there, which ended the child -,
+  chown, fd-relative calls, symlinks without the privilege, fcntl/resource/
+  syslog/pty, a file URL spelled from a POSIX path, libc, sendmsg), and the
+  records are compared after what CPython itself reports differently on
+  Windows (`plat()`: "\\" in paths, WindowsPath, os.system's command and
+  the environment as str, no shutil.chown). sqlite3's case is compared only
+  where libsqlite3 loads. `os.system("exit 0")` replaces `"true"` (both
+  shells have it).
 
 ## 0y3. Round 85 (main session) — exceptions native code swallows, generators as weak references and keys, the harness under Wine, the round 84 suites on Windows (vm_audit120)
 

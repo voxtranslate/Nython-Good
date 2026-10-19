@@ -5847,7 +5847,7 @@ Full detail in `HANDOFF.md` §0y (part E), §0y2 (part F) and §0y3 (main sessio
 
 ## Round 86 — audit events, a language server, HTTP/2
 
-Full detail in `HANDOFF.md` §0z (part G), §0z2 (part H), §0z3 (part I). New tests: `vm_audit121` (109; 89-91 under python3.11-3.13), `vm_audit122` (169, Nython-only), `vm_audit123` (242; 233 under python3).
+Full detail in `HANDOFF.md` §0z (part G), §0z2 (part H), §0z3 (part I), §0z5 (main session). New tests: `vm_audit121` (109; 89-91 under python3.11-3.13), `vm_audit122` (169, Nython-only), `vm_audit123` (242; 233 under python3), `vm_audit125` (14; 11 under python3).
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -5859,6 +5859,13 @@ Full detail in `HANDOFF.md` §0z (part G), §0z2 (part H), §0z3 (part I). New t
 | No HTTP/2, no HPACK, no WebSocket compression | not written (CPython has none) | `lib/hpack.ny` (RFC 7541, Appendix C byte for byte), `lib/h2/` (RFC 9113, sans-I/O after the h2 package, asyncio client/server with ALPN, RFC 9218 priorities), `http.client`/`urllib` with `http2=`, `lib/permessage_deflate.ny` (RFC 7692) in lib/websocket.ny, `lib/websocket_asyncio.ny` (part I) |
 | A thread using memoryview while another thread loaded its prelude chunk got "object of type 'memoryview' has no len()" (about half the http.client runs) | a lazily loaded chunk was marked loaded before its definitions ran, and the GIL could change hands meanwhile | a thread arriving during a load waits for it with the GIL released (`mirrors_loading_`, both engines) |
 | `await websocket_asyncio.connect(...)` deadlocked | an `__await__` returning an unstarted coroutine's own `__await__()` was driven by hand, which cannot wait on another task of the loop | awaited as that coroutine (`_ny_await_iter`) |
+| `f"{x}"` printed `none` and ran a file named `x` in the working directory; `f"{lib}"` beside a `lib/` directory hung; on Windows `f"{...}"` hung (vm_audit122 never finished under Wine) | the parser lexed a field's text through `SourceCode(string)`, which takes a *file name* and reads the string as a file when it names one (Win32 makes `...` the current directory); a stream that failed to open never reached eof | every text caller uses `SourceCode::from_text` (f-string fields, the prelude and mirror chunks on both engines, lang_eval, the editor's text services); the constructor takes regular files only; the reader stops on a failed stream (main session) |
+| Windows: `os.read(0, n)` gave "\n" for "\r\n" and `os.write(1, b)` wrote "\r\r\n" for "\r\n"; nylsp could not read its client's headers | the CRT's text mode on the standard descriptors (CPython sets them binary at startup) | `RawStdFd`: fds 0-2 binary for a raw read or write (main session) |
+| Windows: nylsp never answered | `select()` on stdin (sockets only there) | a reader thread and a queue (main session) |
+| Windows: `subprocess.run(..., capture_output=True).stdout` had "\n" where the child wrote "\r\n" | the process layer translated every capture's line ends (round 77, for os_exec and the IDE) | `os_spawn`/`os_run(raw_output=True)` from subprocess and asyncio; text mode translates in lib/subprocess.ny (main session) |
+| Windows: vm_audit122 never finished; vm_audit121's child stopped halfway | the `f"{...}"` hang above, nylsp's stdin, the test's `file://Z:\\...` URIs; `os.kill(pid, 0)` is TerminateProcess there | fixed above; the tests write file URIs as clients do and skip the calls Windows does not have (main session) |
+| Windows: a nyaudit rule `deny open path=/etc/*` never matched, and a policy derived from a log denied the program's own files | the argument was made absolute (`Z:\\etc\\x`) and the pattern not; a drive-letter pattern was not a path pattern | both case-folded and absolute (`os.path.normcase`); drive-letter and UNC patterns are paths (main session) |
+| vm_audit121's installed-policy check made `/etc/nyaudit_121_never` on the host when the rule did not match (under Wine) | the check opened a file in /etc for writing | a directory of the test's own (main session) |
 
 ## Round 84, part 0 — the semantic gaps rounds 82-83 found
 
