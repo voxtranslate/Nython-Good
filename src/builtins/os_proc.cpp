@@ -647,6 +647,7 @@ struct Proc {
     HANDLE proc = nullptr, job = nullptr;
     std::string out{}, err{};
     bool out_cr = false, err_cr = false;   // text_newlines carry-over
+    bool raw = false;      // os_spawn(raw_output=True): the bytes as written (round 86)
     bool done = false;
     int code = 0;
     int killed_sig = 0;    // reported as -sig, as a signal is on POSIX
@@ -692,7 +693,7 @@ bool reap(long long, Proc& p) {
 void run_to_end(const Cmd& c, const std::string& cwd,
                 const std::vector<std::pair<std::string, std::string>>& env,
                 bool has_input, const std::string& input, bool merge, double timeout,
-                std::string& out, std::string& err, int& code, bool& timed_out) {
+                std::string& out, std::string& err, int& code, bool& timed_out, bool raw = false) {
     WinChild ch = start_process(c, cwd, env, has_input, merge);
     std::thread writer;
     if (ch.in != INVALID_HANDLE_VALUE) {
@@ -722,7 +723,7 @@ void run_to_end(const Cmd& c, const std::string& cwd,
     }
     close_h(ch.out);
     close_h(ch.err);
-    {
+    if (!raw) {   // (round 86) raw: the bytes as written (os_run(raw_output=True))
         bool cr = false;
         out = text_newlines(out, cr, true);
         cr = false;
@@ -738,7 +739,7 @@ void run_to_end(const Cmd& c, const std::string& cwd,
 #endif  // _WIN32
 
 Value run(NythonExecutor& E, std::vector<Value>& args) {
-    nyos::Args A(E, args, {"cwd", "env", "input", "timeout", "shell", "check", "merge", "inherit", "env_replace"});
+    nyos::Args A(E, args, {"cwd", "env", "input", "timeout", "shell", "check", "merge", "inherit", "env_replace", "raw_output"});
     if (!A.has(0, "cmd")) raise("TypeError", "os_run() missing the command");
     Cmd c = parse_cmd(E, A.get(0, "cmd"));
     c.env_replace = A.flag(99, "env_replace", false);
@@ -829,7 +830,7 @@ Value run(NythonExecutor& E, std::vector<Value>& args) {
     }
 #else
     bool timed_out = false;
-    run_to_end(c, cwd, env, has_input, input, merge, timeout, out, err, code, timed_out);
+    run_to_end(c, cwd, env, has_input, input, merge, timeout, out, err, code, timed_out, A.flag(99, "raw_output", false));
     if (timed_out) {
         std::ostringstream m;
         m << "command timed out after " << timeout << " seconds";
@@ -926,7 +927,7 @@ Value dispatch_os_proc(NythonExecutor& E,
     // ── Background processes ─────────────────────────────────────────────────
     if (name == "os_spawn") {
 #ifdef _WIN32
-        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin", "inherit", "env_replace"});
+        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin", "inherit", "env_replace", "raw_output"});
         if (!A.has(0, "cmd")) raise("TypeError", "os_spawn() missing the command");
         Cmd c = parse_cmd(E, A.get(0, "cmd"));
         c.env_replace = A.flag(99, "env_replace", false);
@@ -946,6 +947,10 @@ Value dispatch_os_proc(NythonExecutor& E,
         }
         std::lock_guard<std::mutex> lk(procs_mutex());
         Proc p;
+        // (round 86) subprocess and asyncio read bytes: CPython's pipes give
+        // what the child wrote ("\r\n" included); text mode translates
+        // newlines on the Python side. Other callers keep the translation.
+        p.raw = A.flag(99, "raw_output", false);
         p.in_h = kept_in;
         p.out_h = ch.out;
         p.err_h = ch.err;
@@ -954,7 +959,7 @@ Value dispatch_os_proc(NythonExecutor& E,
         procs()[ch.pid] = std::move(p);
         return Value((int)ch.pid);
 #else
-        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin", "inherit", "env_replace"});
+        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin", "inherit", "env_replace", "raw_output"});
         if (!A.has(0, "cmd")) raise("TypeError", "os_spawn() missing the command");
         Cmd c = parse_cmd(E, A.get(0, "cmd"));
         c.env_replace = A.flag(99, "env_replace", false);
@@ -1078,8 +1083,10 @@ Value dispatch_os_proc(NythonExecutor& E,
             pump(p);
             reap(pid, p);
 #ifdef _WIN32
-            p.out = text_newlines(p.out, p.out_cr, p.done);
-            p.err = text_newlines(p.err, p.err_cr, p.done);
+            if (!p.raw) {
+                p.out = text_newlines(p.out, p.out_cr, p.done);
+                p.err = text_newlines(p.err, p.err_cr, p.done);
+            }
 #endif
             Value r = nyos::make_map(E, {{"stdout", Str(p.out)}, {"stderr", Str(p.err)}, {"done", Value(p.done)}});
             p.out.clear();

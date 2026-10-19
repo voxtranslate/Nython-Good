@@ -91,6 +91,8 @@ check("a program file still runs", [r.returncode, r.stdout.decode().strip()], [0
 # ── raw descriptors move bytes as they are ──────────────────────────────────
 r = subprocess.run([sys.executable, "-c", 'import os\nos.write(1, b"a\\r\\nb\\n\\r")\n'], capture_output=True, timeout=60)
 check("os.write(1, ...) writes the bytes given", r.stdout, b"a\r\nb\n\r")
+r = subprocess.run([sys.executable, "-c", 'import os\nos.write(1, b"a\\r\\nb\\rc\\n")\n'], capture_output=True, text=True, timeout=60)
+check("... and text mode reads its line ends as \\n (universal newlines)", r.stdout, "a\nb\nc\n")
 r = subprocess.run([sys.executable, "-c", 'import os\nd = b""\nwhile True:\n    c = os.read(0, 100)\n    if not c:\n        break\n    d += c\nos.write(1, repr(d).encode())\n'],
                    input=b"h1\r\nh2\n\r\n\r\nbody", capture_output=True, timeout=60)
 check("os.read(0, ...) reads the bytes sent", r.stdout, b"b'h1\\r\\nh2\\n\\r\\n\\r\\nbody'")

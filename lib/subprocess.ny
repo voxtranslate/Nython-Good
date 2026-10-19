@@ -351,6 +351,9 @@ def _native_opts(plan, cwd, env):
         kw["merge"] = true
     if plan.inherit:
         kw["inherit"] = plan.inherit
+    # (round 86) the child's bytes as written: on Windows the native layer
+    # otherwise reads "\r\n" as "\n" (text mode translates here, _decode)
+    kw["raw_output"] = True
     return kw
 
 
