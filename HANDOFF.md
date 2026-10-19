@@ -269,10 +269,16 @@ to a generator.
   on the pointer width (`PBITS`). The 32-bit link warns that one guard
   section of `nyrt::class_dir_names()` is padded differently in core.o and
   main.o (16 vs 12 bytes, the same 12-byte vector): harmless.
+- **Round 85 on AArch64 under qemu-user** (`make cli BUILD=build-arm64
+  CXX=aarch64-linux-gnu-g++`, `qemu-aarch64 -L /usr/aarch64-linux-gnu`, both
+  engines): vm_audit112 135, 117 33, 120 19 pass; vm_audit111 54 of 55,
+  116 and 119 pass every check that runs in the process - the ones that
+  fail start `sys.executable` as a child, which cannot run here (no
+  binfmt_misc: exit 127). vm_audit111 with `NY_FFI_NO_LIBFFI=1` (the built-in
+  caller) passes its structures-by-value calls and callbacks on AArch64 -
+  the round 84 paths written to the AAPCS64 but never run until now.
 
 ### Not done
-- AArch64 (qemu) and 32-bit Windows runs of rounds 84-85: not run this
-  round.
 - In a Python-language file, valid Python still meets Nython's
   conveniences: `"a" + 1` concatenates, `for x in 5` is a range, `1 is int`
   is a type test, `{"a": 1}.a` reads the key, `true`/`none`/`undefined`/
