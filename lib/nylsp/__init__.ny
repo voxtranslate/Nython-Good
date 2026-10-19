@@ -23,7 +23,9 @@
 #   textDocument/didOpen, didChange (incremental: each change's range is
 #       applied to a per-document piece table - two buffers and a list of
 #       pieces that know their line breaks - so an edit costs the pieces, not
-#       the file; full-text changes too), didSave, didClose
+#       the file; full-text changes too), didSave, didClose; a document's
+#       binding rule is its file's (.py or `# nython: python`: Python's),
+#       an untitled document's its languageId's
 #   textDocument/publishDiagnostics: syntax errors (several: see "error
 #       recovery" below), NyScope's static checks (assigning a const,
 #       `nonlocal` without a binding; for Nython-language files the places
