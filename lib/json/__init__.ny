@@ -45,27 +45,27 @@ _default_encoder = JSONEncoder()
 _default_decoder = JSONDecoder()
 
 
-def dump(obj, fp, *, skipkeys=false, ensure_ascii=true, check_circular=true,
-         allow_nan=true, cls=none, indent=none, separators=none,
-         default=none, sort_keys=false, **kw):
+def dump(obj, fp, *, skipkeys=False, ensure_ascii=True, check_circular=True,
+         allow_nan=True, cls=None, indent=None, separators=None,
+         default=None, sort_keys=False, **kw):
     """Serialize ``obj`` as a JSON formatted stream to ``fp`` (a
     ``.write()``-supporting file-like object)."""
     fp.write(dumps(obj, skipkeys=skipkeys, ensure_ascii=ensure_ascii,
                    check_circular=check_circular, allow_nan=allow_nan, cls=cls,
                    indent=indent, separators=separators, default=default,
                    sort_keys=sort_keys, **kw))
-    return none
+    return None
 
 
-def dumps(obj, *, skipkeys=false, ensure_ascii=true, check_circular=true,
-          allow_nan=true, cls=none, indent=none, separators=none,
-          default=none, sort_keys=false, **kw):
+def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
+          allow_nan=True, cls=None, indent=None, separators=None,
+          default=None, sort_keys=False, **kw):
     """Serialize ``obj`` to a JSON formatted ``str``."""
     if (not skipkeys and ensure_ascii and check_circular and allow_nan and
-            cls is none and indent is none and separators is none and
-            default is none and not sort_keys and len(kw) == 0):
+            cls is None and indent is None and separators is None and
+            default is None and not sort_keys and len(kw) == 0):
         return _default_encoder.encode(obj)
-    if cls is none:
+    if cls is None:
         cls = JSONEncoder
     return cls(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
                check_circular=check_circular, allow_nan=allow_nan, indent=indent,
@@ -107,8 +107,8 @@ def _decode_bytes(b):
         return data.decode(enc)
 
 
-def load(fp, *, cls=none, object_hook=none, parse_float=none,
-         parse_int=none, parse_constant=none, object_pairs_hook=none, **kw):
+def load(fp, *, cls=None, object_hook=None, parse_float=None,
+         parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
     """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
     a JSON document) to a Python object."""
     return loads(fp.read(), cls=cls, object_hook=object_hook,
@@ -116,8 +116,8 @@ def load(fp, *, cls=none, object_hook=none, parse_float=none,
                  parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
 
 
-def loads(s, *, cls=none, object_hook=none, parse_float=none,
-          parse_int=none, parse_constant=none, object_pairs_hook=none, **kw):
+def loads(s, *, cls=None, object_hook=None, parse_float=None,
+          parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
     """Deserialize ``s`` (a ``str``, ``bytes`` or ``bytearray`` instance
     containing a JSON document) to a Python object."""
     if isinstance(s, str):
@@ -127,20 +127,20 @@ def loads(s, *, cls=none, object_hook=none, parse_float=none,
         if not (isinstance(s, bytes) or isinstance(s, bytearray)):
             raise TypeError("the JSON object must be str, bytes or bytearray, not " + type(s).__name__)
         s = _decode_bytes(s)
-    if (cls is none and object_hook is none and
-            parse_int is none and parse_float is none and
-            parse_constant is none and object_pairs_hook is none and len(kw) == 0):
+    if (cls is None and object_hook is None and
+            parse_int is None and parse_float is None and
+            parse_constant is None and object_pairs_hook is None and len(kw) == 0):
         return _default_decoder.decode(s)
-    if cls is none:
+    if cls is None:
         cls = JSONDecoder
-    if object_hook is not none:
+    if object_hook is not None:
         kw["object_hook"] = object_hook
-    if object_pairs_hook is not none:
+    if object_pairs_hook is not None:
         kw["object_pairs_hook"] = object_pairs_hook
-    if parse_float is not none:
+    if parse_float is not None:
         kw["parse_float"] = parse_float
-    if parse_int is not none:
+    if parse_int is not None:
         kw["parse_int"] = parse_int
-    if parse_constant is not none:
+    if parse_constant is not None:
         kw["parse_constant"] = parse_constant
     return cls(**kw).decode(s)

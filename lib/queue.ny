@@ -105,7 +105,7 @@ class Queue:
         with self.mutex:
             return 0 < self.maxsize and self.maxsize <= self._qsize()
 
-    def put(self, item, block=true, timeout=none):
+    def put(self, item, block=True, timeout=None):
         """Put an item into the queue.
 
         If optional args 'block' is true and 'timeout' is None (the default),
@@ -121,7 +121,7 @@ class Queue:
                 if not block:
                     if self._qsize() >= self.maxsize:
                         raise Full()
-                elif timeout is none:
+                elif timeout is None:
                     while self._qsize() >= self.maxsize:
                         self.not_full.wait()
                 elif timeout < 0:
@@ -137,7 +137,7 @@ class Queue:
             self.unfinished_tasks = self.unfinished_tasks + 1
             self.not_empty.notify()
 
-    def get(self, block=true, timeout=none):
+    def get(self, block=True, timeout=None):
         """Remove and return an item from the queue.
 
         If optional args 'block' is true and 'timeout' is None (the default),
@@ -152,7 +152,7 @@ class Queue:
             if not block:
                 if not self._qsize():
                     raise Empty()
-            elif timeout is none:
+            elif timeout is None:
                 while not self._qsize():
                     self.not_empty.wait()
             elif timeout < 0:
@@ -174,7 +174,7 @@ class Queue:
         Only enqueue the item if a free slot is immediately available.
         Otherwise raise the Full exception.
         """
-        return self.put(item, false)
+        return self.put(item, False)
 
     def get_nowait(self):
         """Remove and return an item from the queue without blocking.
@@ -182,7 +182,7 @@ class Queue:
         Only get an item if one is immediately available. Otherwise
         raise the Empty exception.
         """
-        return self.get(false)
+        return self.get(False)
 
     # Override these methods to implement other queue organizations
     # (e.g. stack or priority queue).
@@ -295,7 +295,7 @@ class SimpleQueue:
         self._lock = threading.Lock()
         self._not_empty = threading.Condition(self._lock)
 
-    def put(self, item, block=true, timeout=none):
+    def put(self, item, block=True, timeout=None):
         """Put the item on the queue.
 
         The optional 'block' and 'timeout' arguments are ignored, as this
@@ -306,7 +306,7 @@ class SimpleQueue:
             self._queue.append(item)
             self._not_empty.notify()
 
-    def get(self, block=true, timeout=none):
+    def get(self, block=True, timeout=None):
         """Remove and return an item from the queue.
 
         If optional args 'block' is true and 'timeout' is None (the default),
@@ -317,13 +317,13 @@ class SimpleQueue:
         available, else raise the Empty exception ('timeout' is ignored
         in that case).
         """
-        if timeout is not none and timeout < 0:
+        if timeout is not None and timeout < 0:
             raise ValueError("'timeout' must be a non-negative number")
         with self._not_empty:
             if not block:
                 if not len(self._queue):
                     raise Empty()
-            elif timeout is none:
+            elif timeout is None:
                 while not len(self._queue):
                     self._not_empty.wait()
             else:
@@ -341,7 +341,7 @@ class SimpleQueue:
         This is exactly equivalent to `put(item, block=False)` and is only
         provided for compatibility with the Queue class.
         """
-        return self.put(item, false)
+        return self.put(item, False)
 
     def get_nowait(self):
         """Remove and return an item from the queue without blocking.
@@ -349,7 +349,7 @@ class SimpleQueue:
         Only get an item if one is immediately available. Otherwise
         raise the Empty exception.
         """
-        return self.get(false)
+        return self.get(False)
 
     def empty(self):
         """Return True if the queue is empty, False otherwise (not reliable!)."""

@@ -64,8 +64,8 @@ def _split(p):
 def has_magic(s):
     for ch in s:
         if ch == "*" or ch == "?" or ch == "[":
-            return true
-    return false
+            return True
+    return False
 
 
 def _ishidden(path):
@@ -90,7 +90,7 @@ def _iterdir(dirname, dironly):
     return out
 
 
-def _glob1(dirname, pattern, dir_fd, dironly, include_hidden=false):
+def _glob1(dirname, pattern, dir_fd, dironly, include_hidden=False):
     var names = _iterdir(dirname, dironly)
     if include_hidden or not _ishidden(pattern):
         var keep = []
@@ -101,7 +101,7 @@ def _glob1(dirname, pattern, dir_fd, dironly, include_hidden=false):
     return _fnmatch_mod.filter(names, pattern)
 
 
-def _glob0(dirname, basename, dir_fd, dironly, include_hidden=false):
+def _glob0(dirname, basename, dir_fd, dironly, include_hidden=False):
     if basename:
         if _lexists(_join(dirname, basename)):
             return [basename]
@@ -114,14 +114,14 @@ def _glob0(dirname, basename, dir_fd, dironly, include_hidden=false):
 
 
 def glob0(dirname, pattern):
-    return _glob0(dirname, pattern, none, false)
+    return _glob0(dirname, pattern, None, False)
 
 
 def glob1(dirname, pattern):
-    return _glob1(dirname, pattern, none, false)
+    return _glob1(dirname, pattern, None, False)
 
 
-def _rlistdir(dirname, dir_fd, dironly, include_hidden=false):
+def _rlistdir(dirname, dir_fd, dironly, include_hidden=False):
     var names = _iterdir(dirname, dironly)
     for x in names:
         if include_hidden or not _ishidden(x):
@@ -131,13 +131,13 @@ def _rlistdir(dirname, dir_fd, dironly, include_hidden=false):
                 yield _join(x, y)
 
 
-def _glob2(dirname, pattern, dir_fd, dironly, include_hidden=false):
+def _glob2(dirname, pattern, dir_fd, dironly, include_hidden=False):
     if not dirname or _isdir(dirname):
         yield pattern[:0]
     yield from _rlistdir(dirname, dir_fd, dironly, include_hidden)
 
 
-def _iglob(pathname, root_dir, dir_fd, recursive, dironly, include_hidden=false):
+def _iglob(pathname, root_dir, dir_fd, recursive, dironly, include_hidden=False):
     var hs = _split(pathname)
     var dirname = hs[0]
     var basename = hs[1]
@@ -160,7 +160,7 @@ def _iglob(pathname, root_dir, dir_fd, recursive, dironly, include_hidden=false)
     # drive or UNC path: no infinite recursion on magic in r'\\?\C:'.
     var dirs = [dirname]
     if dirname != pathname and has_magic(dirname):
-        dirs = _iglob(dirname, root_dir, dir_fd, recursive, true, include_hidden)
+        dirs = _iglob(dirname, root_dir, dir_fd, recursive, True, include_hidden)
     var mode = 0
     if has_magic(basename):
         if recursive and _isrecursive(basename):
@@ -168,7 +168,7 @@ def _iglob(pathname, root_dir, dir_fd, recursive, dironly, include_hidden=false)
         else:
             mode = 1
     for d in dirs:
-        var names = none
+        var names = None
         if mode == 2:
             names = _glob2(_join(root_dir, d), basename, dir_fd, dironly, include_hidden)
         elif mode == 1:
@@ -179,34 +179,34 @@ def _iglob(pathname, root_dir, dir_fd, recursive, dironly, include_hidden=false)
             yield os_path_join(d, name)
 
 
-def iglob(pathname, root_dir=none, dir_fd=none, recursive=false, include_hidden=false):
+def iglob(pathname, root_dir=None, dir_fd=None, recursive=False, include_hidden=False):
     """Return an iterator which yields the paths matching a pathname pattern."""
     _ny_sys_audit("glob.glob", pathname, recursive)   # round 86: CPython's events
     _ny_sys_audit("glob.glob/2", pathname, recursive, root_dir, dir_fd)
     pathname = _fspath(pathname)
-    if dir_fd is not none:
+    if dir_fd is not None:
         raise NotImplementedError("glob: dir_fd is not supported (no directory file descriptors)")
-    if root_dir is not none:
+    if root_dir is not None:
         root_dir = _fspath(root_dir)
     else:
         root_dir = ""
-    var it = _iglob(pathname, root_dir, dir_fd, recursive, false, include_hidden)
+    var it = _iglob(pathname, root_dir, dir_fd, recursive, False, include_hidden)
     if not pathname or (recursive and _isrecursive(pathname[:2])):
         return _skip_empty_first(it)
     return it
 
 
 def _skip_empty_first(it):
-    var first = true
+    var first = True
     for s in it:
         if first:
-            first = false
+            first = False
             if not s:
                 continue
         yield s
 
 
-def glob(pathname, root_dir=none, dir_fd=none, recursive=false, include_hidden=false):
+def glob(pathname, root_dir=None, dir_fd=None, recursive=False, include_hidden=False):
     """Return a list of paths matching a pathname pattern."""
     return list(iglob(pathname, root_dir, dir_fd, recursive, include_hidden))
 

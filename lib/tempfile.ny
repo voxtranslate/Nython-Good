@@ -46,7 +46,7 @@ __all__ = ["NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile",
 _WINDOWS = os_platform() == "windows"
 TMP_MAX = 10000
 template = "tmp"
-tempdir = none
+tempdir = None
 
 _NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_"
 
@@ -134,7 +134,7 @@ def gettempprefixb():
 def gettempdir():
     """Returns tempfile.tempdir as str."""
     global tempdir
-    if tempdir is none:
+    if tempdir is None:
         tempdir = _get_default_tempdir()
     return tempdir
 
@@ -147,31 +147,31 @@ def gettempdirb():
 def _sanitize_params(prefix, suffix, dir):
     var kinds = []
     for x in [prefix, suffix, dir]:
-        if x is not none and not isinstance(x, str):
+        if x is not None and not isinstance(x, str):
             if hasattr(x, "__fspath__"):
                 x = x.__fspath__()
             if isinstance(x, bytes):
                 kinds.append("bytes")
             elif isinstance(x, str):
                 kinds.append("str")
-        elif x is not none:
+        elif x is not None:
             kinds.append("str")
     if "bytes" in kinds and "str" in kinds:
         raise TypeError("Can't mix bytes and non-bytes in path components.")
     if "bytes" in kinds:
         raise TypeError("bytes paths are not supported by Nython's tempfile")
-    if suffix is none:
+    if suffix is None:
         suffix = ""
-    if prefix is none:
+    if prefix is None:
         prefix = template
-    if dir is none:
+    if dir is None:
         dir = gettempdir()
     else:
         dir = _fspath(dir)
     return [prefix, suffix, dir]
 
 
-def mkstemp(suffix=none, prefix=none, dir=none, text=false):
+def mkstemp(suffix=None, prefix=None, dir=None, text=False):
     """User-callable function to create and return a unique temporary
     file. The return value is a pair (fd, name) where fd is a Nython file
     handle open for reading and writing (close it with file_close(fd)) and
@@ -186,7 +186,7 @@ def mkstemp(suffix=none, prefix=none, dir=none, text=false):
     return (fd, os_path_abspath(path))
 
 
-def mkdtemp(suffix=none, prefix=none, dir=none):
+def mkdtemp(suffix=None, prefix=None, dir=None):
     """User-callable function to create and return a unique temporary
     directory. The return value is the absolute pathname of the directory.
 
@@ -214,13 +214,13 @@ def mkdtemp(suffix=none, prefix=none, dir=none):
     raise FileExistsError("[Errno 17] No usable temporary directory name found")
 
 
-def mktemp(suffix="", prefix=template, dir=none):
+def mktemp(suffix="", prefix=template, dir=None):
     """User-callable function to return a unique temporary file name. The
     file is not created.
 
     THIS FUNCTION IS UNSAFE AND SHOULD NOT BE USED.
     """
-    if dir is none:
+    if dir is None:
         dir = gettempdir()
     var seq = 0
     while seq < TMP_MAX:
@@ -238,12 +238,12 @@ class _TemporaryFileWrapper:
     temporary use.  In particular, it seeks to automatically
     remove the file when it is no longer needed.
     """
-    def __init__(self, file, name, delete=true, delete_on_close=true):
+    def __init__(self, file, name, delete=True, delete_on_close=True):
         object.__setattr__(self, "file", file)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "delete", delete)
         object.__setattr__(self, "_delete_on_close", delete_on_close)
-        object.__setattr__(self, "_removed", false)
+        object.__setattr__(self, "_removed", False)
 
     def __getattr__(self, name):
         # Attribute lookups are delegated to the underlying file
@@ -251,7 +251,7 @@ class _TemporaryFileWrapper:
 
     def _remove(self):
         if not self._removed:
-            object.__setattr__(self, "_removed", true)
+            object.__setattr__(self, "_removed", True)
             try:
                 os_unlink(self.name)
             except FileNotFoundError:
@@ -265,7 +265,7 @@ class _TemporaryFileWrapper:
         self.file.__exit__(exc, value, tb)
         if self.delete:
             self._remove()
-        return false
+        return False
 
     def close(self):
         """Close the temporary file, possibly deleting it."""
@@ -332,10 +332,10 @@ def _open_mode_ok(mode):
             raise ValueError("invalid mode: '" + mode + "'")
 
 
-def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=none,
-                       newline=none, suffix=none, prefix=none,
-                       dir=none, delete=true, errors=none,
-                       delete_on_close=true):
+def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=None,
+                       newline=None, suffix=None, prefix=None,
+                       dir=None, delete=True, errors=None,
+                       delete_on_close=True):
     """Create and return a temporary file.
     Arguments:
     'prefix', 'suffix', 'dir' -- as for mkstemp.
@@ -361,9 +361,9 @@ def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=none,
         m = m.replace("w", "r")
         if "+" not in m:
             m = m + "+"
-    var f = none
+    var f = None
     try:
-        f = open(path, m, encoding if encoding is not none else "utf-8")
+        f = open(path, m, encoding if encoding is not None else "utf-8")
     except Exception as e:
         try:
             os_unlink(path)
@@ -374,9 +374,9 @@ def NamedTemporaryFile(mode="w+b", buffering=-1, encoding=none,
     return _TemporaryFileWrapper(f, path, delete, delete_on_close)
 
 
-def TemporaryFile(mode="w+b", buffering=-1, encoding=none,
-                  newline=none, suffix=none, prefix=none,
-                  dir=none, errors=none):
+def TemporaryFile(mode="w+b", buffering=-1, encoding=None,
+                  newline=None, suffix=None, prefix=None,
+                  dir=None, errors=None):
     """Create and return a temporary file.
     Arguments:
     'prefix', 'suffix', 'dir' -- as for mkstemp.
@@ -389,7 +389,7 @@ def TemporaryFile(mode="w+b", buffering=-1, encoding=none,
     it is closed.
     """
     if _WINDOWS:
-        return NamedTemporaryFile(mode, buffering, encoding, newline, suffix, prefix, dir, true, errors)
+        return NamedTemporaryFile(mode, buffering, encoding, newline, suffix, prefix, dir, True, errors)
     _open_mode_ok(mode)
     var ps = _sanitize_params(prefix, suffix, dir)
     var path = os_path_abspath(os_mkstemp(ps[0], ps[1], ps[2]))
@@ -399,9 +399,9 @@ def TemporaryFile(mode="w+b", buffering=-1, encoding=none,
         m = m.replace("w", "r")
         if "+" not in m:
             m = m + "+"
-    var f = none
+    var f = None
     try:
-        f = open(path, m, encoding if encoding is not none else "utf-8")
+        f = open(path, m, encoding if encoding is not None else "utf-8")
     finally:
         os_unlink(path)
     f.mode = mode
@@ -414,7 +414,7 @@ class _SpooledBuffer:
         self.binary = binary
         self._data = b"" if binary else ""
         self._pos = 0
-        self.closed = false
+        self.closed = False
 
     def _check(self):
         if self.closed:
@@ -441,7 +441,7 @@ class _SpooledBuffer:
 
     def read(self, size=-1):
         self._check()
-        if size is none or size < 0:
+        if size is None or size < 0:
             var r = self._data[self._pos:]
             self._pos = len(self._data)
             return r
@@ -454,7 +454,7 @@ class _SpooledBuffer:
         var nl = b"\n" if self.binary else "\n"
         var i = self._data.find(nl, self._pos)
         var end = len(self._data) if i < 0 else i + 1
-        if size is not none and size >= 0 and self._pos + size < end:
+        if size is not None and size >= 0 and self._pos + size < end:
             end = self._pos + size
         var r = self._data[self._pos:end]
         self._pos = end
@@ -484,9 +484,9 @@ class _SpooledBuffer:
         self._check()
         return self._pos
 
-    def truncate(self, size=none):
+    def truncate(self, size=None):
         self._check()
-        if size is none:
+        if size is None:
             size = self._pos
         self._data = self._data[:size]
         return size
@@ -498,7 +498,7 @@ class _SpooledBuffer:
         pass
 
     def close(self):
-        self.closed = true
+        self.closed = True
 
     def __iter__(self):
         return self
@@ -516,11 +516,11 @@ class SpooledTemporaryFile:
     fileno is needed.
     """
     def __init__(self, max_size=0, mode="w+b", buffering=-1,
-                 encoding=none, newline=none, suffix=none, prefix=none,
-                 dir=none, errors=none):
+                 encoding=None, newline=None, suffix=None, prefix=None,
+                 dir=None, errors=None):
         self._file = _SpooledBuffer("b" in mode)
         self._max_size = max_size
-        self._rolled = false
+        self._rolled = False
         self._TemporaryFileArgs = [mode, buffering, encoding, newline, suffix, prefix, dir, errors]
 
     def _check(self, file):
@@ -539,7 +539,7 @@ class SpooledTemporaryFile:
         newfile.write(file.getvalue())
         newfile.seek(file.tell(), 0)
         self._file = newfile
-        self._rolled = true
+        self._rolled = True
 
     def __enter__(self):
         if self._file.closed:
@@ -548,7 +548,7 @@ class SpooledTemporaryFile:
 
     def __exit__(self, exc, value, tb):
         self._file.close()
-        return false
+        return False
 
     def __iter__(self):
         return self._file.__iter__()
@@ -567,7 +567,7 @@ class SpooledTemporaryFile:
     def encoding(self):
         if self._rolled:
             return self._file.encoding
-        return none if "b" in self._TemporaryFileArgs[0] else (self._TemporaryFileArgs[2] or "utf-8")
+        return None if "b" in self._TemporaryFileArgs[0] else (self._TemporaryFileArgs[2] or "utf-8")
 
     @property
     def mode(self):
@@ -577,7 +577,7 @@ class SpooledTemporaryFile:
     def name(self):
         if self._rolled:
             return self._file.name
-        return none
+        return None
 
     def fileno(self):
         self.rollover()
@@ -587,7 +587,7 @@ class SpooledTemporaryFile:
         self._file.flush()
 
     def isatty(self):
-        return false
+        return False
 
     def read(self, *args):
         return self._file.read(*args)
@@ -604,8 +604,8 @@ class SpooledTemporaryFile:
     def tell(self):
         return self._file.tell()
 
-    def truncate(self, size=none):
-        if size is none:
+    def truncate(self, size=None):
+        if size is None:
             return self._file.truncate()
         if self._max_size and size > self._max_size:
             self.rollover()
@@ -624,13 +624,13 @@ class SpooledTemporaryFile:
         return rv
 
     def readable(self):
-        return true
+        return True
 
     def seekable(self):
-        return true
+        return True
 
     def writable(self):
-        return true
+        return True
 
 
 class TemporaryDirectory:
@@ -644,16 +644,16 @@ class TemporaryDirectory:
     Upon exiting the context, the directory and everything contained
     in it are removed (unless delete=False is passed).
     """
-    def __init__(self, suffix=none, prefix=none, dir=none,
-                 ignore_cleanup_errors=false, delete=true):
+    def __init__(self, suffix=None, prefix=None, dir=None,
+                 ignore_cleanup_errors=False, delete=True):
         self.name = mkdtemp(suffix, prefix, dir)
         self._ignore_cleanup_errors = ignore_cleanup_errors
         self._delete = delete
-        self._done = false
+        self._done = False
 
     def _rmtree(self):
         if self._ignore_cleanup_errors:
-            _shutil_mod.rmtree(self.name, true)
+            _shutil_mod.rmtree(self.name, True)
             return
         def _onexc(func, path, exc):
             if isinstance(exc, PermissionError):
@@ -667,7 +667,7 @@ class TemporaryDirectory:
             if isinstance(exc, FileNotFoundError):
                 return
             raise exc
-        _shutil_mod.rmtree(self.name, false, none, _onexc)
+        _shutil_mod.rmtree(self.name, False, None, _onexc)
 
     def __repr__(self):
         return "<TemporaryDirectory " + repr(self.name) + ">"
@@ -678,11 +678,11 @@ class TemporaryDirectory:
     def __exit__(self, exc, value, tb):
         if self._delete:
             self.cleanup()
-        return false
+        return False
 
     def cleanup(self):
         if not self._done:
-            self._done = true
+            self._done = True
             if os_exists(self.name) or os_islink(self.name):
                 self._rmtree()
 

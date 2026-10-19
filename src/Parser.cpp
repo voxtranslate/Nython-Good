@@ -2253,6 +2253,7 @@ node_ptr Parser::fstringAst(const Token& str_tok, const std::string& raw, const 
                 nython::exception::Reporter sub_reporter(sub_src);
                 auto sub_lex = std::make_shared<Lexer>(sub_src);
                 sub_lex->force_python_strings = true;
+                sub_lex->force_python_names = scanner->python_names;   // round 86
                 sub_lex->tokenize();
                 if (exact) {
                     // the field's tokens in the source's coordinates: a
@@ -2597,6 +2598,7 @@ node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
                 auto sub_src = reader::SourceCode::from_text(expr_str, "stdin");   // (round 86) f"{x}" read a file named x
                 nython::exception::Reporter sub_reporter(sub_src);
                 auto sub_lex = std::make_shared<Lexer>(sub_src);
+                sub_lex->force_python_names = scanner->python_names;   // round 86: f"{true}" in a .py file names `true`
                 sub_lex->tokenize();
                 Parser sub_parser(&sub_reporter, runner, sub_lex.get());
                 sub_parser.mangle_stack_ = mangle_stack_;   // f"{self.__x}" (round 78)

@@ -37,7 +37,7 @@ class JSONDecodeError(ValueError):
         return (self.__class__, (self.msg, self.doc, self.pos))
 
 
-def scanstring(s, end, strict=true):
+def scanstring(s, end, strict=True):
     """Scan the string s for a JSON string. End is the index of the
     character in s after the quote that started the JSON string.
     Returns a tuple of the decoded string and the index of the character in s
@@ -62,13 +62,13 @@ class JSONDecoder:
     their corresponding ``float`` values, which is outside the JSON spec.
     """
 
-    def __init__(self, *, object_hook=none, parse_float=none,
-                 parse_int=none, parse_constant=none, strict=true,
-                 object_pairs_hook=none):
+    def __init__(self, *, object_hook=None, parse_float=None,
+                 parse_int=None, parse_constant=None, strict=True,
+                 object_pairs_hook=None):
         self.object_hook = object_hook
-        self.parse_float = parse_float if parse_float is not none else float
-        self.parse_int = parse_int if parse_int is not none else int
-        self.parse_constant = parse_constant if parse_constant is not none else _constant
+        self.parse_float = parse_float if parse_float is not None else float
+        self.parse_int = parse_int if parse_int is not None else int
+        self.parse_constant = parse_constant if parse_constant is not None else _constant
         self.strict = strict
         self.object_pairs_hook = object_pairs_hook
         self.memo = {}
@@ -76,17 +76,17 @@ class JSONDecoder:
         # as ("i"|"f"|"c", text) for parse_* (raw bit 1), objects as
         # ("o", pairs) for object_pairs_hook (bit 2), dicts for object_hook
         self._raw = 0
-        if parse_float is not none or parse_int is not none or parse_constant is not none:
+        if parse_float is not None or parse_int is not None or parse_constant is not None:
             self._raw = self._raw | 1
-        if object_pairs_hook is not none:
+        if object_pairs_hook is not None:
             self._raw = self._raw | 2
-        self._hooked = self._raw != 0 or object_hook is not none
+        self._hooked = self._raw != 0 or object_hook is not None
 
-    def decode(self, s, _w=none):
+    def decode(self, s, _w=None):
         """Return the Python representation of ``s`` (a ``str`` instance
         containing a JSON document)."""
         if self.__class__.raw_decode == JSONDecoder.raw_decode:
-            var r = _json_scan(s, 0, self.strict, self._raw, true)
+            var r = _json_scan(s, 0, self.strict, self._raw, True)
             if not r[0]:
                 raise JSONDecodeError(r[1], s, r[2])
             if self._hooked:
@@ -104,7 +104,7 @@ class JSONDecoder:
         """Decode a JSON document from ``s`` (a ``str`` beginning with
         a JSON document) and return a 2-tuple of the Python
         representation and the index in ``s`` where the document ended."""
-        var r = _json_scan(s, idx, self.strict, self._raw, false)
+        var r = _json_scan(s, idx, self.strict, self._raw, False)
         if not r[0]:
             raise JSONDecodeError(r[1], s, r[2])
         if self._hooked:
@@ -113,7 +113,7 @@ class JSONDecoder:
 
     def scan_once(self, s, idx):
         """(value, end) at idx; StopIteration(idx) when no value starts there."""
-        var r = _json_scan(s, idx, self.strict, self._raw, false)
+        var r = _json_scan(s, idx, self.strict, self._raw, False)
         if not r[0]:
             if r[1] == "Expecting value" and r[2] == idx:
                 raise StopIteration(idx)
@@ -138,7 +138,7 @@ class JSONDecoder:
                 var v = node[k]
                 if isinstance(v, list) or isinstance(v, dict) or isinstance(v, tuple):
                     node[k] = self._hook(v)
-            if self.object_hook is not none:
+            if self.object_hook is not None:
                 return self.object_hook(node)
             return node
         if isinstance(node, tuple):
@@ -150,12 +150,12 @@ class JSONDecoder:
                 while i < len(flat):
                     pairs.append((flat[i], self._hook(flat[i + 1])))
                     i = i + 2
-                if self.object_pairs_hook is not none:
+                if self.object_pairs_hook is not None:
                     return self.object_pairs_hook(pairs)
                 var d = {}
                 for kv in pairs:
                     d[kv[0]] = kv[1]
-                if self.object_hook is not none:
+                if self.object_hook is not None:
                     return self.object_hook(d)
                 return d
             if tag == "i":

@@ -70,7 +70,7 @@ def _bracket_body(pat, i, j):
     else:
         var chunks = []
         var k = i + 2 if pat[i] == "!" else i + 1
-        while true:
+        while True:
             k = pat.find("-", k, j)
             if k < 0:
                 break
@@ -111,7 +111,7 @@ def _class_ranges(body):
     while p < n:
         var ch = body[p]
         if ch == "\\" and p + 1 < n:
-            atoms.append([body[p + 1], false])
+            atoms.append([body[p + 1], False])
             p = p + 2
         else:
             atoms.append([ch, ch == "-"])
@@ -147,15 +147,15 @@ def _parse(pat):
             if len(lit) > 0:
                 toks.append([_LIT, "".join(lit)])
                 lit = []
-            if len(parts) == 0 or parts[-1] is not none:
-                parts.append(none)
-                toks.append([_STAR, none])
+            if len(parts) == 0 or parts[-1] is not None:
+                parts.append(None)
+                toks.append([_STAR, None])
         elif c == "?":
             if len(lit) > 0:
                 toks.append([_LIT, "".join(lit)])
                 lit = []
             parts.append(".")
-            toks.append([_ANY, none])
+            toks.append([_ANY, None])
         elif c == "[":
             var j = i
             if j < n and pat[j] == "!":
@@ -175,14 +175,14 @@ def _parse(pat):
                     lit = []
                 if stuff == "":
                     parts.append("(?!)")
-                    toks.append([_NEVER, none])
+                    toks.append([_NEVER, None])
                 elif stuff == "!":
                     parts.append(".")
-                    toks.append([_ANY, none])
+                    toks.append([_ANY, None])
                 else:
-                    var neg = false
+                    var neg = False
                     if stuff[0] == "!":
-                        neg = true
+                        neg = True
                         stuff = "^" + stuff[1:]
                     elif stuff[0] == "^" or stuff[0] == "[":
                         stuff = "\\" + stuff
@@ -201,19 +201,19 @@ def _parse(pat):
 # length).
 def _compile(pat):
     var c = _cache.get(pat)
-    if c is not none:
+    if c is not None:
         return c
     var toks = _parse(pat)[1]
     var segs = []
     var cur = []
     var width = 0
-    var star = false
+    var star = False
     for t in toks:
         if t[0] == _STAR:
             segs.append([cur, width])
             cur = []
             width = 0
-            star = true
+            star = True
         else:
             cur.append(t)
             width = width + (len(t[1]) if t[0] == _LIT else 1)
@@ -226,10 +226,10 @@ def _compile(pat):
 
 
 def _in_set(spec, ch):
-    var hit = false
+    var hit = False
     for r in spec[1]:
         if r[0] <= ch and ch <= r[1]:
-            hit = true
+            hit = True
             break
     return hit != spec[0]
 
@@ -240,17 +240,17 @@ def _seg_at(seg, s, pos):
         var k = t[0]
         if k == _LIT:
             if not s.startswith(t[1], pos):
-                return false
+                return False
             pos = pos + len(t[1])
         elif k == _ANY:
             pos = pos + 1
         elif k == _SET:
             if not _in_set(t[1], s[pos]):
-                return false
+                return False
             pos = pos + 1
         else:
-            return false
-    return true
+            return False
+    return True
 
 
 def _match(s, pat):
@@ -262,35 +262,35 @@ def _match(s, pat):
         return first[1] == n and _seg_at(first, s, 0)
     var last = segs[-1]
     if first[1] + last[1] > n:
-        return false
+        return False
     if not _seg_at(first, s, 0):
-        return false
+        return False
     var end = n - last[1]
     if not _seg_at(last, s, end):
-        return false
+        return False
     var pos = first[1]
     var k = 1
     var nsegs = len(segs) - 1
     while k < nsegs:
         var seg = segs[k]
         var w = seg[1]
-        var head = seg[0][0] if len(seg[0]) > 0 else none
-        var found = false
+        var head = seg[0][0] if len(seg[0]) > 0 else None
+        var found = False
         while pos + w <= end:
-            if head is not none and head[0] == _LIT:
+            if head is not None and head[0] == _LIT:
                 var at = s.find(head[1], pos)
                 if at < 0 or at + w > end:
-                    return false
+                    return False
                 pos = at
             if _seg_at(seg, s, pos):
-                found = true
+                found = True
                 break
             pos = pos + 1
         if not found:
-            return false
+            return False
         pos = pos + w
         k = k + 1
-    return true
+    return True
 
 
 def _check_types(name, pat):
@@ -331,7 +331,7 @@ def translate(pat):
     var res = []
     var i = 0
     var n = len(parts)
-    while i < n and parts[i] is not none:
+    while i < n and parts[i] is not None:
         res.append(parts[i])
         i = i + 1
     while i < n:
@@ -340,7 +340,7 @@ def translate(pat):
             res.append(".*")
             break
         var fixed = []
-        while i < n and parts[i] is not none:
+        while i < n and parts[i] is not None:
             fixed.append(parts[i])
             i = i + 1
         var f = "".join(fixed)

@@ -27,7 +27,7 @@ class DefaultSelector:
     def __init__(self):
         self._keys = {}
 
-    def register(self, fileobj, events, data=none):
+    def register(self, fileobj, events, data=None):
         if events == 0 or (events & ~(EVENT_READ | EVENT_WRITE)) != 0:
             raise ValueError("Invalid events: " + repr(events))
         var fd = _fd(fileobj)
@@ -45,11 +45,11 @@ class DefaultSelector:
         del self._keys[fd]
         return key
 
-    def modify(self, fileobj, events, data=none):
+    def modify(self, fileobj, events, data=None):
         self.unregister(fileobj)
         return self.register(fileobj, events, data)
 
-    def select(self, timeout=none):
+    def select(self, timeout=None):
         var rf = []
         var wf = []
         for fd in self._keys:
@@ -59,7 +59,7 @@ class DefaultSelector:
             if k.events & EVENT_WRITE:
                 wf.append(fd)
         var t = timeout
-        if t is not none and t < 0:
+        if t is not None and t < 0:
             t = 0
         var r = _net_select(rf, wf, [], t)
         var ready = {}
@@ -86,7 +86,7 @@ class DefaultSelector:
 
     def __exit__(self, a, b, c):
         self.close()
-        return false
+        return False
 
 SelectSelector = DefaultSelector
 PollSelector = DefaultSelector
@@ -97,17 +97,17 @@ PollSelector = DefaultSelector
 # EpollSelector is CPython's, over select.epoll (Linux). DefaultSelector stays
 # the socket layer's (it parks an async task instead of blocking its loop).
 class BaseSelector:
-    def register(self, fileobj, events, data=none):
+    def register(self, fileobj, events, data=None):
         raise NotImplementedError
 
     def unregister(self, fileobj):
         raise NotImplementedError
 
-    def modify(self, fileobj, events, data=none):
+    def modify(self, fileobj, events, data=None):
         self.unregister(fileobj)
         return self.register(fileobj, events, data)
 
-    def select(self, timeout=none):
+    def select(self, timeout=None):
         raise NotImplementedError
 
     def close(self):
@@ -115,7 +115,7 @@ class BaseSelector:
 
     def get_key(self, fileobj):
         var mapping = self.get_map()
-        if mapping is none:
+        if mapping is None:
             raise RuntimeError("Selector is closed")
         try:
             return mapping[fileobj]
@@ -143,7 +143,7 @@ if os_platform() == "linux":
         def fileno(self):
             return self._selector.fileno()
 
-        def register(self, fileobj, events, data=none):
+        def register(self, fileobj, events, data=None):
             if (not events) or (events & ~(EVENT_READ | EVENT_WRITE)):
                 raise ValueError("Invalid events: " + repr(events))
             var fd = _fd(fileobj)
@@ -170,9 +170,9 @@ if os_platform() == "linux":
                 pass
             return key
 
-        def select(self, timeout=none):
-            var t = none
-            if timeout is not none:
+        def select(self, timeout=None):
+            var t = None
+            if timeout is not None:
                 t = 0 if timeout <= 0 else timeout
             var max_ev = max(len(self._keys), 1)
             var ready = []
@@ -185,7 +185,7 @@ if os_platform() == "linux":
                     if event & ~_select.EPOLLOUT:
                         events = events | EVENT_READ
                     var key = self._keys.get(pair[0])
-                    if key is not none:
+                    if key is not None:
                         ready.append((key, events & key.events))
             except InterruptedError:
                 return ready

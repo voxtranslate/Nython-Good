@@ -16,17 +16,18 @@
 #
 #     ./build/nython-cli examples/vm_audit96.ny
 #     ./build/nython-cli --vm examples/vm_audit96.ny
+# (round 86: in a Python-language file `true` is a name on Nython too, so
+# the engine is told by sys.implementation)
+import sys
+nython = sys.implementation.name == "nython"
 try:
     true
-    nython = True
 except NameError:
-    nython = False
     true = True
     false = False
     none = None
 
 import os
-import sys
 import types
 import tempfile
 import shutil

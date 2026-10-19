@@ -23,10 +23,10 @@ PROTOCOL_TLS_SERVER = 17
 CERT_NONE = 0
 CERT_OPTIONAL = 1
 CERT_REQUIRED = 2
-HAS_SNI = true
-HAS_ALPN = true
-HAS_TLSv1_2 = true
-HAS_TLSv1_3 = true
+HAS_SNI = True
+HAS_ALPN = True
+HAS_TLSv1_2 = True
+HAS_TLSv1_3 = True
 OPENSSL_VERSION = _tls_version_text()
 HAS_TLS = _tls_available()
 
@@ -69,7 +69,7 @@ class SSLContext:
             self._verify_mode = CERT_REQUIRED
         self._minimum = TLSVersion.TLSv1_2
         self._maximum = TLSVersion.MAXIMUM_SUPPORTED
-        self.sni_callback = none
+        self.sni_callback = None
 
     @property
     def check_hostname(self):
@@ -119,10 +119,10 @@ class SSLContext:
     def set_default_verify_paths(self):
         _tls_ctx_default_paths(self._h)
 
-    def load_verify_locations(self, cafile=none, capath=none, cadata=none):
+    def load_verify_locations(self, cafile=None, capath=None, cadata=None):
         _tls_ctx_load_verify(self._h, cafile, capath, cadata)
 
-    def load_cert_chain(self, certfile, keyfile=none, password=none):
+    def load_cert_chain(self, certfile, keyfile=None, password=None):
         if callable(password):
             password = password()
         _tls_ctx_load_cert_chain(self._h, certfile, keyfile, password)
@@ -133,16 +133,16 @@ class SSLContext:
     def set_ciphers(self, ciphers):
         _tls_ctx_set_ciphers(self._h, ciphers)
 
-    def wrap_socket(self, sock, server_side=false, do_handshake_on_connect=true, suppress_ragged_eofs=true, server_hostname=none, session=none):
+    def wrap_socket(self, sock, server_side=False, do_handshake_on_connect=True, suppress_ragged_eofs=True, server_hostname=None, session=None):
         # A connected socket starts TLS now; an unconnected one when it
         # connects, and a listening one wraps each connection accept() returns.
         var s = SSLSocket(sock, self, server_side, server_hostname)
         s._handshake_now = do_handshake_on_connect
-        var connected = true
+        var connected = True
         try:
             sock.getpeername()
         except OSError:
-            connected = false
+            connected = False
         if connected:
             s._start()
         return s
@@ -150,15 +150,15 @@ class SSLContext:
     def __repr__(self):
         return "<ssl.SSLContext protocol=" + str(self.protocol) + ">"
 
-def create_default_context(purpose=Purpose.SERVER_AUTH, cafile=none, capath=none, cadata=none):
-    var ctx = none
+def create_default_context(purpose=Purpose.SERVER_AUTH, cafile=None, capath=None, cadata=None):
+    var ctx = None
     if purpose == Purpose.SERVER_AUTH:
         ctx = SSLContext(PROTOCOL_TLS_CLIENT)
-        if cafile == none and capath == none and cadata == none:
+        if cafile == None and capath == None and cadata == None:
             ctx.load_default_certs(purpose)
     else:
         ctx = SSLContext(PROTOCOL_TLS_SERVER)
-    if cafile != none or capath != none or cadata != none:
+    if cafile != None or capath != None or cadata != None:
         ctx.load_verify_locations(cafile, capath, cadata)
     return ctx
 
@@ -172,14 +172,14 @@ class SSLSocket:
         self.server_hostname = server_hostname
         self.family = sock.family
         self.type = sock.type
-        self._tls = false
-        self._handshake_now = true
+        self._tls = False
+        self._handshake_now = True
 
     def _start(self):
         _tls_wrap(self._sock.fileno_handle(), self.context._h, self.server_side, self.server_hostname, self.context._check_hostname, self._handshake_now)
-        self._tls = true
+        self._tls = True
 
-    def do_handshake(self, block=false):
+    def do_handshake(self, block=False):
         if not self._tls:
             self._start()
         _tls_handshake(self._sock.fileno_handle())
@@ -195,7 +195,7 @@ class SSLSocket:
             self.connect(address)
             return 0
         except OSError as e:
-            return e.errno if hasattr(e, "errno") and e.errno != none else 1
+            return e.errno if hasattr(e, "errno") and e.errno != None else 1
 
     def bind(self, address):
         self._sock.bind(address)
@@ -206,7 +206,7 @@ class SSLSocket:
     def accept(self):
         # The connection, as an SSLSocket that has done its server handshake.
         var pair = self._sock.accept()
-        var conn = self.context.wrap_socket(pair[0], true, self._handshake_now)
+        var conn = self.context.wrap_socket(pair[0], True, self._handshake_now)
         return (conn, pair[1])
 
     def version(self):
@@ -215,15 +215,15 @@ class SSLSocket:
     def cipher(self):
         var i = _tls_info(self._sock.fileno_handle())
         if not ("cipher" in i):
-            return none
+            return None
         return (i["cipher"], i["version"], i["bits"])
 
     def selected_alpn_protocol(self):
         return _tls_info(self._sock.fileno_handle()).get("alpn")
 
-    def getpeercert(self, binary_form=false):
+    def getpeercert(self, binary_form=False):
         var c = _tls_peer_cert(self._sock.fileno_handle(), binary_form)
-        if c == none or binary_form:
+        if c == None or binary_form:
             return c
         if self.context.verify_mode == CERT_NONE:
             return {}
@@ -255,7 +255,7 @@ class SSLSocket:
     def recv_into(self, buffer, nbytes=0, flags=0):
         return self._sock.recv_into(buffer, nbytes, flags)
 
-    def makefile(self, mode="r", buffering=none, encoding=none, errors=none, newline=none):
+    def makefile(self, mode="r", buffering=None, encoding=None, errors=None, newline=None):
         return socket.SocketIO(self, mode, encoding)
 
     def fileno(self):
@@ -285,10 +285,10 @@ class SSLSocket:
     def shutdown(self, how):
         self._sock.shutdown(how)
 
-    def wait_readable(self, timeout=none):
+    def wait_readable(self, timeout=None):
         return self._sock.wait_readable(timeout)
 
-    def wait_writable(self, timeout=none):
+    def wait_writable(self, timeout=None):
         return self._sock.wait_writable(timeout)
 
     def close(self):
@@ -302,7 +302,7 @@ class SSLSocket:
 
     def __exit__(self, a, b, c):
         self.close()
-        return false
+        return False
 
     def __repr__(self):
         return "<ssl.SSLSocket " + repr(self._sock)[1:]
@@ -317,8 +317,8 @@ def get_default_verify_paths():
     var parts = _tls_rand("paths") if HAS_TLS else ["SSL_CERT_FILE", "", "SSL_CERT_DIR", ""]
     var cafile = os.environ.get(parts[0], parts[1])
     var capath = os.environ.get(parts[2], parts[3])
-    return DefaultVerifyPaths(cafile if os.path.isfile(cafile) else none,
-                              capath if os.path.isdir(capath) else none,
+    return DefaultVerifyPaths(cafile if os.path.isfile(cafile) else None,
+                              capath if os.path.isdir(capath) else None,
                               parts[0], parts[1], parts[2], parts[3])
 
 def match_hostname(cert, hostname):
@@ -390,13 +390,13 @@ _PROTOCOL_NAMES = {2: "PROTOCOL_TLS", 3: "PROTOCOL_TLSv1", 4: "PROTOCOL_TLSv1_1"
 def get_protocol_name(protocol_code):
     return _PROTOCOL_NAMES.get(protocol_code, "<unknown>")
 
-HAS_ECDH = true
-HAS_NEVER_CHECK_COMMON_NAME = true
-HAS_NPN = false
-HAS_SSLv2 = false
-HAS_SSLv3 = false
-HAS_TLSv1 = true
-HAS_TLSv1_1 = true
+HAS_ECDH = True
+HAS_NEVER_CHECK_COMMON_NAME = True
+HAS_NPN = False
+HAS_SSLv2 = False
+HAS_SSLv3 = False
+HAS_TLSv1 = True
+HAS_TLSv1_1 = True
 CHANNEL_BINDING_TYPES = ["tls-unique"]
 
 OP_ALL = 2147483728
@@ -506,8 +506,8 @@ def cert_time_to_seconds(cert_time):
     var tt = strptime(cert_time[3:], time_format)
     return timegm((tt[0], month_number) + tuple(tt[2:6]))
 
-def wrap_socket(sock, keyfile=none, certfile=none, server_side=false, cert_reqs=CERT_NONE, ssl_version=PROTOCOL_TLS,
-                ca_certs=none, do_handshake_on_connect=true, suppress_ragged_eofs=true, ciphers=none):
+def wrap_socket(sock, keyfile=None, certfile=None, server_side=False, cert_reqs=CERT_NONE, ssl_version=PROTOCOL_TLS,
+                ca_certs=None, do_handshake_on_connect=True, suppress_ragged_eofs=True, ciphers=None):
     """3.11's module-level wrap_socket (deprecated; removed in 3.12)."""
     import warnings
     warnings.warn("ssl.wrap_socket() is deprecated, use SSLContext.wrap_socket()", category=DeprecationWarning, stacklevel=2)
@@ -526,23 +526,23 @@ def wrap_socket(sock, keyfile=none, certfile=none, server_side=false, cert_reqs=
     return context.wrap_socket(sock, server_side=server_side, do_handshake_on_connect=do_handshake_on_connect,
                                suppress_ragged_eofs=suppress_ragged_eofs)
 
-def get_server_certificate(addr, ssl_version=PROTOCOL_TLS_CLIENT, ca_certs=none, timeout=_GLOBAL_DEFAULT_TIMEOUT):
+def get_server_certificate(addr, ssl_version=PROTOCOL_TLS_CLIENT, ca_certs=None, timeout=_GLOBAL_DEFAULT_TIMEOUT):
     """Retrieve the certificate from the server at the specified address,
     and return it as a PEM-encoded string."""
     var host = addr[0]
     var port = addr[1]
     var context = SSLContext(ssl_version)
-    if ca_certs is not none:
+    if ca_certs is not None:
         context.verify_mode = CERT_REQUIRED
         context.load_verify_locations(ca_certs)
     else:
-        context.check_hostname = false
+        context.check_hostname = False
         context.verify_mode = CERT_NONE
     var sock = create_connection(addr, timeout=timeout)
     try:
         var sslsock = context.wrap_socket(sock, server_hostname=host)
         try:
-            return DER_cert_to_PEM_cert(sslsock.getpeercert(true))
+            return DER_cert_to_PEM_cert(sslsock.getpeercert(True))
         finally:
             sslsock.close()
     finally:

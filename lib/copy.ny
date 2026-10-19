@@ -52,13 +52,13 @@ def _tname(x):
 # ── what a value is ──────────────────────────────────────────────────────────
 def _is_atomic(x):
     # values never copied: they cannot change
-    if x is none:
-        return true
+    if x is None:
+        return True
     if isinstance(x, (bool, int, float, str, bytes)):
-        return true
+        return True
     if isinstance(x, complex):
-        return true
-    return false
+        return True
+    return False
 
 def _runtime_kind(x):
     # a function, bound method, builtin or generator / lazy iterator: kinds
@@ -90,14 +90,14 @@ def _new_instance(cls):
         return object.__new__(cls)
     # Does cls define __init__ itself, or inherit it (or have none)? An
     # inherited one is restored by deleting the stand-in.
-    var own = none
+    var own = None
     if hasattr(cls, "__init__"):
         var mine = getattr(cls, "__init__")
         own = mine
         var mro = list(cls.__mro__)
         for i in range(1, len(mro)):
             if hasattr(mro[i], "__init__") and id(getattr(mro[i], "__init__")) == id(mine):
-                own = none
+                own = None
                 break
     mutex_lock(_new_lock)
     try:
@@ -105,7 +105,7 @@ def _new_instance(cls):
         try:
             return cls()
         finally:
-            if own is none:
+            if own is None:
                 delattr(cls, "__init__")
             else:
                 setattr(cls, "__init__", own)
@@ -117,10 +117,10 @@ def _own_hook(cls, name):
     # a hook the class or a base defines (object's, the default, aside)
     for c in cls.__mro__:
         if c is object:
-            return false
+            return False
         if name in copyreg._cdict(c):
-            return true
-    return false
+            return True
+    return False
 
 
 def _user_reduce(cls):
@@ -129,13 +129,13 @@ def _user_reduce(cls):
     # it, as CPython does, instead of the builtin value's own copy
     for c in cls.__mro__:
         if c is object or c in (str, int, float, bytes, bytearray, list, dict, set, frozenset, tuple):
-            return false
+            return False
         if c.__name__.startswith("_NyB_"):
-            return false
+            return False
         var d = copyreg._cdict(c)
         if "__reduce_ex__" in d or "__reduce__" in d:
-            return true
-    return false
+            return True
+    return False
 
 
 def _state_of(x):
@@ -148,19 +148,19 @@ def _state_of(x):
 
 
 def _set_state(y, state):
-    if state is none:
+    if state is None:
         return
     if hasattr(y, "__setstate__"):
         y.__setstate__(state)
         return
-    var slotstate = none
+    var slotstate = None
     if isinstance(state, tuple) and len(state) == 2:
         slotstate = state[1]
         state = state[0]
-    if state is not none:
+    if state is not None:
         for k in state:
             object.__setattr__(y, k, state[k])
-    if slotstate is not none:
+    if slotstate is not None:
         for k in slotstate:
             setattr(y, k, slotstate[k])
 
@@ -169,9 +169,9 @@ def _has_class_attr(cls, name):
     # a hook the class (not the instance) defines
     try:
         getattr(cls, name)
-        return true
+        return True
     except AttributeError:
-        return false
+        return False
 
 
 # Python's collections types have __copy__; the runtime's (lib/collections.ny)
@@ -195,12 +195,12 @@ def _exception_new(x):
 # dictitems) for a mutable one - then its attributes.
 def _builtin_value(x):
     var v = _ny_payload(x)
-    return none if v is x else v
+    return None if v is x else v
 
 def _copy_valued(x, v, memo):
     var cls = x.__class__
-    var deep = memo is not none
-    var y = none
+    var deep = memo is not None
+    var y = None
     if isinstance(v, (list, dict, set, bytearray)):
         y = cls.__new__(cls)
         if deep:
@@ -222,7 +222,7 @@ def _copy_valued(x, v, memo):
         if deep:
             memo[id(x)] = y
     var state = _state_of(x)
-    if deep and state is not none:
+    if deep and state is not None:
         state = deepcopy(state, memo)
     _set_state(y, state)
     return y
@@ -239,14 +239,14 @@ def copy(x):
             # round 83: before the atomic and container shortcuts, which a str
             # or list subclass would otherwise take
             var urv = _reduce(x, x.__class__)
-            if urv is not none:
+            if urv is not None:
                 if isinstance(urv, str):
                     return x
-                return _reconstruct(x, none, urv)
+                return _reconstruct(x, None, urv)
         else:
             var bv = _builtin_value(x)
-            if bv is not none:
-                return _copy_valued(x, bv, none)
+            if bv is not None:
+                return _copy_valued(x, bv, None)
     if _is_atomic(x):
         return x
     if isinstance(x, list):
@@ -268,10 +268,10 @@ def copy(x):
         if _collections_copy(x):
             return x.copy()
         var rv = _reduce(x, cls)
-        if rv is not none:
+        if rv is not None:
             if isinstance(rv, str):
                 return x
-            return _reconstruct(x, none, rv)
+            return _reconstruct(x, None, rv)
         if isinstance(x, BaseException):
             var e = _exception_new(x)
             _set_state(e, _plain_state(x))
@@ -294,7 +294,7 @@ def _plain_state(x):
         if k != "args" and k != "msg":
             out[k] = d[k]
     if len(out) == 0:
-        return none
+        return None
     return out
 
 
@@ -308,24 +308,24 @@ def _reduce(x, cls):
     # __new__'s arguments: object.__reduce_ex__(4) as CPython makes it
     if _own_hook(cls, "__getnewargs_ex__") or _own_hook(cls, "__getnewargs__"):
         return copyreg._ny_reduce_newobj(x)
-    return none
+    return None
 
 
 # ── deepcopy ─────────────────────────────────────────────────────────────────
-def deepcopy(x, memo=none, _nil=[]):
+def deepcopy(x, memo=None, _nil=[]):
     """Deep copy operation on arbitrary Python objects.
 
     See the module's __doc__ string for more info.
     """
-    if memo is none:
+    if memo is None:
         memo = {}
-    if _is_atomic(x) and _builtin_value(x) is none:
+    if _is_atomic(x) and _builtin_value(x) is None:
         return x
     var d = id(x)
     var y = memo.get(d, _nil)
     if id(y) != id(_nil):
         return y
-    if (_is_instance(x) and not _has_class_attr(x.__class__, "__deepcopy__") and _builtin_value(x) is not none
+    if (_is_instance(x) and not _has_class_attr(x.__class__, "__deepcopy__") and _builtin_value(x) is not None
             and not _user_reduce(x.__class__)):
         y = _copy_valued(x, _builtin_value(x), memo)
     elif isinstance(x, list):
@@ -386,12 +386,12 @@ def _deepcopy_instance(x, memo):
     if _has_class_attr(cls, "__deepcopy__"):
         return x.__deepcopy__(memo)
     var rv = _reduce(x, cls)
-    if rv is not none:
+    if rv is not None:
         if isinstance(rv, str):
             return x
         return _reconstruct(x, memo, rv)
-    var y = none
-    var state = none
+    var y = None
+    var state = None
     if isinstance(x, BaseException):
         y = x.__class__(*deepcopy(list(x.args), memo))
         state = _plain_state(x)
@@ -399,7 +399,7 @@ def _deepcopy_instance(x, memo):
         y = _new_instance(cls)
         state = _state_of(x)
     memo[id(x)] = y
-    if state is not none:
+    if state is not None:
         state = deepcopy(state, memo)
     _set_state(y, state)
     return y
@@ -429,23 +429,23 @@ def _reconstruct(x, memo, rv):
         raise Error("__reduce__ must return a tuple of 2 to 5 items")
     var func = rv[0]
     var args = rv[1]
-    var state = rv[2] if n > 2 else none
-    var listiter = rv[3] if n > 3 else none
-    var dictiter = rv[4] if n > 4 else none
-    var deep = memo is not none
+    var state = rv[2] if n > 2 else None
+    var listiter = rv[3] if n > 3 else None
+    var dictiter = rv[4] if n > 4 else None
+    var deep = memo is not None
     if deep and args:
         args = deepcopy(args, memo)
     var y = func(*args)
     if deep:
         memo[id(x)] = y
-    if state is not none:
+    if state is not None:
         if deep:
             state = deepcopy(state, memo)
         _set_state(y, state)
-    if listiter is not none:
+    if listiter is not None:
         for item in listiter:
             y.append(deepcopy(item, memo) if deep else item)
-    if dictiter is not none:
+    if dictiter is not None:
         for pair in dictiter:
             var key = pair[0]
             var value = pair[1]

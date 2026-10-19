@@ -30,12 +30,12 @@ class _Hash:
     def update(self, data):
         _hash_update(self._h, _hd(data))
 
-    def digest(self, length=none):
-        if length != none:
+    def digest(self, length=None):
+        if length != None:
             return _hash_digest(self._h, length)
         return _hash_digest(self._h)
 
-    def hexdigest(self, length=none):
+    def hexdigest(self, length=None):
         return self.digest(length).hex()
 
     def copy(self):
@@ -49,7 +49,7 @@ class _Hash:
 
 def _new(name, data=b"", digest_size=0, key=b""):
     var h = _hash_new(name, _hd(data), digest_size, _hd(key))
-    if h == none:
+    if h == None:
         raise ValueError("unsupported hash type " + str(name))
     return _Hash(h)
 
@@ -101,7 +101,7 @@ def blake2s(data=b"", digest_size=32, key=b"", **kwargs):
     var h = _hash_new("blake2s", _hd(data), digest_size, _hd(key))
     return _Hash(h)
 
-def pbkdf2_hmac(hash_name, password, salt, iterations, dklen=none):
+def pbkdf2_hmac(hash_name, password, salt, iterations, dklen=None):
     return _hash_pbkdf2(hash_name, _hd(password), _hd(salt), iterations, dklen)
 
 def _scrypt_bytes(v):

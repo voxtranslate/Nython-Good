@@ -41,7 +41,7 @@ __all__ = ["accumulate", "batched", "chain", "combinations", "combinations_with_
 
 
 def _tname(x):
-    if x is none:
+    if x is None:
         return "NoneType"
     return type(x).__name__
 
@@ -49,7 +49,7 @@ def _tname(x):
 def _iter(x):
     # iter(x) with Python's TypeError for a number (the runtime iterates
     # an int as a range)
-    if x is none or isinstance(x, (int, float)):
+    if x is None or isinstance(x, (int, float)):
         raise TypeError("'" + _tname(x) + "' object is not iterable")
     return iter(x)
 
@@ -81,9 +81,9 @@ def _as_index(x, what):
 
 def _is_number(x):
     if isinstance(x, (int, float)):
-        return true
+        return True
     if isinstance(x, (str, bytes, bytearray, list, tuple, dict, set, frozenset)):
-        return false
+        return False
     return hasattr(x, "__add__")
 
 
@@ -117,7 +117,7 @@ class cycle:
         self._it = _iter(iterable)
         self._saved = []
         self._i = 0
-        self._first = true
+        self._first = True
 
     def __iter__(self):
         return self
@@ -129,8 +129,8 @@ class cycle:
                 self._saved.append(v)
                 return v
             except StopIteration:
-                self._first = false
-                self._it = none
+                self._first = False
+                self._it = None
         if len(self._saved) == 0:
             raise StopIteration
         var w = self._saved[self._i]
@@ -142,20 +142,20 @@ class repeat:
     "repeat(object [,times]) -> create an iterator which returns the object for the specified number of times.  If not specified, returns the object endlessly."
     def __init__(self, *args, **kwargs):
         var n = len(args)
-        var obj = none
-        var times = none
-        var has_obj = false
+        var obj = None
+        var times = None
+        var has_obj = False
         if n > 2:
             raise TypeError("repeat expected at most 2 arguments, got " + str(n))
         if n >= 1:
             obj = args[0]
-            has_obj = true
+            has_obj = True
         if n == 2:
             times = args[1]
         for k in kwargs:
             if k == "object" and not has_obj:
                 obj = kwargs[k]
-                has_obj = true
+                has_obj = True
             elif k == "times" and n < 2:
                 times = kwargs[k]
             else:
@@ -164,7 +164,7 @@ class repeat:
             raise TypeError("repeat() missing required argument 'object' (pos 1)")
         self._obj = obj
         self._left = -1
-        if times is not none:
+        if times is not None:
             self._left = _as_index(times, "times")
             if self._left < 0:
                 self._left = 0
@@ -193,7 +193,7 @@ class repeat:
 # ── terminating iterators ────────────────────────────────────────────────────
 class accumulate:
     "Return series of accumulated sums (or other binary function results)."
-    def __init__(self, iterable, func=none, initial=none):
+    def __init__(self, iterable, func=None, initial=None):
         self._it = _iter(iterable)
         self._func = func
         self._total = _NO
@@ -203,14 +203,14 @@ class accumulate:
         return self
 
     def __next__(self):
-        if self._initial is not none:
+        if self._initial is not None:
             self._total = self._initial
-            self._initial = none
+            self._initial = None
             return self._total
         var v = next(self._it)
         if _isno(self._total):
             self._total = v
-        elif self._func is none:
+        elif self._func is None:
             self._total = self._total + v
         else:
             self._total = self._func(self._total, v)
@@ -230,7 +230,7 @@ class batched:
         return self
 
     def __next__(self):
-        if self._it is none:
+        if self._it is None:
             raise StopIteration
         var out = []
         var it = self._it
@@ -240,7 +240,7 @@ class batched:
             except StopIteration:
                 break
         if len(out) == 0:
-            self._it = none
+            self._it = None
             raise StopIteration
         return tuple(out)
 
@@ -249,7 +249,7 @@ class chain:
     "Return a chain object whose .__next__() method returns elements from the first iterable until it is exhausted, then elements from the next iterable, until all of the iterables are exhausted."
     def __init__(self, *iterables):
         self._source = _iter(iterables)
-        self._active = none
+        self._active = None
 
     @classmethod
     def from_iterable(cls, iterable):
@@ -262,19 +262,19 @@ class chain:
         return self
 
     def __next__(self):
-        while true:
-            if self._active is none:
-                if self._source is none:
+        while True:
+            if self._active is None:
+                if self._source is None:
                     raise StopIteration
                 try:
                     self._active = _iter(next(self._source))
                 except StopIteration:
-                    self._source = none
+                    self._source = None
                     raise StopIteration
             try:
                 return next(self._active)
             except StopIteration:
-                self._active = none
+                self._active = None
 
 
 class compress:
@@ -287,7 +287,7 @@ class compress:
         return self
 
     def __next__(self):
-        while true:
+        while True:
             var d = next(self._data)
             var s = next(self._sel)
             if s:
@@ -299,7 +299,7 @@ class dropwhile:
     def __init__(self, predicate, iterable):
         self._pred = predicate
         self._it = _iter(iterable)
-        self._dropping = true
+        self._dropping = True
 
     def __iter__(self):
         return self
@@ -309,7 +309,7 @@ class dropwhile:
         if self._dropping:
             while self._pred(v):
                 v = next(self._it)
-            self._dropping = false
+            self._dropping = False
         return v
 
 
@@ -318,7 +318,7 @@ class takewhile:
     def __init__(self, predicate, iterable):
         self._pred = predicate
         self._it = _iter(iterable)
-        self._stop = false
+        self._stop = False
 
     def __iter__(self):
         return self
@@ -329,7 +329,7 @@ class takewhile:
         var v = next(self._it)
         if self._pred(v):
             return v
-        self._stop = true
+        self._stop = True
         raise StopIteration
 
 
@@ -343,9 +343,9 @@ class filterfalse:
         return self
 
     def __next__(self):
-        while true:
+        while True:
             var v = next(self._it)
-            if self._f is none:
+            if self._f is None:
                 if not v:
                     return v
             elif not self._f(v):
@@ -357,13 +357,13 @@ class groupby:
     # CPython's algorithm: currkey/currvalue are the item read last;
     # tgtkey the key of the group handed out last. A group reads through
     # the same iterator and is valid only while it is the current one.
-    def __init__(self, iterable, key=none):
+    def __init__(self, iterable, key=None):
         self._it = _iter(iterable)
         self._keyfunc = key
         self._tgtkey = _NO
         self._currkey = _NO
         self._currvalue = _NO
-        self._currgrouper = none
+        self._currgrouper = None
 
     def __iter__(self):
         return self
@@ -371,15 +371,15 @@ class groupby:
     def _step(self):
         var v = next(self._it)
         var k = v
-        if self._keyfunc is not none:
+        if self._keyfunc is not None:
             k = self._keyfunc(v)
         self._currvalue = v
         self._currkey = k
 
     def __next__(self):
-        self._currgrouper = none
+        self._currgrouper = None
         # skip to the next group
-        while true:
+        while True:
             if _isno(self._currkey):
                 pass
             elif _isno(self._tgtkey):
@@ -403,7 +403,7 @@ class _groupby_grouper:
 
     def __next__(self):
         var gb = self._parent
-        if gb._currgrouper is none or id(gb._currgrouper) != id(self):
+        if gb._currgrouper is None or id(gb._currgrouper) != id(self):
             raise StopIteration
         if _isno(gb._currvalue):
             gb._step()
@@ -434,14 +434,14 @@ but returns an iterator."""
         var stop = -1
         var step = 1
         if n == 2:
-            if args[1] is not none:
+            if args[1] is not None:
                 stop = _islice_arg(args[1], "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
         else:
-            if args[1] is not none:
+            if args[1] is not None:
                 start = _islice_arg(args[1], "Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
-            if args[2] is not none:
+            if args[2] is not None:
                 stop = _islice_arg(args[2], "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.")
-            if n == 4 and args[3] is not none:
+            if n == 4 and args[3] is not None:
                 step = _islice_arg(args[3], "Step for islice() must be a positive integer or None.")
                 if step == 0:
                     raise ValueError("Step for islice() must be a positive integer or None.")
@@ -456,7 +456,7 @@ but returns an iterator."""
 
     def __next__(self):
         var it = self._it
-        if it is none:
+        if it is None:
             raise StopIteration
         var stop = self._stop
         try:
@@ -464,11 +464,11 @@ but returns an iterator."""
                 next(it)
                 self._cnt += 1
             if stop != -1 and self._cnt >= stop:
-                self._it = none
+                self._it = None
                 raise StopIteration
             var item = next(it)
         except StopIteration:
-            self._it = none
+            self._it = None
             raise StopIteration
         self._cnt += 1
         self._next += self._step
@@ -497,14 +497,14 @@ class pairwise:
 
     def __next__(self):
         var it = self._it
-        if it is none:
+        if it is None:
             raise StopIteration
         try:
             if _isno(self._old):
                 self._old = next(it)
             var nv = next(it)
         except StopIteration:
-            self._it = none
+            self._it = None
             self._old = _NO
             raise StopIteration
         var pair = (self._old, nv)
@@ -530,8 +530,8 @@ class starmap:
 # the source once, by whichever iterator gets there first.
 class _tee_link:
     def __init__(self):
-        self.value = none
-        self.nxt = none     # the next link once this one is filled
+        self.value = None
+        self.nxt = None     # the next link once this one is filled
 
 
 class _tee_source:
@@ -550,7 +550,7 @@ class _tee:
 
     def __next__(self):
         var link = self._link
-        if link.nxt is none:
+        if link.nxt is None:
             var v = next(self._source.it)    # StopIteration ends every copy
             link.value = v
             link.nxt = _tee_link()
@@ -582,7 +582,7 @@ def tee(iterable, n=2):
 class zip_longest:
     "Return a zip_longest object whose .__next__() method returns a tuple where the i-th element comes from the i-th iterable argument.  The .__next__() method continues until the longest iterable in the argument sequence is exhausted and then it raises StopIteration.  When the shorter iterables are exhausted, the fillvalue is substituted in their place.  The fillvalue defaults to None or can be specified by a keyword argument."
     def __init__(self, *iterables, **kwargs):
-        var fill = none
+        var fill = None
         for k in kwargs:
             if k != "fillvalue":
                 raise TypeError("zip_longest() got an unexpected keyword argument '" + k + "'")
@@ -601,13 +601,13 @@ class zip_longest:
         var its = self._its
         for i in range(len(its)):
             var it = its[i]
-            if it is none:
+            if it is None:
                 out.append(self._fill)
                 continue
             try:
                 out.append(next(it))
             except StopIteration:
-                its[i] = none
+                its[i] = None
                 self._active -= 1
                 if self._active == 0:
                     raise StopIteration
@@ -632,11 +632,11 @@ class product:
             for p in pools:
                 all_pools.append(p)
         self._pools = all_pools
-        self._indices = none
-        self._done = false
+        self._indices = None
+        self._done = False
         for p in all_pools:
             if len(p) == 0:
-                self._done = true
+                self._done = True
 
     def __iter__(self):
         return self
@@ -646,7 +646,7 @@ class product:
             raise StopIteration
         var pools = self._pools
         var n = len(pools)
-        if self._indices is none:
+        if self._indices is None:
             self._indices = [0] * n
             return tuple([p[0] for p in pools])
         var idx = self._indices
@@ -659,18 +659,18 @@ class product:
             idx[i] = 0
             i -= 1
         if i < 0:
-            self._done = true
+            self._done = True
             raise StopIteration
         return tuple([pools[j][idx[j]] for j in range(n)])
 
 
 class permutations:
     "Return successive r-length permutations of elements in the iterable."
-    def __init__(self, iterable, r=none):
+    def __init__(self, iterable, r=None):
         var pool = _pool(iterable)
         var n = len(pool)
         var rr = n
-        if r is not none:
+        if r is not None:
             if isinstance(r, bool) or not isinstance(r, int):
                 raise TypeError("Expected int as r")
             rr = r
@@ -681,7 +681,7 @@ class permutations:
         self._r = rr
         self._indices = list(range(n))
         self._cycles = list(range(n, n - rr, -1))
-        self._started = false
+        self._started = False
         self._done = rr > n
 
     def __iter__(self):
@@ -694,10 +694,10 @@ class permutations:
         var r = self._r
         var indices = self._indices
         if not self._started:
-            self._started = true
+            self._started = True
             return tuple([pool[i] for i in indices[:r]])
         if self._n == 0 or r == 0:
-            self._done = true
+            self._done = True
             raise StopIteration
         var cycles = self._cycles
         var n = self._n
@@ -719,7 +719,7 @@ class permutations:
                 indices[n - k] = tmp
                 return tuple([pool[q] for q in indices[:r]])
             i -= 1
-        self._done = true
+        self._done = True
         raise StopIteration
 
 
@@ -733,7 +733,7 @@ class combinations:
         self._pool = _pool(iterable)
         self._r = r
         self._indices = list(range(r))
-        self._started = false
+        self._started = False
         self._done = r > len(self._pool)
 
     def __iter__(self):
@@ -746,14 +746,14 @@ class combinations:
         var r = self._r
         var indices = self._indices
         if not self._started:
-            self._started = true
+            self._started = True
             return tuple([pool[i] for i in indices])
         var n = len(pool)
         var i = r - 1
         while i >= 0 and indices[i] == i + n - r:
             i -= 1
         if i < 0:
-            self._done = true
+            self._done = True
             raise StopIteration
         indices[i] += 1
         var j = i + 1
@@ -773,7 +773,7 @@ class combinations_with_replacement:
         self._pool = _pool(iterable)
         self._r = r
         self._indices = [0] * r
-        self._started = false
+        self._started = False
         self._done = len(self._pool) == 0 and r > 0
 
     def __iter__(self):
@@ -786,14 +786,14 @@ class combinations_with_replacement:
         var r = self._r
         var indices = self._indices
         if not self._started:
-            self._started = true
+            self._started = True
             return tuple([pool[i] for i in indices])
         var n = len(pool)
         var i = r - 1
         while i >= 0 and indices[i] == n - 1:
             i -= 1
         if i < 0:
-            self._done = true
+            self._done = True
             raise StopIteration
         var v = indices[i] + 1
         var j = i

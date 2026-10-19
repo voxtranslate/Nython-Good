@@ -26,32 +26,32 @@ class ThreadError(RuntimeError):
     pass
 
 _threads = {}            # ident -> Thread, for current_thread()/enumerate()
-_main = none
+_main = None
 
 def _ms(timeout):
-    if timeout == none or timeout < 0:
+    if timeout == None or timeout < 0:
         return -1
     return timeout * 1000
 
 class Thread:
-    def __init__(self, group=none, target=none, name=none, args=(), kwargs=none, daemon=none):
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs=None, daemon=None):
         self._target = target
         self._args = args
         self._kwargs = kwargs
-        if kwargs == none:
+        if kwargs == None:
             self._kwargs = {}
         self._name = name
         self._daemon = daemon
-        if daemon == none:
-            self._daemon = false
-        self._ident = none
-        self._started = false
-        self._result = none
+        if daemon == None:
+            self._daemon = False
+        self._ident = None
+        self._started = False
+        self._result = None
 
     @property
     def name(self):
-        if self._name == none:
-            if self._ident != none:
+        if self._name == None:
+            if self._ident != None:
                 return "Thread-" + str(self._ident)
             return "Thread"
         return self._name
@@ -79,13 +79,13 @@ class Thread:
         self._daemon = bool(value)
 
     def run(self):
-        if self._target != none:
+        if self._target != None:
             self._target(*self._args, **self._kwargs)
 
     def _bootstrap(self):
         _threads[thread_id()] = self
         # threading.settrace / setprofile's functions (round 79)
-        var hooked = _trace_hook is not none or _profile_hook is not none
+        var hooked = _trace_hook is not None or _profile_hook is not None
         if hooked:
             _sys_hooks(_trace_hook, _profile_hook)
         try:
@@ -93,10 +93,10 @@ class Thread:
         except SystemExit:
             pass
         except BaseException as e:
-            excepthook(_ExceptHookArgs(type(e), e, none, self))
+            excepthook(_ExceptHookArgs(type(e), e, None, self))
         finally:
             if hooked:
-                _sys_hooks(none, none)
+                _sys_hooks(None, None)
             if thread_id() in _threads:
                 del _threads[thread_id()]
 
@@ -106,20 +106,20 @@ class Thread:
         # (round 86) as CPython 3.12's start(): _thread.start_new_thread's
         # audit event (a hook raising leaves the thread unstarted)
         _ny_sys_audit("_thread.start_new_thread", self._bootstrap, (), None)
-        self._started = true
-        if self._name != none:
+        self._started = True
+        if self._name != None:
             self._ident = thread_create_named(self._name, self._bootstrap)
         else:
             self._ident = thread_create(self._bootstrap)
         if self._daemon:
-            thread_set_daemon(self._ident, true)
+            thread_set_daemon(self._ident, True)
 
-    def join(self, timeout=none):
+    def join(self, timeout=None):
         if not self._started:
             raise RuntimeError("cannot join thread before it is started")
         if self._ident == thread_os_id():
             raise RuntimeError("cannot join current thread")
-        if timeout == none:
+        if timeout == None:
             thread_join(self._ident)
             return
         try:
@@ -152,19 +152,19 @@ class Thread:
 
 class _MainThread(Thread):
     def __init__(self):
-        Thread.__init__(self, none, none, "MainThread")
+        Thread.__init__(self, None, None, "MainThread")
         self._ident = thread_main()
-        self._started = true
+        self._started = True
 
     def is_alive(self):
-        return true
+        return True
 
 class _DummyThread(Thread):
     def __init__(self, ident):
-        Thread.__init__(self, none, none, "Dummy-" + str(ident))
+        Thread.__init__(self, None, None, "Dummy-" + str(ident))
         self._ident = ident
-        self._started = true
-        self._daemon = true
+        self._started = True
+        self._daemon = True
 
     def is_alive(self):
         return thread_is_alive(self._ident)
@@ -178,14 +178,14 @@ class _ExceptHookArgs:
 
 def excepthook(args):
     var who = "<unknown>"
-    if args.thread != none:
+    if args.thread != None:
         who = args.thread.name
     eprint("Exception in thread " + who + ":")
     eprint(type(args.exc_value).__name__ + ": " + str(args.exc_value))
 
 def main_thread():
     global _main
-    if _main == none:
+    if _main == None:
         _main = _MainThread()
     return _main
 
@@ -194,7 +194,7 @@ def current_thread():
     if i == thread_main():
         return main_thread()
     var t = _threads.get(i)
-    if t == none:
+    if t == None:
         return _DummyThread(i)
     return t
 
@@ -221,8 +221,8 @@ def enumerate():
 
 # The trace and profile functions threads started from now on get
 # (round 79: sys.settrace / sys.setprofile are per thread, as CPython's).
-_trace_hook = none
-_profile_hook = none
+_trace_hook = None
+_profile_hook = None
 
 def _sys_hooks(trace, profile):
     # this thread's sys.settrace / sys.setprofile
@@ -263,17 +263,17 @@ class Lock:
     def __init__(self):
         self._id = pylock_create()
 
-    def acquire(self, blocking=true, timeout=-1):
+    def acquire(self, blocking=True, timeout=-1):
         if not blocking:
             if timeout != -1:
                 raise ValueError("can't specify a timeout for a non-blocking call")
             return mutex_try_lock(self._id)
-        if timeout != none and timeout != -1:
+        if timeout != None and timeout != -1:
             if timeout < 0:
                 raise ValueError("timeout value must be positive")
             return mutex_lock_timeout(self._id, timeout * 1000)
         mutex_lock(self._id)
-        return true
+        return True
 
     def release(self):
         mutex_unlock(self._id)
@@ -283,11 +283,11 @@ class Lock:
 
     def __enter__(self):
         mutex_lock(self._id)
-        return true
+        return True
 
-    def __exit__(self, t=none, v=none, tb=none):
+    def __exit__(self, t=None, v=None, tb=None):
         mutex_unlock(self._id)
-        return false
+        return False
 
     def __repr__(self):
         return "<" + ("locked" if self.locked() else "unlocked") + " _thread.lock object at " + hex(id(self)) + ">"
@@ -304,8 +304,8 @@ class Lock:
         _free_native(self)
 
 def _free_native(obj):
-    var h = getattr(obj, "_id", none)
-    if h is not none:
+    var h = getattr(obj, "_id", None)
+    if h is not None:
         try:
             sync_free(h)
         except BaseException:
@@ -325,9 +325,9 @@ class RLock(Lock):
         except RuntimeError:
             raise RuntimeError("cannot release un-acquired lock")
 
-    def __exit__(self, t=none, v=none, tb=none):
+    def __exit__(self, t=None, v=None, tb=None):
         self.release()
-        return false
+        return False
 
     def _is_owned(self):
         return mutex_owner(self._id) == thread_id()
@@ -340,8 +340,8 @@ class RLock(Lock):
         return "<" + ("locked" if o else "unlocked") + " _thread.RLock object owner=" + str(o) + " at " + hex(id(self)) + ">"
 
 class Condition:
-    def __init__(self, lock=none):
-        if lock == none:
+    def __init__(self, lock=None):
+        if lock == None:
             lock = RLock()
         self._lock = lock
         self._id = cond_create()
@@ -352,18 +352,18 @@ class Condition:
     def release(self):
         self._lock.release()
 
-    def wait(self, timeout=none):
-        if timeout == none:
+    def wait(self, timeout=None):
+        if timeout == None:
             return cond_wait(self._id, self._lock._id)
         return cond_wait_timeout(self._id, self._lock._id, timeout * 1000)
 
-    def wait_for(self, predicate, timeout=none):
-        var deadline = none
-        if timeout != none:
+    def wait_for(self, predicate, timeout=None):
+        var deadline = None
+        if timeout != None:
             deadline = monotonic() + timeout
         var ok = predicate()
         while not ok:
-            if deadline == none:
+            if deadline == None:
                 cond_wait(self._id, self._lock._id)
             else:
                 var left = deadline - monotonic()
@@ -393,7 +393,7 @@ class Condition:
     def __enter__(self):
         return self._lock.__enter__()
 
-    def __exit__(self, t=none, v=none, tb=none):
+    def __exit__(self, t=None, v=None, tb=None):
         return self._lock.__exit__(t, v, tb)
 
 class Semaphore:
@@ -402,24 +402,24 @@ class Semaphore:
             raise ValueError("semaphore initial value must be >= 0")
         self._id = semaphore_create(value)
 
-    def acquire(self, blocking=true, timeout=none):
+    def acquire(self, blocking=True, timeout=None):
         if not blocking:
             return semaphore_try_acquire(self._id)
-        if timeout != none:
+        if timeout != None:
             return semaphore_acquire_timeout(self._id, timeout * 1000)
         semaphore_acquire(self._id)
-        return true
+        return True
 
     def release(self, n=1):
         semaphore_release(self._id, n)
 
     def __enter__(self):
         semaphore_acquire(self._id)
-        return true
+        return True
 
-    def __exit__(self, t=none, v=none, tb=none):
+    def __exit__(self, t=None, v=None, tb=None):
         self.release()
-        return false
+        return False
 
     def __del__(self):
         _free_native(self)
@@ -454,8 +454,8 @@ class Event:
     def clear(self):
         event_clear(self._id)
 
-    def wait(self, timeout=none):
-        if timeout == none:
+    def wait(self, timeout=None):
+        if timeout == None:
             return event_wait(self._id)
         return event_wait_timeout(self._id, timeout * 1000)
 
@@ -465,15 +465,15 @@ class Event:
 class Timer(Thread):
     # Calls function(*args, **kwargs) after `interval` seconds unless
     # cancel() comes first.
-    def __init__(self, interval, function, args=none, kwargs=none):
+    def __init__(self, interval, function, args=None, kwargs=None):
         Thread.__init__(self)
         self.interval = interval
         self.function = function
         self.args = args
-        if args == none:
+        if args == None:
             self.args = []
         self.kwargs = kwargs
-        if kwargs == none:
+        if kwargs == None:
             self.kwargs = {}
         self.finished = Event()
 
@@ -487,7 +487,7 @@ class Timer(Thread):
         self.finished.set()
 
 class Barrier:
-    def __init__(self, parties, action=none, timeout=none):
+    def __init__(self, parties, action=None, timeout=None):
         if parties < 1:
             raise ValueError("parties must be > 0")
         self.parties = parties
@@ -496,14 +496,14 @@ class Barrier:
         self._cond = Condition(Lock())
         self._count = 0
         self._generation = 0
-        self.broken = false
+        self.broken = False
 
     @property
     def n_waiting(self):
         return self._count
 
-    def wait(self, timeout=none):
-        if timeout == none:
+    def wait(self, timeout=None):
+        if timeout == None:
             timeout = self._timeout
         with self._cond:
             if self.broken:
@@ -512,7 +512,7 @@ class Barrier:
             var index = self._count
             self._count = self._count + 1
             if self._count == self.parties:
-                if self._action != none:
+                if self._action != None:
                     self._action()
                 self._count = 0
                 self._generation = self._generation + 1
@@ -520,21 +520,21 @@ class Barrier:
                 return index
             var ok = self._cond.wait_for(lambda: self._generation != gen or self.broken, timeout)
             if self.broken or not ok:
-                self.broken = true
+                self.broken = True
                 self._cond.notify_all()
                 raise BrokenBarrierError()
             return index
 
     def reset(self):
         with self._cond:
-            self.broken = false
+            self.broken = False
             self._count = 0
             self._generation = self._generation + 1
             self._cond.notify_all()
 
     def abort(self):
         with self._cond:
-            self.broken = true
+            self.broken = True
             self._cond.notify_all()
 
 class local:
@@ -546,22 +546,22 @@ class local:
     def _mine(self, make):
         var tid = get_ident()
         var d = self._ny_tl.get(tid)
-        if d == none and make:
+        if d == None and make:
             d = {}
             self._ny_tl[tid] = d
         return d
 
     def __getattr__(self, name):
-        var d = self._mine(false)
-        if d == none or not (name in d):
+        var d = self._mine(False)
+        if d == None or not (name in d):
             raise AttributeError("'_thread._local' object has no attribute '" + name + "'")
         return d[name]
 
     def __setattr__(self, name, value):
-        self._mine(true)[name] = value
+        self._mine(True)[name] = value
 
     def __delattr__(self, name):
-        var d = self._mine(false)
-        if d == none or not (name in d):
+        var d = self._mine(False)
+        if d == None or not (name in d):
             raise AttributeError(name)
         del d[name]

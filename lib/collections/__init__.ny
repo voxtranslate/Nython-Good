@@ -33,20 +33,20 @@ def _reprs(items):
 class deque:
     # A circular buffer: _buf holds _n items from _head, wrapping around;
     # it doubles when full, so every end operation is O(1) amortised.
-    def __init__(self, iterable=none, maxlen=none):
-        if maxlen != none and maxlen < 0:
+    def __init__(self, iterable=None, maxlen=None):
+        if maxlen != None and maxlen < 0:
             raise ValueError("maxlen must be non-negative")
         self.maxlen = maxlen
-        self._buf = [none] * 8
+        self._buf = [None] * 8
         self._head = 0
         self._n = 0
-        if iterable != none:
+        if iterable != None:
             for x in iterable:
                 self.append(x)
 
     def _grow(self):
         var cap = len(self._buf)
-        var nb = [none] * (cap * 2)
+        var nb = [None] * (cap * 2)
         for i in range(self._n):
             nb[i] = self._buf[(self._head + i) % cap]
         self._buf = nb
@@ -62,33 +62,33 @@ class deque:
 
     def append(self, x):
         if self.maxlen == 0:
-            return none
-        if self.maxlen != none and self._n == self.maxlen:
+            return None
+        if self.maxlen != None and self._n == self.maxlen:
             self.popleft()
         if self._n == len(self._buf):
             self._grow()
         self._buf[(self._head + self._n) % len(self._buf)] = x
         self._n = self._n + 1
-        return none
+        return None
 
     def appendleft(self, x):
         if self.maxlen == 0:
-            return none
-        if self.maxlen != none and self._n == self.maxlen:
+            return None
+        if self.maxlen != None and self._n == self.maxlen:
             self.pop()
         if self._n == len(self._buf):
             self._grow()
         self._head = (self._head - 1) % len(self._buf)
         self._buf[self._head] = x
         self._n = self._n + 1
-        return none
+        return None
 
     def pop(self):
         if self._n == 0:
             raise IndexError("pop from an empty deque")
         var s = (self._head + self._n - 1) % len(self._buf)
         var x = self._buf[s]
-        self._buf[s] = none
+        self._buf[s] = None
         self._n = self._n - 1
         return x
 
@@ -96,7 +96,7 @@ class deque:
         if self._n == 0:
             raise IndexError("pop from an empty deque")
         var x = self._buf[self._head]
-        self._buf[self._head] = none
+        self._buf[self._head] = None
         self._head = (self._head + 1) % len(self._buf)
         self._n = self._n - 1
         return x
@@ -104,26 +104,26 @@ class deque:
     def extend(self, iterable):
         for x in list(iterable):
             self.append(x)
-        return none
+        return None
 
     def extendleft(self, iterable):
         for x in list(iterable):
             self.appendleft(x)
-        return none
+        return None
 
     def rotate(self, n=1):
         if self._n == 0:
-            return none
+            return None
         n = n % self._n
         for i in range(n):
             self.appendleft(self.pop())
-        return none
+        return None
 
     def clear(self):
-        self._buf = [none] * 8
+        self._buf = [None] * 8
         self._head = 0
         self._n = 0
-        return none
+        return None
 
     def copy(self):
         return deque(self.to_list(), self.maxlen)
@@ -135,21 +135,21 @@ class deque:
                 c = c + 1
         return c
 
-    def index(self, x, start=0, stop=none):
+    def index(self, x, start=0, stop=None):
         var items = self.to_list()
-        var end = len(items) if stop == none else stop
+        var end = len(items) if stop == None else stop
         for i in range(start, end):
             if items[i] == x:
                 return i
         raise ValueError(repr(x) + " is not in deque")
 
     def insert(self, i, x):
-        if self.maxlen != none and self._n == self.maxlen:
+        if self.maxlen != None and self._n == self.maxlen:
             raise IndexError("deque already at its maximum size")
         var items = self.to_list()
         items.insert(i, x)
         self._reset(items)
-        return none
+        return None
 
     def remove(self, x):
         var items = self.to_list()
@@ -157,14 +157,14 @@ class deque:
             if items[i] == x:
                 items.pop(i)
                 self._reset(items)
-                return none
+                return None
         raise ValueError(repr(x) + " is not in deque")
 
     def reverse(self):
         var items = self.to_list()
         items.reverse()
         self._reset(items)
-        return none
+        return None
 
     def _reset(self, items):
         self.clear()
@@ -218,7 +218,7 @@ class deque:
         return d
 
     def __repr__(self):
-        if self.maxlen == none:
+        if self.maxlen == None:
             return "deque([" + _reprs(self.to_list()) + "])"
         return "deque([" + _reprs(self.to_list()) + "], maxlen=" + str(self.maxlen) + ")"
 
@@ -271,12 +271,12 @@ class _DictWrapper:
     def items(self):
         return self.data.items()
 
-    def get(self, k, default=none):
+    def get(self, k, default=None):
         if k in self.data:
             return self.data[k]
         return default
 
-    def setdefault(self, k, default=none):
+    def setdefault(self, k, default=None):
         if not (k in self.data):
             self.data[k] = default
         return self.data[k]
@@ -298,8 +298,8 @@ class _DictWrapper:
         del self.data[k]
         return (k, v)
 
-    def update(self, other=none, **kw):
-        if other != none:
+    def update(self, other=None, **kw):
+        if other != None:
             if hasattr(other, "keys"):
                 for k in other.keys():
                     self[k] = other[k]
@@ -308,18 +308,18 @@ class _DictWrapper:
                     self[kv[0]] = kv[1]
         for k in kw:
             self[k] = kw[k]
-        return none
+        return None
 
     def clear(self):
         self.data = {}
-        return none
+        return None
 
     def to_dict(self):
         return dict(self.data)
 
 
 class UserDict(_DictWrapper):
-    def __init__(self, data=none, **kw):
+    def __init__(self, data=None, **kw):
         self.data = {}
         self.update(data, **kw)
 
@@ -331,11 +331,11 @@ class UserDict(_DictWrapper):
 
 
 class OrderedDict(_DictWrapper):
-    def __init__(self, data=none, **kw):
+    def __init__(self, data=None, **kw):
         self.data = {}
         self.update(data, **kw)
 
-    def move_to_end(self, key, last=true):
+    def move_to_end(self, key, last=True):
         if not (key in self.data):
             raise KeyError(key)
         var v = self.data[key]
@@ -348,9 +348,9 @@ class OrderedDict(_DictWrapper):
             self.data[key] = v
             for k in rest:
                 self.data[k] = rest[k]
-        return none
+        return None
 
-    def popitem(self, last=true):
+    def popitem(self, last=True):
         if len(self.data) == 0:
             raise KeyError("dictionary is empty")
         var ks = list(self.data.keys())
@@ -381,15 +381,15 @@ class OrderedDict(_DictWrapper):
 
 
 class defaultdict(_DictWrapper):
-    def __init__(self, default_factory=none, data=none, **kw):
-        if default_factory != none and not callable(default_factory):
+    def __init__(self, default_factory=None, data=None, **kw):
+        if default_factory != None and not callable(default_factory):
             raise TypeError("first argument must be callable or None")
         self.default_factory = default_factory
         self.data = {}
         self.update(data, **kw)
 
     def __missing__(self, k):
-        if self.default_factory == none:
+        if self.default_factory == None:
             raise KeyError(k)
         var f = self.default_factory
         var v = f()
@@ -401,7 +401,7 @@ class defaultdict(_DictWrapper):
 
     def __repr__(self):
         var fname = "None"
-        if self.default_factory != none:
+        if self.default_factory != None:
             fname = getattr(self.default_factory, "__name__", repr(self.default_factory))
             if fname in ["list", "dict", "set", "int", "float", "str", "tuple"]:
                 fname = "<class '" + fname + "'>"
@@ -410,15 +410,15 @@ class defaultdict(_DictWrapper):
 
 class Counter(_DictWrapper):
     # counts of hashable things; a missing count is 0
-    def __init__(self, iterable=none, **kw):
+    def __init__(self, iterable=None, **kw):
         self.data = {}
         self.update(iterable, **kw)
 
     def __missing__(self, k):
         return 0
 
-    def update(self, iterable=none, **kw):
-        if iterable != none:
+    def update(self, iterable=None, **kw):
+        if iterable != None:
             if hasattr(iterable, "keys"):
                 for k in iterable.keys():
                     self.data[k] = self.data.get(k, 0) + iterable[k]
@@ -427,10 +427,10 @@ class Counter(_DictWrapper):
                     self.data[x] = self.data.get(x, 0) + 1
         for k in kw:
             self.data[k] = self.data.get(k, 0) + kw[k]
-        return none
+        return None
 
-    def subtract(self, iterable=none, **kw):
-        if iterable != none:
+    def subtract(self, iterable=None, **kw):
+        if iterable != None:
             if hasattr(iterable, "keys"):
                 for k in iterable.keys():
                     self.data[k] = self.data.get(k, 0) - iterable[k]
@@ -439,14 +439,14 @@ class Counter(_DictWrapper):
                     self.data[x] = self.data.get(x, 0) - 1
         for k in kw:
             self.data[k] = self.data.get(k, 0) - kw[k]
-        return none
+        return None
 
-    def most_common(self, n=none):
+    def most_common(self, n=None):
         # by count, highest first; equal counts keep first-seen order
         var items = list(self.data.items())
         var order = sorted(range(len(items)), key=lambda i: (-items[i][1], i))
         var out = [(items[i][0], items[i][1]) for i in order]
-        if n != none:
+        if n != None:
             return out[0:n]
         return out
 
@@ -519,7 +519,7 @@ class ChainMap:
                 return m[k]
         raise KeyError(k)
 
-    def get(self, k, default=none):
+    def get(self, k, default=None):
         for m in self.maps:
             if k in m:
                 return m[k]
@@ -536,8 +536,8 @@ class ChainMap:
     def __contains__(self, k):
         for m in self.maps:
             if k in m:
-                return true
-        return false
+                return True
+        return False
 
     def keys(self):
         var seen = {}
@@ -547,7 +547,7 @@ class ChainMap:
         for m in rev:
             for k in m:
                 if not (k in seen):
-                    seen[k] = true
+                    seen[k] = True
                     out.append(k)
         return out
 
@@ -563,8 +563,8 @@ class ChainMap:
     def values(self):
         return [self[k] for k in self.keys()]
 
-    def new_child(self, m=none):
-        return ChainMap(*([m if m != none else {}] + self.maps))
+    def new_child(self, m=None):
+        return ChainMap(*([m if m != None else {}] + self.maps))
 
     @property
     def parents(self):
@@ -576,8 +576,8 @@ class ChainMap:
 
 # ── UserList ─────────────────────────────────────────────────────────────────
 class UserList:
-    def __init__(self, initlist=none):
-        self.data = list(initlist) if initlist != none else []
+    def __init__(self, initlist=None):
+        self.data = list(initlist) if initlist != None else []
 
     def append(self, x):
         self.data.append(x)
@@ -601,7 +601,7 @@ class UserList:
     def count(self, x):
         return self.data.count(x)
 
-    def sort(self, key=none, reverse=false):
+    def sort(self, key=None, reverse=False):
         self.data = sorted(self.data, key=key, reverse=reverse)
 
     def reverse(self):
@@ -688,7 +688,7 @@ def _nt_field(i):
     return property(get)
 
 
-def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
+def namedtuple(typename, field_names, defaults=None, rename=False, module=None):
     # field_names: a list, or a string "x y" / "x, y"
     var names = field_names
     if isinstance(field_names, "str"):
@@ -702,9 +702,9 @@ def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
             names[i] = "_" + str(i)
         elif bad:
             raise ValueError("Invalid field name: " + repr(n))
-        seen[names[i]] = true
+        seen[names[i]] = True
     var field_defaults = {}
-    if defaults != none:
+    if defaults != None:
         var dl = list(defaults)
         if len(dl) > len(names):
             raise TypeError("Got more default values than field names")
@@ -717,13 +717,13 @@ def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
     # module that made it unless module= says otherwise, as CPython's
     _NT.__name__ = typename
     _NT.__qualname__ = typename
-    if module is none:
+    if module is None:
         try:
             import sys as _nt_sys
             module = _nt_sys._getframe(1).f_globals.get("__name__", "__main__")
         except (AttributeError, ValueError):
-            module = none
-    if module is not none:
+            module = None
+    if module is not None:
         _NT.__module__ = module
     _NT.__doc__ = typename + "(" + ", ".join(names) + ")"
     _NT._typename = typename

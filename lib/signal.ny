@@ -43,7 +43,7 @@ def _const(name):
     for pair in _sig_constants():
         if pair[0] == name:
             return pair[1]
-    return none
+    return None
 
 SIGINT = _const("SIGINT")
 SIGTERM = _const("SIGTERM")

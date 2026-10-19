@@ -57,7 +57,7 @@ __all__ = ["update_wrapper", "wraps", "WRAPPER_ASSIGNMENTS", "WRAPPER_UPDATES",
 
 
 def _tname(x):
-    if x is none:
+    if x is None:
         return "NoneType"
     return type(x).__name__
 
@@ -65,7 +65,7 @@ def _tname(x):
 def _iter(x):
     # iter(x) with Python's TypeError for a number (the runtime iterates
     # an int as a range)
-    if x is none or isinstance(x, (int, float)):
+    if x is None or isinstance(x, (int, float)):
         raise TypeError("'" + _tname(x) + "' object is not iterable")
     return iter(x)
 
@@ -237,9 +237,9 @@ _convert = {
 def _user_defined(cls, op):
     # a comparison the class (or a base) defines, not object's own
     if not hasattr(cls, op):
-        return false
+        return False
     if not hasattr(object, op):
-        return true
+        return True
     return id(getattr(cls, op)) != id(getattr(object, op))
 
 def total_ordering(cls):
@@ -323,12 +323,12 @@ def reduce(*args):
     if n > 3:
         raise TypeError("reduce expected at most 3 arguments, got " + str(n))
     var function = args[0]
-    var it = none
+    var it = None
     try:
         it = _iter(args[1])
     except TypeError:
         raise TypeError("reduce() arg 2 must support iteration")
-    var value = none
+    var value = None
     if n == 3:
         value = args[2]
     else:
@@ -394,7 +394,7 @@ class partial:
         return _class_label(self, "functools") + "(" + ", ".join(parts) + ")"
 
     def __reduce__(self):
-        return (self.__class__, (self.func,), (self.func, self.args, self.keywords or none, none))
+        return (self.__class__, (self.func,), (self.func, self.args, self.keywords or None, None))
 
     def __setstate__(self, state):
         # what pickle's BUILD gives back (round 79), as CPython's partial
@@ -405,11 +405,11 @@ class partial:
         var func = state[0]
         var fargs = state[1]
         var kwds = state[2]
-        if not callable(func) or not isinstance(fargs, tuple) or (kwds is not none and not isinstance(kwds, dict)):
+        if not callable(func) or not isinstance(fargs, tuple) or (kwds is not None and not isinstance(kwds, dict)):
             raise TypeError("invalid partial state")
         self.func = func
         self.args = tuple(fargs)
-        self.keywords = dict(kwds) if kwds is not none else {}
+        self.keywords = dict(kwds) if kwds is not None else {}
         if state[3]:
             for k in state[3]:
                 setattr(self, k, state[3][k])
@@ -460,15 +460,15 @@ class partialmethod:
         _method._partialmethod = self
         return _method
 
-    def __get__(self, obj, cls=none):
-        if obj is none:
+    def __get__(self, obj, cls=None):
+        if obj is None:
             return self._make_unbound_method()
         # Python's: a partial of func bound to obj (func.__get__(obj, cls)),
         # so .args are the partial's own; a callable that does not bind
         # gets obj as its first argument instead
         var bound = _bound_to(self.func, obj)
-        var result = none
-        if bound is none:
+        var result = None
+        if bound is None:
             result = partial(self.func, obj, *self.args, **self.keywords)
         else:
             result = partial(bound, *self.args, **self.keywords)
@@ -479,14 +479,14 @@ class partialmethod:
 def _bound_to(func, obj):
     # func bound to obj when it is a method of obj's class (the runtime's
     # functions have no __get__), else None
-    var name = getattr(func, "__name__", none)
+    var name = getattr(func, "__name__", None)
     if not isinstance(name, str) or not hasattr(obj, "__class__"):
-        return none
+        return None
     var cls = obj.__class__
     if not hasattr(cls, name) or id(getattr(cls, name)) != id(func):
-        return none
+        return None
     if name in vars(obj):
-        return none
+        return None
     return getattr(obj, name)
 
 
@@ -572,12 +572,12 @@ def _lru_cache_wrapper(user_function, maxsize, typed):
     var cache = {}
     var hits = 0
     var misses = 0
-    var full = false
+    var full = False
     var lock = rmutex_create()
-    var root = [none, none, none, none]
+    var root = [None, None, None, None]
     root[PREV] = root
     root[NEXT] = root
-    var wrapper = none
+    var wrapper = None
 
     if maxsize == 0:
         def _nocache(*args, **kwds):
@@ -586,7 +586,7 @@ def _lru_cache_wrapper(user_function, maxsize, typed):
             misses += 1
             return user_function(*args, **kwds)
         wrapper = _nocache
-    elif maxsize is none:
+    elif maxsize is None:
         def _unbounded(*args, **kwds):
             # unlimited size: no ordering to keep
             nonlocal hits, misses
@@ -608,7 +608,7 @@ def _lru_cache_wrapper(user_function, maxsize, typed):
             mutex_lock(lock)
             try:
                 var link = cache.get(key)
-                if link is not none:
+                if link is not None:
                     # move the link to the most recent end
                     var link_prev = link[PREV]
                     var link_next = link[NEXT]
@@ -639,8 +639,8 @@ def _lru_cache_wrapper(user_function, maxsize, typed):
                     oldroot[RESULT] = value
                     root = oldroot[NEXT]
                     var oldkey = root[KEY]
-                    root[KEY] = none
-                    root[RESULT] = none
+                    root[KEY] = None
+                    root[RESULT] = None
                     del cache[oldkey]
                     cache[key] = oldroot
                 else:
@@ -667,11 +667,11 @@ def _lru_cache_wrapper(user_function, maxsize, typed):
             cache.clear()
             root[PREV] = root
             root[NEXT] = root
-            root[KEY] = none
-            root[RESULT] = none
+            root[KEY] = None
+            root[RESULT] = None
             hits = 0
             misses = 0
-            full = false
+            full = False
         finally:
             mutex_unlock(lock)
 
@@ -680,7 +680,7 @@ def _lru_cache_wrapper(user_function, maxsize, typed):
     return wrapper
 
 
-def lru_cache(maxsize=128, typed=false):
+def lru_cache(maxsize=128, typed=False):
     """Least-recently-used cache decorator.
 
     If *maxsize* is set to None, the LRU features are disabled and the cache
@@ -706,7 +706,7 @@ def lru_cache(maxsize=128, typed=false):
         var wrapper = _lru_cache_wrapper(user_function, 128, typed)
         wrapper.cache_parameters = _cache_parameters(128, typed)
         return update_wrapper(wrapper, user_function)
-    elif maxsize is not none:
+    elif maxsize is not None:
         raise TypeError("Expected first argument to be an integer, a callable, or None")
     var size = maxsize
 
@@ -725,7 +725,7 @@ def _cache_parameters(maxsize, typed):
 
 def cache(user_function):
     'Simple lightweight unbounded cache.  Sometimes called "memoize".'
-    return lru_cache(maxsize=none)(user_function)
+    return lru_cache(maxsize=None)(user_function)
 
 
 # ── cached_property ──────────────────────────────────────────────────────────
@@ -736,22 +736,22 @@ class cached_property:
     # compute it again.
     def __init__(self, func):
         self.func = func
-        self.attrname = none
-        self.__doc__ = getattr(func, "__doc__", none)
-        self.__module__ = getattr(func, "__module__", none)
+        self.attrname = None
+        self.__doc__ = getattr(func, "__doc__", None)
+        self.__module__ = getattr(func, "__module__", None)
 
     def __set_name__(self, owner, name):
-        if self.attrname is none:
+        if self.attrname is None:
             self.attrname = name
         elif name != self.attrname:
             raise TypeError("Cannot assign the same cached_property to two different names (" +
                             repr(self.attrname) + " and " + repr(name) + ").")
 
-    def __get__(self, instance, owner=none):
-        if instance is none:
+    def __get__(self, instance, owner=None):
+        if instance is None:
             return self
         var name = self.attrname
-        if name is none:
+        if name is None:
             raise TypeError("Cannot use cached_property instance without calling __set_name__ on it.")
         var val = self.func(instance)
         object.__setattr__(instance, name, val)
@@ -780,11 +780,11 @@ def _class_of(x):
 def _is_builtin_type(x):
     for t in _builtin_types:
         if x is t:
-            return true
-    return false
+            return True
+    return False
 
 def _mro_of(cls):
-    var mro = none
+    var mro = None
     if isinstance(cls, str):
         return [cls, object]
     try:
@@ -794,10 +794,10 @@ def _mro_of(cls):
             mro = [bool, int]
         else:
             mro = [cls]
-    var has_object = false
+    var has_object = False
     for c in mro:
         if c is object:
-            has_object = true
+            has_object = True
     if not has_object:
         mro.append(object)
     return mro
@@ -819,7 +819,7 @@ def _is_class(x):
     if isinstance(x, str):
         return x in _kind_names
     if _is_builtin_type(x):
-        return true
+        return True
     return isinstance(x, type) or hasattr(x, "__mro__")
 
 def _issub(cls, typ):
@@ -838,8 +838,8 @@ def _in(x, seq):
     # x in seq, by identity for classes (a type object == its name)
     for y in seq:
         if y is x or (isinstance(x, str) and isinstance(y, str) and x == y):
-            return true
-    return false
+            return True
+    return False
 
 
 def _c3_merge(sequences):
@@ -849,20 +849,20 @@ def _c3_merge(sequences):
 
     """
     var result = []
-    while true:
+    while True:
         sequences = [s for s in sequences if s]   # purge empty sequences
         if not sequences:
             return result
-        var candidate = none
+        var candidate = None
         for s1 in sequences:   # find merge candidates among seq heads
             candidate = s1[0]
             for s2 in sequences:
                 if _in(candidate, s2[1:]):
-                    candidate = none
+                    candidate = None
                     break      # reject the current head, it appears later
-            if candidate is not none:
+            if candidate is not None:
                 break
-        if candidate is none:
+        if candidate is None:
             raise RuntimeError("Inconsistent hierarchy")
         result.append(candidate)
         # remove the chosen candidate
@@ -871,7 +871,7 @@ def _c3_merge(sequences):
                 del seq[0]
 
 
-def _c3_mro(cls, abcs=none):
+def _c3_mro(cls, abcs=None):
     """Computes the method resolution order using extended C3 linearization.
 
     If no *abcs* are given, the algorithm works exactly like the built-in C3
@@ -934,8 +934,8 @@ def _compose_mro(cls, types):
     def is_strict_base(typ):
         for other in types:
             if not (typ is other) and _in(typ, _mro_of(other)):
-                return true
-        return false
+                return True
+        return False
     types = [n for n in types if not is_strict_base(n)]
     # Subclasses of the ABCs in *types* which are also implemented by
     # *cls* can be used to stabilize ABC ordering.
@@ -954,7 +954,7 @@ def _compose_mro(cls, types):
             mro.append(typ)
             continue
         # Favor subclasses with the biggest number of useful bases
-        found = sorted(found, key=len, reverse=true)
+        found = sorted(found, key=len, reverse=True)
         for sub in found:
             for subcls in sub:
                 if not _in(subcls, mro):
@@ -974,9 +974,9 @@ def _find_impl(cls, registry):
     """
     var mro = _compose_mro(cls, registry.keys())
     var cls_mro = _mro_of(cls)
-    var best = none
+    var best = None
     for t in mro:
-        if best is not none:
+        if best is not None:
             # If *best* is an implicit ABC but there is another unrelated,
             # equally matching implicit ABC, refuse the temptation to guess.
             if (t in registry and not _in(t, cls_mro)
@@ -1007,20 +1007,20 @@ class _DispatchRegistry:
         for p in self._pairs:
             if _in(cls, [p[0]]):
                 return p
-        return none
+        return None
 
     def __getitem__(self, cls):
         var p = self._find(cls)
-        if p is none:
+        if p is None:
             raise KeyError(cls)
         return p[1]
 
-    def get(self, cls, default=none):
+    def get(self, cls, default=None):
         var p = self._find(cls)
-        return default if p is none else p[1]
+        return default if p is None else p[1]
 
     def __contains__(self, cls):
-        return self._find(cls) is not none
+        return self._find(cls) is not None
 
     def __len__(self):
         return len(self._pairs)
@@ -1044,18 +1044,18 @@ class _DispatchRegistry:
 def _is_union_type(cls):
     # int | str (types.UnionType), typing.Union[int, str]
     if isinstance(cls, str) or _is_class(cls):
-        return false
+        return False
     if type(cls).__name__ in ["_NyUnionType", "UnionType"]:
-        return true
-    var origin = getattr(cls, "__origin__", none)
-    return origin is not none and repr(origin) == "typing.Union"
+        return True
+    var origin = getattr(cls, "__origin__", None)
+    return origin is not None and repr(origin) == "typing.Union"
 
 def _union_args(cls):
     return tuple(getattr(cls, "__args__", ()))
 
 def _is_valid_dispatch_type(cls):
     if _is_class(cls):
-        return true
+        return True
     return _is_union_type(cls) and all([_is_class(arg) for arg in _union_args(cls)])
 
 def _first_annotation(func):
@@ -1070,7 +1070,7 @@ def _first_annotation(func):
         var t = ann[name]
         if isinstance(t, str):
             if t == "None" or t == "NoneType":
-                t = type(none)
+                t = type(None)
             else:
                 try:
                     t = eval(t)
@@ -1080,7 +1080,7 @@ def _first_annotation(func):
     var names = list(ann.keys())
     if len(names) > 0:
         return (names[0], ann[names[0]])
-    return none
+    return None
 
 
 def singledispatch(func):
@@ -1094,7 +1094,7 @@ def singledispatch(func):
     """
     var registry = _DispatchRegistry()
     var dispatch_cache = {}
-    var cache_token = none
+    var cache_token = None
     var funcname = getattr(func, "__name__", "singledispatch function")
 
     def dispatch(cls):
@@ -1104,7 +1104,7 @@ def singledispatch(func):
         for the given *cls* registered on *generic_func*.
         """
         nonlocal cache_token
-        if cache_token is not none:
+        if cache_token is not None:
             var current_token = _abc_cache_token()
             if cache_token != current_token:
                 dispatch_cache.clear()
@@ -1112,27 +1112,27 @@ def singledispatch(func):
         if cls in dispatch_cache:
             return dispatch_cache[cls]
         var p = registry._find(cls)
-        var impl = none
-        if p is not none:
+        var impl = None
+        if p is not None:
             impl = p[1]
         else:
             impl = _find_impl(cls, registry)
         dispatch_cache[cls] = impl
         return impl
 
-    def register(cls, func=none):
+    def register(cls, func=None):
         """generic_func.register(cls, func) -> func
 
         Registers a new implementation for the given *cls* on a *generic_func*.
         """
         nonlocal cache_token
         if _is_valid_dispatch_type(cls):
-            if func is none:
+            if func is None:
                 def _register_deco(f):
                     return register(cls, f)
                 return _register_deco
         else:
-            if func is not none:
+            if func is not None:
                 raise TypeError("Invalid first argument to `register()`. " + repr(cls) + " is not a class or union type.")
             var ann = getattr(cls, "__annotations__", {})
             if not ann:
@@ -1150,7 +1150,7 @@ def singledispatch(func):
         var members = _union_args(cls) if _is_union_type(cls) else (cls,)
         for arg in members:
             registry._set(arg, func)
-            if cache_token is none and _has_abstracts(arg):
+            if cache_token is None and _has_abstracts(arg):
                 cache_token = _abc_cache_token()
         dispatch_cache.clear()
         return func
@@ -1187,21 +1187,21 @@ class singledispatchmethod:
         self.dispatcher = singledispatch(func)
         self.func = func
 
-    def register(self, cls, method=none):
+    def register(self, cls, method=None):
         """generic_method.register(cls, func) -> func
 
         Registers a new implementation for the given *cls* on a *generic_method*.
         """
         return self.dispatcher.register(cls, func=method)
 
-    def __get__(self, obj, cls=none):
+    def __get__(self, obj, cls=None):
         var dispatcher = self.dispatcher
         var funcname = getattr(self.func, "__name__", "singledispatchmethod method")
         def _method(*args, **kwargs):
             if len(args) == 0:
                 raise TypeError(funcname + " requires at least 1 positional argument")
             var method = dispatcher.dispatch(_class_of(args[0]))
-            if obj is none:
+            if obj is None:
                 return method(*args, **kwargs)
             return method(obj, *args, **kwargs)
         _method.register = self.register

@@ -147,9 +147,9 @@ def _make_dialect(dialect, kw):
             v[name] = getattr(dialect, name)
         else:
             v[name] = _UNSET
-    var delimiter = _char_param("delimiter", v["delimiter"], ",", false)
-    var doublequote = true if id(v["doublequote"]) == id(_UNSET) else bool(v["doublequote"])
-    var escapechar = _char_param("escapechar", v["escapechar"], None, true)
+    var delimiter = _char_param("delimiter", v["delimiter"], ",", False)
+    var doublequote = True if id(v["doublequote"]) == id(_UNSET) else bool(v["doublequote"])
+    var escapechar = _char_param("escapechar", v["escapechar"], None, True)
     var lt = v["lineterminator"]
     if id(lt) == id(_UNSET):
         lt = "\r\n"
@@ -157,7 +157,7 @@ def _make_dialect(dialect, kw):
         raise TypeError("lineterminator must be set")
     elif not isinstance(lt, str):
         raise TypeError("\"lineterminator\" must be a string")
-    var quotechar = _char_param("quotechar", v["quotechar"], "\"", true)
+    var quotechar = _char_param("quotechar", v["quotechar"], "\"", True)
     var quoting = v["quoting"]
     var quoting_given = id(quoting) != id(_UNSET)
     if not quoting_given:
@@ -170,15 +170,15 @@ def _make_dialect(dialect, kw):
         quoting = QUOTE_NONE
     if quoting != QUOTE_NONE and quotechar is None:
         raise TypeError("quotechar must be set if quoting enabled")
-    var sis = false if id(v["skipinitialspace"]) == id(_UNSET) else bool(v["skipinitialspace"])
-    var strict = false if id(v["strict"]) == id(_UNSET) else bool(v["strict"])
+    var sis = False if id(v["skipinitialspace"]) == id(_UNSET) else bool(v["skipinitialspace"])
+    var strict = False if id(v["strict"]) == id(_UNSET) else bool(v["strict"])
     return _CsvDialect(delimiter, doublequote, escapechar, lt, quotechar, quoting, sis, strict)
 
 
 class Dialect:
     # describe a CSV dialect by subclassing and setting the attributes
     _name = ""
-    _valid = false
+    _valid = False
     delimiter = None
     quotechar = None
     escapechar = None
@@ -189,7 +189,7 @@ class Dialect:
 
     def __init__(self):
         if self.__class__.__name__ != "Dialect":
-            self._valid = true
+            self._valid = True
         self._validate()
 
     def _validate(self):
@@ -202,8 +202,8 @@ class Dialect:
 class excel(Dialect):
     delimiter = ","
     quotechar = "\""
-    doublequote = true
-    skipinitialspace = false
+    doublequote = True
+    skipinitialspace = False
     lineterminator = "\r\n"
     quoting = QUOTE_MINIMAL
 
@@ -215,8 +215,8 @@ class excel_tab(excel):
 class unix_dialect(Dialect):
     delimiter = ","
     quotechar = "\""
-    doublequote = true
-    skipinitialspace = false
+    doublequote = True
+    skipinitialspace = False
     lineterminator = "\n"
     quoting = QUOTE_ALL
 
@@ -279,7 +279,7 @@ class _CsvReader:
         self._field = []
         self._field_len = 0
         self._state = _START_RECORD
-        self._numeric = false
+        self._numeric = False
 
     def __iter__(self):
         return self
@@ -289,7 +289,7 @@ class _CsvReader:
         self._field = []
         self._field_len = 0
         if self._numeric:
-            self._numeric = false
+            self._numeric = False
             self._fields.append(_to_float(s))
         else:
             self._fields.append(s)
@@ -325,7 +325,7 @@ class _CsvReader:
                 self._save_field()
             else:
                 if d.quoting == QUOTE_NONNUMERIC:
-                    self._numeric = true
+                    self._numeric = True
                 self._add_char(c)
                 self._state = _IN_FIELD
             return
@@ -437,8 +437,8 @@ class _CsvReader:
         self._field = []
         self._field_len = 0
         self._state = _START_RECORD
-        self._numeric = false
-        while true:
+        self._numeric = False
+        while True:
             var line = None
             try:
                 line = next(self._it)
@@ -484,9 +484,9 @@ def _is_number(x):
     # PyNumber_Check: ints, floats, complex, bools, and objects with
     # __index__ / __int__ / __float__
     if isinstance(x, (int, float, complex)):
-        return true
+        return True
     if isinstance(x, (str, bytes, bytearray, list, tuple, dict)) or x is None:
-        return false
+        return False
     return hasattr(x, "__index__") or hasattr(x, "__int__") or hasattr(x, "__float__")
 
 
@@ -508,10 +508,10 @@ class _CsvWriter:
         # when it holds a special character; quotes doubled or escaped
         var d = self.dialect
         var s = field
-        var special = false
+        var special = False
         for c in self._special:
             if c in s:
-                special = true
+                special = True
                 break
         if not special:
             if quoted:
@@ -520,19 +520,19 @@ class _CsvWriter:
         var out = []
         for c in s:
             if c in self._special:
-                var want_escape = false
+                var want_escape = False
                 if d.quoting == QUOTE_NONE:
-                    want_escape = true
+                    want_escape = True
                 else:
                     if c == d.quotechar:
                         if d.doublequote:
                             out.append(d.quotechar)
                         else:
-                            want_escape = true
+                            want_escape = True
                     elif c == d.escapechar:
-                        want_escape = true
+                        want_escape = True
                     if not want_escape:
-                        quoted = true
+                        quoted = True
                 if want_escape:
                     if d.escapechar is None:
                         raise Error("need to escape, but no escapechar set")
@@ -553,11 +553,11 @@ class _CsvWriter:
         var parts = []
         var reclen = 0
         for field in row:
-            var quoted = false
+            var quoted = False
             if d.quoting == QUOTE_NONNUMERIC:
                 quoted = not _is_number(field)
             elif d.quoting == QUOTE_ALL:
-                quoted = true
+                quoted = True
             elif d.quoting == QUOTE_STRINGS:
                 quoted = isinstance(field, str)
             elif d.quoting == QUOTE_NOTNULL:
@@ -575,7 +575,7 @@ class _CsvWriter:
                 # an empty field between spaces would read back as nothing
                 if d.quoting == QUOTE_NONE or (field is None and (d.quoting == QUOTE_STRINGS or d.quoting == QUOTE_NOTNULL)):
                     raise Error("empty field must be quoted if delimiter is a space and skipinitialspace is true")
-                quoted = true
+                quoted = True
             var piece = self._field_text(text, quoted)
             parts.append(piece)
             reclen = reclen + len(piece)
@@ -770,14 +770,14 @@ def _has_doublequote(data, delim, quotechar):
             var b = f.rfind(quotechar)
             if a < 0 or f.count(quotechar) < 3:
                 continue
-            var ok = true
+            var ok = True
             for c in f[:a] + f[b + 1:]:
                 if _is_wordch(c):
-                    ok = false
+                    ok = False
                     break
             if ok:
-                return true
-    return false
+                return True
+    return False
 
 
 class Sniffer:
@@ -815,7 +815,7 @@ class Sniffer:
             if matches:
                 break
         if not matches:
-            return ("", false, None, 0)
+            return ("", False, None, 0)
         var quotes = {}
         var delims = {}
         var spaces = 0
@@ -868,10 +868,10 @@ class Sniffer:
                         if it[1] > best[1]:
                             best = it
                     var rest = 0
-                    var removed = false
+                    var removed = False
                     for it in items:
                         if not removed and it[0] == best[0] and it[1] == best[1]:
-                            removed = true
+                            removed = True
                             continue
                         rest = rest + it[1]
                     modes[char] = (best[0], best[1] - rest)
@@ -944,14 +944,14 @@ def _is_complex_text(s):
     # would complex(s) succeed?
     try:
         float(s)
-        return true
+        return True
     except (ValueError, TypeError, OverflowError):
         pass
     try:
         complex(s)
-        return true
+        return True
     except Exception:
-        return false
+        return False
 
 
 def _split_keepends(s):

@@ -214,8 +214,8 @@ class _PathParents:
     def __contains__(self, item):
         for p in self:
             if p == item:
-                return true
-        return false
+                return True
+        return False
 
     def __repr__(self):
         return "<" + type(self._path).__name__ + ".parents>"
@@ -380,7 +380,7 @@ class PurePath:
 
     def __eq__(self, other):
         if not isinstance(other, PurePath):
-            return false
+            return False
         return self._str_normcase == other._str_normcase and self._windows == other._windows
 
     def __ne__(self, other):
@@ -500,7 +500,7 @@ class PurePath:
             name = name[:len(name) - len(old_suffix)] + suffix
         return self._from_parsed_parts(self._drv, self._root, self._tail[:-1] + [name])
 
-    def relative_to(self, other, *_deprecated, walk_up=false):
+    def relative_to(self, other, *_deprecated, walk_up=False):
         """Return the relative path to another path identified by the passed
         arguments.  If the operation is not possible (because this is not
         related to the other path), raise ValueError.
@@ -514,7 +514,7 @@ class PurePath:
             other = self.with_segments(other)
         var candidates = [other] + list(other.parents)
         var step = 0
-        var found = none
+        var found = None
         for path in candidates:
             if self.is_relative_to(path):
                 found = path
@@ -524,7 +524,7 @@ class PurePath:
             elif path.name == "..":
                 raise ValueError("'..' segment in " + repr(str(other)) + " cannot be walked")
             step = step + 1
-        if found is none:
+        if found is None:
             raise ValueError(repr(str(self)) + " and " + repr(str(other)) + " have different anchors")
         var parts = [".."] * step + self._tail[len(found._tail):]
         return self.with_segments(*parts)
@@ -587,24 +587,24 @@ class PurePath:
         """Return True if the path contains one of the special names reserved
         by the system, if any."""
         if not self._windows or not self._tail:
-            return false
+            return False
         # NOTE: the rules for reserved names seem somewhat complicated
         # (e.g. r"..\NUL" is reserved but not r"foo\NUL" if "foo" does not
         # exist). We err on the side of caution and return True for paths
         # which are not considered reserved by Windows.
         if self._drv.startswith("\\\\"):
             # UNC paths are never reserved.
-            return false
+            return False
         var name = self._tail[-1].split(".")[0].split(":")[0].rstrip(" ")
         return name.upper() in _WIN_RESERVED
 
-    def match(self, path_pattern, case_sensitive=none):
+    def match(self, path_pattern, case_sensitive=None):
         """
         Return True if this path matches the given pattern.
         """
         if isinstance(path_pattern, PurePath):
             path_pattern = str(path_pattern)
-        if case_sensitive is none:
+        if case_sensitive is None:
             case_sensitive = not self._windows
         var pat = self.with_segments(path_pattern)
         var pat_parts = list(pat.parts)
@@ -622,19 +622,19 @@ class PurePath:
             pat_parts = lq
         if pat._drv or pat._root:
             if len(pat_parts) != len(parts):
-                return false
+                return False
             if pat_parts[0] != parts[0]:
-                return false
+                return False
             pat_parts = pat_parts[1:]
             parts = parts[1:]
         elif len(pat_parts) > len(parts):
-            return false
+            return False
         var i = 1
         while i <= len(pat_parts):
             if not _fnmatch_mod.fnmatchcase(parts[-i], pat_parts[-i]):
-                return false
+                return False
             i = i + 1
-        return true
+        return True
 
 
 class PurePosixPath(PurePath):
@@ -643,7 +643,7 @@ class PurePosixPath(PurePath):
     On a POSIX system, instantiating a PurePath should return this object.
     However, you can also instantiate it directly on any system.
     """
-    _windows = false
+    _windows = False
     _shown_name = "PurePosixPath"
 
 
@@ -653,7 +653,7 @@ class PureWindowsPath(PurePath):
     On a Windows system, instantiating a PurePath should return this object.
     However, you can also instantiate it directly on any system.
     """
-    _windows = true
+    _windows = True
     _shown_name = "PureWindowsPath"
 
 
@@ -728,11 +728,11 @@ def _S_IFMT(mode):
     return mode & 0o170000
 
 
-def _oserror(cls, eno, strerror, filename=none, filename2=none):
+def _oserror(cls, eno, strerror, filename=None, filename2=None):
     var text = "[Errno " + str(eno) + "] " + strerror
-    if filename is not none:
+    if filename is not None:
         text = text + ": " + repr(filename)
-    if filename2 is not none:
+    if filename2 is not None:
         text = text + " -> " + repr(filename2)
     var e = cls(text)
     e.errno = eno
@@ -788,7 +788,7 @@ class _ConcretePath(PurePath):
         """
         return cls("~").expanduser()
 
-    def stat(self, follow_symlinks=true):
+    def stat(self, follow_symlinks=True):
         """
         Return the result of the stat() system call on this path, like
         os.stat() does.
@@ -802,9 +802,9 @@ class _ConcretePath(PurePath):
         Like stat(), except if the path points to a symlink, the symlink's
         status information is returned, rather than its target's.
         """
-        return self.stat(false)
+        return self.stat(False)
 
-    def exists(self, follow_symlinks=true):
+    def exists(self, follow_symlinks=True):
         """
         Whether this path exists.
 
@@ -838,7 +838,7 @@ class _ConcretePath(PurePath):
         try:
             return _S_IFMT(os_stat(self._str)["mode"]) == fmt
         except OSError:
-            return false
+            return False
 
     def is_block_device(self):
         """
@@ -868,38 +868,38 @@ class _ConcretePath(PurePath):
         """
         Whether this path is a junction.
         """
-        return false
+        return False
 
     def is_mount(self):
         """
         Check if this path is a mount point
         """
         if not self.exists() or not self.is_dir():
-            return false
+            return False
         if self._windows:
             return self.is_absolute() and len(self._tail) == 0
         var p = os_path_realpath(self._str)
         if p == "/":
-            return true
+            return True
         try:
             var st = os_lstat(self._str)
             if os_islink(self._str):
-                return false
+                return False
             var parent = os_lstat(os_path_join(self._str, ".."))
             var dev1 = st.get("dev", 0)
             var dev2 = parent.get("dev", 0)
             if dev1 != dev2:
-                return true
+                return True
             return st["ino"] == parent["ino"]
         except OSError:
-            return false
+            return False
 
     def samefile(self, other_path):
         """Return whether other_path is the same or not as this file
         (as returned by os.path.samefile()).
         """
         var st = self.stat()
-        var other_st = none
+        var other_st = None
         if isinstance(other_path, _ConcretePath):
             other_st = other_path.stat()
         else:
@@ -1000,34 +1000,34 @@ class _ConcretePath(PurePath):
                 elif os_isdir(child3._str):
                     self._glob_select(child3, parts, i + 1, case_sensitive, out)
 
-    def glob(self, pattern, case_sensitive=none):
+    def glob(self, pattern, case_sensitive=None):
         """Iterate over this subtree and yield all existing files (of any
         kind, including directories) matching the given relative pattern.
         """
         _ny_sys_audit("pathlib.Path.glob", self, pattern)   # round 86: CPython's events
         var parts = self._glob_parts(pattern)
-        if case_sensitive is none:
+        if case_sensitive is None:
             case_sensitive = not self._windows
         var out = []
         self._glob_select(self, parts, 0, case_sensitive, out)
         for p in out:
             yield p
 
-    def rglob(self, pattern, case_sensitive=none):
+    def rglob(self, pattern, case_sensitive=None):
         """Recursively yield all existing files (of any kind, including
         directories) matching the given relative pattern, anywhere in
         this subtree.
         """
         _ny_sys_audit("pathlib.Path.rglob", self, pattern)
         var parts = self._glob_parts(pattern)
-        if case_sensitive is none:
+        if case_sensitive is None:
             case_sensitive = not self._windows
         var out = []
         self._glob_select(self, ["**"] + parts, 0, case_sensitive, out)
         for p in out:
             yield p
 
-    def walk(self, top_down=true, on_error=none, follow_symlinks=false):
+    def walk(self, top_down=True, on_error=None, follow_symlinks=False):
         """Walk the directory tree from this directory, similar to os.walk()."""
         _ny_sys_audit("pathlib.Path.walk", self, on_error, follow_symlinks)
         var paths = [self]
@@ -1036,11 +1036,11 @@ class _ConcretePath(PurePath):
             if isinstance(path, tuple):
                 yield path
                 continue
-            var names = none
+            var names = None
             try:
                 names = path._listdir()
             except OSError as error:
-                if on_error is not none:
+                if on_error is not None:
                     on_error(error)
                 continue
             var dirnames = []
@@ -1076,7 +1076,7 @@ class _ConcretePath(PurePath):
             cwd = os_path_abspath(self._drv)
         return self.with_segments(cwd, self._str)
 
-    def resolve(self, strict=false):
+    def resolve(self, strict=False):
         """
         Make the path absolute, resolving all symlinks on the way and also
         normalizing it.
@@ -1105,14 +1105,14 @@ class _ConcretePath(PurePath):
         """
         return self.with_segments(os_readlink(self._str))
 
-    def open(self, mode="r", buffering=-1, encoding=none, errors=none, newline=none):
+    def open(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
         """
         Open the file pointed by this path and return a file object, as
         the built-in open() function does.
         """
         if "b" in mode:
             return _builtin_open(self._str, mode)
-        return _builtin_open(self._str, mode, encoding if encoding is not none else "utf-8")
+        return _builtin_open(self._str, mode, encoding if encoding is not None else "utf-8")
 
     def read_bytes(self):
         """
@@ -1124,7 +1124,7 @@ class _ConcretePath(PurePath):
         finally:
             f.close()
 
-    def read_text(self, encoding=none, errors=none):
+    def read_text(self, encoding=None, errors=None):
         """
         Open the file in text mode, read it, and close the file.
         """
@@ -1147,7 +1147,7 @@ class _ConcretePath(PurePath):
             f.close()
         return len(data)
 
-    def write_text(self, data, encoding=none, errors=none, newline=none):
+    def write_text(self, data, encoding=None, errors=None, newline=None):
         """
         Open the file in text mode, write to it, and close the file.
         """
@@ -1160,7 +1160,7 @@ class _ConcretePath(PurePath):
             f.close()
         return len(data)
 
-    def touch(self, mode=0o666, exist_ok=true):
+    def touch(self, mode=0o666, exist_ok=True):
         """
         Create this file with the given access mode, if it doesn't exist.
         """
@@ -1173,7 +1173,7 @@ class _ConcretePath(PurePath):
         if mode != 0o666:
             os_chmod(p, mode & 0o755)
 
-    def mkdir(self, mode=0o777, parents=false, exist_ok=false):
+    def mkdir(self, mode=0o777, parents=False, exist_ok=False):
         """
         Create a new directory at this given path.
         """
@@ -1192,12 +1192,12 @@ class _ConcretePath(PurePath):
                 if _lexists(parent._str):
                     raise _oserror(NotADirectoryError, 20, "Not a directory", p)
                 raise _oserror(FileNotFoundError, 2, "No such file or directory", p)
-            parent.mkdir(0o777, true, true)
-            self.mkdir(mode, false, exist_ok)
+            parent.mkdir(0o777, True, True)
+            self.mkdir(mode, False, exist_ok)
             return
         raise _oserror(PermissionError, 13, "Permission denied", p)
 
-    def chmod(self, mode, follow_symlinks=true):
+    def chmod(self, mode, follow_symlinks=True):
         """
         Change the permissions of the path, like os.chmod().
         """
@@ -1208,9 +1208,9 @@ class _ConcretePath(PurePath):
         Like chmod(), except if the path points to a symlink, the symlink's
         permissions are changed, rather than its target's.
         """
-        self.chmod(mode, false)
+        self.chmod(mode, False)
 
-    def unlink(self, missing_ok=false):
+    def unlink(self, missing_ok=False):
         """
         Remove this file or link.
         If the path is a directory, use rmdir() instead.
@@ -1272,7 +1272,7 @@ class _ConcretePath(PurePath):
             raise self._rename_error(self._str, dst)
         return self.with_segments(target)
 
-    def symlink_to(self, target, target_is_directory=false):
+    def symlink_to(self, target, target_is_directory=False):
         """
         Make this path a symlink pointing to the target path.
         Note the order of arguments (link, target) is the reverse of os.symlink.
@@ -1303,7 +1303,7 @@ class PosixPath(_ConcretePath, PurePosixPath):
 
     On a POSIX system, instantiating a Path should return this object.
     """
-    _windows = false
+    _windows = False
 
 
 class WindowsPath(_ConcretePath, PureWindowsPath):
@@ -1311,7 +1311,7 @@ class WindowsPath(_ConcretePath, PureWindowsPath):
 
     On a Windows system, instantiating a Path should return this object.
     """
-    _windows = true
+    _windows = True
 
 
 # Path(...) is the platform's concrete class (no __new__ in Nython yet).
@@ -1321,5 +1321,5 @@ Path = WindowsPath if _IS_WINDOWS else PosixPath
 def _fnmatch_has_magic(s):
     for ch in s:
         if ch == "*" or ch == "?" or ch == "[":
-            return true
-    return false
+            return True
+    return False

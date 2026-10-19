@@ -97,20 +97,20 @@ def _is_num(x):
 def _comparable(a, b):
     # would Python's a < b work (rather than raise TypeError)?
     if _is_num(a) and _is_num(b):
-        return true
+        return True
     if isinstance(a, str) and isinstance(b, str):
-        return true
+        return True
     if isinstance(a, (bytes, bytearray)) and isinstance(b, (bytes, bytearray)):
-        return true
+        return True
     if isinstance(a, tuple) and isinstance(b, tuple):
-        return true
+        return True
     if isinstance(a, list) and isinstance(b, list):
-        return true
+        return True
     if isinstance(a, (set, frozenset)) and isinstance(b, (set, frozenset)):
-        return true
+        return True
     var ta = _tn(a)
     if ta not in _BUILTIN_TYPE_NAMES and hasattr(a, "__lt__"):
-        return true
+        return True
     var tb = _tn(b)
     return tb not in _BUILTIN_TYPE_NAMES and hasattr(b, "__gt__")
 
@@ -146,14 +146,14 @@ def _sorted_items(d):
     # keys that are all strings, or all numbers, sort by themselves (dict
     # keys are distinct, so the values never decide); the general case
     # wraps both sides in _safe_key
-    var all_str = true
-    var all_num = true
+    var all_str = True
+    var all_num = True
     for kv in items:
         var k = kv[0]
         if not isinstance(k, str):
-            all_str = false
+            all_str = False
         if not _is_num(k) or k != k:
-            all_num = false
+            all_num = False
         if not all_str and not all_num:
             break
     if all_str or all_num:
@@ -226,8 +226,8 @@ class PrettyPrinter:
         self._compact = bool(compact)
         self._sort_dicts = sort_dicts
         self._underscore_numbers = underscore_numbers
-        self._readable = true
-        self._recursive = false
+        self._readable = True
+        self._recursive = False
 
     def pprint(self, object):
         if self._stream is not None:
@@ -251,8 +251,8 @@ class PrettyPrinter:
         var objid = id(object)
         if objid in context:
             stream.write(_recursion(object))
-            self._recursive = true
-            self._readable = false
+            self._recursive = True
+            self._readable = False
             return
         var rep = self._repr(object, context, level)
         var max_width = self._width - indent - allowance
@@ -465,9 +465,9 @@ class PrettyPrinter:
     def _repr(self, object, context, level):
         var r = self.format(object, context.copy(), self._depth, level)
         if not r[1]:
-            self._readable = false
+            self._readable = False
         if r[2]:
-            self._recursive = true
+            self._recursive = True
         return r[0]
 
     def format(self, object, context, maxlevels, level):
@@ -540,19 +540,19 @@ class PrettyPrinter:
         var t = _tn(object)
         if t == "int":
             if self._underscore_numbers:
-                return (format(object, "_d"), true, false)
-            return (repr(object), true, false)
+                return (format(object, "_d"), True, False)
+            return (repr(object), True, False)
         if t == "dict":
             if not object:
-                return ("{}", true, false)
+                return ("{}", True, False)
             var objid = id(object)
             if maxlevels and level >= maxlevels:
-                return ("{...}", false, objid in context)
+                return ("{...}", False, objid in context)
             if objid in context:
-                return (_recursion(object), false, true)
+                return (_recursion(object), False, True)
             context[objid] = 1
-            var readable = true
-            var recursive = false
+            var readable = True
+            var recursive = False
             var components = []
             level = level + 1
             var items = _sorted_items(object) if self._sort_dicts else list(object.items())
@@ -562,7 +562,7 @@ class PrettyPrinter:
                 components.append(kr[0] + ": " + vr[0])
                 readable = readable and kr[1] and vr[1]
                 if kr[2] or vr[2]:
-                    recursive = true
+                    recursive = True
             del context[objid]
             return ("{" + ", ".join(components) + "}", readable, recursive)
         if t == "list" or t == "tuple":
@@ -570,35 +570,35 @@ class PrettyPrinter:
             var fmt_close = "]"
             if t == "list":
                 if not object:
-                    return ("[]", true, false)
+                    return ("[]", True, False)
             elif len(object) == 1:
                 fmt_open = "("
                 fmt_close = ",)"
             else:
                 if not object:
-                    return ("()", true, false)
+                    return ("()", True, False)
                 fmt_open = "("
                 fmt_close = ")"
             var oid = id(object)
             if maxlevels and level >= maxlevels:
-                return (fmt_open + "..." + fmt_close, false, oid in context)
+                return (fmt_open + "..." + fmt_close, False, oid in context)
             if oid in context:
-                return (_recursion(object), false, true)
+                return (_recursion(object), False, True)
             context[oid] = 1
-            var readable2 = true
-            var recursive2 = false
+            var readable2 = True
+            var recursive2 = False
             var comps = []
             level = level + 1
             for o in object:
                 var orr = self.format(o, context, maxlevels, level)
                 comps.append(orr[0])
                 if not orr[1]:
-                    readable2 = false
+                    readable2 = False
                 if orr[2]:
-                    recursive2 = true
+                    recursive2 = True
             del context[oid]
             return (fmt_open + ", ".join(comps) + fmt_close, readable2, recursive2)
         var rep = repr(object)
         if t in ("str", "bytes", "bytearray", "float", "complex", "bool", "NoneType"):
-            return (rep, true, false)
-        return (rep, bool(rep) and not rep.startswith("<"), false)
+            return (rep, True, False)
+        return (rep, bool(rep) and not rep.startswith("<"), False)

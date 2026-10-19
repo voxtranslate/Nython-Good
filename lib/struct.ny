@@ -379,7 +379,7 @@ def unpack_from(fmt, buffer, offset=0):
 
 def pack_into(fmt, buffer, offset, *values):
     var layout = _layout(fmt)
-    var view = none
+    var view = None
     var target = buffer
     if not isinstance(buffer, bytearray):
         # any writable buffer, written in place (round 84)
@@ -403,7 +403,7 @@ def pack_into(fmt, buffer, offset, *values):
                         " (actual buffer size is " + str(n) + ")")
         target[off:off + layout.size] = data
     finally:
-        if view is not none:
+        if view is not None:
             view.release()
 
 

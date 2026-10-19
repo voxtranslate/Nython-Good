@@ -14,12 +14,12 @@ INFINITY = float("inf")
 
 def encode_basestring(s):
     """Return a JSON representation of a Python string"""
-    return _json_quote(s, false)
+    return _json_quote(s, False)
 
 
 def encode_basestring_ascii(s):
     """Return an ASCII-only JSON representation of a Python string"""
-    return _json_quote(s, true)
+    return _json_quote(s, True)
 
 
 py_encode_basestring = encode_basestring
@@ -36,13 +36,13 @@ def _as_dict(o):
     var n = _type_name(o)
     if (n == "OrderedDict" or n == "defaultdict" or n == "Counter") and hasattr(o, "data") and isinstance(o.data, dict):
         return o.data
-    return none
+    return None
 
 
 def _as_tuple(o):
     if hasattr(o, "_fields") and hasattr(o, "_values") and isinstance(o._values, tuple):
         return o._values
-    return none
+    return None
 
 
 def _key_kind(k):
@@ -57,14 +57,14 @@ def _check_sortable(keys):
     # sorted(dct.items()) raises in Python when two keys cannot be ordered
     # (Nython orders an int before a str instead of raising)
     if len(keys) < 2:
-        return none
+        return None
     var k0 = _key_kind(keys[0])
     for i in range(1, len(keys)):
         var ki = _key_kind(keys[i])
         if ki != k0 or (ki != "str" and ki != "number"):
             raise TypeError("'<' not supported between instances of '" + type(keys[i]).__name__ +
                             "' and '" + type(keys[0]).__name__ + "'")
-    return none
+    return None
 
 
 class _NyJsonIterEncode:
@@ -75,7 +75,7 @@ class _NyJsonIterEncode:
         self.markers = markers
         self.default = default
         self.encoder = encoder
-        if indent is not none and not isinstance(indent, str):
+        if indent is not None and not isinstance(indent, str):
             indent = " " * indent
         self.indent = indent
         self.allow_nan = allow_nan
@@ -102,7 +102,7 @@ class _NyJsonIterEncode:
         # the text of a str/None/bool/int/float, or none for anything else
         if isinstance(value, str):
             return self.encoder(value)
-        if value is none:
+        if value is None:
             return "null"
         if isinstance(value, bool):
             return "true" if value else "false"
@@ -110,17 +110,17 @@ class _NyJsonIterEncode:
             return repr(int(value))
         if isinstance(value, float):
             return self.floatstr(value)
-        return none
+        return None
 
     def enter(self, o):
-        if self.markers is not none:
+        if self.markers is not None:
             var markerid = id(o)
             if markerid in self.markers:
                 raise ValueError("Circular reference detected")
             self.markers[markerid] = o
 
     def leave(self, o):
-        if self.markers is not none:
+        if self.markers is not None:
             del self.markers[id(o)]
 
     def nested(self, value, level):
@@ -136,26 +136,26 @@ class _NyJsonIterEncode:
             return
         self.enter(lst)
         var buf = "["
-        var newline_indent = none
+        var newline_indent = None
         var separator = self.item_separator
-        if self.indent is not none:
+        if self.indent is not None:
             level = level + 1
             newline_indent = "\n" + self.indent * level
             separator = self.item_separator + newline_indent
             buf = buf + newline_indent
-        var first = true
+        var first = True
         for value in lst:
             if first:
-                first = false
+                first = False
             else:
                 buf = separator
             var text = self.scalar(value)
-            if text is not none:
+            if text is not None:
                 yield buf + text
             else:
                 yield buf
                 yield from self.nested(value, level)
-        if newline_indent is not none:
+        if newline_indent is not None:
             level = level - 1
             yield "\n" + self.indent * level
         yield "]"
@@ -167,14 +167,14 @@ class _NyJsonIterEncode:
             return
         self.enter(dct)
         yield "{"
-        var newline_indent = none
+        var newline_indent = None
         var item_separator = self.item_separator
-        if self.indent is not none:
+        if self.indent is not None:
             level = level + 1
             newline_indent = "\n" + self.indent * level
             item_separator = self.item_separator + newline_indent
             yield newline_indent
-        var first = true
+        var first = True
         if self.sort_keys:
             _check_sortable(list(dct.keys()))
         var items = sorted(dct.items()) if self.sort_keys else dct.items()
@@ -187,7 +187,7 @@ class _NyJsonIterEncode:
                 key = self.floatstr(key)
             elif isinstance(key, bool):
                 key = "true" if key else "false"
-            elif key is none:
+            elif key is None:
                 key = "null"
             elif isinstance(key, int):
                 key = repr(int(key))
@@ -196,17 +196,17 @@ class _NyJsonIterEncode:
             else:
                 raise TypeError("keys must be str, int, float, bool or None, not " + _type_name(key))
             if first:
-                first = false
+                first = False
             else:
                 yield item_separator
             yield self.encoder(key)
             yield self.key_separator
             var text = self.scalar(value)
-            if text is not none:
+            if text is not None:
                 yield text
             else:
                 yield from self.nested(value, level)
-        if newline_indent is not none:
+        if newline_indent is not None:
             level = level - 1
             yield "\n" + self.indent * level
         yield "}"
@@ -214,7 +214,7 @@ class _NyJsonIterEncode:
 
     def iterencode(self, o, level):
         var text = self.scalar(o)
-        if text is not none:
+        if text is not None:
             yield text
             return
         if isinstance(o, list) or isinstance(o, tuple):
@@ -224,11 +224,11 @@ class _NyJsonIterEncode:
             yield from self.iter_dict(o, level)
             return
         var d = _as_dict(o)
-        if d is not none:
+        if d is not None:
             yield from self.iter_dict(d, level)
             return
         var t = _as_tuple(o)
-        if t is not none:
+        if t is not None:
             yield from self.iter_list(t, level)
             return
         self.enter(o)
@@ -248,21 +248,21 @@ class JSONEncoder:
     item_separator = ", "
     key_separator = ": "
 
-    def __init__(self, *, skipkeys=false, ensure_ascii=true,
-                 check_circular=true, allow_nan=true, sort_keys=false,
-                 indent=none, separators=none, default=none):
+    def __init__(self, *, skipkeys=False, ensure_ascii=True,
+                 check_circular=True, allow_nan=True, sort_keys=False,
+                 indent=None, separators=None, default=None):
         self.skipkeys = skipkeys
         self.ensure_ascii = ensure_ascii
         self.check_circular = check_circular
         self.allow_nan = allow_nan
         self.sort_keys = sort_keys
         self.indent = indent
-        if separators is not none:
+        if separators is not None:
             self.item_separator = separators[0]
             self.key_separator = separators[1]
-        elif indent is not none:
+        elif indent is not None:
             self.item_separator = ","
-        if default is not none:
+        if default is not None:
             self.default = default
 
     def default(self, o):
@@ -281,20 +281,20 @@ class JSONEncoder:
             return _json_quote(o, self.ensure_ascii)
         if self.__class__.iterencode == JSONEncoder.iterencode:
             var indent = self.indent
-            if indent is not none and not isinstance(indent, str):
+            if indent is not None and not isinstance(indent, str):
                 indent = " " * indent
             var text = _json_encode(o, indent, self.item_separator, self.key_separator,
                                     self.sort_keys, self.ensure_ascii, self.allow_nan,
                                     self.skipkeys, self.check_circular)
-            if text is not none:
+            if text is not None:
                 return text
-        var chunks = self.iterencode(o, true)
+        var chunks = self.iterencode(o, True)
         return "".join(list(chunks))
 
-    def iterencode(self, o, _one_shot=false):
+    def iterencode(self, o, _one_shot=False):
         """Encode the given object and yield each string
         representation as available."""
-        var markers = {} if self.check_circular else none
+        var markers = {} if self.check_circular else None
         var enc = encode_basestring_ascii if self.ensure_ascii else encode_basestring
         var it = _NyJsonIterEncode(markers, self.default, enc, self.indent, self.allow_nan,
                                    self.key_separator, self.item_separator, self.sort_keys,

@@ -8,7 +8,7 @@
 import hashlib
 
 def _algo(digestmod):
-    if digestmod == none:
+    if digestmod == None:
         raise TypeError("Missing required parameter 'digestmod'.")
     if isinstance(digestmod, "str"):
         return digestmod
@@ -17,7 +17,7 @@ def _algo(digestmod):
     return digestmod.name
 
 class HMAC:
-    def __init__(self, key, msg=none, digestmod=none):
+    def __init__(self, key, msg=None, digestmod=None):
         self._algo = _algo(digestmod)
         var probe = hashlib._new(self._algo)
         self.digest_size = probe.digest_size
@@ -34,14 +34,14 @@ class HMAC:
             opad[i] = k[i] ^ 0x5C
         self._inner = hashlib._new(self._algo, bytes(ipad))
         self._outer = hashlib._new(self._algo, bytes(opad))
-        if msg != none:
+        if msg != None:
             self.update(msg)
 
     def update(self, msg):
         self._inner.update(msg)
 
     def copy(self):
-        var c = HMAC(b"", none, self._algo)
+        var c = HMAC(b"", None, self._algo)
         c._inner = self._inner.copy()
         c._outer = self._outer.copy()
         return c
@@ -54,7 +54,7 @@ class HMAC:
     def hexdigest(self):
         return self.digest().hex()
 
-def new(key, msg=none, digestmod=none):
+def new(key, msg=None, digestmod=None):
     return HMAC(key, msg, digestmod)
 
 def digest(key, msg, digest):

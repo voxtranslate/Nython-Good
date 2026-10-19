@@ -785,6 +785,12 @@ struct VMCode {
     // the main program's frame, so a program's top-level `list = ...` does
     // not change the builtins it calls (VirtualMachine::frame_visible)
     bool prelude_code = false;
+    // round 86: Python-language source's code (Node::py_src - a .py file, a
+    // `# nython: python` file or function, code compiled from one): where
+    // Nython is lenient (str + non-str, an int iterated, a dict's keys read
+    // as attributes) the VM takes CPython's path while it runs (vm_py()).
+    // Decided when compiled; a nested code object inherits it.
+    bool py = false;
     bool                   module_top = false;
     std::vector<std::shared_ptr<VMCode>> sub_codes;
     std::vector<ExceptionEntry>          exc_table;
@@ -1123,6 +1129,7 @@ class Compiler {
 
     void push_code(const std::string& name, bool is_class=false) {
         auto c=std::make_shared<VMCode>(); c->name=name; c->is_class=is_class;
+        c->py=code_&&code_->py;   // round 86: a class body / comprehension has its enclosing code's rule
         code_stack_.push_back(code_); code_=c;
         body_saves_.push_back({std::move(loops_),std::move(fin_stack_),persist_depth_,std::move(exc_vars_)});
         body_saves_.back().fbl=std::move(fin_body_loops_);   // round 82
@@ -1284,6 +1291,7 @@ public:
 
     std::shared_ptr<VMCode> compile(nython::node::node_ptr root) {
         if(!root) return code_;
+        code_->py=root->py_src;   // round 86: a Python-language module's top level
         visit(root);
         emit(Op::HALT);
         return code_;
@@ -1536,7 +1544,9 @@ private:
             // straight to COMPARE_IS (plain value/pointer equality between
             // the instance and the class itself, never true) instead of
             // this opcode's actual type check.
-            if((op=="is"||op=="is not"||op=="instanceof") && b->right
+            // round 86: not in Python-language source, whose `is` is
+            // identity (COMPARE_IS, below) - `1 is int` is False there
+            if((op=="is"||op=="is not"||op=="instanceof") && b->right && !b->py_src
                && b->right->type()==NT::VARIABLE){
                 const std::string& tn=b->right->token().value;
                 if(isTypeNameToken(tn)){
@@ -1606,6 +1616,7 @@ private:
         case NT::LAMBDA: {
             auto lm=std::static_pointer_cast<nython::node::LambdaNode>(nd);
             push_code("<lambda>");
+            C().py=lm->py_rule;   // round 86
             C().qualname=lm->qualname; C().first_line=l; C().file=lm->token().fileName();   // round 77
             // a first parameter named self is bound as a def's is (round 77:
             // it was dropped, so `(lambda self: self)(5)` was an arity error)
@@ -2449,6 +2460,7 @@ private:
         int l=ln(fn);
         bool in_class_body=C().is_class;   // round 78
         push_code(fn->name);
+        C().py=fn->py_rule;   // round 86: the function's own rule (a def may opt in)
         C().doc=fn->doc; C().has_doc=fn->has_doc;
         C().qualname=fn->qualname; C().is_async=fn->is_async; C().is_async_gen=fn->is_async_gen;   // round 77
         C().first_line=fn->first_line?fn->first_line:l; C().file=fn->token().fileName();
@@ -5460,6 +5472,9 @@ public:
             if(!it.is_set()) return list_iter(it);   // round 81: live, not a copy
             return set_iter(it);                     // round 81: its size checked
         }
+        // round 86: `for i in n` is Nython's; to Python-language source an
+        // int is not iterable
+        if(it.type==VMType::INT&&vm_py()) raise_native_exception("TypeError","'int' object is not iterable");
         // a dict's (typed) keys; a string's characters; the old helper for
         // the rest
         return make_iter(it);
@@ -5794,6 +5809,10 @@ private:
         // The right side of an unpacking assignment (see VarDeclNode::unpack).
         globals_["__unpack_seq__"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_none();
+            // round 86: a number or None, CPython's TypeError (it read "'int'
+            // object is not subscriptable"), as the interpreter's evalVarDecl
+            if(a[0].type==VMType::INT||a[0].type==VMType::FLOAT||a[0].type==VMType::BOOL||a[0].type==VMType::NONE)
+                raise_native_exception("TypeError","cannot unpack non-iterable "+vm_type_name(a[0])+" object");
             // an object with __iter__ / __next__ is iterated too, as Python
             // unpacks (it was indexed: "'It' object is not subscriptable")
             bool inst_iter=false;
@@ -6888,7 +6907,15 @@ private:
     // registry of the files parsed as such)
     bool vm_caller_python() {
         if(call_stack_.empty()||!call_stack_.back().code) return false;
+        if(call_stack_.back().code->py) return true;   // round 86: the code's own mark (code exec'd from such code too)
         return nython::scope::python_file(call_stack_.back().code->file);
+    }
+    // round 86: the running code is Python-language source's (VMCode::py) -
+    // what the VM asks on Nython's lenient paths (binop's str + non-str, an
+    // int iterated, a dict's key read as an attribute, list.sort's result):
+    // a builtin's caller is the frame on top
+    bool vm_py() {
+        return !call_stack_.empty()&&call_stack_.back().code&&call_stack_.back().code->py;
     }
 
     // ── Reflection (round 77) ──
@@ -9122,7 +9149,7 @@ private:
 
             case Op::LOAD_ATTR: {
                 NY_QUICKEN();   // round 80
-                VMVal obj=pop(); push(get_attr(obj,fr.code->names[ins.arg])); break;
+                VMVal obj=pop(); push(get_attr(obj,fr.code->names[ins.arg],fr.code->py)); break;   // round 86: the code's rule
             }
             case Op::LOAD_ATTR_OPT: {
                 VMVal obj=pop(), v;
@@ -9141,6 +9168,10 @@ private:
             case Op::STORE_ATTR: {
                 NY_QUICKEN();   // round 80
                 VMVal obj=pop(); VMVal val=pop();
+                // round 86: `d.x = v` in Python-language source - a plain
+                // dict takes no attributes (CPython's AttributeError)
+                if(fr.code->py&&obj.type==VMType::MAP&&dict_keys_hidden(obj))
+                    raise_native_exception("AttributeError","'dict' object has no attribute '"+fr.code->names[ins.arg]+"'");
                 set_attr(obj,fr.code->names[ins.arg],std::move(val)); break;
             }
             case Op::LOAD_SUBSCR: {
@@ -9272,9 +9303,11 @@ private:
                 NY_QUICKEN();   // round 80
                 VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__add__","__radd__",res)){ push(std::move(res)); break; } }
-                // A string joined with an instance takes str(instance).
-                if(r.type==VMType::INSTANCE&&lv.type==VMType::STRING) r=VMVal::make_str(vm_str(r));
-                if(lv.type==VMType::INSTANCE&&r.type==VMType::STRING) lv=VMVal::make_str(vm_str(lv));
+                // A string joined with an instance takes str(instance) -
+                // Nython's; binop raises Python's TypeError for Python-language
+                // source (round 86)
+                if(r.type==VMType::INSTANCE&&lv.type==VMType::STRING&&!fr.code->py) r=VMVal::make_str(vm_str(r));
+                if(lv.type==VMType::INSTANCE&&r.type==VMType::STRING&&!fr.code->py) lv=VMVal::make_str(vm_str(lv));
                 if(lv.type==VMType::INT&&r.type==VMType::INT&&lv.s.empty()&&r.s.empty()){
                     int64_t sum; if(!nypy::add_ovf(lv.i,r.i,sum)){ push(VMVal::make_int(sum)); break; }
                 }
@@ -11367,6 +11400,14 @@ private:
         if(!a.empty()) ba.push_back(to_barg(a[0]));
         return VMVal::make_bytes(nycall([&]{ return nypy::bytes_construct(ba,enc,err,has_enc,tn); }),mut);
     }
+    // round 86: `a + b` that nothing defines, in CPython's words: a str, list
+    // or tuple on the left says what it concatenates, anything else is the
+    // generic message (as the interpreter's concatError)
+    [[noreturn]] void concat_error(const VMVal& l, const VMVal& r) {
+        std::string lt=l.type==VMType::STRING?"str":(l.type==VMType::LIST&&!l.is_set())?(l.b?"tuple":"list"):"";
+        if(lt.empty()) raise_native_exception("TypeError","unsupported operand type(s) for +: '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        raise_native_exception("TypeError","can only concatenate "+lt+" (not \""+vm_type_name(r)+"\") to "+lt);
+    }
     VMVal binop(int op, const VMVal& l, const VMVal& r) {
         // a class operand's metaclass operators (round 83): type(C).__mul__(C,
         // x), then the other's reflected one - ctypes' c_int * 5
@@ -11412,14 +11453,18 @@ private:
         case nypy::A_ADD:
             if(l.type==VMType::STRING&&r.type==VMType::STRING) return VMVal::make_str(l.s+r.s);
             if(l.type==VMType::LIST&&r.type==VMType::LIST){
+                // round 86: a list and a tuple - Python's TypeError in
+                // Python-language source (Nython concatenates them)
+                if(l.b!=r.b&&vm_py()) concat_error(l,r);
                 std::vector<VMVal> out; if(l.list) out=*l.list;
                 if(r.list) out.insert(out.end(),r.list->begin(),r.list->end());
                 VMVal res=VMVal::make_list(std::move(out)); res.b=l.b&&r.b; return res;
             }
             // Lenient, as on the interpreter: a string on either side
-            // concatenates the other's text.
-            if(l.type==VMType::STRING||r.type==VMType::STRING) return VMVal::make_str(l.to_string()+r.to_string());
-            break;
+            // concatenates the other's text - Nython's; Python-language
+            // source's + is Python's (round 86: vm_py, the running code's)
+            if((l.type==VMType::STRING||r.type==VMType::STRING)&&!vm_py()) return VMVal::make_str(l.to_string()+r.to_string());
+            concat_error(l,r);   // round 86: CPython's messages
         case nypy::A_MUL: {
             int64_t times;
             const VMVal* seq=nullptr;
@@ -11433,6 +11478,12 @@ private:
                 if(seq->list) for(int64_t t=0;t<times;t++) out.insert(out.end(),seq->list->begin(),seq->list->end());
                 VMVal res=VMVal::make_list(std::move(out)); res.b=seq->b; return res;
             }
+            // round 86: a sequence and no int - CPython's sequence_repeat
+            // message, the left operand's repeat first
+            if(l.type==VMType::STRING||(l.type==VMType::LIST&&!l.is_set()))
+                raise_native_exception("TypeError","can't multiply sequence by non-int of type '"+vm_type_name(r)+"'");
+            if(r.type==VMType::STRING||(r.type==VMType::LIST&&!r.is_set()))
+                raise_native_exception("TypeError","can't multiply sequence by non-int of type '"+vm_type_name(l)+"'");
             break;
         }
         case nypy::A_MOD:
@@ -11652,6 +11703,9 @@ private:
                 return out;
             }
             case VMType::INT: {   // for i in n: 0..n-1, as the VM always allowed
+                // round 86: wherever Nython code iterates; not in
+                // Python-language source (the running code's rule)
+                if(vm_py()) raise_native_exception("TypeError","'int' object is not iterable");
                 std::vector<VMVal> out;
                 for(int64_t k=0;k<v.i;k++) out.push_back(VMVal::make_int(k));
                 return out;
@@ -12101,18 +12155,20 @@ private:
     // AttributeError, whatever the object (round 75: it read none), as on
     // the interpreter (NythonExecutor::evalAttribute). getattr(o, n, d),
     // hasattr, `o?.attr` and `o?.attr ?? d` are the graceful forms.
-    VMVal get_attr(const VMVal& obj, const std::string& attr) {
+    // `py` (round 86): Python-language source's read (lookup_attr)
+    VMVal get_attr(const VMVal& obj, const std::string& attr, bool py=false) {
         // The common read, a field present on an instance or a map (not a
         // property), straight from the map: a VMVal is costly to default-
         // construct and copy twice - unless the class defines
         // __getattribute__ (round 77).
-        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map&&!(obj.type==VMType::MAP&&dict_method_wins(obj,attr))&&!(any_getattribute_&&getattribute_hook(obj))){
+        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map&&!(obj.type==VMType::MAP&&dict_method_wins(obj,attr))&&!(any_getattribute_&&getattribute_hook(obj))
+           &&!(py&&dict_keys_hidden(obj))){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()&&!is_property_desc(it->second)
                &&(data_descr_names_.empty()||!data_descr_names_.count(attr))) return it->second;   // round 78
         }
         VMVal v;
-        if(lookup_attr(obj, attr, v)) return v;
+        if(lookup_attr(obj, attr, v, true, py)) return v;
         if(type_own_member(obj, attr, v)) return v;   // round 83
         return missing_attr(obj, attr);
     }
@@ -12131,6 +12187,13 @@ private:
     // A dict's methods win over its keys (round 77): a plain dict - not a
     // module or namespace, a bound method, a typed map - read with `.` for
     // keys / get / pop ... gives the method.
+    // round 86: a plain dict (not a module, namespace or typed map) - whose
+    // keys Python-language source does not read or set as attributes
+    bool dict_keys_hidden(const VMVal& obj) {
+        if(obj.type!=VMType::MAP||!obj.map||!obj.class_name.empty()) return false;
+        if(obj.map->count("__type__")||obj.map->count("__is_property__")) return false;
+        return !is_module_ns(obj);
+    }
     bool dict_method_wins(const VMVal& obj, const std::string& attr) {
         if(obj.type!=VMType::MAP||!obj.map||!obj.class_name.empty()||!nyrt::is_dict_method_name(attr)) return false;
         if(obj.map->count("__type__")||obj.map->count("__is_property__")) return false;
@@ -12183,7 +12246,10 @@ private:
         out=builtin_doc(key);
         return true;
     }
-    bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true) {
+    // `py` (round 86): the read is Python-language source's (LOAD_ATTR of a
+    // VMCode::py code, getattr / hasattr asking vm_py()): a plain dict's keys
+    // are not its attributes then, as in CPython; Nython reads the key.
+    bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true, bool py=false) {
         if(any_getattribute_){
             // a class's __getattribute__ (round 77); object.__getattribute__
             // asks for the lookup below
@@ -12201,8 +12267,8 @@ private:
             return lookup_attr(fit->second, attr, out, bind);
         }
         // Instance / map fields — check for property descriptors (a dict's
-        // own methods first, round 77)
-        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map&&!dict_method_wins(obj,attr)){
+        // own methods first, round 77; round 86: no dict key for Python code)
+        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map&&!dict_method_wins(obj,attr)&&!(py&&dict_keys_hidden(obj))){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
                 // A data descriptor of the class (a property, an object with
@@ -12627,8 +12693,8 @@ private:
     }
     // obj.attr, or false when it has none (hasattr / getattr with a default):
     // an AttributeError from a property getter or __getattr__ counts as none.
-    bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out) {
-        try { return lookup_attr(obj, attr, out) || type_own_member(obj, attr, out); }
+    bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool py=false) {
+        try { return lookup_attr(obj, attr, out, true, py) || type_own_member(obj, attr, out); }   // round 86: py
         catch(VMException& e){
             if(class_derives(e.value.class_name,"AttributeError")) return false;
             throw;
@@ -12932,6 +12998,9 @@ private:
         if(idx.type==VMType::INT) return idx.s.empty()?idx.i:(idx.s[0]=='-'?INT64_MIN/2:INT64_MAX/2);
         if(idx.type==VMType::BOOL) return idx.b?1:0;
         if(idx.type==VMType::INSTANCE){ VMVal r; if(index_value(idx,r)) return index_of(r,what); }
+        // round 86: a str's own words in CPython (unicode_subscript), as the
+        // interpreter says them
+        if(std::string(what)=="string") raise_native_exception("TypeError","string indices must be integers, not '"+vm_type_name(idx)+"'");
         raise_native_exception("TypeError",std::string(what)+" indices must be integers or slices, not "+vm_type_name(idx));
     }
     // x.__index__() (PEP 357): an object standing for an int as an index,
@@ -13080,6 +13149,8 @@ private:
             if(i<0) raise_native_exception("IndexError","list assignment index out of range");
             // Past the end the list grows (padded with none), on both engines:
             // library code appends with `a[len] = x`.
+            // round 86: Nython's - Python-language source gets CPython's IndexError
+            if(i>=sz&&vm_py()) raise_native_exception("IndexError","list assignment index out of range");
             if(i>=sz) L.resize((size_t)i+1,VMVal::make_none());
             L[(size_t)i]=std::move(val);
         } else if(obj.type==VMType::MAP&&obj.map) {
@@ -14910,21 +14981,24 @@ private:
         };
         globals_["hasattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
             if(a.size()!=2) raise_native_exception("TypeError","hasattr expected 2 arguments, got "+std::to_string(a.size()));
-            VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr_name(a,"hasattr"),v));});
+            VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr_name(a,"hasattr"),v,vm_py()));});   // round 86: py
         globals_["getattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2||a.size()>3) raise_native_exception("TypeError","getattr expected at most 3 arguments, got "+std::to_string(a.size()));
             std::string n=attr_name(a,"getattr");
             VMVal v;
+            const bool py=vm_py();   // round 86: a dict's keys are not its attributes to Python code
             // without a default, the AttributeError a property's getter or
             // __getattr__ raises is the one raised (round 77)
-            if(a.size()==2){ if(lookup_attr(a[0],n,v)) return v; }
-            else if(try_get_attr(a[0],n,v)) return v;
+            if(a.size()==2){ if(lookup_attr(a[0],n,v,true,py)) return v; }
+            else if(try_get_attr(a[0],n,v,py)) return v;
             if(a.size()==3) return a[2];
             throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(a[0],n))}));
             return VMVal::make_none();});
         globals_["setattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
             if(a.size()!=3) raise_native_exception("TypeError","setattr expected 3 arguments, got "+std::to_string(a.size()));
-            set_attr(a[0],attr_name(a,"setattr"),a[2]);
+            std::string n=attr_name(a,"setattr");
+            if(vm_py()&&dict_keys_hidden(a[0])) raise_native_exception("AttributeError","'dict' object has no attribute '"+n+"'");   // round 86
+            set_attr(a[0],n,a[2]);
             return VMVal::make_none();});
         globals_["delattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
             if(a.size()!=2) raise_native_exception("TypeError","delattr expected 2 arguments, got "+std::to_string(a.size()));
@@ -15377,6 +15451,9 @@ private:
             }
             if(v.type==VMType::LIST&&v.list&&!v.is_set()) return list_iter(v);   // live (round 81)
             if(v.type==VMType::LIST&&v.list&&v.is_set()) return set_iter(v);     // size checked (round 81)
+            // round 86: iter(3) in Nython code, as list(3) and `for i in 3`
+            // (the interpreter's did; iter_items raises for Python code)
+            if(v.type==VMType::INT) return VMVal::make_iter(iter_items(v));
             if(v.type==VMType::LIST||v.type==VMType::STRING||v.type==VMType::MAP||v.type==VMType::BYTES){
                 // named as Python names it: list_iterator, str_iterator ... (round 77)
                 VMVal it=VMVal::make_iter(iter_items(v));
@@ -15868,7 +15945,7 @@ private:
             std::vector<VMVal> sorted_items; sorted_items.reserve(L.size());
             for(size_t k:order) sorted_items.push_back(L[k]);
             L.swap(sorted_items);
-            out=obj; return true;   // the list itself, as on the interpreter
+            out=vm_py()?VMVal::make_none():obj; return true;   // the list itself, as on the interpreter (None to Python code, round 86)
         }
         if(m=="index"||m=="indexOf"){
             if(a.empty()) raise_native_exception("TypeError","index expected at least 1 argument, got 0");
@@ -15904,33 +15981,43 @@ private:
             L.insert(L.begin()+i,a[1]); out=VMVal::make_none(); return true;
         }
         if(m=="copy"){ out=VMVal::make_list(std::vector<VMVal>(L)); out.b=obj.b; return true; }
-        if(m=="reverse"){ std::reverse(L.begin(),L.end()); out=obj; return true; }
+        if(m=="reverse"){ std::reverse(L.begin(),L.end()); out=vm_py()?VMVal::make_none():obj; return true; }   // round 86: None to Python code
         if(m=="clear"){ L.clear(); out=VMVal::make_none(); return true; }
         return false;
     }
     // sorted()/min()/max()/list.sort() ordering: Python's where defined;
     // values Python cannot compare fall back to type name then text.
-    bool sort_less(const VMVal& x, const VMVal& y) {
-        if(x.is_num()&&y.is_num()) return VMVal::num_compare(x,y)==-1;
-        if(x.type==VMType::STRING&&y.type==VMType::STRING) return x.s<y.s;
-        if(x.type==VMType::LIST&&y.type==VMType::LIST&&x.list&&y.list){
+    // x < y (x > y for `op` ">") as sorted, min, max and list.sort compare
+    // - round 86: CPython's, values Python cannot order are a TypeError
+    // ("'<' not supported between instances of 'str' and 'int'"; they fell
+    // back to type name, then text, so [1, "a"] sorted), as the
+    // interpreter's sortLess
+    bool sort_less(const VMVal& x, const VMVal& y, const char* op="<") {
+        const bool gt=op[0]=='>';
+        if(x.is_num()&&y.is_num()){ int c=VMVal::num_compare(x,y); return gt?c==1:c==-1; }
+        if(x.type==VMType::STRING&&y.type==VMType::STRING) return gt?x.s>y.s:x.s<y.s;
+        if(x.is_set()&&y.is_set()){   // proper subset / superset, as the operators
+            const VMVal& lo=gt?y:x; const VMVal& hi=gt?x:y;
+            return lo.list->size()<hi.list->size()&&set_subset(lo,hi);
+        }
+        if(x.type==VMType::LIST&&y.type==VMType::LIST&&x.list&&y.list&&!x.is_set()&&!y.is_set()&&x.b==y.b){
             size_t n=std::min(x.list->size(),y.list->size());
             for(size_t k=0;k<n;k++){
                 const VMVal& p=(*x.list)[k]; const VMVal& q=(*y.list)[k];
                 if(p==q) continue;
-                return sort_less(p,q);
+                return sort_less(p,q,op);
             }
-            return x.list->size()<y.list->size();
+            return gt?x.list->size()>y.list->size():x.list->size()<y.list->size();
         }
         if(x.type==VMType::INSTANCE||y.type==VMType::INSTANCE){
             // x.__lt__(y), else y.__gt__(x): sorted([F(3), 1, F(2)]) sorts
             // an int against objects (it compared type names)
             VMVal r;
-            if(rich_compare(x,y,"__lt__","__gt__",r)) return vm_truthy(r);
+            if(gt?rich_compare(x,y,"__gt__","__lt__",r):rich_compare(x,y,"__lt__","__gt__",r)) return vm_truthy(r);
+            order_unsupported(op,x,y);
         }
-        std::string tx=vm_type_name(x), ty=vm_type_name(y);
-        if(tx!=ty) return tx<ty;
-        return x.to_string()<y.to_string();
+        if(x.type==VMType::BYTES&&y.type==VMType::BYTES) return gt?x.bdata()>y.bdata():x.bdata()<y.bdata();
+        order_unsupported(op,x,y);
     }
     VMVal list_method(VMVal obj, const std::string& m) {
         VirtualMachine* vm=this;
@@ -16361,7 +16448,7 @@ private:
                 VMVal bk=keyv?call1(*keyv,items[0]):items[0];
                 for(size_t k=1;k<items.size();k++){
                     VMVal kk=keyv?call1(*keyv,items[k]):items[k];
-                    if(is_min?vm->sort_less(kk,bk):vm->sort_less(bk,kk)){ best=k; bk=kk; }
+                    if(vm->sort_less(kk,bk,is_min?"<":">")){ best=k; bk=kk; }   // item < best / item > best, CPython's min_max (round 86)
                 }
                 return items[best];
             });

@@ -125,7 +125,7 @@ class _ShutilTermSize:
             return self.columns == other.columns and self.lines == other.lines
         if isinstance(other, tuple):
             return (self.columns, self.lines) == other
-        return false
+        return False
 
     def __hash__(self):
         return hash((self.columns, self.lines))
@@ -142,11 +142,11 @@ def _fspath(p):
     raise TypeError("expected str, bytes or os.PathLike object, not " + type(p).__name__)
 
 
-def _oserror(cls, eno, strerror, filename=none, filename2=none):
+def _oserror(cls, eno, strerror, filename=None, filename2=None):
     var text = "[Errno " + str(eno) + "] " + strerror
-    if filename is not none:
+    if filename is not None:
         text = text + ": " + repr(filename)
-    if filename2 is not none:
+    if filename2 is not None:
         text = text + " -> " + repr(filename2)
     var e = cls(text)
     e.errno = eno
@@ -156,7 +156,7 @@ def _oserror(cls, eno, strerror, filename=none, filename2=none):
     return e
 
 
-def _stat(p, follow_symlinks=true):
+def _stat(p, follow_symlinks=True):
     if follow_symlinks:
         return os_stat(p)
     return os_lstat(p)
@@ -180,17 +180,17 @@ def _imode(mode):
 
 def _samefile(src, dst):
     if not (os_exists(src) and os_exists(dst)):
-        return false
+        return False
     try:
         var a = os_stat(src)
         var b = os_stat(dst)
     except OSError:
-        return false
+        return False
     if a["ino"] != 0 and a["ino"] == b["ino"] and a.get("dev", 0) == b.get("dev", 0):
-        return true
+        return True
     if a["ino"] == 0 or _WINDOWS:
         return _normcase(os_path_abspath(src)) == _normcase(os_path_abspath(dst))
-    return false
+    return False
 
 
 def _normcase(p):
@@ -203,14 +203,14 @@ def copyfileobj(fsrc, fdst, length=0):
     """copy data from file-like object fsrc to file-like object fdst"""
     if not length:
         length = COPY_BUFSIZE
-    while true:
+    while True:
         var buf = fsrc.read(length)
         if not buf:
             break
         fdst.write(buf)
 
 
-def copyfile(src, dst, follow_symlinks=true):
+def copyfile(src, dst, follow_symlinks=True):
     """Copy data from src to dst in the most efficient way possible.
 
     If follow_symlinks is not set and src is a symbolic link, a new
@@ -223,13 +223,13 @@ def copyfile(src, dst, follow_symlinks=true):
         raise SameFileError(repr(src) + " and " + repr(dst) + " are the same file")
     var i = 0
     for fn in [src, dst]:
-        var st = none
+        var st = None
         try:
             st = os_stat(fn)
         except OSError:
             # File most likely does not exist
             pass
-        if st is not none and _isfifo(st["mode"]):
+        if st is not None and _isfifo(st["mode"]):
             raise SpecialFileError("`" + fn + "` is a named pipe")
         i = i + 1
     if not follow_symlinks and _islink(src):
@@ -237,7 +237,7 @@ def copyfile(src, dst, follow_symlinks=true):
     else:
         var fsrc = open(src, "rb")
         try:
-            var fdst = none
+            var fdst = None
             try:
                 fdst = open(dst, "wb")
             except IsADirectoryError as e:
@@ -253,7 +253,7 @@ def copyfile(src, dst, follow_symlinks=true):
     return dst
 
 
-def copymode(src, dst, follow_symlinks=true):
+def copymode(src, dst, follow_symlinks=True):
     """Copy mode bits from src to dst."""
     _ny_sys_audit("shutil.copymode", src, dst)
     src = _fspath(src)
@@ -265,7 +265,7 @@ def copymode(src, dst, follow_symlinks=true):
     os_chmod(dst, _imode(st["mode"]))
 
 
-def copystat(src, dst, follow_symlinks=true):
+def copystat(src, dst, follow_symlinks=True):
     """Copy file metadata: permission bits, last access time and last
     modification time (and nothing else: no flags or extended attributes)."""
     _ny_sys_audit("shutil.copystat", src, dst)
@@ -276,12 +276,12 @@ def copystat(src, dst, follow_symlinks=true):
         # utime/chmod of a link itself are not available: as CPython where
         # the platform lacks them, nothing is copied.
         return
-    var st = _stat(src, true)
+    var st = _stat(src, True)
     os_utime(dst, (st["atime"], st["mtime"]))
     os_chmod(dst, _imode(st["mode"]))
 
 
-def copy(src, dst, follow_symlinks=true):
+def copy(src, dst, follow_symlinks=True):
     """Copy data and mode bits ("cp src dst"). Return the file's destination.
 
     The destination may be a directory.
@@ -295,7 +295,7 @@ def copy(src, dst, follow_symlinks=true):
     return dst
 
 
-def copy2(src, dst, follow_symlinks=true):
+def copy2(src, dst, follow_symlinks=True):
     """Copy data and metadata. Return the file's destination.
 
     The destination may be a directory.
@@ -332,11 +332,11 @@ def _listdir_or_raise(path):
 
 def _copytree(names, src, dst, symlinks, ignore, copy_function, ignore_dangling_symlinks, dirs_exist_ok):
     var ignored_names = set()
-    if ignore is not none:
+    if ignore is not None:
         ignored_names = ignore(src, list(names))
     if dirs_exist_ok:
         if not os_isdir(dst):
-            os_makedirs(dst, exist_ok=true)
+            os_makedirs(dst, exist_ok=True)
     else:
         if _lexists(dst):
             raise _oserror(FileExistsError, 17, "File exists", dst)
@@ -383,8 +383,8 @@ def _copytree(names, src, dst, symlinks, ignore, copy_function, ignore_dangling_
     return dst
 
 
-def copytree(src, dst, symlinks=false, ignore=none, copy_function=none,
-             ignore_dangling_symlinks=false, dirs_exist_ok=false):
+def copytree(src, dst, symlinks=False, ignore=None, copy_function=None,
+             ignore_dangling_symlinks=False, dirs_exist_ok=False):
     """Recursively copy a directory tree and return the destination directory.
 
     If exception(s) occur, an Error is raised with a list of reasons.
@@ -392,7 +392,7 @@ def copytree(src, dst, symlinks=false, ignore=none, copy_function=none,
     _ny_sys_audit("shutil.copytree", src, dst)
     src = _fspath(src)
     dst = _fspath(dst)
-    if copy_function is none:
+    if copy_function is None:
         copy_function = copy2
     var names = _listdir_or_raise(src)
     return _copytree(names, src, dst, symlinks, ignore, copy_function,
@@ -421,7 +421,7 @@ def _rmtree_unsafe(path, onexc):
         onexc(os_rmdir, path, err)
 
 
-def rmtree(path, ignore_errors=false, onerror=none, onexc=none, dir_fd=none):
+def rmtree(path, ignore_errors=False, onerror=None, onexc=None, dir_fd=None):
     """Recursively delete a directory tree.
 
     If ignore_errors is set, errors are ignored; otherwise, if onexc or
@@ -435,22 +435,22 @@ def rmtree(path, ignore_errors=false, onerror=none, onexc=none, dir_fd=none):
     compatibility with onexc.
     """
     _ny_sys_audit("shutil.rmtree", path, dir_fd)
-    if onerror is not none and onexc is not none:
+    if onerror is not None and onexc is not None:
         raise TypeError("You cannot provide both onerror and onexc")
-    if dir_fd is not none:
+    if dir_fd is not None:
         raise NotImplementedError("dir_fd unavailable on this platform")
-    var handler = none
+    var handler = None
     if ignore_errors:
         def _ignore(*args):
             pass
         handler = _ignore
-    elif onerror is none and onexc is none:
+    elif onerror is None and onexc is None:
         def _raise(func, p, exc):
             raise exc
         handler = _raise
-    elif onerror is not none:
+    elif onerror is not None:
         def _onexc(func, p, exc):
-            onerror(func, p, (type(exc), exc, none))
+            onerror(func, p, (type(exc), exc, None))
         handler = _onexc
     else:
         handler = onexc
@@ -499,7 +499,7 @@ def _destinsrc(src, dst):
     return dst.startswith(src)
 
 
-def move(src, dst, copy_function=none):
+def move(src, dst, copy_function=None):
     """Recursively move a file or directory to another location. This is
     similar to the Unix "mv" command. Return the file or directory's
     destination.
@@ -511,7 +511,7 @@ def move(src, dst, copy_function=none):
     (with copy_function, copy2 by default) and then removed.
     """
     _ny_sys_audit("shutil.move", src, dst)
-    if copy_function is none:
+    if copy_function is None:
         copy_function = copy2
     src = _fspath(src)
     dst = _fspath(dst)
@@ -534,7 +534,7 @@ def move(src, dst, copy_function=none):
     elif os_isdir(src):
         if _destinsrc(src, dst):
             raise Error("Cannot move a directory '" + src + "' into itself '" + dst + "'.")
-        copytree(src, real_dst, true, none, copy_function)
+        copytree(src, real_dst, True, None, copy_function)
         rmtree(src)
     else:
         copy_function(src, real_dst)
@@ -552,7 +552,7 @@ def disk_usage(path):
     return _usage(d["total"], d["used"], d["free"])
 
 
-def chown(path, user=none, group=none):
+def chown(path, user=None, group=None):
     """Change owner user and group of the given path.
 
     user and group can be the uid/gid or the user/group names, and in that case,
@@ -560,45 +560,45 @@ def chown(path, user=none, group=none):
     """
     # (round 86) CPython's, over os.chown (POSIX; round 85) - audited
     _ny_sys_audit("shutil.chown", path, user, group)
-    if user is none and group is none:
+    if user is None and group is None:
         raise ValueError("user and/or group must be set")
     var _user = user
     var _group = group
-    if user is none:
+    if user is None:
         _user = -1
     elif isinstance(user, str):
         _user = _get_uid(user)
-        if _user is none:
+        if _user is None:
             raise LookupError("no such user: " + repr(user))
-    if group is none:
+    if group is None:
         _group = -1
     elif not isinstance(group, int):
         _group = _get_gid(group)
-        if _group is none:
+        if _group is None:
             raise LookupError("no such group: " + repr(group))
     os.chown(path, _user, _group)
 
 
 def _get_gid(name):
     """Returns a gid, given a group name."""
-    if name is none:
-        return none
+    if name is None:
+        return None
     try:
         import grp
         return grp.getgrnam(name)[2]
     except (ImportError, KeyError):
-        return none
+        return None
 
 
 def _get_uid(name):
     """Returns an uid, given a user name."""
-    if name is none:
-        return none
+    if name is None:
+        return None
     try:
         import pwd
         return pwd.getpwnam(name)[2]
     except (ImportError, KeyError):
-        return none
+        return None
 
 
 def get_terminal_size(fallback=(80, 24)):
@@ -643,7 +643,7 @@ def _access_check(fn, mode):
     return os_exists(fn) and os_access(fn, m) and not os_isdir(fn)
 
 
-def which(cmd, mode=1, path=none):
+def which(cmd, mode=1, path=None):
     """Given a command, mode, and a PATH string, return the path which
     conforms to the given mode on the PATH, or None if there is no such
     file.
@@ -657,13 +657,13 @@ def which(cmd, mode=1, path=none):
     if hs[0]:
         if _access_check(cmd, mode):
             return cmd
-        return none
-    if path is none:
+        return None
+    if path is None:
         path = os_getenv("PATH")
-        if path is none:
+        if path is None:
             path = "/bin:/usr/bin" if not _WINDOWS else ".;C:\\bin"
     if not path:
-        return none
+        return None
     path = _fspath(path)
     var dirs = path.split(os_pathsep)
     var files = [cmd]
@@ -690,7 +690,7 @@ def which(cmd, mode=1, path=none):
                 var name = os_path_join(d, thefile)
                 if _access_check(name, mode):
                     return name
-    return none
+    return None
 
 
 # ── Archives ─────────────────────────────────────────────────────────────────
@@ -786,15 +786,15 @@ def _tar_add(out, path, arcname):
             out.write(b"\0" * pad)
 
 
-def _make_tarball(base_name, base_dir, compress="", verbose=0, dry_run=0, owner=none, group=none, logger=none, root_dir=none):
+def _make_tarball(base_name, base_dir, compress="", verbose=0, dry_run=0, owner=None, group=None, logger=None, root_dir=None):
     var archive_name = base_name + ".tar"
     var archive_dir = os_path_split(archive_name)[0]
     if archive_dir and not os_exists(archive_dir):
         if not dry_run:
-            os_makedirs(archive_dir, exist_ok=true)
+            os_makedirs(archive_dir, exist_ok=True)
     if dry_run:
         return archive_name
-    var src = base_dir if root_dir is none else os_path_join(root_dir, base_dir)
+    var src = base_dir if root_dir is None else os_path_join(root_dir, base_dir)
     var out = open(archive_name, "wb")
     try:
         var arc = base_dir
@@ -827,9 +827,9 @@ def get_archive_formats():
     return formats
 
 
-def register_archive_format(name, function, extra_args=none, description=""):
+def register_archive_format(name, function, extra_args=None, description=""):
     """Registers an archive format."""
-    if extra_args is none:
+    if extra_args is None:
         extra_args = []
     if not callable(function):
         raise TypeError("The " + repr(function) + " object is not callable")
@@ -845,8 +845,8 @@ def unregister_archive_format(name):
     del _ARCHIVE_FORMATS[name]
 
 
-def make_archive(base_name, format, root_dir=none, base_dir=none, verbose=0,
-                 dry_run=0, owner=none, group=none, logger=none):
+def make_archive(base_name, format, root_dir=None, base_dir=None, verbose=0,
+                 dry_run=0, owner=None, group=None, logger=None):
     """Create an archive file (eg. zip or tar).
 
     'base_name' is the name of the file to create, minus any format-specific
@@ -862,16 +862,16 @@ def make_archive(base_name, format, root_dir=none, base_dir=none, verbose=0,
     if format not in _ARCHIVE_FORMATS:
         raise ValueError("unknown archive format '" + str(format) + "'")
     var fmt = _ARCHIVE_FORMATS[format]
-    if root_dir is not none:
+    if root_dir is not None:
         root_dir = _fspath(root_dir)
         base_name = os_path_abspath(base_name)
-    if base_dir is none:
+    if base_dir is None:
         base_dir = "."
     var func = fmt[0]
     if id(func) == id(_make_tarball):
         return func(base_name, base_dir, "", verbose, dry_run, owner, group, logger, root_dir)
-    var save_cwd = none
-    if root_dir is not none:
+    var save_cwd = None
+    if root_dir is not None:
         save_cwd = os_getcwd()
         os_chdir(root_dir)
     try:
@@ -880,7 +880,7 @@ def make_archive(base_name, format, root_dir=none, base_dir=none, verbose=0,
             kwargs[kv[0]] = kv[1]
         return func(base_name, base_dir, **kwargs)
     finally:
-        if save_cwd is not none:
+        if save_cwd is not None:
             os_chdir(save_cwd)
 
 
@@ -898,9 +898,9 @@ def _tar_cstr(b):
     return b.decode("utf-8", "replace")
 
 
-def _unpack_tarfile(filename, extract_dir, filter=none):
+def _unpack_tarfile(filename, extract_dir, filter=None):
     """Unpack tar `filename` to `extract_dir`."""
-    var f = none
+    var f = None
     try:
         f = open(filename, "rb")
     except OSError:
@@ -909,7 +909,7 @@ def _unpack_tarfile(filename, extract_dir, filter=none):
     f.close()
     var pos = 0
     var n = len(data)
-    var any_ok = false
+    var any_ok = False
     var dir_times = []
     while pos + 512 <= n:
         var hdr = data[pos:pos + 512]
@@ -922,7 +922,7 @@ def _unpack_tarfile(filename, extract_dir, filter=none):
             k = k + 1
         if _tar_parse_octal(hdr[148:156]) != chk:
             raise ReadError(filename + " is not a compressed or uncompressed tar file")
-        any_ok = true
+        any_ok = True
         var name = _tar_cstr(hdr[0:100])
         var prefix = _tar_cstr(hdr[345:500]) if hdr[257:262] == b"ustar" else ""
         if prefix:
@@ -947,19 +947,19 @@ def _unpack_tarfile(filename, extract_dir, filter=none):
             raise ReadError("refusing to extract " + repr(name) + " outside the destination directory")
         var target = os_path_join(extract_dir, clean.replace("/", os.sep))
         if typeflag == b"5":
-            os_makedirs(target, exist_ok=true)
+            os_makedirs(target, exist_ok=True)
             dir_times.append([target, mode, mtime])
         elif typeflag == b"2":
             var parent = os_path_split(target)[0]
             if parent:
-                os_makedirs(parent, exist_ok=true)
+                os_makedirs(parent, exist_ok=True)
             if _lexists(target):
                 os_unlink(target)
             os_symlink(linkname, target)
         elif typeflag == b"0" or typeflag == b"\0" or typeflag == b"7":
             var parent2 = os_path_split(target)[0]
             if parent2:
-                os_makedirs(parent2, exist_ok=true)
+                os_makedirs(parent2, exist_ok=True)
             var out = open(target, "wb")
             out.write(body)
             out.close()
@@ -989,9 +989,9 @@ def get_unpack_formats():
     return formats
 
 
-def register_unpack_format(name, extensions, function, extra_args=none, description=""):
+def register_unpack_format(name, extensions, function, extra_args=None, description=""):
     """Registers an unpack format."""
-    if extra_args is none:
+    if extra_args is None:
         extra_args = []
     var existing_extensions = {}
     for nm in _UNPACK_FORMATS:
@@ -1015,10 +1015,10 @@ def _find_unpack_format(filename):
         for extension in _UNPACK_FORMATS[name][0]:
             if filename.endswith(extension):
                 return name
-    return none
+    return None
 
 
-def unpack_archive(filename, extract_dir=none, format=none, filter=none):
+def unpack_archive(filename, extract_dir=None, format=None, filter=None):
     """Unpack an archive.
 
     `filename` is the name of the archive. `extract_dir` is the name of the
@@ -1026,18 +1026,18 @@ def unpack_archive(filename, extract_dir=none, format=none, filter=none):
     archive format; when not given, it is guessed from the extension.
     """
     _ny_sys_audit("shutil.unpack_archive", filename, extract_dir, format)
-    if extract_dir is none:
+    if extract_dir is None:
         extract_dir = os_getcwd()
     extract_dir = _fspath(extract_dir)
     filename = _fspath(filename)
-    var info = none
-    if format is not none:
+    var info = None
+    if format is not None:
         if format not in _UNPACK_FORMATS:
             raise ValueError("Unknown unpack format '" + str(format) + "'")
         info = _UNPACK_FORMATS[format]
     else:
         var fmt = _find_unpack_format(filename)
-        if fmt is none:
+        if fmt is None:
             raise ReadError("Unknown archive format '" + filename + "'")
         info = _UNPACK_FORMATS[fmt]
     var func = info[1]

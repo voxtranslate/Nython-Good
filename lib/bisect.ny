@@ -16,7 +16,7 @@
 __all__ = ["bisect", "bisect_left", "bisect_right", "insort", "insort_left", "insort_right"]
 
 
-def bisect_right(a, x, lo=0, hi=none, key=none):
+def bisect_right(a, x, lo=0, hi=None, key=None):
     """Return the index where to insert item x in list a, assuming a is sorted.
 
     The return value i is such that all e in a[:i] have e <= x, and all e in
@@ -30,9 +30,9 @@ def bisect_right(a, x, lo=0, hi=none, key=none):
     """
     if lo < 0:
         raise ValueError("lo must be non-negative")
-    if hi is none:
+    if hi is None:
         hi = len(a)
-    if key is none:
+    if key is None:
         while lo < hi:
             var mid = (lo + hi) // 2
             if x < a[mid]:
@@ -49,7 +49,7 @@ def bisect_right(a, x, lo=0, hi=none, key=none):
     return lo
 
 
-def bisect_left(a, x, lo=0, hi=none, key=none):
+def bisect_left(a, x, lo=0, hi=None, key=None):
     """Return the index where to insert item x in list a, assuming a is sorted.
 
     The return value i is such that all e in a[:i] have e < x, and all e in
@@ -63,9 +63,9 @@ def bisect_left(a, x, lo=0, hi=none, key=none):
     """
     if lo < 0:
         raise ValueError("lo must be non-negative")
-    if hi is none:
+    if hi is None:
         hi = len(a)
-    if key is none:
+    if key is None:
         while lo < hi:
             var mid = (lo + hi) // 2
             if a[mid] < x:
@@ -82,7 +82,7 @@ def bisect_left(a, x, lo=0, hi=none, key=none):
     return lo
 
 
-def insort_right(a, x, lo=0, hi=none, key=none):
+def insort_right(a, x, lo=0, hi=None, key=None):
     """Insert item x in list a, and keep it sorted assuming a is sorted.
 
     If x is already in a, insert it to the right of the rightmost x.
@@ -92,14 +92,14 @@ def insort_right(a, x, lo=0, hi=none, key=none):
 
     A custom key function can be supplied to customize the sort order.
     """
-    if key is none:
+    if key is None:
         lo = bisect_right(a, x, lo, hi)
     else:
         lo = bisect_right(a, key(x), lo, hi, key=key)
     a.insert(lo, x)
 
 
-def insort_left(a, x, lo=0, hi=none, key=none):
+def insort_left(a, x, lo=0, hi=None, key=None):
     """Insert item x in list a, and keep it sorted assuming a is sorted.
 
     If x is already in a, insert it to the left of the leftmost x.
@@ -109,7 +109,7 @@ def insort_left(a, x, lo=0, hi=none, key=none):
 
     A custom key function can be supplied to customize the sort order.
     """
-    if key is none:
+    if key is None:
         lo = bisect_left(a, x, lo, hi)
     else:
         lo = bisect_left(a, key(x), lo, hi, key=key)

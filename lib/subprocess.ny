@@ -72,7 +72,7 @@ class CalledProcessError(SubprocessError):
     Attributes:
       cmd, returncode, stdout, stderr, output
     """
-    def __init__(self, returncode, cmd, output=none, stderr=none):
+    def __init__(self, returncode, cmd, output=None, stderr=None):
         SubprocessError.__init__(self, returncode, cmd)
         self.returncode = returncode
         self.cmd = cmd
@@ -83,7 +83,7 @@ class CalledProcessError(SubprocessError):
         if self.returncode and self.returncode < 0:
             var sig = -self.returncode
             var name = _SIGNAL_NAMES.get(sig)
-            if name is none:
+            if name is None:
                 return "Command '" + _cmd_text(self.cmd) + "' died with unknown signal " + str(sig) + "."
             return "Command '" + _cmd_text(self.cmd) + "' died with <Signals." + name + ": " + str(sig) + ">."
         return "Command '" + _cmd_text(self.cmd) + "' returned non-zero exit status " + str(self.returncode) + "."
@@ -101,7 +101,7 @@ class TimeoutExpired(SubprocessError):
     Attributes:
         cmd, output, stdout, stderr, timeout
     """
-    def __init__(self, cmd, timeout, output=none, stderr=none):
+    def __init__(self, cmd, timeout, output=None, stderr=None):
         SubprocessError.__init__(self, cmd, timeout)
         self.cmd = cmd
         self.timeout = timeout
@@ -132,7 +132,7 @@ class CompletedProcess:
       stdout: The standard output (None if not captured).
       stderr: The standard error (None if not captured).
     """
-    def __init__(self, args, returncode, stdout=none, stderr=none):
+    def __init__(self, args, returncode, stdout=None, stderr=None):
         self.args = args
         self.returncode = returncode
         self.stdout = stdout
@@ -140,9 +140,9 @@ class CompletedProcess:
 
     def __repr__(self):
         var a = ["args=" + repr(self.args), "returncode=" + repr(self.returncode)]
-        if self.stdout is not none:
+        if self.stdout is not None:
             a.append("stdout=" + repr(self.stdout))
-        if self.stderr is not none:
+        if self.stderr is not None:
             a.append("stderr=" + repr(self.stderr))
         return "CompletedProcess(" + ", ".join(a) + ")"
 
@@ -225,12 +225,12 @@ def _as_bytes(raw):
 
 
 def _encode_input(data, text, encoding, errors):
-    if data is none:
-        return none
+    if data is None:
+        return None
     if text:
         if not isinstance(data, str):
             raise TypeError("write() argument must be str, not " + _tname(data))
-        if encoding is none or encoding.lower().replace("-", "").replace("_", "") == "utf8":
+        if encoding is None or encoding.lower().replace("-", "").replace("_", "") == "utf8":
             return data
         return data.encode(encoding, errors or "strict")
     if not (isinstance(data, bytes) or isinstance(data, bytearray)):
@@ -239,16 +239,16 @@ def _encode_input(data, text, encoding, errors):
 
 
 def _is_fileobj(x):
-    return x is not none and not isinstance(x, int) and hasattr(x, "write")
+    return x is not None and not isinstance(x, int) and hasattr(x, "write")
 
 
 # Where captured output goes once the process has been waited for: a file
 # object, a Nython file handle, or the standard streams (Windows "inherit").
 def _deliver(dest, data, text):
-    if data is none or len(data) == 0:
+    if data is None or len(data) == 0:
         return
-    if dest is none or (isinstance(dest, int) and (dest == 1 or dest == 2)):
-        var stream = sys_stdout_() if dest is none or dest == 1 else sys_stderr_()
+    if dest is None or (isinstance(dest, int) and (dest == 1 or dest == 2)):
+        var stream = sys_stdout_() if dest is None or dest == 1 else sys_stderr_()
         stream.write(data if isinstance(data, str) else data.decode("utf-8", "replace"))
         stream.flush()
         return
@@ -282,73 +282,73 @@ def _read_stdin_source(stdin):
 class _SubprocessPlan:
     def __init__(self, stdin, stdout, stderr, text):
         self.inherit = ""
-        self.merge = false
-        self.keep_stdin = false
-        self.input = none
-        self.stdin_inherit = false
+        self.merge = False
+        self.keep_stdin = False
+        self.input = None
+        self.stdin_inherit = False
         # stdin
-        if stdin is none or (isinstance(stdin, int) and stdin == 0):
+        if stdin is None or (isinstance(stdin, int) and stdin == 0):
             if _CAN_INHERIT:
                 self.inherit = self.inherit + "0"
         elif isinstance(stdin, int) and stdin == PIPE:
-            self.keep_stdin = true
+            self.keep_stdin = True
         elif isinstance(stdin, int) and stdin == DEVNULL:
             pass
         else:
             var src = _read_stdin_source(stdin)
             self.input = src
         # stdout
-        self.out_dest = none
-        self.out_capture = false
-        self.out_forward = false
-        if stdout is none or (isinstance(stdout, int) and stdout == 1):
+        self.out_dest = None
+        self.out_capture = False
+        self.out_forward = False
+        if stdout is None or (isinstance(stdout, int) and stdout == 1):
             if _CAN_INHERIT:
                 self.inherit = self.inherit + "1"
             else:
-                self.out_forward = true
+                self.out_forward = True
         elif isinstance(stdout, int) and stdout == PIPE:
-            self.out_capture = true
+            self.out_capture = True
         elif isinstance(stdout, int) and stdout == DEVNULL:
             pass
         elif isinstance(stdout, int) and stdout == 2:
             self.out_dest = 2
-            self.out_forward = true
+            self.out_forward = True
         else:
             self.out_dest = stdout
-            self.out_forward = true
+            self.out_forward = True
         # stderr
-        self.err_dest = none
-        self.err_capture = false
-        self.err_forward = false
+        self.err_dest = None
+        self.err_capture = False
+        self.err_forward = False
         if isinstance(stderr, int) and stderr == STDOUT:
-            self.merge = true
-        elif stderr is none or (isinstance(stderr, int) and stderr == 2):
+            self.merge = True
+        elif stderr is None or (isinstance(stderr, int) and stderr == 2):
             if _CAN_INHERIT:
                 self.inherit = self.inherit + "2"
             else:
-                self.err_forward = true
+                self.err_forward = True
                 self.err_dest = 2
         elif isinstance(stderr, int) and stderr == PIPE:
-            self.err_capture = true
+            self.err_capture = True
         elif isinstance(stderr, int) and stderr == DEVNULL:
             pass
         else:
             self.err_dest = stderr
-            self.err_forward = true
+            self.err_forward = True
 
 
 def _native_opts(plan, cwd, env):
     var kw = {}
-    if cwd is not none:
+    if cwd is not None:
         kw["cwd"] = _arg_text(cwd)
-    if env is not none:
+    if env is not None:
         var e = {}
         for k in env:
             e[_arg_text(k)] = _arg_text(env[k])
         kw["env"] = e
-        kw["env_replace"] = true
+        kw["env_replace"] = True
     if plan.merge:
-        kw["merge"] = true
+        kw["merge"] = True
     if plan.inherit:
         kw["inherit"] = plan.inherit
     # (round 86) the child's bytes as written: on Windows the native layer
@@ -359,7 +359,7 @@ def _native_opts(plan, cwd, env):
 
 # ── run and friends ──────────────────────────────────────────────────────────
 
-def run(*popenargs, input=none, capture_output=false, timeout=none, check=false, **kwargs):
+def run(*popenargs, input=None, capture_output=False, timeout=None, check=False, **kwargs):
     """Run command with arguments and return a CompletedProcess instance.
 
     The returned instance will have attributes args, returncode, stdout and
@@ -374,49 +374,49 @@ def run(*popenargs, input=none, capture_output=false, timeout=none, check=false,
     There is an optional argument "input", allowing you to pass bytes or a
     string to the subprocess's stdin.
     """
-    if input is not none:
-        if kwargs.get("stdin") is not none:
+    if input is not None:
+        if kwargs.get("stdin") is not None:
             raise ValueError("stdin and input arguments may not both be used.")
     if capture_output:
-        if kwargs.get("stdout") is not none or kwargs.get("stderr") is not none:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
             raise ValueError("stdout and stderr arguments may not be used with capture_output.")
         kwargs["stdout"] = PIPE
         kwargs["stderr"] = PIPE
     var args = popenargs[0] if len(popenargs) > 0 else kwargs.get("args")
-    if args is none:
+    if args is None:
         raise TypeError("run() missing 1 required positional argument: 'args'")
-    var shell = kwargs.get("shell", false)
+    var shell = kwargs.get("shell", False)
     var encoding = kwargs.get("encoding")
     var errors = kwargs.get("errors")
     var text = _text_mode(kwargs.get("text"), kwargs.get("universal_newlines"), encoding, errors)
     var stdin = kwargs.get("stdin")
-    if input is not none:
+    if input is not None:
         stdin = DEVNULL
     var plan = _SubprocessPlan(stdin, kwargs.get("stdout"), kwargs.get("stderr"), text)
-    if input is not none:
+    if input is not None:
         plan.input = _encode_input(input, text, encoding, errors)
         plan.inherit = plan.inherit.replace("0", "")
-    elif plan.input is not none:
+    elif plan.input is not None:
         plan.inherit = plan.inherit.replace("0", "")
     if _ny_audit_hooks:
         _audit_popen(args, kwargs.get("executable"), shell, kwargs.get("cwd"), kwargs.get("env"))   # round 86: run() is Popen's
     var cmd = _native_cmd(args, shell)
     var kw = _native_opts(plan, kwargs.get("cwd"), kwargs.get("env"))
-    if plan.input is not none:
+    if plan.input is not None:
         kw["input"] = plan.input
-    if timeout is not none:
+    if timeout is not None:
         kw["timeout"] = timeout
-    var r = none
+    var r = None
     try:
         r = os_run(cmd, **kw)
     except TimeoutError:
         raise TimeoutExpired(args, timeout)
-    var out = none
-    var err = none
+    var out = None
+    var err = None
     if plan.out_capture:
         out = _decode(_as_bytes(r["stdout"]), encoding, errors) if text else _as_bytes(r["stdout"])
     elif plan.out_forward:
-        _deliver(plan.out_dest, _decode(_as_bytes(r["stdout"]), encoding, "replace") if text or plan.out_dest is none else _as_bytes(r["stdout"]), text)
+        _deliver(plan.out_dest, _decode(_as_bytes(r["stdout"]), encoding, "replace") if text or plan.out_dest is None else _as_bytes(r["stdout"]), text)
     if plan.err_capture:
         err = _decode(_as_bytes(r["stderr"]), encoding, errors) if text else _as_bytes(r["stderr"])
     elif plan.err_forward:
@@ -427,7 +427,7 @@ def run(*popenargs, input=none, capture_output=false, timeout=none, check=false,
     return CompletedProcess(args, retcode, out, err)
 
 
-def call(*popenargs, timeout=none, **kwargs):
+def call(*popenargs, timeout=None, **kwargs):
     """Run command with arguments.  Wait for command to complete or
     timeout, then return the returncode attribute.
     """
@@ -443,13 +443,13 @@ def check_call(*popenargs, **kwargs):
     var retcode = call(*popenargs, **kwargs)
     if retcode:
         var cmd = kwargs.get("args")
-        if cmd is none:
+        if cmd is None:
             cmd = popenargs[0]
         raise CalledProcessError(retcode, cmd)
     return 0
 
 
-def check_output(*popenargs, timeout=none, **kwargs):
+def check_output(*popenargs, timeout=None, **kwargs):
     """Run command with arguments and return its output.
 
     If the exit code was non-zero it raises a CalledProcessError.  The
@@ -459,17 +459,17 @@ def check_output(*popenargs, timeout=none, **kwargs):
     for kw in ["stdout", "check"]:
         if kw in kwargs:
             raise ValueError(kw + " argument not allowed, it will be overridden.")
-    if "input" in kwargs and kwargs["input"] is none:
+    if "input" in kwargs and kwargs["input"] is None:
         # Explicitly passing input=None was previously equivalent to passing
         # an empty string. That is maintained here for backwards compatibility.
         if kwargs.get("universal_newlines") or kwargs.get("text") or kwargs.get("encoding") or kwargs.get("errors"):
             kwargs["input"] = ""
         else:
             kwargs["input"] = b""
-    return run(*popenargs, stdout=PIPE, timeout=timeout, check=true, **kwargs).stdout
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True, **kwargs).stdout
 
 
-def getstatusoutput(cmd, encoding=none, errors=none):
+def getstatusoutput(cmd, encoding=None, errors=None):
     """Return (exitcode, output) of executing cmd in a shell.
 
     Execute the string 'cmd' in a shell with 'check_output' and
@@ -478,10 +478,10 @@ def getstatusoutput(cmd, encoding=none, errors=none):
 
     A trailing newline is stripped from the output.
     """
-    var data = none
+    var data = None
     var exitcode = 0
     try:
-        data = check_output(cmd, shell=true, text=true, stderr=STDOUT, encoding=encoding, errors=errors)
+        data = check_output(cmd, shell=True, text=True, stderr=STDOUT, encoding=encoding, errors=errors)
         exitcode = 0
     except CalledProcessError as ex:
         data = ex.output
@@ -491,7 +491,7 @@ def getstatusoutput(cmd, encoding=none, errors=none):
     return (exitcode, data)
 
 
-def getoutput(cmd, encoding=none, errors=none):
+def getoutput(cmd, encoding=None, errors=None):
     """Return output (stdout or stderr) of executing cmd in a shell.
 
     Like getstatusoutput(), except the exit status is ignored and the return
@@ -556,7 +556,7 @@ class _SubprocessPipeIn:
     # Popen.stdin with stdin=PIPE: writes go to the child's standard input.
     def __init__(self, proc):
         self._proc = proc
-        self.closed = false
+        self.closed = False
         self.mode = "w" if proc.text_mode else "wb"
 
     def write(self, data):
@@ -577,24 +577,24 @@ class _SubprocessPipeIn:
 
     def close(self):
         if not self.closed:
-            self.closed = true
+            self.closed = True
             try:
                 os_proc_close_stdin(self._proc.pid)
             except Exception:
                 pass
 
     def writable(self):
-        return true
+        return True
 
     def readable(self):
-        return false
+        return False
 
     def __enter__(self):
         return self
 
-    def __exit__(self, t=none, v=none, tb=none):
+    def __exit__(self, t=None, v=None, tb=None):
         self.close()
-        return false
+        return False
 
 
 class _SubprocessPipeOut:
@@ -603,7 +603,7 @@ class _SubprocessPipeOut:
     def __init__(self, proc, which):
         self._proc = proc
         self._which = which
-        self.closed = false
+        self.closed = False
         self.mode = "r" if proc.text_mode else "rb"
 
     def _result(self, raw):
@@ -617,14 +617,14 @@ class _SubprocessPipeOut:
             raise ValueError("I/O operation on closed file.")
         var p = self._proc
         var w = self._which
-        if size is none or size < 0:
+        if size is None or size < 0:
             while not p._eof:
-                p._pump(true)
+                p._pump(True)
             var all = p._bufs[w]
             p._bufs[w] = b""
             return self._result(all)
         while len(p._bufs[w]) < size and not p._eof:
-            p._pump(true)
+            p._pump(True)
         if not p.text_mode:
             var part = p._bufs[w][:size]
             p._bufs[w] = p._bufs[w][size:]
@@ -639,11 +639,11 @@ class _SubprocessPipeOut:
         var p = self._proc
         var w = self._which
         while b"\n" not in p._bufs[w] and not p._eof:
-            p._pump(true)
+            p._pump(True)
         var b = p._bufs[w]
         var i = b.find(b"\n")
         var end = len(b) if i < 0 else i + 1
-        if size is not none and size >= 0 and size < end:
+        if size is not None and size >= 0 and size < end:
             end = size
         var line = b[:end]
         p._bufs[w] = b[end:]
@@ -667,13 +667,13 @@ class _SubprocessPipeOut:
         return line
 
     def close(self):
-        self.closed = true
+        self.closed = True
 
     def readable(self):
-        return true
+        return True
 
     def writable(self):
-        return false
+        return False
 
     def fileno(self):
         raise OSError("a Popen pipe has no file descriptor in Nython")
@@ -681,9 +681,9 @@ class _SubprocessPipeOut:
     def __enter__(self):
         return self
 
-    def __exit__(self, t=none, v=none, tb=none):
+    def __exit__(self, t=None, v=None, tb=None):
         self.close()
-        return false
+        return False
 
 
 def _audit_popen(args, executable, shell, cwd, env):
@@ -710,7 +710,7 @@ def _audit_popen(args, executable, shell, cwd, env):
         args = ["/bin/sh", "-c"] + args
         if executable:
             args[0] = executable
-    if executable is none:
+    if executable is None:
         executable = args[0]
     _ny_sys_audit("subprocess.Popen", executable, args, cwd, env)
 
@@ -734,41 +734,41 @@ class Popen:
     Attributes:
         stdin, stdout, stderr, pid, returncode
     """
-    def __init__(self, args, bufsize=-1, executable=none,
-                 stdin=none, stdout=none, stderr=none,
-                 preexec_fn=none, close_fds=true,
-                 shell=false, cwd=none, env=none, universal_newlines=none,
-                 startupinfo=none, creationflags=0,
-                 restore_signals=true, start_new_session=false,
-                 pass_fds=(), user=none, group=none, extra_groups=none,
-                 encoding=none, errors=none, text=none, umask=-1, pipesize=-1,
-                 process_group=none):
+    def __init__(self, args, bufsize=-1, executable=None,
+                 stdin=None, stdout=None, stderr=None,
+                 preexec_fn=None, close_fds=True,
+                 shell=False, cwd=None, env=None, universal_newlines=None,
+                 startupinfo=None, creationflags=0,
+                 restore_signals=True, start_new_session=False,
+                 pass_fds=(), user=None, group=None, extra_groups=None,
+                 encoding=None, errors=None, text=None, umask=-1, pipesize=-1,
+                 process_group=None):
         self.args = args
-        self.returncode = none
-        self.stdin = none
-        self.stdout = none
-        self.stderr = none
-        self.pid = none
+        self.returncode = None
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+        self.pid = None
         self._encoding = encoding
         self._errors = errors
-        if universal_newlines is not none and text is not none and bool(universal_newlines) != bool(text):
+        if universal_newlines is not None and text is not None and bool(universal_newlines) != bool(text):
             raise SubprocessError("Cannot disambiguate when both text and universal_newlines are supplied but different. Pass one or the other.")
         self.text_mode = _text_mode(text, universal_newlines, encoding, errors)
         self._plan = _SubprocessPlan(stdin, stdout, stderr, self.text_mode)
         self._bufs = {"stdout": b"", "stderr": b""}
-        self._eof = false
-        self._communication_started = false
-        self._delivered = false
+        self._eof = False
+        self._communication_started = False
+        self._delivered = False
         if _ny_audit_hooks:
             _audit_popen(args, executable, shell, cwd, env)   # round 86
         var cmd = _native_cmd(args, shell)
         var kw = _native_opts(self._plan, cwd, env)
         if self._plan.keep_stdin:
-            kw["stdin"] = true
-        elif self._plan.input is not none:
+            kw["stdin"] = True
+        elif self._plan.input is not None:
             var data = self._plan.input
             if self.text_mode and isinstance(data, str):
-                data = _encode_input(data, true, encoding, errors)
+                data = _encode_input(data, True, encoding, errors)
             kw["input"] = data
         self.pid = os_spawn(cmd, **kw)
         if self._plan.keep_stdin:
@@ -783,7 +783,7 @@ class Popen:
         return self.text_mode
 
     def __repr__(self):
-        return "<Popen: returncode: " + ("None" if self.returncode is none else str(self.returncode)) + " args: " + repr(self.args) + ">"
+        return "<Popen: returncode: " + ("None" if self.returncode is None else str(self.returncode)) + " args: " + repr(self.args) + ">"
 
     def __enter__(self):
         return self
@@ -798,7 +798,7 @@ class Popen:
                 self.stdin.close()
         finally:
             self.wait()
-        return false
+        return False
 
     # Moves what the child wrote since the last call into the buffers.
     # `block`: wait a little first when there is nothing yet.
@@ -810,8 +810,8 @@ class Popen:
         if len(r["stderr"]) > 0:
             self._bufs["stderr"] = self._bufs["stderr"] + _as_bytes(r["stderr"])
         if r["done"]:
-            self._eof = true
-            if self.returncode is none:
+            self._eof = True
+            if self.returncode is None:
                 self.returncode = os_poll(self.pid)
             return
         if block and got == 0:
@@ -826,7 +826,7 @@ class Popen:
         if n == 0:
             return
         while i < n:
-            self._pump(false)
+            self._pump(False)
             try:
                 os_proc_write(self.pid, raw[i:i + piece])
             except BrokenPipeError:
@@ -841,7 +841,7 @@ class Popen:
         if plan.out_forward and self._bufs["stdout"]:
             var o = self._bufs["stdout"]
             self._bufs["stdout"] = b""
-            _deliver(plan.out_dest, _decode(o, self._encoding, "replace") if self.text_mode or plan.out_dest is none else o, self.text_mode)
+            _deliver(plan.out_dest, _decode(o, self._encoding, "replace") if self.text_mode or plan.out_dest is None else o, self.text_mode)
         if plan.err_forward and self._bufs["stderr"]:
             var e = self._bufs["stderr"]
             self._bufs["stderr"] = b""
@@ -854,31 +854,31 @@ class Popen:
     def poll(self):
         """Check if child process has terminated. Set and return returncode
         attribute."""
-        if self.returncode is none:
+        if self.returncode is None:
             var c = os_poll(self.pid)
-            if c is not none:
+            if c is not None:
                 self.returncode = c
-        if self.returncode is not none and not (self._plan.out_capture or self._plan.err_capture):
-            self._pump(false)
+        if self.returncode is not None and not (self._plan.out_capture or self._plan.err_capture):
+            self._pump(False)
             self._deliver_rest()
         return self.returncode
 
-    def wait(self, timeout=none):
+    def wait(self, timeout=None):
         """Wait for child process to terminate; returns self.returncode."""
-        if self.returncode is none:
+        if self.returncode is None:
             try:
-                if timeout is not none:
+                if timeout is not None:
                     self.returncode = os_wait(self.pid, timeout=timeout)
                 else:
                     self.returncode = os_wait(self.pid)
             except TimeoutError:
                 raise TimeoutExpired(self.args, timeout)
         if not (self._plan.out_capture or self._plan.err_capture):
-            self._pump(false)
+            self._pump(False)
             self._deliver_rest()
         return self.returncode
 
-    def communicate(self, input=none, timeout=none):
+    def communicate(self, input=None, timeout=None):
         """Interact with process: Send data to stdin and close it.
         Read data from stdout and stderr, until end-of-file is
         reached.  Wait for process to terminate.
@@ -898,26 +898,26 @@ class Popen:
         if self._communication_started and input:
             raise ValueError("Cannot send input after starting communication")
         var first = not self._communication_started
-        self._communication_started = true
-        if first and self.stdin is not none:
+        self._communication_started = True
+        if first and self.stdin is not None:
             if input:
                 var raw = _encode_input(input, self.text_mode, self._encoding, self._errors)
                 self._write_input(raw)
             self.stdin.close()
-        var deadline = none
-        if timeout is not none:
+        var deadline = None
+        if timeout is not None:
             deadline = monotonic() + timeout
         while not self._eof:
-            if deadline is not none and monotonic() >= deadline:
-                var po = self._bufs["stdout"] if self._plan.out_capture else none
-                var pe = self._bufs["stderr"] if self._plan.err_capture else none
+            if deadline is not None and monotonic() >= deadline:
+                var po = self._bufs["stdout"] if self._plan.out_capture else None
+                var pe = self._bufs["stderr"] if self._plan.err_capture else None
                 raise TimeoutExpired(self.args, timeout,
-                                     self.stdout._result(po) if po is not none else none,
-                                     self.stderr._result(pe) if pe is not none else none)
-            self._pump(true)
+                                     self.stdout._result(po) if po is not None else None,
+                                     self.stderr._result(pe) if pe is not None else None)
+            self._pump(True)
         self.wait()
-        var out = none
-        var err = none
+        var out = None
+        var err = None
         if self._plan.out_capture:
             out = self.stdout._result(self._bufs["stdout"])
             self._bufs["stdout"] = b""
@@ -932,7 +932,7 @@ class Popen:
     def send_signal(self, sig):
         """Send a signal to the process."""
         self.poll()
-        if self.returncode is not none:
+        if self.returncode is not None:
             # Skip signalling a process that we know has already died.
             return
         os_kill(self.pid, sig)

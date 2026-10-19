@@ -6,15 +6,15 @@ import base64
 
 DEFAULT_ENTROPY = 32
 
-def token_bytes(nbytes=none):
-    if nbytes == none:
+def token_bytes(nbytes=None):
+    if nbytes == None:
         nbytes = DEFAULT_ENTROPY
     return os_urandom(nbytes)
 
-def token_hex(nbytes=none):
+def token_hex(nbytes=None):
     return token_bytes(nbytes).hex()
 
-def token_urlsafe(nbytes=none):
+def token_urlsafe(nbytes=None):
     var t = base64.urlsafe_b64encode(token_bytes(nbytes))
     return t.rstrip(b"=").decode("ascii")
 

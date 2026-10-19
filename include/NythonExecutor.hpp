@@ -1521,6 +1521,12 @@ public:   // NythonExecutor is a struct: members default to public
         // dropped and missing ones an IndexError). VarDeclNode::unpack: n,
         // or -3 - k for a starred list of k other targets.
         if (vd->unpack != -2) {
+            // round 86: a number or None, CPython's TypeError (it read
+            // "'int' object is not subscriptable"); unpacking never iterates
+            // an int, as a for statement's targets do not (forUnpackParts)
+            if (val.type == ValueType::INTEGER || val.type == ValueType::DOUBLE || val.type == ValueType::BOOLEAN
+                || val.type == ValueType::NONE)
+                pyRaise("TypeError", "cannot unpack non-iterable " + typeNameOf(val) + " object");
             Container* uc = contOf(val);
             if (uc && (isSetCont(uc) || seqLen(uc) < 0) && !isGenCont(uc)) val = nygen::make_iter(*this, val, ctx);
             int64_t len = -1;
@@ -1576,7 +1582,10 @@ public:   // NythonExecutor is a struct: members default to public
             auto* attr = static_cast<AttributeNode*>((an->target).get());
             Value obj = evalNode(attr->object, ctx);
             // an instance's field through the target's cache (round 81)
-            if (!(astSpecOn() && heapKind(obj) == HK_INST && storeFast(attr, obj, val))) setAttr(obj, attr->attr, val);
+            if (!(astSpecOn() && heapKind(obj) == HK_INST && storeFast(attr, obj, val))) {
+                if (attr->py_src) dictAttrStoreCheck(obj, attr->attr);   // round 86: d.x = v in Python-language source
+                setAttr(obj, attr->attr, val);
+            }
         } else if (an->target->type() == NodeType::SUBSCRIPT) {
             auto* sub = static_cast<SubscriptNode*>((an->target).get());
             Value obj = evalNode(sub->object, ctx);
@@ -2335,6 +2344,21 @@ public:   // NythonExecutor is a struct: members default to public
         return orderFail(a, b);
     }
 
+    // round 86: a < b (a > b for `op` ">") as sorted, min, max and list.sort
+    // compare, CPython's: values Python cannot order are a TypeError ("'<'
+    // not supported between instances of 'str' and 'int'"; they fell back to
+    // type name, then text, so [1, "a"] sorted); a NaN compares false.
+    bool sortLess(const Value& a, const Value& b, Context* ctx, const char* op = "<") {
+        const bool lt = op[0] == '<';
+        // bytes by their bytes, sets by inclusion - as the operators order them
+        if (auto* ba = bytesOf(a)) if (auto* bb = bytesOf(b)) { int k = ba->s.compare(bb->s); return lt ? k < 0 : k > 0; }
+        if (setOf(a) && setOf(b)) { Value r; if (setBinary(lt ? OP_LT : OP_GT, a, b, ctx, r)) return isTruthy(r); }
+        int c = 3;
+        if (orderValues(a, b, c, ctx)) return op[0] == '<' ? c < 0 : c > 0;
+        if (c == 2) return false;
+        pyRaise("TypeError", std::string("'") + op + "' not supported between instances of '" + order_fail_l_ + "' and '" + order_fail_r_ + "'");
+    }
+
     // `x in c`
     bool containsValue(const Value& c, const Value& x, Context* ctx) {
         // A generator: consumed up to the first match.
@@ -2401,7 +2425,34 @@ public:   // NythonExecutor is a struct: members default to public
         pyRaise("TypeError", std::string("unsupported operand type(s) for ") + opSymbol(opc) + ": '"
                 + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
     }
-    Value binaryOp(int opc, Value lv, Value rv, Context* ctx) {
+    // round 86: `a + b` that nothing defines, in CPython's words: a str, list
+    // or tuple on the left says what it concatenates (sequence concat's own
+    // message), anything else is the generic one
+    [[noreturn]] void concatError(const Value& lv, const Value& rv) {
+        std::string lt;
+        if (isStringValue(lv)) lt = "str";
+        else if (Container* lc = contOf(lv); lc && !isInstanceVal(lv) && seqLen(lc) >= 0 && !isSetCont(lc) && !nygen::is_gen(lv))
+            lt = isTupleCont(lc) ? "tuple" : "list";
+        if (lt.empty()) unsupportedOperands(OP_ADD, lv, rv);
+        pyRaise("TypeError", "can only concatenate " + lt + " (not \"" + typeNameOf(rv) + "\") to " + lt);
+    }
+    // round 86: `a * b` with a sequence and no int, CPython's sequence_repeat
+    // message - the left operand's repeat first (its count the right one)
+    [[noreturn]] void repeatError(const Value& lv, const Value& rv) {
+        auto isSeq = [&](const Value& v) {
+            if (isStringValue(v)) return true;
+            Container* c = contOf(v);
+            return c && !isInstanceVal(v) && seqLen(c) >= 0 && !isSetCont(c) && !nygen::is_gen(v);
+        };
+        if (isSeq(lv)) pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(rv) + "'");
+        if (isSeq(rv)) pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(lv) + "'");
+        unsupportedOperands(OP_MUL, lv, rv);
+    }
+    // `py` (round 86): the operator is Python-language source's (Node::py_src)
+    // - 1 yes, 0 no, -1 a builtin's (sum) operation: its caller's (pyCode).
+    // Python's + then concatenates no str with a non-str, nor a list with a
+    // tuple (Nython's leniencies): CPython's TypeError.
+    Value binaryOp(int opc, Value lv, Value rv, Context* ctx, int py = -1) {
         // Sets: | & - ^ and the subset comparisons (round 77).
         if (opc == OP_BOR || opc == OP_BAND || opc == OP_SUB || opc == OP_BXOR ||
             opc == OP_LT || opc == OP_LE || opc == OP_GT || opc == OP_GE) {
@@ -2451,13 +2502,18 @@ public:   // NythonExecutor is a struct: members default to public
             Container* lc = contOf(lv); Container* rc = contOf(rv);
             if ((lc && isSetCont(lc)) || (rc && isSetCont(rc))) unsupportedOperands(opc, lv, rv);
             if (lc && rc && seqLen(lc) >= 0 && seqLen(rc) >= 0) {
+                // round 86: a list and a tuple: Python's TypeError in
+                // Python-language source (Nython concatenates them)
+                if (isTupleCont(lc) != isTupleCont(rc) && (py > 0 || (py < 0 && pyCode()))) concatError(lv, rv);
                 std::vector<Value> items = seqItems(lc);
                 for (auto& v : seqItems(rc)) items.push_back(v);
                 return makeListValue(items, isTupleCont(lc) && isTupleCont(rc));
             }
-            // Lenient: a string on either side concatenates the other's text.
-            if (ls || rs) return makeStringValue(strOf(lv, ctx) + strOf(rv, ctx));
-            unsupportedOperands(opc, lv, rv);
+            // Lenient: a string on either side concatenates the other's text
+            // - Nython's; Python-language source's + is Python's (round 86)
+            if ((ls || rs) && py == 0) return makeStringValue(strOf(lv, ctx) + strOf(rv, ctx));
+            if ((ls || rs) && py < 0 && !pyCode()) return makeStringValue(strOf(lv, ctx) + strOf(rv, ctx));
+            concatError(lv, rv);   // round 86: CPython's messages (it said "unsupported operand" for [1] + 1)
         }
         case OP_SUB:
             if (nums) return numArith(opc, x, y);
@@ -2483,7 +2539,7 @@ public:   // NythonExecutor is a struct: members default to public
                     }
                 }
             }
-            unsupportedOperands(opc, lv, rv);
+            repeatError(lv, rv);   // round 86: "can't multiply sequence by non-int of type 'str'"
         }
         case OP_DIV: case OP_FLOORDIV: case OP_POW:
             if (nums) return numArith(opc, x, y);
@@ -2888,7 +2944,7 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (kind == 2) {
             auto* attr = static_cast<AttributeNode*>((an->target).get());
             obj = evalNode(attr->object, ctx);
-            if (!getAttrValue(obj, attr->attr, ctx, old_val)) old_val = missingAttribute(obj, attr->attr, an->target.get());
+            if (!getAttrValue(obj, attr->attr, ctx, old_val, true, attr->py_src)) old_val = missingAttribute(obj, attr->attr, an->target.get());   // round 86: py
         } else {
             old_val = evalNode(an->target, ctx);
         }
@@ -2932,7 +2988,7 @@ public:   // NythonExecutor is a struct: members default to public
                 (*oc->container)["__len__"] = intValue(n);
             } else {
                 Num cnt;
-                if (!asNum(new_val, cnt) || cnt.k == 3) pyRaise("TypeError", "can't multiply sequence by non-int");
+                if (!asNum(new_val, cnt) || cnt.k == 3) pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(new_val) + "'");   // round 86: the type, as CPython's
                 int64_t times = cnt.k == 1 ? cnt.i : (numIsNeg(cnt) ? 0 : 1);
                 std::vector<Value> items = seqItems(oc);
                 int64_t n = (int64_t)items.size();
@@ -2969,7 +3025,7 @@ public:   // NythonExecutor is a struct: members default to public
             }
             if (!done) {
                 if (opc == OP_UNKNOWN) result = new_val;
-                else result = binaryOp(opc, old_val, new_val, ctx);
+                else result = binaryOp(opc, old_val, new_val, ctx, an->py_src);   // round 86: the node's rule
             }
         }
         storeAugTarget(an, kind, obj, idx, result, ctx);
@@ -3119,6 +3175,14 @@ public:   // NythonExecutor is a struct: members default to public
         return r;
     }
     Node* object_class_node_ = nullptr;
+    // round 86: `d.x = v` / setattr(d, "x", v) in Python-language source: a
+    // plain dict takes no attributes (CPython's AttributeError; Nython sets
+    // the key)
+    void dictAttrStoreCheck(const Value& obj, const std::string& name) {
+        Container* c = contOf(obj);
+        if (c && !isInstanceVal(obj) && isPlainDict(c))
+            pyRaise("AttributeError", "'dict' object has no attribute '" + name + "'");
+    }
     void setAttr(const Value& obj, const std::string& name, const Value& val) {
         if (__builtin_expect(nyrt::audit_on(), 0)) auditAttrStore(obj, name, &val);   // round 86
         if (isInstanceValue(obj) && instanceAttrHook(obj, 0)) {
@@ -3730,22 +3794,17 @@ public:   // NythonExecutor is a struct: members default to public
                 for (auto& v : items) { std::vector<Value> ka = {v}; keys.push_back(callFunctionValue(keyfn, ka, ctx)); }
             std::vector<size_t> order(items.size());
             for (size_t k = 0; k < order.size(); k++) order[k] = k;
-            auto less = [&](const Value& x, const Value& y) {
-                int cmp;
-                if (orderValues(x, y, cmp, ctx)) return cmp < 0;
-                std::string tx = typeNameOf(x), ty = typeNameOf(y);
-                if (tx != ty) return tx < ty;
-                return strOf(x, ctx) < strOf(y, ctx);
-            };
+            // round 86: values Python cannot order are CPython's TypeError
+            // (sortLess; they were ordered by type name, then text)
             std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) {
                 const Value& kx = keys.empty() ? items[x] : keys[x];
                 const Value& ky = keys.empty() ? items[y] : keys[y];
-                return rev ? less(ky, kx) : less(kx, ky);
+                return rev ? sortLess(ky, kx, ctx) : sortLess(kx, ky, ctx);
             });
             std::vector<Value> sorted_items;
             for (size_t k : order) sorted_items.push_back(items[k]);
             store(sorted_items);
-            out = obj; return true;   // the list itself, for chaining
+            out = pyCode() ? NONE_VALUE : obj; return true;   // the list itself, for chaining (None to Python code, round 86)
         }
         if (name == "index" || name == "indexOf") {
             if (args.empty()) pyRaise("TypeError", "index expected at least 1 argument, got 0");
@@ -3803,7 +3862,7 @@ public:   // NythonExecutor is a struct: members default to public
             std::vector<Value> items = seqItems(c);
             std::reverse(items.begin(), items.end());
             store(items);
-            out = obj; return true;   // the list itself, like sort (Nython chains these)
+            out = pyCode() ? NONE_VALUE : obj; return true;   // the list itself, like sort (Nython chains these); None to Python code (round 86)
         }
         if (name == "clear") { store({}); out = NONE_VALUE; return true; }
         return false;
@@ -4125,6 +4184,10 @@ public:   // NythonExecutor is a struct: members default to public
                     if (exc_out) { *exc_out = std::move(e); return NONE_VALUE; }   // round 82
                     throw e;
                 }
+                // round 86: a list or tuple takes no other index (["a"]["0"]
+                // found the item the list keeps under the key "0")
+                if (!isSetCont(cont))
+                    pyRaise("TypeError", std::string(isTupleCont(cont) ? "tuple" : "list") + " indices must be integers or slices, not " + typeNameOf(idx));
             }
             auto it = dictFind(cont, idx);
             if (it != cont->container->end()) return it->second;
@@ -4253,6 +4316,8 @@ public:   // NythonExecutor is a struct: members default to public
             // Past the end the list grows (padded with none): the VM always
             // did this, and library code appends with `a[len] = x`. It used
             // to store the element without growing the length here.
+            // round 86: Nython's - Python-language source gets CPython's IndexError
+            if (i >= n && pyCode()) pyRaise("IndexError", "list assignment index out of range");
             if (i >= n) {
                 for (int64_t k = n; k < i; k++) (*cont->container)[std::to_string(k)] = NONE_VALUE;
                 (*cont->container)["__len__"] = intValue(i + 1);
@@ -4317,6 +4382,15 @@ public:   // NythonExecutor is a struct: members default to public
         if (!class_meta_.empty()) {
             Value it;
             if (metaCall(v, "__iter__", {}, ctx, it)) return iterItems(it, ctx);
+        }
+        // round 86: an int iterates as range(n) wherever Nython code
+        // iterates (list(3), sorted(3), enumerate(3) ... as `for i in 3` and
+        // the VM already did); not in Python-language source (pyCode)
+        if (v.type == ValueType::INTEGER && !pyCode()) {
+            std::vector<Value> out;
+            int64_t n = bigint_to_i64(v.value.i);
+            for (int64_t i = 0; i < n; i++) out.push_back(intValue(i));
+            return out;
         }
         pyRaise("TypeError", "'" + typeNameOf(v) + "' object is not iterable");
     }
@@ -4818,6 +4892,12 @@ public:   // NythonExecutor is a struct: members default to public
             // spelling of `is`. `is not` is its negation (it used to rewrite
             // the AST node in place and put it back afterwards).
             Value lv = evalNode(bn->left, ctx);
+            if (bn->py_src) {
+                // round 86: Python-language source's `is` is identity, as
+                // CPython's (`1 is int` is False there)
+                bool same = identical(lv, evalNode(bn->right, ctx));
+                return Value(opc == OP_IS ? same : !same);
+            }
             std::string tn = typeNameOperand(bn->right, ctx);
             bool r;
             if (!tn.empty() && isTypeObject(lv)) {
@@ -4859,7 +4939,7 @@ public:   // NythonExecutor is a struct: members default to public
             Value r;
             if (numBinary(opc, lv, rv, r)) return r;
         }
-        return binaryOp(opc, std::move(lv), std::move(rv), ctx);
+        return binaryOp(opc, std::move(lv), std::move(rv), ctx, bn->py_src);   // round 86: the node's rule
     }
     // round 82: the message of the ZeroDivisionError x / // % y raises
     // (nypy::arith's), or nullptr when y is not zero
@@ -5460,6 +5540,9 @@ public:   // NythonExecutor is a struct: members default to public
 
         // range() returns an integer — iterate 0..n-1
         if (iter_val.type == ValueType::INTEGER) {
+            // round 86: Nython's `for i in n`; to Python-language source an
+            // int is not iterable
+            if (fn->py_src) pyRaise("TypeError", "'int' object is not iterable");
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
                 NY_PYT_HEAD(i > 0)
@@ -9927,7 +10010,7 @@ public:
         // a class attribute or a method read as a value (round 81)
         if (astSpecOn() && !any_getattribute_ && obj.type == ValueType::USERDATA && obj.value.p
             && classLoadFast(an, obj, ctx, v)) return v;
-        if (getAttrValue(obj, an->attr, ctx, v)) return v;
+        if (getAttrValue(obj, an->attr, ctx, v, true, an->py_src)) return v;   // round 86: the node's rule
         if (pend && !nypy::lenient_reads_log()) {   // round 82: missingAttribute's, by the flag
             pendExc("__exc__:AttributeError:" + attributeErrorText(obj, an->attr));
             return NONE_VALUE;
@@ -10087,7 +10170,11 @@ public:
     // getters and __getattr__ run, and what they raise propagates. `bind`
     // false: a builtin method (list.append ...) is left to the method call
     // that is about to happen instead of being read as a bound value.
-    bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
+    // `py` (round 86): the read is Python-language source's (an attribute
+    // node's py_src, getattr / hasattr asking pyCode()) - a plain dict's keys
+    // are then not its attributes, as in CPython ({"a": 1}.a is an
+    // AttributeError); Nython reads the key.
+    bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true, bool py = false) {
         if (any_getattribute_) {
             // a class's __getattribute__ (round 77); object.__getattribute__
             // asks for the lookup below
@@ -10165,7 +10252,7 @@ public:
                     return false;
                 }
                 auto it = cont->container->find(attr);
-                if (it != cont->container->end()) { out = it->second; return true; }
+                if (it != cont->container->end() && !(py && isPlainDict(cont))) { out = it->second; return true; }   // round 86: py
                 // round 81: a module's __spec__ / __loader__, made when first
                 // read (the prelude's _ny_module_spec_attr); round 83: its
                 // __dict__, the live namespace vars(module) gives
@@ -11165,6 +11252,9 @@ public:
                     }
                 }
             } else {
+                // round 86: an int iterated is Nython's (iterValues); not in
+                // Python-language source
+                if (cn->py_src && itv.type == ValueType::INTEGER) pyRaise("TypeError", "'int' object is not iterable");
                 for (auto& item : iterValues(itv, cc)) one(item);
             }
         };
@@ -11788,6 +11878,18 @@ public:
     // put back to the caller's when a frame ends (last_stmt() is not: an
     // uncaught error reports the innermost statement).
     static Node*& cur_stmt() { static thread_local Node* p = nullptr; return p; }
+    // round 86: whether the running code is Python-language source's
+    // (Node::py_src, NyScope): a lambda's own rule (its body has no
+    // statements), else the running statement's. What a builtin asks on
+    // its rare paths (sum's int + str, getattr of a dict key, an int
+    // iterated); the operators read their node's flag instead.
+    static bool pyCode() {
+        auto& F = py_frames();
+        if (!F.empty() && F.back().code && F.back().code->type() == NodeType::LAMBDA)
+            return static_cast<LambdaNode*>(F.back().code)->py_rule;
+        Node* cs = cur_stmt();
+        return cs && cs->py_src;
+    }
     struct FrameGuard {
         FrameGuard(Node* code, Context* ctx) { py_frames().push_back({code, cur_stmt(), ctx}); }
         ~FrameGuard() {
@@ -15455,6 +15557,7 @@ public:
     // round 85: the running statement is Python-language source's (NyScope's
     // registry of the files parsed as such)
     bool callerPython() {
+        if (pyCode()) return true;   // round 86: the node's own mark (code exec'd from such code too)
         Node* cs = cur_stmt();
         return cs && nython::scope::python_file(cs->tok().fileName());
     }
@@ -16456,6 +16559,7 @@ public:
             std::string an = getStringValue(args[1]);
             if (name == "setattr") {
                 if (args.size() != 3) pyRaise("TypeError", "setattr expected 3 arguments, got " + std::to_string(args.size()));
+                if (pyCode()) dictAttrStoreCheck(args[0], an);   // round 86
                 setAttr(args[0], an, args[2]);
                 out = NONE_VALUE; return true;
             }
@@ -16468,7 +16572,7 @@ public:
                 pyRaise("TypeError", name + " expected " + (name == "hasattr" ? "2" : "at most 3") + " arguments, got " + std::to_string(args.size()));
             Value v;
             bool has;
-            try { has = getAttrValue(args[0], an, ctx, v); }
+            try { has = getAttrValue(args[0], an, ctx, v, true, pyCode()); }   // round 86: a dict's keys are not its attributes to Python code
             catch (std::string& e) {
                 // getattr(o, n) without a default raises the AttributeError a
                 // property's getter or __getattr__ raised (round 77)
@@ -16564,7 +16668,13 @@ public:
             if (isRangeValue(args[i]) || viewOf(args[i], nullptr) >= 0) continue;
             if (isInstanceValue(args[i]) && (instanceHasMethod(args[i], "__iter__") || instanceHasMethod(args[i], "__next__")
                                              || instanceHasMethod(args[i], "__getitem__"))) {
-                args[i] = makeListValue(iterValues(args[i], ctx));
+                // round 86: the call's keyword arguments are kept from the
+                // code __next__ runs - a builtin called there (len) took
+                // them, so sorted(scandir(d), key=f) sorted without f
+                {
+                    KwScope ks(this, nullptr);
+                    args[i] = makeListValue(iterValues(args[i], ctx));
+                }
                 changed = true;
             }
         }

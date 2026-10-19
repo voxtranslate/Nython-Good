@@ -336,7 +336,7 @@ def _encode_long(x):
     if x == 0:
         return b""
     var nbytes = (x.bit_length() >> 3) + 1
-    var result = x.to_bytes(nbytes, "little", signed=true)
+    var result = x.to_bytes(nbytes, "little", signed=True)
     if x < 0 and nbytes > 1:
         if result[-1] == 0xff and (result[-2] & 0x80) != 0:
             result = result[:-1]
@@ -344,7 +344,7 @@ def _encode_long(x):
 
 
 def _decode_long(data):
-    return int.from_bytes(data, "little", signed=true)
+    return int.from_bytes(data, "little", signed=True)
 
 
 class PickleBuffer:
@@ -356,7 +356,7 @@ class PickleBuffer:
         self._obj = buffer
 
     def _ny_live(self):
-        if self._view is none:
+        if self._view is None:
             raise ValueError("operation forbidden on released PickleBuffer object")
         return self._view
 
@@ -369,9 +369,9 @@ class PickleBuffer:
 
     def release(self):
         """Release the underlying buffer exposed by the PickleBuffer object."""
-        if self._view is not none:
+        if self._view is not None:
             self._view.release()
-            self._view = none
+            self._view = None
 
     def __buffer__(self, flags):
         var v = self._ny_live()
@@ -450,7 +450,7 @@ def _import(module):
         import os
         return os
     var m = _module_cache.get(module)
-    if m is not none:
+    if m is not None:
         return m
     var ns = {}
     exec("import " + module + " as _ny_mod", ns)
@@ -476,16 +476,16 @@ def _attr_of(mod, name):
 
 
 def _getattribute(mod, name):
-    var parent = none
+    var parent = None
     var obj = mod
-    var first = true
+    var first = True
     for subpath in name.split("."):
         if subpath == "<locals>":
             raise AttributeError("Can't get local attribute " + repr(name) + " on " + repr(mod))
         parent = obj
         if first:
             obj = _attr_of(mod, subpath)
-            first = false
+            first = False
         else:
             obj = getattr(obj, subpath)
     return obj, parent
@@ -498,8 +498,8 @@ _BUILTIN_TYPE_NAMES = {"int": int, "float": float, "str": str, "bytes": bytes, "
 
 
 def _whichmodule(obj, name):
-    var m = getattr(obj, "__module__", none)
-    if m is not none:
+    var m = getattr(obj, "__module__", None)
+    if m is not None:
         return m
     return "__main__"
 
@@ -511,9 +511,9 @@ def _os_function_name(obj):
     for k in dir(os):
         if k.startswith("_") or k == "path":
             continue
-        if getattr(os, k, none) is obj:
+        if getattr(os, k, None) is obj:
             return k
-    return none
+    return None
 
 
 def _global_name(obj):
@@ -523,17 +523,17 @@ def _global_name(obj):
     for k in _BUILTIN_TYPE_NAMES:
         if _BUILTIN_TYPE_NAMES[k] is obj:
             return "builtins", k
-    var name = getattr(obj, "__qualname__", none)
-    if name is none:
-        name = getattr(obj, "__name__", none)
-    if name is none:
+    var name = getattr(obj, "__qualname__", None)
+    if name is None:
+        name = getattr(obj, "__name__", None)
+    if name is None:
         raise PicklingError("Can't pickle " + repr(obj) + ": it has no __name__")
     var module = _whichmodule(obj, name)
     if module == "builtins" or module == "__builtin__":
         module = "builtins"
         if type(obj).__name__ == "builtin_function_or_method" and (name.startswith("os_") or name not in _BUILTINS):
             var osname = _os_function_name(obj)
-            if osname is not none:
+            if osname is not None:
                 import os
                 return ("nt" if os.name == "nt" else "posix"), osname
     elif module == "__mp_main__":
@@ -562,14 +562,14 @@ def _is_function(x):
 class Pickler:
     """Writes the pickle of an object to a binary file (CPython's _pickle)."""
 
-    def __init__(self, file, protocol=none, fix_imports=true, buffer_callback=none):
-        if protocol is none:
+    def __init__(self, file, protocol=None, fix_imports=True, buffer_callback=None):
+        if protocol is None:
             protocol = DEFAULT_PROTOCOL
         if protocol < 0:
             protocol = HIGHEST_PROTOCOL
         elif not 0 <= protocol <= HIGHEST_PROTOCOL:
             raise ValueError("pickle protocol must be <= " + str(HIGHEST_PROTOCOL))
-        if buffer_callback is not none and protocol < 5:
+        if buffer_callback is not None and protocol < 5:
             raise ValueError("buffer_callback needs protocol >= 5")
         try:
             self._file_write = file.write
@@ -584,7 +584,7 @@ class Pickler:
         self._fresh = 0
         self._out = bytearray()
         self._frame_start = -1
-        self._framing = false
+        self._framing = False
 
     def clear_memo(self):
         self.memo.clear()
@@ -619,7 +619,7 @@ class Pickler:
         var framing = self._framing
         if bypass:
             self._commit_frame()
-            self._framing = false
+            self._framing = False
         self._write(header)
         self._write(data)
         self._framing = framing
@@ -629,13 +629,13 @@ class Pickler:
             raise PicklingError("Pickler.__init__() was not called by " + type(self).__name__ + ".__init__()")
         self._out = bytearray()
         self._frame_start = -1
-        self._framing = false
-        self._pers_func = getattr(self, "persistent_id", none)
-        self._reducer_override = getattr(self, "reducer_override", none)
+        self._framing = False
+        self._pers_func = getattr(self, "persistent_id", None)
+        self._reducer_override = getattr(self, "reducer_override", None)
         if self.proto >= 2:
             self._write(PROTO + bytes([self.proto]))
             if self.proto >= 4:
-                self._framing = true
+                self._framing = True
         self.save(obj)
         self._write(STOP)
         self._commit_frame()
@@ -651,11 +651,11 @@ class Pickler:
             return ("b", obj)
         return id(obj)
 
-    def _memoize(self, obj, key=none):
+    def _memoize(self, obj, key=None):
         if self.fast:
             return
         var idx = len(self.memo)
-        self.memo[self._memo_key(obj) if key is none else key] = (idx, obj)
+        self.memo[self._memo_key(obj) if key is None else key] = (idx, obj)
         if self.proto >= 4:
             self._write(MEMOIZE)
         elif not self.bin:
@@ -680,14 +680,14 @@ class Pickler:
         self._get(self.memo[self._memo_key(obj)][0])
 
     # ── save ───────────────────────────────────────────────────────────────
-    def save(self, obj, save_persistent_id=true):
+    def save(self, obj, save_persistent_id=True):
         self._boundary()
-        if save_persistent_id and self._pers_func is not none:
+        if save_persistent_id and self._pers_func is not None:
             var pid = self._pers_func(obj)
-            if pid is not none:
+            if pid is not None:
                 self._save_pers(pid)
                 return
-        if obj is none:
+        if obj is None:
             self._write(NONE)
             return
         var t = type(obj)
@@ -735,7 +735,7 @@ class Pickler:
             self._save_picklebuffer(obj)
             return
         var rv = NotImplemented
-        if self._reducer_override is not none:
+        if self._reducer_override is not None:
             rv = self._reducer_override(obj)
         if rv is NotImplemented:
             if _is_type_object(obj):
@@ -744,28 +744,28 @@ class Pickler:
             if _is_function(obj):
                 self.save_global(obj)
                 return
-            var reduce = none
+            var reduce = None
             var dt = getattr(self, "dispatch_table", copyreg.dispatch_table)
             try:
                 reduce = dt.get(t)
             except TypeError:
-                reduce = none
-            if reduce is not none:
+                reduce = None
+            if reduce is not None:
                 rv = reduce(obj)
             else:
                 # a class's own __reduce_ex__, else its own __reduce__,
                 # else object.__reduce_ex__ (copyreg)
-                var found = false
+                var found = False
                 for c in t.__mro__:
                     if c is object:
                         break
                     if "__reduce_ex__" in copyreg._cdict(c):
                         rv = obj.__reduce_ex__(self.proto)
-                        found = true
+                        found = True
                         break
                     if "__reduce__" in copyreg._cdict(c):
                         rv = obj.__reduce__()
-                        found = true
+                        found = True
                         break
                 if not found:
                     rv = copyreg._ny_reduce_ex(obj, self.proto)
@@ -778,7 +778,7 @@ class Pickler:
 
     def _save_pers(self, pid):
         if self.bin:
-            self.save(pid, false)
+            self.save(pid, False)
             self._write(BINPERSID)
         else:
             var s = str(pid)
@@ -849,8 +849,8 @@ class Pickler:
     def _save_picklebuffer(self, obj):
         if self.proto < 5:
             raise PicklingError("PickleBuffer can only be pickled with protocol >= 5")
-        var in_band = true
-        if self._buffer_callback is not none:
+        var in_band = True
+        if self._buffer_callback is not None:
             in_band = bool(self._buffer_callback(obj))
         if in_band:
             var raw = obj._ny_live().tobytes()
@@ -864,7 +864,7 @@ class Pickler:
             if obj.readonly:
                 self._write(READONLY_BUFFER)
 
-    def _save_str(self, obj, key=none):
+    def _save_str(self, obj, key=None):
         if self.bin:
             var enc = obj.encode("utf-8")
             var n = len(enc)
@@ -932,7 +932,7 @@ class Pickler:
             self._write(APPEND)
             return
         var total = 0
-        while true:
+        while True:
             self._write(MARK)
             var this_batch = 0
             while total < len(obj):
@@ -952,7 +952,7 @@ class Pickler:
                 self._write(APPEND)
             return
         var sentinel = []
-        while true:
+        while True:
             var first = next(it, sentinel)
             if first is sentinel:
                 break
@@ -997,7 +997,7 @@ class Pickler:
             self._write(SETITEM)
             return
         var pos = 0
-        while true:
+        while True:
             self._write(MARK)
             var i = 0
             while pos < len(keys):
@@ -1024,7 +1024,7 @@ class Pickler:
                 self._write(SETITEM)
             return
         var sentinel = []
-        while true:
+        while True:
             var first = next(it, sentinel)
             if first is sentinel:
                 break
@@ -1061,7 +1061,7 @@ class Pickler:
         if size == 0:
             return
         var pos = 0
-        while true:
+        while True:
             self._write(MARK)
             var i = 0
             while pos < size:
@@ -1091,24 +1091,24 @@ class Pickler:
         self._memoize(obj)
 
     def _save_type(self, obj):
-        if obj is type(none):
-            return self._save_reduce((type, (none,)), obj)
+        if obj is type(None):
+            return self._save_reduce((type, (None,)), obj)
         if obj is type(NotImplemented):
             return self._save_reduce((type, (NotImplemented,)), obj)
         if obj is type(...):
             return self._save_reduce((type, (...,)), obj)
         return self.save_global(obj)
 
-    def save_global(self, obj, name=none):
-        var module_name = none
-        if name is none:
+    def save_global(self, obj, name=None):
+        var module_name = None
+        if name is None:
             var mn = _global_name(obj)
             module_name = mn[0]
             name = mn[1]
         else:
             module_name = _whichmodule(obj, name)
-        var parent = none
-        var module = none
+        var parent = None
+        var module = None
         if module_name == "builtins":
             module = "builtins"
             try:
@@ -1126,7 +1126,7 @@ class Pickler:
             except Exception:
                 raise PicklingError("Can't pickle " + repr(obj) + ": import of module " + repr(module_name)
                                     + " failed") from None
-            var got = none
+            var got = None
             try:
                 var r = _getattribute(module, name)
                 got = r[0]
@@ -1151,7 +1151,7 @@ class Pickler:
         if parent is module:
             name = lastname
         if self.proto >= 4:
-            if getattr(obj, "_ny_ctype", false):
+            if getattr(obj, "_ny_ctype", False):
                 # a type CPython implements in C makes its __module__ and
                 # __qualname__ strings anew: never found in the memo
                 self._fresh = self._fresh + 1
@@ -1163,13 +1163,13 @@ class Pickler:
                 self.save(name)
             self._write(STACK_GLOBAL)
         elif parent is not module:
-            self._save_reduce((getattr, (parent, lastname)), none)
+            self._save_reduce((getattr, (parent, lastname)), None)
         else:
             var mn = module_name
             var nm = name
             if self.proto < 3 and self.fix_imports:
                 var r2 = _REVERSE_NAME_MAPPING.get((mn, nm))
-                if r2 is not none:
+                if r2 is not None:
                     mn = r2[0]
                     nm = r2[1]
                 elif mn in _REVERSE_IMPORT_MAPPING:
@@ -1188,21 +1188,21 @@ class Pickler:
             raise PicklingError("tuple returned by __reduce__ must contain 2 through 6 elements")
         var func = rv[0]
         var args = rv[1]
-        var state = rv[2] if size > 2 else none
-        var listitems = rv[3] if size > 3 else none
-        var dictitems = rv[4] if size > 4 else none
-        var state_setter = rv[5] if size > 5 else none
+        var state = rv[2] if size > 2 else None
+        var listitems = rv[3] if size > 3 else None
+        var dictitems = rv[4] if size > 4 else None
+        var state_setter = rv[5] if size > 5 else None
         if not callable(func):
             raise PicklingError("first item of the tuple returned by __reduce__ must be callable")
         if not isinstance(args, tuple):
             raise PicklingError("second item of the tuple returned by __reduce__ must be a tuple")
-        if listitems is not none and not hasattr(listitems, "__next__"):
+        if listitems is not None and not hasattr(listitems, "__next__"):
             raise PicklingError("fourth element of the tuple returned by __reduce__ must be an iterator, not "
                                 + type(listitems).__name__)
-        if dictitems is not none and not hasattr(dictitems, "__next__"):
+        if dictitems is not None and not hasattr(dictitems, "__next__"):
             raise PicklingError("fifth element of the tuple returned by __reduce__ must be an iterator, not "
                                 + type(dictitems).__name__)
-        if state_setter is not none and not callable(state_setter):
+        if state_setter is not None and not callable(state_setter):
             raise PicklingError("sixth element of the tuple returned by __reduce__ must be a function, not "
                                 + type(state_setter).__name__)
         var fname = getattr(func, "__name__", "") if self.proto >= 2 else ""
@@ -1237,7 +1237,7 @@ class Pickler:
             var cls = args[0]
             if not _is_type_object(cls):
                 raise PicklingError("args[0] from __newobj__ args is not a type")
-            if obj is not none and type(obj) is not cls:
+            if obj is not None and type(obj) is not cls:
                 raise PicklingError("args[0] from __newobj__ args has the wrong class")
             self.save(cls)
             self.save(tuple(args[1:]))
@@ -1246,18 +1246,18 @@ class Pickler:
             self.save(func)
             self.save(args)
             self._write(REDUCE)
-        if obj is not none:
+        if obj is not None:
             if self._in_memo(obj):
                 self._write(POP)
                 self._memo_get(obj)
                 return
             self._memoize(obj)
-        if listitems is not none:
+        if listitems is not None:
             self._batch_list(listitems)
-        if dictitems is not none:
+        if dictitems is not None:
             self._batch_dict(dictitems)
-        if state is not none:
-            if state_setter is none:
+        if state is not None:
+            if state_setter is None:
                 self.save(state)
                 self._write(BUILD)
             else:
@@ -1277,19 +1277,19 @@ class _Mark:
 class Unpickler:
     """Reads a pickle from a binary file and rebuilds the object."""
 
-    def __init__(self, file, fix_imports=true, encoding="ASCII", errors="strict", buffers=none):
+    def __init__(self, file, fix_imports=True, encoding="ASCII", errors="strict", buffers=None):
         self._file = file
-        self._data = none
+        self._data = None
         self._pos = 0
-        self._frame = none
+        self._frame = None
         self._fpos = 0
         self.fix_imports = fix_imports
         self.encoding = encoding
         self.errors = errors
-        self._buffers = iter(buffers) if buffers is not none else none
+        self._buffers = iter(buffers) if buffers is not None else None
         self.memo = {}
         self.proto = 0
-        self._dispatch = none
+        self._dispatch = None
 
     # (loads gives the bytes themselves: no file object in between)
     def _set_bytes(self, data):
@@ -1297,7 +1297,7 @@ class Unpickler:
         self._pos = 0
 
     def _read_raw(self, n):
-        if self._data is not none:
+        if self._data is not None:
             var p = self._pos
             var b = self._data[p:p + n]
             self._pos = p + len(b)
@@ -1305,7 +1305,7 @@ class Unpickler:
         return self._file.read(n)
 
     def _readline_raw(self):
-        if self._data is not none:
+        if self._data is not None:
             var p = self._pos
             var i = self._data.find(b"\n", p)
             if i < 0:
@@ -1316,21 +1316,21 @@ class Unpickler:
         return self._file.readline()
 
     def _read(self, n):
-        if self._frame is not none:
+        if self._frame is not None:
             var fp = self._fpos
             if fp + n <= len(self._frame):
                 self._fpos = fp + n
                 return self._frame[fp:fp + n]
             if fp < len(self._frame):
                 raise UnpicklingError("pickle exhausted before end of frame")
-            self._frame = none
+            self._frame = None
         var b = self._read_raw(n)
         if len(b) < n:
             raise UnpicklingError("pickle data was truncated")
         return b
 
     def _readline(self):
-        if self._frame is not none:
+        if self._frame is not None:
             var fp = self._fpos
             var i = self._frame.find(b"\n", fp)
             if i >= 0:
@@ -1338,7 +1338,7 @@ class Unpickler:
                 return self._frame[fp:i + 1]
             if fp < len(self._frame):
                 raise UnpicklingError("pickle exhausted before end of frame")
-            self._frame = none
+            self._frame = None
         var line = self._readline_raw()
         if not line.endswith(b"\n"):
             raise UnpicklingError("pickle data was truncated")
@@ -1350,21 +1350,21 @@ class Unpickler:
         self.stack = []
         self.metastack = []
         self.proto = 0
-        self._frame = none
-        var first = true
-        while true:
-            var key = none
-            if self._frame is not none and self._fpos < len(self._frame):
+        self._frame = None
+        var first = True
+        while True:
+            var key = None
+            if self._frame is not None and self._fpos < len(self._frame):
                 key = self._frame[self._fpos]
                 self._fpos = self._fpos + 1
             else:
-                if self._frame is not none:
-                    self._frame = none
+                if self._frame is not None:
+                    self._frame = None
                 var b = self._read_raw(1)
                 if not b:
                     raise EOFError("Ran out of input")
                 key = b[0]
-            first = false
+            first = False
             try:
                 self._op(key)
             except _Stop as s:
@@ -1410,12 +1410,12 @@ class Unpickler:
         _ny_sys_audit("pickle.find_class", module, name)   # round 86: CPython's event
         if self.proto < 3 and self.fix_imports:
             var r = _NAME_MAPPING.get((module, name))
-            if r is not none:
+            if r is not None:
                 module = r[0]
                 name = r[1]
             elif module in _IMPORT_MAPPING:
                 module = _IMPORT_MAPPING[module]
-        var mod = none
+        var mod = None
         try:
             mod = _import(module)
         except Exception:
@@ -1444,7 +1444,7 @@ class Unpickler:
             self.proto = p
         elif key == 0x95:                      # FRAME
             var n = _le_int(self._read(8))
-            if self._frame is not none and self._fpos < len(self._frame):
+            if self._frame is not None and self._fpos < len(self._frame):
                 raise UnpicklingError("beginning of a new frame before end of current frame")
             self._frame = self._read_raw(n)
             self._fpos = 0
@@ -1456,21 +1456,21 @@ class Unpickler:
             self.metastack.append(self.stack)
             self.stack = []
         elif key == 0x4e:                      # NONE
-            st.append(none)
+            st.append(None)
         elif key == 0x88:
-            st.append(true)
+            st.append(True)
         elif key == 0x89:
-            st.append(false)
+            st.append(False)
         elif key == 0x49:                      # INT
             var data = self._readline()
             if data == b"00\n":
-                st.append(false)
+                st.append(False)
             elif data == b"01\n":
-                st.append(true)
+                st.append(True)
             else:
                 st.append(int(data.decode("ascii").strip(), 0))
         elif key == 0x4a:                      # BININT
-            st.append(int.from_bytes(self._read(4), "little", signed=true))
+            st.append(int.from_bytes(self._read(4), "little", signed=True))
         elif key == 0x4b:
             st.append(self._read(1)[0])
         elif key == 0x4d:
@@ -1484,7 +1484,7 @@ class Unpickler:
             var n = self._read(1)[0]
             st.append(_decode_long(self._read(n)))
         elif key == 0x8b:                      # LONG4
-            var n = int.from_bytes(self._read(4), "little", signed=true)
+            var n = int.from_bytes(self._read(4), "little", signed=True)
             if n < 0:
                 raise UnpicklingError("LONG pickle has negative byte count")
             st.append(_decode_long(self._read(n)))
@@ -1500,7 +1500,7 @@ class Unpickler:
                 raise UnpicklingError("the STRING opcode argument must be quoted")
             st.append(self._decode_str(_escape_decode(data)))
         elif key == 0x54:                      # BINSTRING
-            var n = int.from_bytes(self._read(4), "little", signed=true)
+            var n = int.from_bytes(self._read(4), "little", signed=True)
             if n < 0:
                 raise UnpicklingError("BINSTRING pickle has negative byte count")
             st.append(self._decode_str(self._read(n)))
@@ -1520,7 +1520,7 @@ class Unpickler:
             var n = _le_int(self._read(8))
             st.append(bytearray(self._read(n)))
         elif key == 0x97:                      # NEXT_BUFFER
-            if self._buffers is none:
+            if self._buffers is None:
                 raise UnpicklingError("pickle stream refers to out-of-band data but no *buffers* argument was given")
             var sentinel = []
             var buf = next(self._buffers, sentinel)
@@ -1620,7 +1620,7 @@ class Unpickler:
             elif key == 0x83:
                 code = _le_int(self._read(2))
             else:
-                code = int.from_bytes(self._read(4), "little", signed=true)
+                code = int.from_bytes(self._read(4), "little", signed=True)
             self._get_extension(code)
         elif key == 0x52:                      # REDUCE
             var args = st.pop()
@@ -1663,8 +1663,8 @@ class Unpickler:
             if type(lst) is list:
                 lst.extend(items)
             else:
-                var ext = getattr(lst, "extend", none)
-                if ext is not none:
+                var ext = getattr(lst, "extend", None)
+                if ext is not None:
                     ext(items)
                 else:
                     for x in items:
@@ -1705,11 +1705,11 @@ class Unpickler:
             raise UnpicklingError("invalid load key, '\\x%02x'." % key)
 
     def _build(self, inst, state):
-        var setstate = getattr(inst, "__setstate__", none)
-        if setstate is not none:
+        var setstate = getattr(inst, "__setstate__", None)
+        if setstate is not None:
             setstate(state)
             return
-        var slotstate = none
+        var slotstate = None
         if isinstance(state, tuple) and len(state) == 2:
             slotstate = state[1]
             state = state[0]
@@ -1723,7 +1723,7 @@ class Unpickler:
 
     def _get_extension(self, code):
         var obj = copyreg._extension_cache.get(code)
-        if obj is not none:
+        if obj is not None:
             self.stack.append(obj)
             return
         var key = copyreg._inverted_registry.get(code)
@@ -1746,36 +1746,36 @@ class _BytesSink:
         return len(b)
 
 
-def dump(obj, file, protocol=none, fix_imports=true, buffer_callback=none):
+def dump(obj, file, protocol=None, fix_imports=True, buffer_callback=None):
     Pickler(file, protocol, fix_imports, buffer_callback).dump(obj)
 
 
-def dumps(obj, protocol=none, fix_imports=true, buffer_callback=none):
+def dumps(obj, protocol=None, fix_imports=True, buffer_callback=None):
     # plain data at protocols 4 and 5: the same bytes, natively (round 80,
     # src/builtins/nypickle.cpp; none when obj holds anything else)
-    if buffer_callback is none:
-        var p = DEFAULT_PROTOCOL if protocol is none else protocol
+    if buffer_callback is None:
+        var p = DEFAULT_PROTOCOL if protocol is None else protocol
         if p == 4 or p == 5:
             var fast = _ny_pickle_dumps(obj, p)
-            if fast is not none:
+            if fast is not None:
                 return fast
     var sink = _BytesSink()
     Pickler(sink, protocol, fix_imports, buffer_callback).dump(obj)
     return sink.data
 
 
-def load(file, fix_imports=true, encoding="ASCII", errors="strict", buffers=none):
+def load(file, fix_imports=True, encoding="ASCII", errors="strict", buffers=None):
     return Unpickler(file, fix_imports, encoding, errors, buffers).load()
 
 
-def loads(data, fix_imports=true, encoding="ASCII", errors="strict", buffers=none):
+def loads(data, fix_imports=True, encoding="ASCII", errors="strict", buffers=None):
     if isinstance(data, str):
         raise TypeError("a bytes-like object is required, not 'str'")
-    if buffers is none:
+    if buffers is None:
         # plain data, natively (round 80; (False, None) for anything else)
         var r = _ny_pickle_loads(bytes(data))
         if r[0]:
             return r[1]
-    var u = Unpickler(none, fix_imports, encoding, errors, buffers)
+    var u = Unpickler(None, fix_imports, encoding, errors, buffers)
     u._set_bytes(bytes(data))
     return u.load()

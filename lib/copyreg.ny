@@ -21,11 +21,11 @@ __all__ = ["pickle", "constructor", "add_extension", "remove_extension", "clear_
 dispatch_table = {}
 
 
-def pickle(ob_type, pickle_function, constructor_ob=none):
+def pickle(ob_type, pickle_function, constructor_ob=None):
     if not callable(pickle_function):
         raise TypeError("reduction functions must be callable")
     dispatch_table[ob_type] = pickle_function
-    if constructor_ob is not none:
+    if constructor_ob is not None:
         constructor(constructor_ob)
 
 
@@ -43,9 +43,9 @@ dispatch_table[complex] = pickle_complex
 
 # cls.__new__(cls, *args): a class that names no base reads no __new__
 # here (object's is not found through it), so object.__new__ stands in
-def _ny_new(cls, args, kwargs=none):
-    var nw = getattr(cls, "__new__", none)
-    if nw is none:
+def _ny_new(cls, args, kwargs=None):
+    var nw = getattr(cls, "__new__", None)
+    if nw is None:
         return object.__new__(cls)
     if kwargs:
         return nw(cls, *args, **kwargs)
@@ -53,7 +53,7 @@ def _ny_new(cls, args, kwargs=none):
 
 
 def _reconstructor(cls, base, state):
-    var obj = none
+    var obj = None
     if base is object:
         obj = object.__new__(cls)
     else:
@@ -79,17 +79,17 @@ _BUILTIN_TYPES = (int, float, str, bytes, bytearray, list, dict, tuple, set, fro
 def _is_builtin_type(t):
     for b in _BUILTIN_TYPES:
         if t is b:
-            return true
-    return false
+            return True
+    return False
 
 
 def _has_own_getstate(cls):
     for c in cls.__mro__:
         if c is object:
-            return false
+            return False
         if "__getstate__" in _cdict(c):
-            return true
-    return false
+            return True
+    return False
 
 
 # Python's implementation of object.__reduce_ex__ for protocols 0 and 1
@@ -100,18 +100,18 @@ def _reduce_ex(self, proto):
         if _is_builtin_type(b) or b is object:
             base = b
             break
-    var state = none
+    var state = None
     if base is not object:
         if base is cls:
             raise TypeError("cannot pickle " + repr(cls.__name__) + " object")
         state = base(self)
     var args = (cls, base, state)
-    var dict = none
+    var dict = None
     if _has_own_getstate(cls):
         dict = self.__getstate__()
     else:
         # (3.11: object.__getstate__ exists, so this is the message)
-        if getattr(self, "__slots__", none):
+        if getattr(self, "__slots__", None):
             raise TypeError("a class that defines __slots__ without defining __getstate__ cannot be pickled")
         dict = _ny_getstate(self)
     if dict:
@@ -129,7 +129,7 @@ def __newobj_ex__(cls, args, kwargs):
 
 def _slotnames(cls):
     var names = _cdict(cls).get("__slotnames__")
-    if names is not none:
+    if names is not None:
         return names
     names = []
     if not hasattr(cls, "__slots__"):
@@ -162,15 +162,15 @@ def _slotnames(cls):
 def _ny_has_dict(obj):
     try:
         obj.__dict__
-        return true
+        return True
     except AttributeError:
-        return false
+        return False
     except TypeError:
-        return false
+        return False
 
 
-def _ny_getstate(obj, required=false):
-    var state = none
+def _ny_getstate(obj, required=False):
+    var state = None
     if _ny_has_dict(obj):
         var d = obj.__dict__
         if len(d):
@@ -190,8 +190,8 @@ def _ny_getstate(obj, required=false):
 
 def _ny_getnewargs(obj):
     var cls = type(obj)
-    var gx = getattr(cls, "__getnewargs_ex__", none)
-    if gx is not none:
+    var gx = getattr(cls, "__getnewargs_ex__", None)
+    if gx is not None:
         var na = obj.__getnewargs_ex__()
         if not isinstance(na, tuple):
             raise TypeError("__getnewargs_ex__ should return a tuple, not '" + type(na).__name__ + "'")
@@ -204,13 +204,13 @@ def _ny_getnewargs(obj):
             raise TypeError("second item of the tuple returned by __getnewargs_ex__ must be a dict, not '"
                             + type(na[1]).__name__ + "'")
         return na[0], na[1]
-    var g = getattr(cls, "__getnewargs__", none)
-    if g is not none:
+    var g = getattr(cls, "__getnewargs__", None)
+    if g is not None:
         var a = obj.__getnewargs__()
         if not isinstance(a, tuple):
             raise TypeError("__getnewargs__ should return a tuple, not '" + type(a).__name__ + "'")
-        return a, none
-    return none, none
+        return a, None
+    return None, None
 
 
 def _ny_reduce_newobj(obj):
@@ -218,22 +218,22 @@ def _ny_reduce_newobj(obj):
     var na = _ny_getnewargs(obj)
     var args = na[0]
     var kwargs = na[1]
-    var hasargs = args is not none
-    var newobj = none
-    var newargs = none
-    if kwargs is none or len(kwargs) == 0:
+    var hasargs = args is not None
+    var newobj = None
+    var newargs = None
+    if kwargs is None or len(kwargs) == 0:
         newobj = __newobj__
-        newargs = (cls,) + (args if args is not none else ())
+        newargs = (cls,) + (args if args is not None else ())
     else:
         newobj = __newobj_ex__
         newargs = (cls, args, kwargs)
-    var state = none
+    var state = None
     if _has_own_getstate(cls):
         state = obj.__getstate__()
     else:
         state = _ny_getstate(obj, not (hasargs or isinstance(obj, list) or isinstance(obj, dict)))
-    var listitems = iter(obj) if isinstance(obj, list) else none
-    var dictitems = iter(obj.items()) if isinstance(obj, dict) else none
+    var listitems = iter(obj) if isinstance(obj, list) else None
+    var dictitems = iter(obj.items()) if isinstance(obj, dict) else None
     return newobj, newargs, state, listitems, dictitems
 
 

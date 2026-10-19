@@ -24,8 +24,8 @@ def _fd(x):
         return x
     return x.fileno()
 
-def select(rlist, wlist, xlist, timeout=none):
-    if timeout is not none and timeout < 0:
+def select(rlist, wlist, xlist, timeout=None):
+    if timeout is not None and timeout < 0:
         raise ValueError("timeout must be non-negative")
     var rm = {}
     var wm = {}
@@ -67,7 +67,7 @@ class _Poll:
             raise KeyError(f)
         del self.fds[f]
 
-    def poll(self, timeout=none):
+    def poll(self, timeout=None):
         var rf = []
         var wf = []
         for f in self.fds:
@@ -76,8 +76,8 @@ class _Poll:
                 rf.append(f)
             if m & POLLOUT:
                 wf.append(f)
-        var t = none
-        if timeout is not none and timeout >= 0:
+        var t = None
+        if timeout is not None and timeout >= 0:
             t = timeout / 1000.0
         var r = _net_select(rf, wf, [], t)
         var out = {}
@@ -109,8 +109,8 @@ if os_platform() == "linux":
 
         Returns an epolling object."""
         __module__ = "select"
-        def __init__(self, sizehint=-1, flags=0, _fd=none):
-            if _fd is not none:
+        def __init__(self, sizehint=-1, flags=0, _fd=None):
+            if _fd is not None:
                 self._fd = _fd
                 return
             if sizehint == -1:
@@ -153,14 +153,14 @@ if os_platform() == "linux":
             self._check()
             _ny_os_call("epoll_ctl", self._fd, 2, _fd(fd), 0)
 
-        def poll(self, timeout=none, maxevents=-1):
+        def poll(self, timeout=None, maxevents=-1):
             self._check()
             if maxevents == -1:
                 maxevents = 1023
             elif maxevents < 1:
                 raise ValueError("maxevents must be greater than 0, got " + str(maxevents))
-            var t = none
-            if timeout is not none and timeout >= 0:
+            var t = None
+            if timeout is not None and timeout >= 0:
                 t = float(timeout)
             return [(e[0], e[1]) for e in _ny_os_call("epoll_wait", self._fd, t, maxevents)]
 

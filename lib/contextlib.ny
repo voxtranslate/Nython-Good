@@ -62,7 +62,7 @@ def _attr_or_none(obj, name):
     try:
         return getattr(obj, name)
     except AttributeError:
-        return none
+        return None
 
 
 class AbstractContextManager:
@@ -74,7 +74,7 @@ class AbstractContextManager:
 
     def __exit__(self, exc_type, exc_value, traceback):
         "Raise any exception triggered within the runtime context."
-        return none
+        return None
 
 
 class ContextDecorator:
@@ -104,12 +104,12 @@ class ContextDecorator:
 def _copy_wrapper_attrs(wrapper, wrapped):
     # functools.wraps, without importing functools
     for attr in ["__module__", "__name__", "__qualname__", "__doc__"]:
-        var v = none
-        var have = true
+        var v = None
+        var have = True
         try:
             v = getattr(wrapped, attr)
         except AttributeError:
-            have = false
+            have = False
         if have:
             setattr(wrapper, attr, v)
     wrapper.__wrapped__ = wrapped
@@ -125,8 +125,8 @@ class _GeneratorContextManager(ContextDecorator, AbstractContextManager):
         self.args = args
         self.kwds = kwds
         # the generator function's docstring, as Python's
-        var doc = getattr(func, "__doc__", none)
-        if doc is none:
+        var doc = getattr(func, "__doc__", None)
+        if doc is None:
             doc = "Helper for @contextmanager decorator."
         self.__doc__ = doc
 
@@ -143,19 +143,19 @@ class _GeneratorContextManager(ContextDecorator, AbstractContextManager):
             raise RuntimeError("generator didn't yield")
 
     def __exit__(self, typ, value, traceback):
-        if typ is none:
-            var stopped = false
+        if typ is None:
+            var stopped = False
             try:
                 next(self.gen)
             except StopIteration:
-                stopped = true
+                stopped = True
             if stopped:
-                return false
+                return False
             try:
                 raise RuntimeError("generator didn't stop")
             finally:
                 self.gen.close()
-        if value is none:
+        if value is None:
             # Need to force instantiation so we can reliably
             # tell if we get the same exception back
             value = typ()
@@ -164,9 +164,9 @@ class _GeneratorContextManager(ContextDecorator, AbstractContextManager):
             # Suppress StopIteration *unless* it's the same exception that
             # was passed to throw().  This prevents a StopIteration
             # raised inside the "with" statement from being suppressed.
-            return true
+            return True
         if outcome == "propagate":
-            return false
+            return False
         # the generator yielded again
         try:
             raise RuntimeError("generator didn't stop after throw()")
@@ -280,7 +280,7 @@ class AbstractAsyncContextManager:
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         "Raise any exception triggered within the runtime context."
-        return none
+        return None
 
 
 class AsyncContextDecorator:
@@ -307,8 +307,8 @@ class _AsyncGeneratorContextManager(AbstractAsyncContextManager, AsyncContextDec
         self.func = func
         self.args = args
         self.kwds = kwds
-        var doc = getattr(func, "__doc__", none)
-        if doc is none:
+        var doc = getattr(func, "__doc__", None)
+        if doc is None:
             doc = "Helper for @asynccontextmanager decorator."
         self.__doc__ = doc
 
@@ -322,25 +322,25 @@ class _AsyncGeneratorContextManager(AbstractAsyncContextManager, AsyncContextDec
             raise RuntimeError("generator didn't yield")
 
     async def __aexit__(self, typ, value, traceback):
-        if typ is none:
-            var stopped = false
+        if typ is None:
+            var stopped = False
             try:
                 _agen_next(self.gen)
             except StopAsyncIteration:
-                stopped = true
+                stopped = True
             if stopped:
-                return false
+                return False
             try:
                 raise RuntimeError("generator didn't stop")
             finally:
                 _await(self.gen.aclose())
-        if value is none:
+        if value is None:
             value = typ()
         var outcome = _acm_throw(self.gen, value)
         if outcome == "stopped":
-            return true
+            return True
         if outcome == "propagate":
-            return false
+            return False
         try:
             raise RuntimeError("generator didn't stop after athrow()")
         finally:
@@ -458,7 +458,7 @@ class nullcontext(AbstractContextManager):
         # Perform operation, using optional_cm if condition is True
     """
 
-    def __init__(self, enter_result=none):
+    def __init__(self, enter_result=None):
         self.enter_result = enter_result
 
     def __enter__(self):
@@ -489,18 +489,18 @@ class suppress(AbstractContextManager):
         # Unlike isinstance and issubclass, CPython exception handling
         # currently only looks at the concrete type hierarchy (ignoring
         # the instance and subclass checking hooks).
-        if exctype is none:
-            return false
+        if exctype is None:
+            return False
         for e in self._exceptions:
             if issubclass(exctype, e):
-                return true
-        return false
+                return True
+        return False
 
 
 # ── redirect_stdout / redirect_stderr ────────────────────────────────────────
 class _RedirectStream(AbstractContextManager):
 
-    _stream = none
+    _stream = None
 
     def __init__(self, new_target):
         self._new_target = new_target
@@ -630,13 +630,13 @@ class _BaseExitStack:
 def _has_method(obj, name):
     # the class defines it (special methods are looked up on the type)
     if not hasattr(obj, "__class__"):
-        return false
+        return False
     return hasattr(obj.__class__, name)
 
 
 def _cls_label(obj):
-    var cls = obj.__class__ if hasattr(obj, "__class__") else none
-    if cls is none:
+    var cls = obj.__class__ if hasattr(obj, "__class__") else None
+    if cls is None:
         return "builtins." + _tname(obj)
     var mod = getattr(cls, "__module__", "builtins")
     var name = getattr(cls, "__qualname__", cls.__name__)
@@ -662,7 +662,7 @@ class ExitStack(_BaseExitStack, AbstractContextManager):
 
     def close(self):
         "Immediately unwind the context stack."
-        self.__exit__(none, none, none)
+        self.__exit__(None, None, None)
 
 
 class _AsyncExitStackCMExit:
@@ -745,7 +745,7 @@ class AsyncExitStack(_BaseExitStack, AbstractAsyncContextManager):
 
     async def aclose(self):
         "Immediately unwind the context stack."
-        _unwind(self, (none, none, none))
+        _unwind(self, (None, None, None))
 
     async def __aenter__(self):
         return self
@@ -758,42 +758,42 @@ class AsyncExitStack(_BaseExitStack, AbstractAsyncContextManager):
 
 def _unwind(stack, exc_details):
     # the exits of an ExitStack / AsyncExitStack, last in first out
-    var exc_type = exc_details[0] if len(exc_details) > 0 else none
-    var exc = exc_details[1] if len(exc_details) > 1 else none
-    var tb = exc_details[2] if len(exc_details) > 2 else none
-    var received_exc = exc_type is not none
+    var exc_type = exc_details[0] if len(exc_details) > 0 else None
+    var exc = exc_details[1] if len(exc_details) > 1 else None
+    var tb = exc_details[2] if len(exc_details) > 2 else None
+    var received_exc = exc_type is not None
     # the exception being handled while the exits run (Python's
     # sys.exc_info()): the one the with block raised
     var frame_exc = exc
-    var suppressed_exc = false
-    var pending_raise = false
+    var suppressed_exc = False
+    var pending_raise = False
     # Callbacks are invoked in LIFO order to match the behaviour of
     # nested context managers
     while len(stack._exit_callbacks) > 0:
         var cb = stack._exit_callbacks.pop()
-        var raised = none
-        var suppressing = false
+        var raised = None
+        var suppressing = False
         try:
             suppressing = cb(exc_type, exc, tb)
         except BaseException as new_exc:
             raised = new_exc
-        if raised is not none:
+        if raised is not None:
             # Python chains an exception raised there to frame_exc by
             # itself; the runtime does not, so it is done here first
-            if frame_exc is not none and not _same(raised, frame_exc) and _attr_or_none(raised, "__context__") is none:
+            if frame_exc is not None and not _same(raised, frame_exc) and _attr_or_none(raised, "__context__") is None:
                 raised.__context__ = frame_exc
             # simulate the stack of exceptions by setting the context
             _fix_exception_context(raised, exc, frame_exc)
-            pending_raise = true
+            pending_raise = True
             exc_type = raised.__class__
             exc = raised
-            tb = none
+            tb = None
         elif suppressing:
-            suppressed_exc = true
-            pending_raise = false
-            exc_type = none
-            exc = none
-            tb = none
+            suppressed_exc = True
+            pending_raise = False
+            exc_type = None
+            exc = None
+            tb = None
     if pending_raise:
         raise exc
     return received_exc and suppressed_exc
@@ -807,7 +807,7 @@ def _fix_exception_context(new_exc, old_exc, frame_exc):
     var seen = 0
     while seen < 10000:
         var exc_context = _attr_or_none(e, "__context__")
-        if exc_context is none or _same(exc_context, old_exc):
+        if exc_context is None or _same(exc_context, old_exc):
             # context is already set correctly (see issue 20317)
             return
         if _same(exc_context, frame_exc):

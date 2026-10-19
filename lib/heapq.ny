@@ -168,7 +168,7 @@ def _siftup_max(heap, pos):
     _siftdown_max(heap, startpos, pos)
 
 
-def merge(*iterables, key=none, reverse=false):
+def merge(*iterables, key=None, reverse=False):
     """Merge multiple sorted inputs into a single sorted output.
 
     Similar to sorted(itertools.chain(*iterables)) but returns a generator,
@@ -194,7 +194,7 @@ def merge(*iterables, key=none, reverse=false):
         var it = iter(src)
         try:
             var value = next(it)
-            h.append([value if key is none else key(value), order * direction, value, it])
+            h.append([value if key is None else key(value), order * direction, value, it])
         except StopIteration:
             pass
         order += 1
@@ -207,7 +207,7 @@ def merge(*iterables, key=none, reverse=false):
         yield s[2]
         try:
             var nv = next(s[3])
-            s[0] = nv if key is none else key(nv)
+            s[0] = nv if key is None else key(nv)
             s[2] = nv
             if reverse:
                 _heapreplace_max(h, s)
@@ -226,21 +226,21 @@ def merge(*iterables, key=none, reverse=false):
             yield v
 
 
-def nsmallest(n, iterable, key=none):
+def nsmallest(n, iterable, key=None):
     """Find the n smallest elements in a dataset.
 
     Equivalent to:  sorted(iterable, key=key)[:n]
     """
     if n == 1:
-        var found = false
-        var best = none
-        var bestk = none
+        var found = False
+        var best = None
+        var bestk = None
         for elem in iterable:
-            var k = elem if key is none else key(elem)
+            var k = elem if key is None else key(elem)
             if not found or k < bestk:
                 best = elem
                 bestk = k
-                found = true
+                found = True
         return [best] if found else []
     var size = -1
     try:
@@ -262,7 +262,7 @@ def nsmallest(n, iterable, key=none):
             var e = next(it)
         except StopIteration:
             break
-        if key is none:
+        if key is None:
             result.append((e, i))
         else:
             result.append((key(e), i, e))
@@ -273,35 +273,35 @@ def nsmallest(n, iterable, key=none):
     var top = result[0][0]
     var order = n
     for elem in it:
-        var k = elem if key is none else key(elem)
+        var k = elem if key is None else key(elem)
         if k < top:
-            if key is none:
+            if key is None:
                 _heapreplace_max(result, (elem, order))
             else:
                 _heapreplace_max(result, (k, order, elem))
             top = result[0][0]
             order += 1
     result.sort()
-    if key is none:
+    if key is None:
         return [r[0] for r in result]
     return [r[2] for r in result]
 
 
-def nlargest(n, iterable, key=none):
+def nlargest(n, iterable, key=None):
     """Find the n largest elements in a dataset.
 
     Equivalent to:  sorted(iterable, key=key, reverse=True)[:n]
     """
     if n == 1:
-        var found = false
-        var best = none
-        var bestk = none
+        var found = False
+        var best = None
+        var bestk = None
         for elem in iterable:
-            var k = elem if key is none else key(elem)
+            var k = elem if key is None else key(elem)
             if not found or bestk < k:
                 best = elem
                 bestk = k
-                found = true
+                found = True
         return [best] if found else []
     var size = -1
     try:
@@ -311,7 +311,7 @@ def nlargest(n, iterable, key=none):
     except AttributeError:
         pass
     if size >= 0 and n >= size:
-        return sorted(iterable, key=key, reverse=true)[:n]
+        return sorted(iterable, key=key, reverse=True)[:n]
     var it = iter(iterable)
     var result = []
     var i = 0
@@ -320,7 +320,7 @@ def nlargest(n, iterable, key=none):
             var e = next(it)
         except StopIteration:
             break
-        if key is none:
+        if key is None:
             result.append((e, -i))
         else:
             result.append((key(e), -i, e))
@@ -331,15 +331,15 @@ def nlargest(n, iterable, key=none):
     var top = result[0][0]
     var order = -n
     for elem in it:
-        var k = elem if key is none else key(elem)
+        var k = elem if key is None else key(elem)
         if top < k:
-            if key is none:
+            if key is None:
                 heapreplace(result, (elem, order))
             else:
                 heapreplace(result, (k, order, elem))
             top = result[0][0]
             order -= 1
-    result.sort(reverse=true)
-    if key is none:
+    result.sort(reverse=True)
+    if key is None:
         return [r[0] for r in result]
     return [r[2] for r in result]

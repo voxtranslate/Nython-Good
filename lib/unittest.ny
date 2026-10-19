@@ -59,7 +59,7 @@ __all__ = ["TestResult", "TestCase", "IsolatedAsyncioTestCase", "TestSuite",
            "addModuleCleanup", "doModuleCleanups", "enterModuleContext",
            "BaseTestSuite"]
 
-__unittest = true
+__unittest = True
 
 DIFF_OMITTED = "\nDiff is %s characters long. Set self.maxDiff to None to see it."
 _MAX_LENGTH = 80
@@ -119,7 +119,7 @@ def _same_class(a, b):
     if ha and hb:
         return id(a.__class__) == id(b.__class__)
     if ha or hb:
-        return false
+        return False
     return _kind_of(a) == _kind_of(b)
 
 
@@ -134,7 +134,7 @@ def _class_of(obj):
 def _py_repr(obj):
     # repr() as CPython spells it: None, True and False (Nython's own repr
     # writes none/true/false), also inside lists, tuples, dicts and sets.
-    if obj is none:
+    if obj is None:
         return "None"
     if isinstance(obj, bool):
         return "True" if obj else "False"
@@ -171,7 +171,7 @@ def _exc_str(value):
     return s
 
 
-def safe_repr(obj, short=false):
+def safe_repr(obj, short=False):
     var result = ""
     try:
         result = _py_repr(obj)
@@ -183,10 +183,10 @@ def safe_repr(obj, short=false):
 
 
 def strclass(cls):
-    var mod = getattr(cls, "__module__", none)
+    var mod = getattr(cls, "__module__", None)
     if not mod or not isinstance(mod, str):
         mod = "__main__"
-    var q = getattr(cls, "__qualname__", none)
+    var q = getattr(cls, "__qualname__", None)
     if not q or not isinstance(q, str):
         q = cls.__name__
     return mod + "." + q
@@ -258,12 +258,12 @@ def _re_search(pattern, text):
     # the runtime's regex engine. Returns the matched text or none.
     if hasattr(pattern, "search"):
         var m = pattern.search(text)
-        if m is none:
-            return none
+        if m is None:
+            return None
         return m.group(0) if hasattr(m, "group") else str(m)
     var r = re_search(pattern, text)
-    if r is none:
-        return none
+    if r is None:
+        return None
     if isinstance(r, str):
         return r
     return r[0]
@@ -279,10 +279,10 @@ def _pattern_text(pattern):
 
 class _UtSequenceMatcher:
     # difflib.SequenceMatcher (Ratcliff/Obershelp), CPython's algorithm.
-    def __init__(self, isjunk=none, a="", b="", autojunk=true):
+    def __init__(self, isjunk=None, a="", b="", autojunk=True):
         self.isjunk = isjunk
-        self.a = none
-        self.b = none
+        self.a = None
+        self.b = None
         self.autojunk = autojunk
         self.set_seqs(a, b)
 
@@ -292,14 +292,14 @@ class _UtSequenceMatcher:
 
     def set_seq1(self, a):
         self.a = a
-        self.matching_blocks = none
-        self.opcodes = none
+        self.matching_blocks = None
+        self.opcodes = None
 
     def set_seq2(self, b):
         self.b = b
-        self.matching_blocks = none
-        self.opcodes = none
-        self.fullbcount = none
+        self.matching_blocks = None
+        self.opcodes = None
+        self.fullbcount = None
         self._chain_b()
 
     def _chain_b(self):
@@ -308,7 +308,7 @@ class _UtSequenceMatcher:
         var i = 0
         for elt in b:
             var indices = b2j.get(elt)
-            if indices is none:
+            if indices is None:
                 indices = []
                 b2j[elt] = indices
             indices.append(i)
@@ -346,7 +346,7 @@ class _UtSequenceMatcher:
         while i < ahi:
             var newj2len = {}
             var js = b2j.get(a[i])
-            if js is not none:
+            if js is not None:
                 for j in js:
                     if j < blo:
                         continue
@@ -375,7 +375,7 @@ class _UtSequenceMatcher:
         return [besti, bestj, bestsize]
 
     def get_matching_blocks(self):
-        if self.matching_blocks is not none:
+        if self.matching_blocks is not None:
             return self.matching_blocks
         var la = len(self.a)
         var lb = len(self.b)
@@ -421,7 +421,7 @@ class _UtSequenceMatcher:
         return non_adjacent
 
     def get_opcodes(self):
-        if self.opcodes is not none:
+        if self.opcodes is not None:
             return self.opcodes
         var i = 0
         var j = 0
@@ -453,7 +453,7 @@ class _UtSequenceMatcher:
         return _calculate_ratio(matches, len(self.a) + len(self.b))
 
     def quick_ratio(self):
-        if self.fullbcount is none:
+        if self.fullbcount is None:
             var fb = {}
             for elt in self.b:
                 fb[elt] = fb.get(elt, 0) + 1
@@ -505,7 +505,7 @@ def _keep_original_ws(s, tag_s):
 
 class _UtDiffer:
     # difflib.Differ: compare two sequences of lines, CPython's output.
-    def __init__(self, linejunk=none, charjunk=none):
+    def __init__(self, linejunk=None, charjunk=None):
         self.linejunk = linejunk
         self.charjunk = charjunk
 
@@ -542,8 +542,8 @@ class _UtDiffer:
         var best_ratio = 0.74
         var cutoff = 0.75
         var cruncher = _UtSequenceMatcher(self.charjunk)
-        var eqi = none
-        var eqj = none
+        var eqi = None
+        var eqj = None
         var best_i = 0
         var best_j = 0
         var j = blo
@@ -554,7 +554,7 @@ class _UtDiffer:
             while i < ahi:
                 var ai = a[i]
                 if ai == bj:
-                    if eqi is none:
+                    if eqi is None:
                         eqi = i
                         eqj = j
                     i = i + 1
@@ -567,18 +567,18 @@ class _UtDiffer:
                 i = i + 1
             j = j + 1
         if best_ratio < cutoff:
-            if eqi is none:
+            if eqi is None:
                 self._plain_replace(a, alo, ahi, b, blo, bhi, out)
                 return
             best_i = eqi
             best_j = eqj
             best_ratio = 1.0
         else:
-            eqi = none
+            eqi = None
         self._fancy_helper(a, alo, best_i, b, blo, best_j, out)
         var aelt = a[best_i]
         var belt = b[best_j]
-        if eqi is none:
+        if eqi is None:
             var atags = ""
             var btags = ""
             cruncher.set_seqs(aelt, belt)
@@ -622,10 +622,10 @@ class _UtDiffer:
 
 
 def _ndiff(a, b):
-    return _UtDiffer(none, _is_character_junk).compare(a, b)
+    return _UtDiffer(None, _is_character_junk).compare(a, b)
 
 
-def _splitlines(s, keepends=false):
+def _splitlines(s, keepends=False):
     var out = []
     var cur = []
     var i = 0
@@ -753,15 +753,15 @@ def _exc_text(err):
     var etype = err[0]
     var value = err[1]
     var tname = "Exception"
-    if etype is not none:
+    if etype is not None:
         tname = etype.__name__
-    elif value is not none:
+    elif value is not None:
         tname = _class_of(value).__name__
-    var mod = getattr(etype, "__module__", none) if etype is not none else none
-    if mod is not none and isinstance(mod, str) and mod not in ["__main__", "builtins"]:
+    var mod = getattr(etype, "__module__", None) if etype is not None else None
+    if mod is not None and isinstance(mod, str) and mod not in ["__main__", "builtins"]:
         tname = mod + "." + tname
     var msg = ""
-    if value is not none:
+    if value is not None:
         try:
             msg = _exc_str(value)
         except Exception:
@@ -771,12 +771,12 @@ def _exc_text(err):
 
 
 def _exc_info_of(e):
-    return (_class_of(e), e, none)
+    return (_class_of(e), e, None)
 
 
 def failfast(method):
     def inner(self, *args, **kw):
-        if getattr(self, "failfast", false):
+        if getattr(self, "failfast", False):
             self.stop()
         return method(self, *args, **kw)
     return inner
@@ -793,12 +793,12 @@ class TestResult:
     contain tuples of (testcase, exceptioninfo), where exceptioninfo is the
     formatted traceback of the error that occurred.
     """
-    _previousTestClass = none
-    _testRunEntered = false
-    _moduleSetUpFailed = false
+    _previousTestClass = None
+    _testRunEntered = False
+    _moduleSetUpFailed = False
 
-    def __init__(self, stream=none, descriptions=none, verbosity=none):
-        self.failfast = false
+    def __init__(self, stream=None, descriptions=None, verbosity=None):
+        self.failfast = False
         self.failures = []
         self.errors = []
         self.testsRun = 0
@@ -806,12 +806,12 @@ class TestResult:
         self.expectedFailures = []
         self.unexpectedSuccesses = []
         self.collectedDurations = []
-        self.shouldStop = false
-        self.buffer = false
-        self.tb_locals = false
-        self._previousTestClass = none
-        self._testRunEntered = false
-        self._moduleSetUpFailed = false
+        self.shouldStop = False
+        self.buffer = False
+        self.tb_locals = False
+        self._previousTestClass = None
+        self._testRunEntered = False
+        self._moduleSetUpFailed = False
 
     def printErrors(self):
         "Called by TestRunner after test run"
@@ -859,8 +859,8 @@ class TestResult:
         'err' is None if the subtest ended successfully, otherwise it's a
         tuple of values as returned by sys.exc_info().
         """
-        if err is not none:
-            if getattr(self, "failfast", false):
+        if err is not None:
+            if getattr(self, "failfast", False):
                 self.stop()
             if issubclass(err[0], test.failureException):
                 self.failures.append((subtest, self._exc_info_to_string(err, test)))
@@ -895,7 +895,7 @@ class TestResult:
 
     def stop(self):
         """Indicates that the tests should be aborted."""
-        self.shouldStop = true
+        self.shouldStop = True
 
     def _exc_info_to_string(self, err, test):
         """Converts a sys.exc_info()-style tuple of values into a string."""
@@ -917,7 +917,7 @@ class _WritelnDecorator:
         if hasattr(self.stream, "flush"):
             self.stream.flush()
 
-    def writeln(self, arg=none):
+    def writeln(self, arg=None):
         if arg:
             self.write(arg)
         self.write("\n")  # text-mode streams translate to \r\n if needed
@@ -934,13 +934,13 @@ class TextTestResult(TestResult):
     separator1 = "=" * 70
     separator2 = "-" * 70
 
-    def __init__(self, stream, descriptions, verbosity, durations=none):
+    def __init__(self, stream, descriptions, verbosity, durations=None):
         TestResult.__init__(self, stream, descriptions, verbosity)
         self.stream = stream
         self.showAll = verbosity > 1
         self.dots = verbosity == 1
         self.descriptions = descriptions
-        self._newline = true
+        self._newline = True
         self.durations = durations
 
     def getDescription(self, test):
@@ -955,7 +955,7 @@ class TextTestResult(TestResult):
             self.stream.write(self.getDescription(test))
             self.stream.write(" ... ")
             self.stream.flush()
-            self._newline = false
+            self._newline = False
 
     def _write_status(self, test, status):
         var is_subtest = isinstance(test, _SubTest)
@@ -968,10 +968,10 @@ class TextTestResult(TestResult):
             self.stream.write(" ... ")
         self.stream.writeln(status)
         self.stream.flush()
-        self._newline = true
+        self._newline = True
 
     def addSubTest(self, test, subtest, err):
-        if err is not none:
+        if err is not None:
             if self.showAll:
                 if issubclass(err[0], subtest.failureException):
                     self._write_status(subtest, "FAIL")
@@ -1064,15 +1064,15 @@ class TextTestRunner:
     """
     resultclass = TextTestResult
 
-    def __init__(self, stream=none, descriptions=true, verbosity=1,
-                 failfast=false, buffer=false, resultclass=none, warnings=none,
-                 tb_locals=false, durations=none):
+    def __init__(self, stream=None, descriptions=True, verbosity=1,
+                 failfast=False, buffer=False, resultclass=None, warnings=None,
+                 tb_locals=False, durations=None):
         """Construct a TextTestRunner.
 
         Subclasses should accept **kwargs to ensure compatibility as the
         interface changes.
         """
-        if stream is none:
+        if stream is None:
             stream = sys.stderr
         self.stream = _WritelnDecorator(stream)
         self.descriptions = descriptions
@@ -1082,7 +1082,7 @@ class TextTestRunner:
         self.tb_locals = tb_locals
         self.durations = durations
         self.warnings = warnings
-        if resultclass is not none:
+        if resultclass is not None:
             self.resultclass = resultclass
 
     def _makeResult(self):
@@ -1094,16 +1094,16 @@ class TextTestRunner:
     def _printDurations(self, result):
         if not result.collectedDurations:
             return
-        var ls = sorted(result.collectedDurations, key=lambda x: x[1], reverse=true)
+        var ls = sorted(result.collectedDurations, key=lambda x: x[1], reverse=True)
         if self.durations > 0:
             ls = ls[:self.durations]
         self.stream.writeln("Slowest test durations")
         if hasattr(result, "separator2"):
             self.stream.writeln(result.separator2)
-        var hidden = false
+        var hidden = False
         for pair in ls:
             if self.verbosity < 2 and pair[1] < 0.001:
-                hidden = true
+                hidden = True
                 continue
             self.stream.writeln("%-10s %s" % ("%.3fs" % pair[1], pair[0]))
         if hidden:
@@ -1118,19 +1118,19 @@ class TextTestRunner:
         result.buffer = self.buffer
         result.tb_locals = self.tb_locals
         var startTime = perf_counter()
-        var startTestRun = getattr(result, "startTestRun", none)
-        if startTestRun is not none:
+        var startTestRun = getattr(result, "startTestRun", None)
+        if startTestRun is not None:
             startTestRun()
         try:
             test(result)
         finally:
-            var stopTestRun = getattr(result, "stopTestRun", none)
-            if stopTestRun is not none:
+            var stopTestRun = getattr(result, "stopTestRun", None)
+            if stopTestRun is not None:
                 stopTestRun()
         var stopTime = perf_counter()
         var timeTaken = stopTime - startTime
         result.printErrors()
-        if self.durations is not none:
+        if self.durations is not None:
             self._printDurations(result)
         if hasattr(result, "separator2"):
             self.stream.writeln(result.separator2)
@@ -1170,26 +1170,26 @@ class TextTestRunner:
 # ── TestCase ─────────────────────────────────────────────────────────────────
 
 class _Outcome:
-    def __init__(self, result=none):
-        self.expecting_failure = false
+    def __init__(self, result=None):
+        self.expecting_failure = False
         self.result = result
         self.result_supports_subtests = hasattr(result, "addSubTest")
-        self.success = true
-        self.expectedFailure = none
+        self.success = True
+        self.expectedFailure = None
 
     # testPartExecutor: run fn(), recording how it ended (CPython's context
     # manager of the same name, as a call).
-    def run_part(self, test_case, fn, subTest=false):
+    def run_part(self, test_case, fn, subTest=False):
         var old_success = self.success
-        self.success = true
+        self.success = True
         try:
             fn()
             if subTest and self.success:
-                self.result.addSubTest(test_case.test_case, test_case, none)
+                self.result.addSubTest(test_case.test_case, test_case, None)
         except KeyboardInterrupt:
             raise
         except SkipTest as e:
-            self.success = false
+            self.success = False
             _addSkip(self.result, test_case, str(e))
         except _ShouldStop as _stop:      # `as`: a bare lowercase name would catch everything
             pass
@@ -1198,7 +1198,7 @@ class _Outcome:
             if self.expecting_failure:
                 self.expectedFailure = exc_info
             else:
-                self.success = false
+                self.success = False
                 if subTest:
                     self.result.addSubTest(test_case.test_case, test_case, exc_info)
                 else:
@@ -1207,15 +1207,15 @@ class _Outcome:
 
 
 def _addSkip(result, test_case, reason):
-    var addSkip = getattr(result, "addSkip", none)
-    if addSkip is not none:
+    var addSkip = getattr(result, "addSkip", None)
+    if addSkip is not None:
         addSkip(test_case, reason)
     else:
         result.addSuccess(test_case)
 
 
 def _addError(result, test, exc_info):
-    if result is not none and exc_info is not none:
+    if result is not None and exc_info is not None:
         if issubclass(exc_info[0], test.failureException):
             result.addFailure(test, exc_info)
         else:
@@ -1236,9 +1236,9 @@ def skip(reason):
             def skip_wrapper(*args, **kwargs):
                 raise SkipTest(reason)
             skip_wrapper.__name__ = getattr(inner, "__name__", "skip_wrapper")
-            skip_wrapper.__doc__ = getattr(inner, "__doc__", none)
+            skip_wrapper.__doc__ = getattr(inner, "__doc__", None)
             test_item = skip_wrapper
-        test_item.__unittest_skip__ = true
+        test_item.__unittest_skip__ = True
         test_item.__unittest_skip_why__ = reason
         return test_item
     if callable(reason) and not isinstance(reason, str):
@@ -1267,7 +1267,7 @@ def skipUnless(condition, reason):
 
 
 def expectedFailure(test_item):
-    test_item.__unittest_expecting_failure__ = true
+    test_item.__unittest_expecting_failure__ = True
     return test_item
 
 
@@ -1282,14 +1282,14 @@ class _BaseTestCaseContext:
 
 class _AssertRaisesContext(_BaseTestCaseContext):
     """A context manager used to implement TestCase.assertRaises* methods."""
-    def __init__(self, expected, test_case, expected_regex=none):
+    def __init__(self, expected, test_case, expected_regex=None):
         _BaseTestCaseContext.__init__(self, test_case)
         self.expected = expected
         self.test_case = test_case
         self.expected_regex = expected_regex
-        self.obj_name = none
-        self.msg = none
-        self.exception = none
+        self.obj_name = None
+        self.msg = None
+        self.exception = None
 
     def handle(self, name, args, kwargs):
         """
@@ -1298,43 +1298,43 @@ class _AssertRaisesContext(_BaseTestCaseContext):
         If args is not empty, call a callable passing positional and keyword
         arguments.
         """
-        var ok = true
+        var ok = True
         if isinstance(self.expected, tuple):
             for t in self.expected:
                 if not (_is_class(t) and issubclass(t, BaseException)):
-                    ok = false
+                    ok = False
         elif not (_is_class(self.expected) and issubclass(self.expected, BaseException)):
-            ok = false
+            ok = False
         if not ok:
             raise TypeError(name + "() arg 1 must be an exception type or tuple of exception types")
         if not args:
-            self.msg = kwargs.pop("msg", none)
+            self.msg = kwargs.pop("msg", None)
             if kwargs:
                 raise TypeError(repr(list(kwargs.keys())[0]) + " is an invalid keyword argument for this function")
             return self
         var callable_obj = args[0]
         var rest = list(args[1:])
-        self.obj_name = getattr(callable_obj, "__name__", none)
-        if self.obj_name is none:
+        self.obj_name = getattr(callable_obj, "__name__", None)
+        if self.obj_name is None:
             self.obj_name = str(callable_obj)
-        var raised = none
+        var raised = None
         try:
             callable_obj(*rest, **kwargs)
         except BaseException as e:
             raised = e
-        if raised is none:
-            self.__exit__(none, none, none)
-        elif not self.__exit__(_class_of(raised), raised, none):
+        if raised is None:
+            self.__exit__(None, None, None)
+        elif not self.__exit__(_class_of(raised), raised, None):
             raise raised
-        return none
+        return None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, tb):
-        if exc_type is none:
-            var exc_name = getattr(self.expected, "__name__", none)
-            if exc_name is none:
+        if exc_type is None:
+            var exc_name = getattr(self.expected, "__name__", None)
+            if exc_name is None:
                 exc_name = str(self.expected)
             if self.obj_name:
                 self._raiseFailure(exc_name + " not raised by " + str(self.obj_name))
@@ -1342,15 +1342,15 @@ class _AssertRaisesContext(_BaseTestCaseContext):
                 self._raiseFailure(exc_name + " not raised")
         if not issubclass(exc_type, self.expected):
             # let unexpected exceptions pass through
-            return false
+            return False
         # store exception, without traceback, for later retrieval
         self.exception = exc_value
-        if self.expected_regex is none:
-            return true
+        if self.expected_regex is None:
+            return True
         var expected_regex = self.expected_regex
-        if _re_search(expected_regex, str(exc_value)) is none:
+        if _re_search(expected_regex, str(exc_value)) is None:
             self._raiseFailure("\"" + _pattern_text(expected_regex) + "\" does not match \"" + str(exc_value) + "\"")
-        return true
+        return True
 
 
 class _UtLoggingWatcher:
@@ -1378,12 +1378,12 @@ class _AssertLogsContext(_BaseTestCaseContext):
             self.level = logging._nameToLevel.get(level, level)
         else:
             self.level = logging.INFO
-        self.msg = none
+        self.msg = None
         self.no_logs = no_logs
 
     def __enter__(self):
         var logging = self._logging
-        var logger = none
+        var logger = None
         if isinstance(self.logger_name, logging.Logger):
             logger = self.logger_name
         else:
@@ -1396,7 +1396,7 @@ class _AssertLogsContext(_BaseTestCaseContext):
             watcher.records.append(record)
             watcher.output.append(handler.format(record))
         handler.emit = _emit
-        handler.flush = lambda: none
+        handler.flush = lambda: None
         handler.setLevel(self.level)
         handler.setFormatter(formatter)
         self.watcher = watcher
@@ -1405,18 +1405,18 @@ class _AssertLogsContext(_BaseTestCaseContext):
         self.old_propagate = logger.propagate
         logger.handlers = [handler]
         logger.setLevel(self.level)
-        logger.propagate = false
+        logger.propagate = False
         if self.no_logs:
-            return none
+            return None
         return watcher
 
     def __exit__(self, exc_type, exc_value, tb):
         self.logger.handlers = self.old_handlers
         self.logger.propagate = self.old_propagate
         self.logger.setLevel(self.old_level)
-        if exc_type is not none:
+        if exc_type is not None:
             # let unexpected exceptions pass through
-            return false
+            return False
         if self.no_logs:
             # assertNoLogs
             if len(self.watcher.records) > 0:
@@ -1425,7 +1425,7 @@ class _AssertLogsContext(_BaseTestCaseContext):
             # assertLogs
             if len(self.watcher.records) == 0:
                 self._raiseFailure("no logs of level " + str(self._logging.getLevelName(self.level)) + " or higher triggered on " + self.logger.name)
-        return false
+        return False
 
 
 class _SubTestCM:
@@ -1434,54 +1434,54 @@ class _SubTestCM:
         self.case = case
         self.msg = msg
         self.params = params
-        self.parent = none
-        self.active = false
+        self.parent = None
+        self.active = False
 
     def __enter__(self):
         var case = self.case
-        if case._outcome is none or not case._outcome.result_supports_subtests:
-            return none
-        self.active = true
+        if case._outcome is None or not case._outcome.result_supports_subtests:
+            return None
+        self.active = True
         self.parent = case._subtest
         var params_map = {}
-        if self.parent is not none:
+        if self.parent is not None:
             for k in self.parent.params:
                 params_map[k] = self.parent.params[k]
         for k2 in self.params:
             params_map[k2] = self.params[k2]
         case._subtest = _SubTest(case, self.msg, params_map)
         self.old_success = case._outcome.success
-        case._outcome.success = true
-        return none
+        case._outcome.success = True
+        return None
 
     def __exit__(self, exc_type, exc_value, tb):
         if not self.active:
-            return false
+            return False
         var case = self.case
         var outcome = case._outcome
         var sub = case._subtest
-        var suppress = true
+        var suppress = True
         try:
-            if exc_type is none:
+            if exc_type is None:
                 if outcome.success:
-                    outcome.result.addSubTest(case, sub, none)
+                    outcome.result.addSubTest(case, sub, None)
             elif issubclass(exc_type, KeyboardInterrupt):
-                suppress = false
+                suppress = False
             elif issubclass(exc_type, SkipTest):
-                outcome.success = false
+                outcome.success = False
                 _addSkip(outcome.result, sub, str(exc_value))
             elif issubclass(exc_type, _ShouldStop):
                 pass
             elif outcome.expecting_failure:
-                outcome.expectedFailure = (exc_type, exc_value, none)
+                outcome.expectedFailure = (exc_type, exc_value, None)
             else:
-                outcome.success = false
-                outcome.result.addSubTest(case, sub, (exc_type, exc_value, none))
+                outcome.success = False
+                outcome.result.addSubTest(case, sub, (exc_type, exc_value, None))
             outcome.success = outcome.success and self.old_success
             if suppress:
                 if not outcome.success:
                     var result = outcome.result
-                    if result is not none and result.failfast:
+                    if result is not None and result.failfast:
                         raise _ShouldStop()
                 elif outcome.expectedFailure:
                     raise _ShouldStop()
@@ -1515,10 +1515,10 @@ class TestCase:
     in order to be run.
     """
     failureException = AssertionError
-    longMessage = true
+    longMessage = True
     maxDiff = 80 * 8
     _diffThreshold = 2 ** 16
-    _classSetupFailed = false
+    _classSetupFailed = False
     _class_cleanups = []
 
     def __init__(self, methodName="runTest"):
@@ -1527,7 +1527,7 @@ class TestCase:
            not have a method with the specified name.
         """
         self._testMethodName = methodName
-        self._outcome = none
+        self._outcome = None
         self._testMethodDoc = "No test"
         var cls = _class_of(self)
         if not hasattr(cls, methodName):
@@ -1536,9 +1536,9 @@ class TestCase:
                 # but not an *incorrect* or missing method name
                 raise ValueError("no such test method in " + str(cls) + ": " + methodName)
         else:
-            self._testMethodDoc = getattr(getattr(cls, methodName), "__doc__", none)
+            self._testMethodDoc = getattr(getattr(cls, methodName), "__doc__", None)
         self._cleanups = []
-        self._subtest = none
+        self._subtest = None
         # Map types to custom assertEqual functions that will compare
         # instances of said type in more detail to generate a more useful
         # error message.
@@ -1573,7 +1573,7 @@ class TestCase:
         function and returns the result of the __enter__ method.
         """
         var result = cm.__enter__()
-        self.addCleanup(cm.__exit__, none, none, none)
+        self.addCleanup(cm.__exit__, None, None, None)
         return result
 
     @classmethod
@@ -1586,7 +1586,7 @@ class TestCase:
     def enterClassContext(cls, cm):
         """Same as enterContext, but class-wide."""
         var result = cm.__enter__()
-        cls.addClassCleanup(cm.__exit__, none, none, none)
+        cls.addClassCleanup(cm.__exit__, None, None, None)
         return result
 
     def setUp(self):
@@ -1622,7 +1622,7 @@ class TestCase:
         """
         var doc = self._testMethodDoc
         if not doc or not isinstance(doc, str):
-            return none
+            return None
         return doc.strip().split("\n")[0].strip()
 
     def id(self):
@@ -1630,7 +1630,7 @@ class TestCase:
 
     def __eq__(self, other):
         if not isinstance(other, TestCase):
-            return false
+            return False
         return _same(_class_of(self), _class_of(other)) and self._testMethodName == other._testMethodName
 
     def __hash__(self):
@@ -1652,15 +1652,15 @@ class TestCase:
         return _SubTestCM(self, msg, params)
 
     def _addExpectedFailure(self, result, exc_info):
-        var addExpectedFailure = getattr(result, "addExpectedFailure", none)
-        if addExpectedFailure is not none:
+        var addExpectedFailure = getattr(result, "addExpectedFailure", None)
+        if addExpectedFailure is not None:
             addExpectedFailure(self, exc_info)
         else:
             result.addSuccess(self)
 
     def _addUnexpectedSuccess(self, result):
-        var addUnexpectedSuccess = getattr(result, "addUnexpectedSuccess", none)
-        if addUnexpectedSuccess is not none:
+        var addUnexpectedSuccess = getattr(result, "addUnexpectedSuccess", None)
+        if addUnexpectedSuccess is not None:
             addUnexpectedSuccess(self)
         else:
             # The test was supposed to fail, but it didn't
@@ -1681,26 +1681,26 @@ class TestCase:
     def _callCleanup(self, function, *args, **kwargs):
         function(*args, **kwargs)
 
-    def run(self, result=none):
-        var stopTestRun = none
-        if result is none:
+    def run(self, result=None):
+        var stopTestRun = None
+        if result is None:
             result = self.defaultTestResult()
-            var startTestRun = getattr(result, "startTestRun", none)
-            stopTestRun = getattr(result, "stopTestRun", none)
-            if startTestRun is not none:
+            var startTestRun = getattr(result, "startTestRun", None)
+            stopTestRun = getattr(result, "stopTestRun", None)
+            if startTestRun is not None:
                 startTestRun()
         result.startTest(self)
         var start_time = perf_counter()
         try:
             var cls = _class_of(self)
-            var classMethod = getattr(cls, self._testMethodName, none)
+            var classMethod = getattr(cls, self._testMethodName, None)
             var testMethod = getattr(self, self._testMethodName)
-            if getattr(cls, "__unittest_skip__", false) or getattr(classMethod, "__unittest_skip__", false):
+            if getattr(cls, "__unittest_skip__", False) or getattr(classMethod, "__unittest_skip__", False):
                 # If the class or method was skipped.
                 var skip_why = getattr(cls, "__unittest_skip_why__", "") or getattr(classMethod, "__unittest_skip_why__", "")
                 _addSkip(result, self, skip_why)
                 return result
-            var expecting_failure = getattr(cls, "__unittest_expecting_failure__", false) or getattr(classMethod, "__unittest_expecting_failure__", false)
+            var expecting_failure = getattr(cls, "__unittest_expecting_failure__", False) or getattr(classMethod, "__unittest_expecting_failure__", False)
             var outcome = _Outcome(result)
             var me = self
             try:
@@ -1709,7 +1709,7 @@ class TestCase:
                 if outcome.success:
                     outcome.expecting_failure = expecting_failure
                     outcome.run_part(self, lambda: me._callTestMethod(testMethod))
-                    outcome.expecting_failure = false
+                    outcome.expecting_failure = False
                     outcome.run_part(self, lambda: me._callTearDown())
                 self.doCleanups()
                 if hasattr(result, "addDuration"):
@@ -1724,11 +1724,11 @@ class TestCase:
                         result.addSuccess(self)
                 return result
             finally:
-                outcome.expectedFailure = none
-                self._outcome = none
+                outcome.expectedFailure = None
+                self._outcome = None
         finally:
             result.stopTest(self)
-            if stopTestRun is not none:
+            if stopTestRun is not None:
                 stopTestRun()
 
     def doCleanups(self):
@@ -1761,8 +1761,8 @@ class TestCase:
     def debug(self):
         """Run the test without collecting errors in a TestResult"""
         var cls = _class_of(self)
-        var classMethod = getattr(cls, self._testMethodName, none)
-        if getattr(cls, "__unittest_skip__", false) or getattr(classMethod, "__unittest_skip__", false):
+        var classMethod = getattr(cls, self._testMethodName, None)
+        if getattr(cls, "__unittest_skip__", False) or getattr(classMethod, "__unittest_skip__", False):
             # If the class or method was skipped.
             var skip_why = getattr(cls, "__unittest_skip_why__", "") or getattr(classMethod, "__unittest_skip_why__", "")
             raise SkipTest(skip_why)
@@ -1777,17 +1777,17 @@ class TestCase:
         """Skip this test."""
         raise SkipTest(reason)
 
-    def fail(self, msg=none):
+    def fail(self, msg=None):
         """Fail immediately, with the given message."""
         raise self.failureException(msg)
 
-    def assertFalse(self, expr, msg=none):
+    def assertFalse(self, expr, msg=None):
         """Check that the expression is false."""
         if expr:
             msg = self._formatMessage(msg, safe_repr(expr) + " is not false")
             raise self.failureException(msg)
 
-    def assertTrue(self, expr, msg=none):
+    def assertTrue(self, expr, msg=None):
         """Check that the expression is true."""
         if not expr:
             msg = self._formatMessage(msg, safe_repr(expr) + " is not true")
@@ -1805,7 +1805,7 @@ class TestCase:
         """
         if not self.longMessage:
             return msg or standardMsg
-        if msg is none:
+        if msg is None:
             return standardMsg
         return standardMsg + " : " + str(msg)
 
@@ -1850,7 +1850,7 @@ class TestCase:
         var context = _AssertRaisesContext(expected_exception, self, expected_regex)
         return context.handle("assertRaisesRegex", args, kwargs)
 
-    def assertLogs(self, logger=none, level=none):
+    def assertLogs(self, logger=None, level=None):
         """Fail unless a log message of level *level* or higher is emitted
         on *logger_name* or its children.  If omitted, *level* defaults to
         INFO and *logger* defaults to the root logger.
@@ -1858,15 +1858,15 @@ class TestCase:
         This method must be used as a context manager, and will yield
         a recording object with two attributes: `output` and `records`.
         """
-        return _AssertLogsContext(self, logger, level, false)
+        return _AssertLogsContext(self, logger, level, False)
 
-    def assertNoLogs(self, logger=none, level=none):
+    def assertNoLogs(self, logger=None, level=None):
         """ Fail unless no log messages of level *level* or higher are emitted
         on *logger_name* or its children.
 
         This method must be used as a context manager.
         """
-        return _AssertLogsContext(self, logger, level, true)
+        return _AssertLogsContext(self, logger, level, True)
 
     def _getAssertEqualityFunc(self, first, second):
         """Get a detailed comparison function for the types of the two args.
@@ -1878,13 +1878,13 @@ class TestCase:
         var k1 = _kind_of(first)
         if k1 == _kind_of(second) and _same_class(first, second):
             var asserter = self._type_equality_funcs.get(k1)
-            if asserter is not none:
+            if asserter is not None:
                 if isinstance(asserter, str):
                     asserter = getattr(self, asserter)
                 return asserter
         return self._baseAssertEqual
 
-    def _baseAssertEqual(self, first, second, msg=none):
+    def _baseAssertEqual(self, first, second, msg=None):
         """The default assertEqual implementation, not type specific."""
         if not first == second:
             var reps = _common_shorten_repr(first, second)
@@ -1892,14 +1892,14 @@ class TestCase:
             msg = self._formatMessage(msg, standardMsg)
             raise self.failureException(msg)
 
-    def assertEqual(self, first, second, msg=none):
+    def assertEqual(self, first, second, msg=None):
         """Fail if the two objects are unequal as determined by the '=='
            operator.
         """
         var assertion_func = self._getAssertEqualityFunc(first, second)
         assertion_func(first, second, msg)
 
-    def assertNotEqual(self, first, second, msg=none):
+    def assertNotEqual(self, first, second, msg=None):
         """Fail if the two objects are equal as determined by the '!='
            operator.
         """
@@ -1907,7 +1907,7 @@ class TestCase:
             msg = self._formatMessage(msg, safe_repr(first) + " == " + safe_repr(second))
             raise self.failureException(msg)
 
-    def assertAlmostEqual(self, first, second, places=none, msg=none, delta=none):
+    def assertAlmostEqual(self, first, second, places=None, msg=None, delta=None):
         """Fail if the two objects are unequal as determined by their
            difference rounded to the given number of decimal places
            (default 7) and comparing to zero, or by comparing that the
@@ -1917,16 +1917,16 @@ class TestCase:
         if first == second:
             # shortcut
             return
-        if delta is not none and places is not none:
+        if delta is not None and places is not None:
             raise TypeError("specify delta or places not both")
         var diff = abs(first - second)
         var standardMsg = ""
-        if delta is not none:
+        if delta is not None:
             if diff <= delta:
                 return
             standardMsg = safe_repr(first) + " != " + safe_repr(second) + " within " + safe_repr(delta) + " delta (" + safe_repr(diff) + " difference)"
         else:
-            if places is none:
+            if places is None:
                 places = 7
             if round(diff, places) == 0:
                 return
@@ -1934,22 +1934,22 @@ class TestCase:
         msg = self._formatMessage(msg, standardMsg)
         raise self.failureException(msg)
 
-    def assertNotAlmostEqual(self, first, second, places=none, msg=none, delta=none):
+    def assertNotAlmostEqual(self, first, second, places=None, msg=None, delta=None):
         """Fail if the two objects are equal as determined by their
            difference rounded to the given number of decimal places
            (default 7) and comparing to zero, or by comparing that the
            difference between the two objects is less than the given delta.
         """
-        if delta is not none and places is not none:
+        if delta is not None and places is not None:
             raise TypeError("specify delta or places not both")
         var diff = abs(first - second)
         var standardMsg = ""
-        if delta is not none:
+        if delta is not None:
             if not (first == second) and diff > delta:
                 return
             standardMsg = safe_repr(first) + " == " + safe_repr(second) + " within " + safe_repr(delta) + " delta (" + safe_repr(diff) + " difference)"
         else:
-            if places is none:
+            if places is None:
                 places = 7
             if not (first == second) and round(diff, places) != 0:
                 return
@@ -1957,37 +1957,37 @@ class TestCase:
         msg = self._formatMessage(msg, standardMsg)
         raise self.failureException(msg)
 
-    def assertSequenceEqual(self, seq1, seq2, msg=none, seq_type=none):
+    def assertSequenceEqual(self, seq1, seq2, msg=None, seq_type=None):
         """An equality assertion for ordered sequences (like lists and tuples).
 
         For the purposes of this function, a valid ordered sequence type is one
         which can be indexed, has a length, and has an equality operator.
         """
         var seq_type_name = "sequence"
-        if seq_type is not none:
+        if seq_type is not None:
             seq_type_name = _kind_of_type(seq_type)
             if not isinstance(seq1, seq_type):
                 raise self.failureException("First sequence is not a " + seq_type_name + ": " + safe_repr(seq1))
             if not isinstance(seq2, seq_type):
                 raise self.failureException("Second sequence is not a " + seq_type_name + ": " + safe_repr(seq2))
-        var differing = none
+        var differing = None
         var len1 = 0
         var len2 = 0
         try:
             len1 = len(seq1)
         except Exception:
             differing = "First " + seq_type_name + " has no length.    Non-sequence?"
-        if differing is none:
+        if differing is None:
             try:
                 len2 = len(seq2)
             except Exception:
                 differing = "Second " + seq_type_name + " has no length.    Non-sequence?"
-        if differing is none:
+        if differing is None:
             if seq1 == seq2:
                 return
             var reps = _common_shorten_repr(seq1, seq2)
             differing = seq_type_name.capitalize() + "s differ: " + reps[0] + " != " + reps[1] + "\n"
-            var found = false
+            var found = False
             var i = 0
             var n = min(len1, len2)
             while i < n:
@@ -1996,11 +1996,11 @@ class TestCase:
                 if item1 != item2:
                     var r2 = _common_shorten_repr(item1, item2)
                     differing = differing + "\nFirst differing element " + str(i) + ":\n" + r2[0] + "\n" + r2[1] + "\n"
-                    found = true
+                    found = True
                     break
                 i = i + 1
             if not found:
-                if len1 == len2 and seq_type is none and not _same_class(seq1, seq2):
+                if len1 == len2 and seq_type is None and not _same_class(seq1, seq2):
                     # The sequences are the same, but have differing types.
                     return
             if len1 > len2:
@@ -2017,22 +2017,22 @@ class TestCase:
 
     def _truncateMessage(self, message, diff):
         var max_diff = self.maxDiff
-        if max_diff is none or len(diff) <= max_diff:
+        if max_diff is None or len(diff) <= max_diff:
             return message + diff
         return message + (DIFF_OMITTED % len(diff))
 
-    def assertListEqual(self, list1, list2, msg=none):
+    def assertListEqual(self, list1, list2, msg=None):
         """A list-specific equality assertion."""
         self.assertSequenceEqual(list1, list2, msg, list)
 
-    def assertTupleEqual(self, tuple1, tuple2, msg=none):
+    def assertTupleEqual(self, tuple1, tuple2, msg=None):
         """A tuple-specific equality assertion."""
         self.assertSequenceEqual(tuple1, tuple2, msg, tuple)
 
-    def assertSetEqual(self, set1, set2, msg=none):
+    def assertSetEqual(self, set1, set2, msg=None):
         """A set-specific equality assertion."""
-        var difference1 = none
-        var difference2 = none
+        var difference1 = None
+        var difference2 = None
         try:
             difference1 = set1.difference(set2)
         except TypeError as e:
@@ -2059,31 +2059,31 @@ class TestCase:
         var standardMsg = "\n".join(lines)
         self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIn(self, member, container, msg=none):
+    def assertIn(self, member, container, msg=None):
         """Just like self.assertTrue(a in b), but with a nicer default message."""
         if member not in container:
             var standardMsg = safe_repr(member) + " not found in " + safe_repr(container)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertNotIn(self, member, container, msg=none):
+    def assertNotIn(self, member, container, msg=None):
         """Just like self.assertTrue(a not in b), but with a nicer default message."""
         if member in container:
             var standardMsg = safe_repr(member) + " unexpectedly found in " + safe_repr(container)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIs(self, expr1, expr2, msg=none):
+    def assertIs(self, expr1, expr2, msg=None):
         """Just like self.assertTrue(a is b), but with a nicer default message."""
-        if not _same(expr1, expr2) and not (expr1 is none and expr2 is none):
+        if not _same(expr1, expr2) and not (expr1 is None and expr2 is None):
             var standardMsg = safe_repr(expr1) + " is not " + safe_repr(expr2)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIsNot(self, expr1, expr2, msg=none):
+    def assertIsNot(self, expr1, expr2, msg=None):
         """Just like self.assertTrue(a is not b), but with a nicer default message."""
-        if _same(expr1, expr2) or (expr1 is none and expr2 is none):
+        if _same(expr1, expr2) or (expr1 is None and expr2 is None):
             var standardMsg = "unexpectedly identical: " + safe_repr(expr1)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertDictEqual(self, d1, d2, msg=none):
+    def assertDictEqual(self, d1, d2, msg=None):
         self.assertIsInstance(d1, dict, "First argument is not a dictionary")
         self.assertIsInstance(d2, dict, "Second argument is not a dictionary")
         if d1 != d2:
@@ -2093,7 +2093,7 @@ class TestCase:
             standardMsg = self._truncateMessage(standardMsg, diff)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertCountEqual(self, first, second, msg=none):
+    def assertCountEqual(self, first, second, msg=None):
         """Asserts that two iterables have the same elements, the same number of
         times, without regard to order.
 
@@ -2115,7 +2115,7 @@ class TestCase:
             msg = self._formatMessage(msg, standardMsg)
             self.fail(msg)
 
-    def assertMultiLineEqual(self, first, second, msg=none):
+    def assertMultiLineEqual(self, first, second, msg=None):
         """Assert that two multi-line strings are equal."""
         self.assertIsInstance(first, str, "First argument is not a string")
         self.assertIsInstance(second, str, "Second argument is not a string")
@@ -2137,8 +2137,8 @@ class TestCase:
                 second_presplit = second_presplit + "\n"
             elif first and first[-1] != "\n":
                 first_presplit = first_presplit + "\n"
-            var firstlines = _splitlines(first_presplit, true)
-            var secondlines = _splitlines(second_presplit, true)
+            var firstlines = _splitlines(first_presplit, True)
+            var secondlines = _splitlines(second_presplit, True)
             # Generate the message and diff, then raise the exception
             var reps = _common_shorten_repr(first, second)
             var standardMsg = reps[0] + " != " + reps[1]
@@ -2146,66 +2146,66 @@ class TestCase:
             standardMsg = self._truncateMessage(standardMsg, diff)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertLess(self, a, b, msg=none):
+    def assertLess(self, a, b, msg=None):
         """Just like self.assertTrue(a < b), but with a nicer default message."""
         if not a < b:
             var standardMsg = safe_repr(a) + " not less than " + safe_repr(b)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertLessEqual(self, a, b, msg=none):
+    def assertLessEqual(self, a, b, msg=None):
         """Just like self.assertTrue(a <= b), but with a nicer default message."""
         if not a <= b:
             var standardMsg = safe_repr(a) + " not less than or equal to " + safe_repr(b)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertGreater(self, a, b, msg=none):
+    def assertGreater(self, a, b, msg=None):
         """Just like self.assertTrue(a > b), but with a nicer default message."""
         if not a > b:
             var standardMsg = safe_repr(a) + " not greater than " + safe_repr(b)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertGreaterEqual(self, a, b, msg=none):
+    def assertGreaterEqual(self, a, b, msg=None):
         """Just like self.assertTrue(a >= b), but with a nicer default message."""
         if not a >= b:
             var standardMsg = safe_repr(a) + " not greater than or equal to " + safe_repr(b)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIsNone(self, obj, msg=none):
+    def assertIsNone(self, obj, msg=None):
         """Same as self.assertTrue(obj is None), with a nicer default message."""
-        if obj is not none:
+        if obj is not None:
             var standardMsg = safe_repr(obj) + " is not None"
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIsNotNone(self, obj, msg=none):
+    def assertIsNotNone(self, obj, msg=None):
         """Included for symmetry with assertIsNone."""
-        if obj is none:
+        if obj is None:
             var standardMsg = "unexpectedly None"
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertIsInstance(self, obj, cls, msg=none):
+    def assertIsInstance(self, obj, cls, msg=None):
         """Same as self.assertTrue(isinstance(obj, cls)), with a nicer
         default message."""
         if not isinstance(obj, cls):
             var standardMsg = safe_repr(obj) + " is not an instance of " + _type_repr(cls)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertNotIsInstance(self, obj, cls, msg=none):
+    def assertNotIsInstance(self, obj, cls, msg=None):
         """Included for symmetry with assertIsInstance."""
         if isinstance(obj, cls):
             var standardMsg = safe_repr(obj) + " is an instance of " + _type_repr(cls)
             self.fail(self._formatMessage(msg, standardMsg))
 
-    def assertRegex(self, text, expected_regex, msg=none):
+    def assertRegex(self, text, expected_regex, msg=None):
         """Fail the test unless the text matches the regular expression."""
-        if _re_search(expected_regex, text) is none:
+        if _re_search(expected_regex, text) is None:
             var standardMsg = "Regex didn't match: " + repr(_pattern_text(expected_regex)) + " not found in " + repr(text)
             msg = self._formatMessage(msg, standardMsg)
             raise self.failureException(msg)
 
-    def assertNotRegex(self, text, unexpected_regex, msg=none):
+    def assertNotRegex(self, text, unexpected_regex, msg=None):
         """Fail the test if the text matches the regular expression."""
         var m = _re_search(unexpected_regex, text)
-        if m is not none:
+        if m is not None:
             var standardMsg = "Regex matched: " + repr(m) + " matches " + repr(_pattern_text(unexpected_regex)) + " in " + repr(text)
             msg = self._formatMessage(msg, standardMsg)
             raise self.failureException(msg)
@@ -2217,12 +2217,12 @@ def _type_repr(cls):
         if len(cls) == 1:
             return "(" + _type_repr(cls[0]) + ",)"
         return "(" + ", ".join([_type_repr(c) for c in cls]) + ")"
-    var name = getattr(cls, "__name__", none)
-    if name is none:
+    var name = getattr(cls, "__name__", None)
+    if name is None:
         return repr(cls)
     if name in ["int", "str", "float", "bool", "list", "tuple", "dict", "set", "frozenset", "bytes", "bytearray", "complex", "object", "type", "map"]:
         return "<class '" + ("dict" if name == "map" else name) + "'>"
-    var mod = getattr(cls, "__module__", none)
+    var mod = getattr(cls, "__module__", None)
     if not mod or not isinstance(mod, str):
         mod = "__main__"
     if mod == "builtins" or (mod == "__main__" and _is_builtin_exc_name(name)):
@@ -2251,8 +2251,8 @@ def _count_diff_all_purpose(actual, expected):
     var t = list(expected)
     var m = len(s)
     var n = len(t)
-    var used_s = [false] * m
-    var used_t = [false] * n
+    var used_s = [False] * m
+    var used_t = [False] * n
     var result = []
     var i = 0
     while i < m:
@@ -2266,13 +2266,13 @@ def _count_diff_all_purpose(actual, expected):
         while j < m:
             if not used_s[j] and s[j] == elem:
                 cnt_s = cnt_s + 1
-                used_s[j] = true
+                used_s[j] = True
             j = j + 1
         var k = 0
         while k < n:
             if not used_t[k] and t[k] == elem:
                 cnt_t = cnt_t + 1
-                used_t[k] = true
+                used_t[k] = True
             k = k + 1
         if cnt_s != cnt_t:
             result.append((cnt_s, cnt_t, elem))
@@ -2288,7 +2288,7 @@ def _count_diff_all_purpose(actual, expected):
         while j2 < n:
             if not used_t[j2] and t[j2] == elem2:
                 cnt = cnt + 1
-                used_t[j2] = true
+                used_t[j2] = True
             j2 = j2 + 1
         result.append((0, cnt, elem2))
         i = i + 1
@@ -2303,7 +2303,7 @@ class FunctionTestCase(TestCase):
     supplied. As with TestCase, the tidy-up ('tearDown') function will
     always be called if the set-up ('setUp') function ran successfully.
     """
-    def __init__(self, testFunc, setUp=none, tearDown=none, description=none):
+    def __init__(self, testFunc, setUp=None, tearDown=None, description=None):
         TestCase.__init__(self)
         self._setUpFunc = setUp
         self._tearDownFunc = tearDown
@@ -2311,17 +2311,17 @@ class FunctionTestCase(TestCase):
         self._description = description
 
     def setUp(self):
-        if self._setUpFunc is not none:
+        if self._setUpFunc is not None:
             self._setUpFunc()
 
     def tearDown(self):
-        if self._tearDownFunc is not none:
+        if self._tearDownFunc is not None:
             self._tearDownFunc()
 
     def runTest(self):
         self._testFunc()
 
-    def run(self, result=none):
+    def run(self, result=None):
         self._testMethodName = "runTest"
         return TestCase.run(self, result)
 
@@ -2330,7 +2330,7 @@ class FunctionTestCase(TestCase):
 
     def __eq__(self, other):
         if not isinstance(other, FunctionTestCase):
-            return false
+            return False
         return _same(self._setUpFunc, other._setUpFunc) and _same(self._tearDownFunc, other._tearDownFunc) and _same(self._testFunc, other._testFunc) and self._description == other._description
 
     def __hash__(self):
@@ -2343,12 +2343,12 @@ class FunctionTestCase(TestCase):
         return "<" + strclass(_class_of(self)) + " tec=" + repr(self._testFunc) + ">"
 
     def shortDescription(self):
-        if self._description is not none:
+        if self._description is not None:
             return self._description
-        var doc = getattr(self._testFunc, "__doc__", none)
+        var doc = getattr(self._testFunc, "__doc__", None)
         if doc and isinstance(doc, str):
             return doc.split("\n")[0].strip()
-        return none
+        return None
 
 
 class _SubTest(TestCase):
@@ -2391,7 +2391,7 @@ class _SubTest(TestCase):
 class BaseTestSuite:
     """A simple test suite that doesn't provide class or module shared fixtures.
     """
-    _cleanup = true
+    _cleanup = True
 
     def __init__(self, tests=()):
         self._tests = []
@@ -2403,7 +2403,7 @@ class BaseTestSuite:
 
     def __eq__(self, other):
         if not isinstance(other, BaseTestSuite):
-            return false
+            return False
         return list(self) == list(other)
 
     def __iter__(self):
@@ -2445,7 +2445,7 @@ class BaseTestSuite:
             var test = self._tests[index]
             if hasattr(test, "countTestCases"):
                 self._removed_tests = self._removed_tests + test.countTestCases()
-            self._tests[index] = none
+            self._tests[index] = None
         except Exception:
             pass
 
@@ -2463,7 +2463,7 @@ def _isnotsuite(test):
     try:
         iter(test)
     except TypeError:
-        return true
+        return True
     return not hasattr(test, "_tests")
 
 
@@ -2473,7 +2473,7 @@ class _ErrorHolder:
     is concerned, this looks exactly like a unit test. Used to insert
     arbitrary errors into a test suite run.
     """
-    failureException = none
+    failureException = None
 
     def __init__(self, description):
         self.description = description
@@ -2482,7 +2482,7 @@ class _ErrorHolder:
         return self.description
 
     def shortDescription(self):
-        return none
+        return None
 
     def __repr__(self):
         return "<ErrorHolder description=" + repr(self.description) + ">"
@@ -2511,78 +2511,78 @@ class TestSuite(BaseTestSuite):
     in the order in which they were added, aggregating the results. When
     subclassing, do not forget to call the base class constructor.
     """
-    def run(self, result, debug=false):
-        var topLevel = false
-        if not getattr(result, "_testRunEntered", false):
-            result._testRunEntered = true
-            topLevel = true
+    def run(self, result, debug=False):
+        var topLevel = False
+        if not getattr(result, "_testRunEntered", False):
+            result._testRunEntered = True
+            topLevel = True
         for test in list(self._tests):
             if result.shouldStop:
                 break
-            if test is none:
+            if test is None:
                 continue
             if _isnotsuite(test):
                 self._tearDownPreviousClass(test, result)
                 self._handleClassSetUp(test, result)
                 result._previousTestClass = _class_of(test)
-                if getattr(_class_of(test), "_classSetupFailed", false) or getattr(result, "_moduleSetUpFailed", false):
+                if getattr(_class_of(test), "_classSetupFailed", False) or getattr(result, "_moduleSetUpFailed", False):
                     continue
             if not debug:
                 test(result)
             else:
                 test.debug()
         if topLevel:
-            self._tearDownPreviousClass(none, result)
-            result._testRunEntered = false
+            self._tearDownPreviousClass(None, result)
+            result._testRunEntered = False
         return result
 
     def debug(self):
         """Run the tests without collecting errors in a TestResult"""
         var debug = _DebugResult()
-        self.run(debug, true)
+        self.run(debug, True)
 
     def _handleClassSetUp(self, test, result):
-        var previousClass = getattr(result, "_previousTestClass", none)
+        var previousClass = getattr(result, "_previousTestClass", None)
         var currentClass = _class_of(test)
-        if previousClass is not none and _same(currentClass, previousClass):
+        if previousClass is not None and _same(currentClass, previousClass):
             return
         if result._moduleSetUpFailed:
             return
-        if getattr(currentClass, "__unittest_skip__", false):
+        if getattr(currentClass, "__unittest_skip__", False):
             return
-        var failed = false
+        var failed = False
         try:
-            currentClass._classSetupFailed = false
+            currentClass._classSetupFailed = False
         except Exception:
             pass
-        var setUpClass = getattr(currentClass, "setUpClass", none)
-        var doClassCleanups = getattr(currentClass, "doClassCleanups", none)
-        if setUpClass is not none:
+        var setUpClass = getattr(currentClass, "setUpClass", None)
+        var doClassCleanups = getattr(currentClass, "doClassCleanups", None)
+        if setUpClass is not None:
             var className = strclass(currentClass)
             try:
                 setUpClass()
             except Exception as e:
                 if isinstance(result, _DebugResult):
                     raise
-                failed = true
+                failed = True
                 try:
-                    currentClass._classSetupFailed = true
+                    currentClass._classSetupFailed = True
                 except Exception:
                     pass
                 self._createClassOrModuleLevelException(result, e, "setUpClass", className)
-            if failed and doClassCleanups is not none:
+            if failed and doClassCleanups is not None:
                 doClassCleanups()
                 for exc_info in getattr(currentClass, "tearDown_exceptions", []):
                     self._createClassOrModuleLevelException(result, exc_info[1], "setUpClass", className, exc_info)
 
-    def _createClassOrModuleLevelException(self, result, exc, method_name, parent, info=none):
+    def _createClassOrModuleLevelException(self, result, exc, method_name, parent, info=None):
         var errorName = method_name + " (" + parent + ")"
         self._addClassOrModuleLevelException(result, exc, errorName, info)
 
-    def _addClassOrModuleLevelException(self, result, exception, errorName, info=none):
+    def _addClassOrModuleLevelException(self, result, exception, errorName, info=None):
         var error = _ErrorHolder(errorName)
-        var addSkip = getattr(result, "addSkip", none)
-        if addSkip is not none and isinstance(exception, SkipTest):
+        var addSkip = getattr(result, "addSkip", None)
+        if addSkip is not None and isinstance(exception, SkipTest):
             addSkip(error, str(exception))
         else:
             if not info:
@@ -2591,30 +2591,30 @@ class TestSuite(BaseTestSuite):
                 result.addError(error, info)
 
     def _tearDownPreviousClass(self, test, result):
-        var previousClass = getattr(result, "_previousTestClass", none)
-        if previousClass is none:
+        var previousClass = getattr(result, "_previousTestClass", None)
+        if previousClass is None:
             return
-        if test is not none and _same(_class_of(test), previousClass):
+        if test is not None and _same(_class_of(test), previousClass):
             return
-        if getattr(previousClass, "_classSetupFailed", false):
+        if getattr(previousClass, "_classSetupFailed", False):
             return
-        if getattr(result, "_moduleSetUpFailed", false):
+        if getattr(result, "_moduleSetUpFailed", False):
             return
-        if getattr(previousClass, "__unittest_skip__", false):
+        if getattr(previousClass, "__unittest_skip__", False):
             return
-        var tearDownClass = getattr(previousClass, "tearDownClass", none)
-        var doClassCleanups = getattr(previousClass, "doClassCleanups", none)
-        if tearDownClass is none and doClassCleanups is none:
+        var tearDownClass = getattr(previousClass, "tearDownClass", None)
+        var doClassCleanups = getattr(previousClass, "doClassCleanups", None)
+        if tearDownClass is None and doClassCleanups is None:
             return
         var className = strclass(previousClass)
-        if tearDownClass is not none:
+        if tearDownClass is not None:
             try:
                 tearDownClass()
             except Exception as e:
                 if isinstance(result, _DebugResult):
                     raise
                 self._createClassOrModuleLevelException(result, e, "tearDownClass", className)
-        if doClassCleanups is not none:
+        if doClassCleanups is not None:
             doClassCleanups()
             for exc_info in getattr(previousClass, "tearDown_exceptions", []):
                 if isinstance(result, _DebugResult):
@@ -2624,15 +2624,15 @@ class TestSuite(BaseTestSuite):
 
 class _DebugResult:
     "Used by the TestSuite to hold previous class when running in debug."
-    _previousTestClass = none
-    _moduleSetUpFailed = false
-    shouldStop = false
+    _previousTestClass = None
+    _moduleSetUpFailed = False
+    shouldStop = False
 
     def __init__(self):
-        self._previousTestClass = none
-        self._moduleSetUpFailed = false
-        self.shouldStop = false
-        self._testRunEntered = false
+        self._previousTestClass = None
+        self._moduleSetUpFailed = False
+        self.shouldStop = False
+        self._testRunEntered = False
 
 
 # ── loading ──────────────────────────────────────────────────────────────────
@@ -2666,12 +2666,12 @@ class TestLoader:
     """
     testMethodPrefix = "test"
     sortTestMethodsUsing = staticmethod(three_way_cmp)
-    testNamePatterns = none
+    testNamePatterns = None
     suiteClass = TestSuite
 
     def __init__(self):
         self.errors = []
-        self.testNamePatterns = none
+        self.testNamePatterns = None
 
     def loadTestsFromTestCase(self, testCaseClass):
         """Return a suite of all test cases contained in testCaseClass"""
@@ -2687,24 +2687,24 @@ class TestLoader:
             tests.append(testCaseClass(name))
         return self.suiteClass(tests)
 
-    def loadTestsFromModule(self, module, pattern=none):
+    def loadTestsFromModule(self, module, pattern=None):
         """Return a suite of all test cases contained in the given module"""
         var tests = []
         for item in _module_items(module):
             var obj = item[1]
             if _is_class(obj) and issubclass(obj, TestCase) and not (_same(obj, TestCase) or _same(obj, FunctionTestCase) or _same(obj, _SubTest)):
                 tests.append(self.loadTestsFromTestCase(obj))
-        var load_tests = none
+        var load_tests = None
         if isinstance(module, dict):
             load_tests = module.get("load_tests")
         else:
-            load_tests = getattr(module, "load_tests", none)
+            load_tests = getattr(module, "load_tests", None)
         var suite = self.suiteClass(tests)
-        if load_tests is not none and callable(load_tests):
+        if load_tests is not None and callable(load_tests):
             return load_tests(self, suite, pattern)
         return suite
 
-    def loadTestsFromName(self, name, module=none):
+    def loadTestsFromName(self, name, module=None):
         """Return a suite of all test cases given a string specifier.
 
         The name may resolve either to a module, a test case class, a
@@ -2714,10 +2714,10 @@ class TestLoader:
         The method optionally resolves the names relative to a given module
         (here a globals dict or a module namespace).
         """
-        if module is none:
+        if module is None:
             module = _ny_main_globals()
         var parts = name.split(".")
-        var parent = none
+        var parent = None
         var obj = module
         for part in parts:
             parent = obj
@@ -2729,7 +2729,7 @@ class TestLoader:
             return self.loadTestsFromTestCase(obj)
         if isinstance(obj, TestSuite):
             return obj
-        if parent is not none and _is_class(parent) and issubclass(parent, TestCase):
+        if parent is not None and _is_class(parent) and issubclass(parent, TestCase):
             var mname = parts[-1]
             var inst = parent(mname)
             return self.suiteClass([inst])
@@ -2742,7 +2742,7 @@ class TestLoader:
             raise TypeError("calling " + repr(obj) + " returned " + repr(test) + ", not a test")
         raise TypeError("don't know how to make test from: " + repr(obj))
 
-    def loadTestsFromNames(self, names, module=none):
+    def loadTestsFromNames(self, names, module=None):
         """Return a suite of all test cases found using the given sequence
         of string specifiers. See 'loadTestsFromName()'.
         """
@@ -2760,16 +2760,16 @@ class TestLoader:
         for attrname in dir(testCaseClass):
             if not attrname.startswith(prefix):
                 continue
-            var testFunc = getattr(testCaseClass, attrname, none)
+            var testFunc = getattr(testCaseClass, attrname, None)
             if not callable(testFunc):
                 continue
-            if patterns is not none:
+            if patterns is not None:
                 var fullName = strclass(testCaseClass) + "." + attrname
                 import fnmatch
-                var hit = false
+                var hit = False
                 for p in patterns:
                     if fnmatch.fnmatchcase(fullName, p):
-                        hit = true
+                        hit = True
                         break
                 if not hit:
                     continue
@@ -2799,7 +2799,7 @@ def _sort_cmp(items, cmp):
 defaultTestLoader = TestLoader()
 
 
-def getTestCaseNames(testCaseClass, prefix, sortUsing=three_way_cmp, testNamePatterns=none):
+def getTestCaseNames(testCaseClass, prefix, sortUsing=three_way_cmp, testNamePatterns=None):
     var loader = TestLoader()
     loader.testMethodPrefix = prefix
     loader.sortTestMethodsUsing = sortUsing
@@ -2837,7 +2837,7 @@ def addModuleCleanup(function, *args, **kwargs):
 def enterModuleContext(cm):
     """Same as enterContext, but module-wide."""
     var result = cm.__enter__()
-    addModuleCleanup(cm.__exit__, none, none, none)
+    addModuleCleanup(cm.__exit__, None, None, None)
     return result
 
 
@@ -2861,10 +2861,10 @@ def installHandler():
     pass
 
 
-def removeHandler(method=none):
-    if method is not none:
+def removeHandler(method=None):
+    if method is not None:
         return method
-    return none
+    return None
 
 
 def registerResult(result):
@@ -2872,7 +2872,7 @@ def registerResult(result):
 
 
 def removeResult(result):
-    return false
+    return False
 
 
 IsolatedAsyncioTestCase = TestCase
@@ -2890,17 +2890,17 @@ class TestProgram:
     """A command-line program that runs a set of tests; this is primarily
        for making test modules conveniently executable.
     """
-    def __init__(self, module="__main__", defaultTest=none, argv=none,
-                 testRunner=none, testLoader=none, exit=true, verbosity=1,
-                 failfast=none, catchbreak=none, buffer=none, warnings=none,
-                 tb_locals=false, durations=none):
+    def __init__(self, module="__main__", defaultTest=None, argv=None,
+                 testRunner=None, testLoader=None, exit=True, verbosity=1,
+                 failfast=None, catchbreak=None, buffer=None, warnings=None,
+                 tb_locals=False, durations=None):
         if isinstance(module, str) and module == "__main__":
             self.module = _ny_main_globals()
         elif isinstance(module, str):
             raise ImportError("unittest.main(module=" + repr(module) + "): only '__main__' or a namespace is supported")
         else:
             self.module = module
-        if argv is none:
+        if argv is None:
             argv = sys.argv
         self.exit = exit
         self.failfast = failfast
@@ -2912,14 +2912,14 @@ class TestProgram:
         self.warnings = warnings
         self.defaultTest = defaultTest
         self.testRunner = testRunner
-        self.testLoader = testLoader if testLoader is not none else defaultTestLoader
+        self.testLoader = testLoader if testLoader is not None else defaultTestLoader
         self.progName = os_path_basename(argv[0]) if argv else "python -m unittest"
-        self.testNamePatterns = none
-        self.result = none
+        self.testNamePatterns = None
+        self.result = None
         self.parseArgs(argv)
         self.runTests()
 
-    def usageExit(self, msg=none):
+    def usageExit(self, msg=None):
         if msg:
             print(msg)
         print(_MAIN_USAGE % {"prog": self.progName}, end="")
@@ -2939,13 +2939,13 @@ class TestProgram:
             elif a in ["-q", "--quiet"]:
                 self.verbosity = 0
             elif a in ["-f", "--failfast"]:
-                self.failfast = true
+                self.failfast = True
             elif a in ["-c", "--catch"]:
-                self.catchbreak = true
+                self.catchbreak = True
             elif a in ["-b", "--buffer"]:
-                self.buffer = true
+                self.buffer = True
             elif a == "--locals":
-                self.tb_locals = true
+                self.tb_locals = True
             elif a == "--durations":
                 i = i + 1
                 self.durations = int(args[i])
@@ -2963,18 +2963,18 @@ class TestProgram:
             self.testNamePatterns = [("*" + p + "*") if "*" not in p else p for p in patterns]
         if names:
             self.testNames = names
-        elif self.defaultTest is none:
-            self.testNames = none
+        elif self.defaultTest is None:
+            self.testNames = None
         elif isinstance(self.defaultTest, str):
             self.testNames = [self.defaultTest]
         else:
             self.testNames = list(self.defaultTest)
         self.createTests()
 
-    def createTests(self, from_discovery=false, Loader=none):
+    def createTests(self, from_discovery=False, Loader=None):
         if self.testNamePatterns:
             self.testLoader.testNamePatterns = self.testNamePatterns
-        if self.testNames is none:
+        if self.testNames is None:
             self.test = self.testLoader.loadTestsFromModule(self.module)
         else:
             self.test = self.testLoader.loadTestsFromNames(self.testNames, self.module)
@@ -2982,17 +2982,17 @@ class TestProgram:
     def _module_hook(self, name):
         if isinstance(self.module, dict):
             return self.module.get(name)
-        return getattr(self.module, name, none)
+        return getattr(self.module, name, None)
 
     def runTests(self):
         if self.catchbreak:
             installHandler()
         var testRunner = self.testRunner
-        if testRunner is none:
+        if testRunner is None:
             testRunner = TextTestRunner
         if _is_class(testRunner):
             try:
-                testRunner = testRunner(none, true, self.verbosity, self.failfast or false, self.buffer or false, none, self.warnings, self.tb_locals, self.durations)
+                testRunner = testRunner(None, True, self.verbosity, self.failfast or False, self.buffer or False, None, self.warnings, self.tb_locals, self.durations)
             except TypeError:
                 testRunner = testRunner()
         # The __main__ module's fixtures run inside the run, around its tests,
@@ -3002,16 +3002,16 @@ class TestProgram:
         var tests = self.test
         var holder = TestSuite([])
         def _with_module_fixtures(result):
-            var failed = false
-            if setUpModule is not none and callable(setUpModule):
+            var failed = False
+            if setUpModule is not None and callable(setUpModule):
                 try:
                     setUpModule()
                 except Exception as e:
-                    failed = true
+                    failed = True
                     holder._addClassOrModuleLevelException(result, e, "setUpModule (__main__)")
             if not failed:
                 tests(result)
-                if tearDownModule is not none and callable(tearDownModule):
+                if tearDownModule is not None and callable(tearDownModule):
                     try:
                         tearDownModule()
                     except Exception as e2:
@@ -3047,7 +3047,7 @@ def _ny_unittest_cli(argv):
     # used (CPython's unittest/__main__.py does the same)
     import unittest as _ut
     var verbosity = 1
-    var failfast = false
+    var failfast = False
     var names = []
     var patterns = []
     var args = list(argv[1:])
@@ -3059,7 +3059,7 @@ def _ny_unittest_cli(argv):
         elif a in ["-q", "--quiet"]:
             verbosity = 0
         elif a in ["-f", "--failfast"]:
-            failfast = true
+            failfast = True
         elif a in ["-b", "--buffer", "-c", "--catch", "--locals"]:
             pass
         elif a == "-k":
@@ -3099,20 +3099,20 @@ def _ny_unittest_cli(argv):
                 sys.path.insert(0, os.path.abspath(d))
             nm = os.path.basename(nm)[0:len(os.path.basename(nm)) - 3]
         var parts = nm.split(".")
-        var mod = none
+        var mod = None
         var k = len(parts)
-        while k > 0 and mod is none:
+        while k > 0 and mod is None:
             try:
                 mod = importlib.import_module(".".join(parts[0:k]))
             except ImportError:
                 # a test_x.py: Nython imports .ny files by name, so a .py
                 # module is loaded from its path
-                var py = none
+                var py = None
                 for d in sys.path:
                     var cand = os.path.join(d if d != "" else cwd, parts[0] + ".py")
-                    if k == 1 and py is none and os.path.isfile(cand):
+                    if k == 1 and py is None and os.path.isfile(cand):
                         py = cand
-                if py is not none:
+                if py is not None:
                     import importlib.util as _ilu
                     var spec = _ilu.spec_from_file_location(parts[0], py)
                     mod = _ilu.module_from_spec(spec)
@@ -3127,7 +3127,7 @@ def _ny_unittest_cli(argv):
             suite.addTest(loader.loadTestsFromModule(mod))
         else:
             suite.addTest(loader.loadTestsFromName(rest, mod))
-    var result = _ut.TextTestRunner(none, true, verbosity, failfast).run(suite)
+    var result = _ut.TextTestRunner(None, True, verbosity, failfast).run(suite)
     if result.testsRun == 0 and len(result.skipped) == 0:
         raise SystemExit(_NO_TESTS_EXITCODE)
     raise SystemExit(0 if result.wasSuccessful() else 1)

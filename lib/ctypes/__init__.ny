@@ -122,7 +122,7 @@ class PyCStructType(_CDataType):
             if cls.__dict__.get("_ny_final_", False):
                 raise AttributeError("_fields_ is final")
             type.__setattr__(cls, name, value)
-            _layout(cls, value, false)
+            _layout(cls, value, False)
             return
         type.__setattr__(cls, name, value)
 
@@ -132,7 +132,7 @@ class UnionType(_CDataType):
             if cls.__dict__.get("_ny_final_", False):
                 raise AttributeError("_fields_ is final")
             type.__setattr__(cls, name, value)
-            _layout(cls, value, true)
+            _layout(cls, value, True)
             return
         type.__setattr__(cls, name, value)
 

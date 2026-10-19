@@ -67,6 +67,12 @@ bool python_file(const std::string& file);
 // <doctest x>...) has its caller's (round 85).
 bool code_rule(const std::string& name, const std::string& code, bool caller_python);
 
+// Whether the lexer reads `file` / `code` as Python-language source (round
+// 86): the rule this thread's RuleScope sets, else python_source (never the
+// engines' own text, "stdin"). Nython's literal spellings true / false /
+// none / null / undefined and `elseif` are then ordinary names.
+bool lexer_python(const std::string& file, const std::string& code);
+
 // The rule of the code this thread parses while a RuleScope lives (round
 // 85): exec / eval / compile give a snippet its caller's rule, and
 // `top_locals` makes a snippet exec'd without namespaces in a
@@ -92,6 +98,14 @@ std::string& warn_filter();
 // parsed while it is set, Nython-language or not, one tab-separated line
 // each (see NyScope.cpp, report_line).
 std::ostream*& report_sink();
+
+// --python-compat-report (round 86): for the Nython-language parts of a file
+// (`code` its source, `scope_lines` what --scope-report printed for it), every
+// construct whose meaning differs from Python's, one `file:line:col: kind:
+// message` line each - concat, int-iter, is-type, dict-attr, literal,
+// sort-value, binding. A static portability lint (see NyScope.cpp).
+void compat_report(const nython::node::node_ptr& root, const std::string& file, const std::string& code,
+                   const std::string& scope_lines, std::ostream& out);
 
 // The names a module's top level binds: defs, classes, interfaces, enums,
 // namespaces, var/let/const and plain assignments (unpacking targets too),

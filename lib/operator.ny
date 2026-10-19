@@ -74,7 +74,7 @@ def not_(a):
 
 def truth(a):
     "Return True if a is true, False otherwise."
-    return true if a else false
+    return True if a else False
 
 def is_(a, b):
     "Same as a is b."
@@ -230,7 +230,7 @@ def length_hint(obj, default=0):
         pass
     if not hasattr(obj, "__length_hint__"):
         return default
-    var val = none
+    var val = None
     try:
         val = obj.__length_hint__()
     except TypeError:

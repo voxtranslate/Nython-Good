@@ -40,23 +40,23 @@ URLError = urllib.error.URLError
 HTTPError = urllib.error.HTTPError
 ContentTooShortError = urllib.error.ContentTooShortError
 
-_opener = none
+_opener = None
 
-def urlopen(url, data=none, timeout=none, cafile=none, capath=none, cadefault=false, context=none, http2=false):
+def urlopen(url, data=None, timeout=None, cafile=None, capath=None, cadefault=False, context=None, http2=False):
     global _opener
-    var opener = none
+    var opener = None
     if http2:
         var hs = [HTTPSHandler(context=context, http2=http2)]
         if http2 == "prior_knowledge":
             hs.append(HTTPHandler(http2=http2))
         opener = build_opener(*hs)
-    elif context != none:
+    elif context != None:
         opener = build_opener(HTTPSHandler(context=context))
-    elif cafile != none or capath != none:
+    elif cafile != None or capath != None:
         import ssl
         opener = build_opener(HTTPSHandler(context=ssl.create_default_context(cafile=cafile, capath=capath)))
     else:
-        if _opener == none:
+        if _opener == None:
             _opener = build_opener()
         opener = _opener
     return opener.open(url, data, timeout)
@@ -68,23 +68,23 @@ def install_opener(opener):
 # ─── requests ───────────────────────────────────────────────────────────────
 
 class Request:
-    def __init__(self, url, data=none, headers=none, origin_req_host=none, unverifiable=false, method=none):
+    def __init__(self, url, data=None, headers=None, origin_req_host=None, unverifiable=False, method=None):
         self.headers = {}
         self.unredirected_hdrs = {}
-        self._data = none
-        self._tunnel_host = none
-        self.fragment = none
-        self.redirect_dict = none
-        self.timeout = none
-        self.type = none
-        self.host = none
-        self.selector = none
+        self._data = None
+        self._tunnel_host = None
+        self.fragment = None
+        self.redirect_dict = None
+        self.timeout = None
+        self.type = None
+        self.host = None
+        self.selector = None
         self.full_url = url
         self.data = data
-        if headers != none:
+        if headers != None:
             for k in headers:
                 self.add_header(k, headers[k])
-        if origin_req_host == none:
+        if origin_req_host == None:
             origin_req_host = self.host
         self.origin_req_host = origin_req_host
         self.unverifiable = unverifiable
@@ -117,14 +117,14 @@ class Request:
 
     def _parse(self):
         var i = self._full_url.find(":")
-        var scheme = none
+        var scheme = None
         if i > 0:
             scheme = self._full_url[0:i]
             for ch in scheme:
                 if not (ch.isalnum() or ch == "+" or ch == "-" or ch == "."):
-                    scheme = none
+                    scheme = None
                     break
-        if scheme == none:
+        if scheme == None:
             raise ValueError("unknown url type: " + repr(self.full_url))
         self.type = scheme.lower()
         var rest = self._full_url[i + 1:]
@@ -135,9 +135,9 @@ class Request:
             self.host = urllib.parse.unquote(self.host)
 
     def get_method(self):
-        if self.method != none:
+        if self.method != None:
             return self.method
-        if self.data != none:
+        if self.data != None:
             return "POST"
         return "GET"
 
@@ -164,7 +164,7 @@ class Request:
     def has_header(self, header_name):
         return header_name in self.headers or header_name in self.unredirected_hdrs
 
-    def get_header(self, header_name, default=none):
+    def get_header(self, header_name, default=None):
         if header_name in self.headers:
             return self.headers[header_name]
         return self.unredirected_hdrs.get(header_name, default)
@@ -198,7 +198,7 @@ def _unwrap(url):
 def _splithost(rest):
     # "//host:port/path" -> [host:port, "/path"]; anything else -> [none, rest]
     if not rest.startswith("//"):
-        return [none, rest]
+        return [None, rest]
     var r = rest[2:]
     var cut = len(r)
     for ch in ["/", "?", "#"]:
@@ -213,13 +213,13 @@ def _splithost(rest):
 def _splituser(host):
     var i = host.rfind("@")
     if i < 0:
-        return [none, host]
+        return [None, host]
     return [host[0:i], host[i + 1:]]
 
 def _splitpasswd(user):
     var i = user.find(":")
     if i < 0:
-        return [user, none]
+        return [user, None]
     return [user[0:i], user[i + 1:]]
 
 # ─── responses that are not HTTP's ─────────────────────────────────────────
@@ -227,7 +227,7 @@ def _splitpasswd(user):
 class addinfourl:
     # A file-like response: read/readline/readlines/close plus info(),
     # geturl(), getcode() (file: and data: URLs).
-    def __init__(self, fp, headers, url, code=none):
+    def __init__(self, fp, headers, url, code=None):
         self.fp = fp
         self.headers = headers
         self.url = url
@@ -261,7 +261,7 @@ class addinfourl:
         return self.code
 
     def close(self):
-        if self.fp != none:
+        if self.fp != None:
             self.fp.close()
 
     def __enter__(self):
@@ -269,7 +269,7 @@ class addinfourl:
 
     def __exit__(self, a, b, c):
         self.close()
-        return false
+        return False
 
 class _BytesIO:
     def __init__(self, data):
@@ -277,7 +277,7 @@ class _BytesIO:
         self.pos = 0
 
     def read(self, n=-1):
-        if n == none or n < 0:
+        if n == None or n < 0:
             n = len(self.data) - self.pos
         var out = self.data[self.pos:self.pos + n]
         self.pos = self.pos + len(out)
@@ -334,15 +334,15 @@ class OpenerDirector:
         for h in self.handlers:
             if hasattr(h, meth_name):
                 var result = getattr(h, meth_name)(*args)
-                if result != none:
+                if result != None:
                     return result
-        return none
+        return None
 
-    def open(self, fullurl, data=none, timeout=none):
+    def open(self, fullurl, data=None, timeout=None):
         var req = fullurl
         if isinstance(fullurl, "str"):
             req = Request(fullurl, data)
-        elif data != none:
+        elif data != None:
             req.data = data
         req.timeout = timeout
         var protocol = req.type
@@ -361,17 +361,17 @@ class OpenerDirector:
 
     def _open(self, req):
         var result = self._chain("default_open", req)
-        if result != none:
+        if result != None:
             return result
         result = self._chain(req.type + "_open", req)
-        if result != none:
+        if result != None:
             return result
         return self._chain("unknown_open", req)
 
     def error(self, proto, req, fp, code, msg, hdrs):
         # http_error_<code> handlers, then http_error_default
         var result = self._chain("http_error_" + str(code), req, fp, code, msg, hdrs)
-        if result != none:
+        if result != None:
             return result
         return self._chain("http_error_default", req, fp, code, msg, hdrs)
 
@@ -383,9 +383,9 @@ def build_opener(*handlers):
         for check in handlers:
             if isinstance(check, BaseHandler):
                 if isinstance(check, klass):
-                    skip[id(klass)] = true
+                    skip[id(klass)] = True
             elif check is klass:
-                skip[id(klass)] = true
+                skip[id(klass)] = True
     for klass in defaults:
         if not (id(klass) in skip):
             opener.add_handler(klass())
@@ -411,7 +411,7 @@ class HTTPErrorProcessor(BaseHandler):
 
     def http_response(self, request, response):
         var code = response.code
-        if code == none or (code >= 200 and code < 300):
+        if code == None or (code >= 200 and code < 300):
             return response
         return self.parent.error("http", request, response, code, response.msg, response.info())
 
@@ -419,9 +419,9 @@ class HTTPErrorProcessor(BaseHandler):
         return self.http_response(request, response)
 
 class AbstractHTTPHandler(BaseHandler):
-    def __init__(self, debuglevel=none):
+    def __init__(self, debuglevel=None):
         self._debuglevel = 0
-        if debuglevel != none:
+        if debuglevel != None:
             self._debuglevel = debuglevel
 
     def set_http_debuglevel(self, level):
@@ -430,7 +430,7 @@ class AbstractHTTPHandler(BaseHandler):
     def do_request_(self, request):
         if not request.host:
             raise URLError("no host given")
-        if request.data != none:
+        if request.data != None:
             var data = request.data
             if isinstance(data, "str"):
                 raise TypeError("POST data should be bytes, an iterable of bytes, or a file object. It cannot be of type str.")
@@ -474,8 +474,8 @@ class AbstractHTTPHandler(BaseHandler):
             if "Proxy-Authorization" in titled:
                 tunnel_headers["Proxy-Authorization"] = titled["Proxy-Authorization"]
                 del titled["Proxy-Authorization"]
-            h.set_tunnel(req._tunnel_host, none, tunnel_headers)
-        var r = none
+            h.set_tunnel(req._tunnel_host, None, tunnel_headers)
+        var r = None
         try:
             try:
                 h.request(req.get_method(), req.selector, req.data, titled, req.has_header("Transfer-encoding"))
@@ -490,20 +490,20 @@ class AbstractHTTPHandler(BaseHandler):
         r._on_done = _close_response_socket
         if r._done:
             _close_response_socket(r)
-        h.sock = none
+        h.sock = None
         r.url = req.get_full_url()
         r.msg = r.reason
         return r
 
 def _close_response_socket(resp):
-    if resp.sock != none:
+    if resp.sock != None:
         try:
             resp.sock.close()
         except OSError:
             pass
 
 class HTTPHandler(AbstractHTTPHandler):
-    def __init__(self, debuglevel=none, http2=false):
+    def __init__(self, debuglevel=None, http2=False):
         AbstractHTTPHandler.__init__(self, debuglevel)
         self._http2 = http2
 
@@ -520,19 +520,19 @@ class HTTPSHandler(AbstractHTTPHandler):
     # build_opener() installs this handler in every opener, and on a system
     # without OpenSSL that made every urlopen() fail, plain http included
     # (CPython leaves the handler out when there is no ssl module).
-    def __init__(self, debuglevel=none, context=none, check_hostname=none, http2=false):
+    def __init__(self, debuglevel=None, context=None, check_hostname=None, http2=False):
         AbstractHTTPHandler.__init__(self, debuglevel)
-        if context != none and check_hostname != none:
+        if context != None and check_hostname != None:
             context.check_hostname = check_hostname
         self._context = context
         self._check_hostname = check_hostname
         self._http2 = http2
 
     def https_open(self, req):
-        if self._context == none:
+        if self._context == None:
             import ssl
             self._context = ssl.create_default_context()
-            if self._check_hostname != none:
+            if self._check_hostname != None:
                 self._context.check_hostname = self._check_hostname
         if self._http2:
             return self.do_open(http.client.HTTPSConnection, req, context=self._context, http2=self._http2)
@@ -560,14 +560,14 @@ class HTTPRedirectHandler(BaseHandler):
         var method = "HEAD"
         if m != "HEAD":
             method = "GET"
-        return Request(newurl, none, newheaders, req.origin_req_host, true, method)
+        return Request(newurl, None, newheaders, req.origin_req_host, True, method)
 
     def http_error_302(self, req, fp, code, msg, headers):
         var newurl = headers.get("location")
-        if newurl == none:
+        if newurl == None:
             newurl = headers.get("uri")
-        if newurl == none:
-            return none
+        if newurl == None:
+            return None
         var parts = urllib.parse.urlparse(newurl)
         if not (parts.scheme in ["http", "https", "ftp", ""]):
             raise HTTPError(newurl, code, msg + " - Redirection to url '" + newurl + "' is not allowed", headers, fp)
@@ -575,11 +575,11 @@ class HTTPRedirectHandler(BaseHandler):
             newurl = urllib.parse.urlunparse((parts.scheme, parts.netloc, "/", parts.params, parts.query, parts.fragment))
         newurl = urllib.parse.urljoin(req.full_url, newurl)
         var newreq = self.redirect_request(req, fp, code, msg, headers, newurl)
-        if newreq == none:
-            return none
+        if newreq == None:
+            return None
         # loops: the same URL too often, or too many redirections in all
         var visited = req.redirect_dict
-        if visited == none:
+        if visited == None:
             visited = {}
         newreq.redirect_dict = visited
         if visited.get(newurl, 0) >= self.max_repeats or len(visited) >= self.max_redirections:
@@ -587,7 +587,7 @@ class HTTPRedirectHandler(BaseHandler):
         visited[newurl] = visited.get(newurl, 0) + 1
         fp.read()
         fp.close()
-        return self.parent.open(newreq, none, req.timeout)
+        return self.parent.open(newreq, None, req.timeout)
 
     def http_error_301(self, req, fp, code, msg, headers):
         return self.http_error_302(req, fp, code, msg, headers)
@@ -620,12 +620,12 @@ def getproxies():
         del out["http"]            # CGI: HTTP_PROXY is a request header
     return out
 
-def proxy_bypass(host, proxies=none):
-    if proxies == none:
+def proxy_bypass(host, proxies=None):
+    if proxies == None:
         proxies = getproxies()
     var no = proxies.get("no", "")
     if no == "*":
-        return true
+        return True
     var h = host.lower()
     var hostonly = h
     if h.startswith("["):
@@ -637,12 +637,12 @@ def proxy_bypass(host, proxies=none):
             continue
         name = name.lstrip(".").lower()
         if hostonly == name or h == name or hostonly.endswith("." + name) or h.endswith("." + name):
-            return true
-    return false
+            return True
+    return False
 
 def _parse_proxy(proxy):
     # -> [scheme or none, user, password, "host:port"]
-    var scheme = none
+    var scheme = None
     var rest = proxy
     var i = proxy.find("://")
     if i > 0:
@@ -652,44 +652,44 @@ def _parse_proxy(proxy):
     if end >= 0:
         rest = rest[0:end]
     var up = _splituser(rest)
-    var user = none
-    var password = none
-    if up[0] != none:
+    var user = None
+    var password = None
+    if up[0] != None:
         var pw = _splitpasswd(up[0])
         user = urllib.parse.unquote(pw[0])
-        if pw[1] != none:
+        if pw[1] != None:
             password = urllib.parse.unquote(pw[1])
     return [scheme, user, password, up[1]]
 
 class ProxyHandler(BaseHandler):
     handler_order = 100
 
-    def __init__(self, proxies=none):
-        if proxies == none:
+    def __init__(self, proxies=None):
+        if proxies == None:
             proxies = getproxies()
         self.proxies = proxies
 
     def default_open(self, req):
         var t = req.type
         if req._tunnel_host or req.has_proxy():
-            return none
+            return None
         if not (t in self.proxies) or t == "no":
-            return none
+            return None
         var host = req.host
-        if host != none and proxy_bypass(host, self.proxies):
-            return none
+        if host != None and proxy_bypass(host, self.proxies):
+            return None
         var p = _parse_proxy(self.proxies[t])
         var proxy_type = p[0]
-        if proxy_type == none:
+        if proxy_type == None:
             proxy_type = t
-        if p[1] != none and p[2] != none:
+        if p[1] != None and p[2] != None:
             var creds = base64.b64encode((p[1] + ":" + p[2]).encode()).decode("ascii")
             req.add_header("Proxy-authorization", "Basic " + creds)
         var hostport = urllib.parse.unquote(p[3])
         req.set_proxy(hostport, proxy_type)
         if t == proxy_type or t == "https":
-            return none            # the scheme's own handler, now via the proxy
-        return self.parent.open(req, none, req.timeout)
+            return None            # the scheme's own handler, now via the proxy
+        return self.parent.open(req, None, req.timeout)
 
 # ─── authentication ─────────────────────────────────────────────────────────
 
@@ -710,14 +710,14 @@ class HTTPPasswordMgr:
         for entry in self.passwd.get(realm, []):
             if self._is_suburi(entry[0], target):
                 return [entry[1], entry[2]]
-        return [none, none]
+        return [None, None]
 
     def _reduce(self, uri):
         var parts = urllib.parse.urlsplit(uri)
         if parts.netloc != "":
             var port = parts.port
             var host = parts.hostname
-            if port == none:
+            if port == None:
                 if parts.scheme == "https":
                     port = 443
                 else:
@@ -730,7 +730,7 @@ class HTTPPasswordMgr:
 
     def _is_suburi(self, base, test):
         if base[0] != test[0]:
-            return false
+            return False
         var prefix = base[1]
         if not prefix.endswith("/"):
             prefix = prefix + "/"
@@ -739,20 +739,20 @@ class HTTPPasswordMgr:
 class HTTPPasswordMgrWithDefaultRealm(HTTPPasswordMgr):
     def find_user_password(self, realm, authuri):
         var r = HTTPPasswordMgr.find_user_password(self, realm, authuri)
-        if r[0] != none:
+        if r[0] != None:
             return r
-        return HTTPPasswordMgr.find_user_password(self, none, authuri)
+        return HTTPPasswordMgr.find_user_password(self, None, authuri)
 
 class HTTPPasswordMgrWithPriorAuth(HTTPPasswordMgrWithDefaultRealm):
     def __init__(self):
         HTTPPasswordMgrWithDefaultRealm.__init__(self)
         self.authenticated = {}
 
-    def add_password(self, realm, uri, user, passwd, is_authenticated=false):
+    def add_password(self, realm, uri, user, passwd, is_authenticated=False):
         HTTPPasswordMgrWithDefaultRealm.add_password(self, realm, uri, user, passwd)
         self.update_authenticated(uri, is_authenticated)
 
-    def update_authenticated(self, uri, is_authenticated=false):
+    def update_authenticated(self, uri, is_authenticated=False):
         if isinstance(uri, "str"):
             uri = [uri]
         for u in uri:
@@ -762,8 +762,8 @@ class HTTPPasswordMgrWithPriorAuth(HTTPPasswordMgrWithDefaultRealm):
         var t = self._reduce(authuri)
         for k in self.authenticated:
             if self.authenticated[k] and k == str(t):
-                return true
-        return false
+                return True
+        return False
 
 def _basic_realm(header):
     # The realm of a "Basic" challenge in a WWW-Authenticate value, "" when
@@ -771,7 +771,7 @@ def _basic_realm(header):
     var low = header.lower()
     var i = low.find("basic")
     if i < 0:
-        return none
+        return None
     var r = low.find("realm=", i)
     if r < 0:
         return ""
@@ -787,8 +787,8 @@ def _basic_realm(header):
     return v.strip()
 
 class AbstractBasicAuthHandler:
-    def __init__(self, password_mgr=none):
-        if password_mgr == none:
+    def __init__(self, password_mgr=None):
+        if password_mgr == None:
             password_mgr = HTTPPasswordMgr()
         self.passwd = password_mgr
         self.add_password = self.passwd.add_password
@@ -800,24 +800,24 @@ class AbstractBasicAuthHandler:
         var values = headers.get_all(authreq, [])
         for v in values:
             var realm = _basic_realm(v)
-            if realm != none:
+            if realm != None:
                 return self.retry_http_basic_auth(host, req, realm)
-        return none
+        return None
 
     def retry_http_basic_auth(self, host, req, realm):
         var up = self.passwd.find_user_password(realm, host)
-        if up[1] == none:
-            return none
+        if up[1] == None:
+            return None
         var auth = self._auth_value(up[0], up[1])
-        if req.get_header(self.auth_header, none) == auth:
-            return none            # it was refused already
+        if req.get_header(self.auth_header, None) == auth:
+            return None            # it was refused already
         req.add_unredirected_header(self.auth_header, auth)
-        return self.parent.open(req, none, req.timeout)
+        return self.parent.open(req, None, req.timeout)
 
     def http_request(self, req):
         if hasattr(self.passwd, "is_authenticated") and self.passwd.is_authenticated(req.full_url):
-            var up = self.passwd.find_user_password(none, req.full_url)
-            if up[0] != none and not req.has_header("Authorization"):
+            var up = self.passwd.find_user_password(None, req.full_url)
+            if up[0] != None and not req.has_header("Authorization"):
                 req.add_unredirected_header("Authorization", self._auth_value(up[0], up[1]))
         return req
 
@@ -841,9 +841,9 @@ class ProxyBasicAuthHandler(AbstractBasicAuthHandler, BaseHandler):
         return self.http_error_auth_reqed("proxy-authenticate", req.host, req, headers)
 
 class HTTPCookieProcessor(BaseHandler):
-    def __init__(self, cookiejar=none):
+    def __init__(self, cookiejar=None):
         import http.cookiejar
-        if cookiejar == none:
+        if cookiejar == None:
             cookiejar = http.cookiejar.CookieJar()
         self.cookiejar = cookiejar
 
@@ -894,7 +894,7 @@ class DataHandler(BaseHandler):
             raise ValueError("data URL has no comma")
         var mediatype = rest[0:comma]
         var data = rest[comma + 1:]
-        var raw = none
+        var raw = None
         if mediatype.endswith(";base64"):
             raw = base64.b64decode(urllib.parse.unquote(data).encode("ascii"))
             mediatype = mediatype[0:len(mediatype) - 7]
@@ -948,15 +948,15 @@ def url2pathname(url):
 
 _url_tempfiles = []
 
-def urlretrieve(url, filename=none, reporthook=none, data=none):
+def urlretrieve(url, filename=None, reporthook=None, data=None):
     # Copies the URL to a file (a temporary one when no name is given):
     # (filename, headers). reporthook(blocks, block_size, total_size).
     var fp = urlopen(url, data)
     try:
         var headers = fp.info()
-        var result = none
-        var tfp = none
-        if filename != none:
+        var result = None
+        var tfp = None
+        if filename != None:
             tfp = open(filename, "wb")
         else:
             var tmp = os_mkstemp()
@@ -971,16 +971,16 @@ def urlretrieve(url, filename=none, reporthook=none, data=none):
             var blocknum = 0
             if "content-length" in headers:
                 size = int(headers["Content-Length"])
-            if reporthook != none:
+            if reporthook != None:
                 reporthook(blocknum, bs, size)
-            while true:
+            while True:
                 var block = fp.read(bs)
                 if len(block) == 0:
                     break
                 read = read + len(block)
                 tfp.write(block)
                 blocknum = blocknum + 1
-                if reporthook != none:
+                if reporthook != None:
                     reporthook(blocknum, bs, size)
         finally:
             tfp.close()
@@ -998,4 +998,4 @@ def urlcleanup():
         except OSError:
             pass
     _url_tempfiles.clear()
-    _opener = none
+    _opener = None

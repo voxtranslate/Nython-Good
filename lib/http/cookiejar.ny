@@ -32,37 +32,37 @@ def _http_date(text):
             cur = ""
     if cur != "":
         tokens.append(cur)
-    var hms = none
-    var day = none
-    var month = none
-    var year = none
+    var hms = None
+    var day = None
+    var month = None
+    var year = None
     for tok in tokens:
-        if hms == none and tok.count(":") == 2:
+        if hms == None and tok.count(":") == 2:
             var p = tok.split(":")
             if p[0].isdigit() and p[1].isdigit() and p[2].isdigit():
                 hms = [int(p[0]), int(p[1]), int(p[2])]
                 continue
-        if day == none and tok.isdigit() and len(tok) <= 2:
+        if day == None and tok.isdigit() and len(tok) <= 2:
             day = int(tok)
             continue
-        if month == none and tok[0:3].lower() in _MONTHS:
+        if month == None and tok[0:3].lower() in _MONTHS:
             month = _MONTHS[tok[0:3].lower()]
             continue
-        if year == none and tok.isdigit() and len(tok) >= 2 and len(tok) <= 4:
+        if year == None and tok.isdigit() and len(tok) >= 2 and len(tok) <= 4:
             year = int(tok)
             continue
-    if hms == none or day == none or month == none or year == none:
-        return none
+    if hms == None or day == None or month == None or year == None:
+        return None
     if year >= 70 and year <= 99:
         year = year + 1900
     elif year >= 0 and year <= 69:
         year = year + 2000
     if day < 1 or day > 31 or year < 1601 or hms[0] > 23 or hms[1] > 59 or hms[2] > 59:
-        return none
+        return None
     return time_timegm({"year": year, "month": month, "day": day, "hour": hms[0], "minute": hms[1], "second": hms[2]})
 
 class Cookie:
-    def __init__(self, version, name, value, port, port_specified, domain, domain_specified, domain_initial_dot, path, path_specified, secure, expires, discard, comment, comment_url, rest, rfc2109=false):
+    def __init__(self, version, name, value, port, port_specified, domain, domain_specified, domain_initial_dot, path, path_specified, secure, expires, discard, comment, comment_url, rest, rfc2109=False):
         self.version = version
         self.name = name
         self.value = value
@@ -80,30 +80,30 @@ class Cookie:
         self.comment_url = comment_url
         self.rfc2109 = rfc2109
         self._rest = rest
-        if rest == none:
+        if rest == None:
             self._rest = {}
         self.creation = time()
 
     def has_nonstandard_attr(self, name):
         return name in self._rest
 
-    def get_nonstandard_attr(self, name, default=none):
+    def get_nonstandard_attr(self, name, default=None):
         return self._rest.get(name, default)
 
     def set_nonstandard_attr(self, name, value):
         self._rest[name] = value
 
-    def is_expired(self, now=none):
-        if now == none:
+    def is_expired(self, now=None):
+        if now == None:
             now = time()
-        return self.expires != none and self.expires <= now
+        return self.expires != None and self.expires <= now
 
     def __str__(self):
         var p = ""
-        if self.path != none:
+        if self.path != None:
             p = self.path
         var nv = self.name
-        if self.value != none:
+        if self.value != None:
             nv = self.name + "=" + self.value
         return "<Cookie " + nv + " for " + self.domain + p + ">"
 
@@ -125,36 +125,36 @@ def _host_only(host):
 def domain_match(host, domain):
     # RFC 6265 5.1.3
     if host == domain:
-        return true
+        return True
     if not host.endswith(domain):
-        return false
+        return False
     var d = domain
     if not d.startswith("."):
         if not host.endswith("." + d):
-            return false
+            return False
     return not _is_ip(host)
 
 def _is_ip(host):
     if host.find(":") >= 0:
-        return true
+        return True
     var parts = host.split(".")
     if len(parts) != 4:
-        return false
+        return False
     for p in parts:
         if not p.isdigit():
-            return false
-    return true
+            return False
+    return True
 
 def _path_match(req_path, cookie_path):
     # RFC 6265 5.1.4
     if req_path == cookie_path:
-        return true
+        return True
     if req_path.startswith(cookie_path):
         if cookie_path.endswith("/"):
-            return true
+            return True
         if req_path[len(cookie_path):len(cookie_path) + 1] == "/":
-            return true
-    return false
+            return True
+    return False
 
 def _default_path(path):
     if path == "" or not path.startswith("/"):
@@ -167,9 +167,9 @@ def _default_path(path):
 class DefaultCookiePolicy:
     # RFC 6265: a cookie for a domain the request host does not belong to,
     # or for a public suffix-like single label, is refused.
-    def __init__(self, blocked_domains=none, allowed_domains=none, secure_protocols=["https", "wss"]):
+    def __init__(self, blocked_domains=None, allowed_domains=None, secure_protocols=["https", "wss"]):
         self._blocked = []
-        if blocked_domains != none:
+        if blocked_domains != None:
             self._blocked = list(blocked_domains)
         self._allowed = allowed_domains
         self.secure_protocols = secure_protocols
@@ -183,37 +183,37 @@ class DefaultCookiePolicy:
     def is_blocked(self, domain):
         for b in self._blocked:
             if domain_match(domain, b.lstrip(".")) or domain == b:
-                return true
-        return false
+                return True
+        return False
 
     def set_ok(self, cookie, request):
         var host = _host_only(request.host)
         if self.is_blocked(cookie.domain.lstrip(".")):
-            return false
-        if self._allowed != none:
-            var any = false
+            return False
+        if self._allowed != None:
+            var any = False
             for a in self._allowed:
                 if domain_match(host, a.lstrip(".")):
-                    any = true
+                    any = True
             if not any:
-                return false
+                return False
         if cookie.domain_specified:
             var d = cookie.domain.lstrip(".")
             if d.find(".") < 0 and d != host:
-                return false            # "com", "localhost" as a Domain
+                return False            # "com", "localhost" as a Domain
             if not domain_match(host, d):
-                return false
-        return true
+                return False
+        return True
 
     def return_ok(self, cookie, request):
         var scheme = request.type
         if cookie.secure and not (scheme in self.secure_protocols):
-            return false
-        return true
+            return False
+        return True
 
 class CookieJar:
-    def __init__(self, policy=none):
-        if policy == none:
+    def __init__(self, policy=None):
+        if policy == None:
             policy = DefaultCookiePolicy()
         self._policy = policy
         self._cookies = {}            # domain -> {path -> {name -> Cookie}}
@@ -250,14 +250,14 @@ class CookieJar:
         if self._policy.set_ok(cookie, request):
             self.set_cookie(cookie)
 
-    def clear(self, domain=none, path=none, name=none):
-        if domain == none:
+    def clear(self, domain=None, path=None, name=None):
+        if domain == None:
             self._cookies = {}
             return
-        if path == none:
+        if path == None:
             del self._cookies[domain]
             return
-        if name == none:
+        if name == None:
             del self._cookies[domain][path]
             return
         del self._cookies[domain][path][name]
@@ -301,7 +301,7 @@ class CookieJar:
             return
         var parts = []
         for c in cs:
-            if c.value == none:
+            if c.value == None:
                 parts.append(c.name)
             else:
                 parts.append(c.name + "=" + c.value)
@@ -316,13 +316,13 @@ class CookieJar:
         var req_path = urllib_path(request.selector)
         for line in lines:
             var c = _parse_set_cookie(line, host, req_path)
-            if c != none:
+            if c != None:
                 out.append(c)
         return out
 
     def extract_cookies(self, response, request):
         for c in self.make_cookies(response, request):
-            if c.expires != none and c.expires <= time():
+            if c.expires != None and c.expires <= time():
                 # an expiry in the past deletes the cookie
                 try:
                     self.clear(c.domain, c.path, c.name)
@@ -356,18 +356,18 @@ def _parse_set_cookie(line, host, req_path):
     var first = parts[0]
     var eq = first.find("=")
     if eq < 0:
-        return none
+        return None
     var name = first[0:eq].strip()
     var value = first[eq + 1:].strip()
     if name == "":
-        return none
+        return None
     var domain = host
-    var domain_specified = false
+    var domain_specified = False
     var path = _default_path(req_path)
-    var path_specified = false
-    var secure = false
-    var expires = none
-    var max_age = none
+    var path_specified = False
+    var secure = False
+    var expires = None
+    var max_age = None
     var rest = {}
     for attr in parts[1:]:
         var a = attr.strip()
@@ -381,16 +381,16 @@ def _parse_set_cookie(line, host, req_path):
         if kl == "domain":
             if v != "":
                 domain = v.lower().lstrip(".")
-                domain_specified = true
+                domain_specified = True
         elif kl == "path":
             if v.startswith("/"):
                 path = v
-                path_specified = true
+                path_specified = True
         elif kl == "secure":
-            secure = true
+            secure = True
         elif kl == "expires":
             var t = _http_date(v)
-            if t != none:
+            if t != None:
                 expires = t
         elif kl == "max-age":
             var neg = v.startswith("-")
@@ -401,10 +401,10 @@ def _parse_set_cookie(line, host, req_path):
                     n = -n
                 max_age = n
         elif kl == "httponly":
-            rest["HttpOnly"] = none
+            rest["HttpOnly"] = None
         elif kl == "samesite":
             rest["SameSite"] = v
-    if max_age != none:
+    if max_age != None:
         if max_age <= 0:
             expires = 0
         else:
@@ -412,4 +412,4 @@ def _parse_set_cookie(line, host, req_path):
     var stored = domain
     if domain_specified:
         stored = "." + domain
-    return Cookie(0, name, value, none, false, stored, domain_specified, domain_specified, path, path_specified, secure, expires, expires == none, none, none, rest)
+    return Cookie(0, name, value, None, False, stored, domain_specified, domain_specified, path, path_specified, secure, expires, expires == None, None, None, rest)

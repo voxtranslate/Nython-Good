@@ -10,7 +10,7 @@
 #   ContentTooShortError(message, content)
 
 class URLError(OSError):
-    def __init__(self, reason, filename=none):
+    def __init__(self, reason, filename=None):
         OSError.__init__(self, reason)
         self.reason = reason
         self.filename = filename
@@ -45,15 +45,15 @@ class HTTPError(URLError):
     def getcode(self):
         return self.code
 
-    def read(self, amt=none):
-        if self.fp == none:
+    def read(self, amt=None):
+        if self.fp == None:
             return b""
-        if amt == none:
+        if amt == None:
             return self.fp.read()
         return self.fp.read(amt)
 
     def close(self):
-        if self.fp != none:
+        if self.fp != None:
             self.fp.close()
 
     def __enter__(self):
@@ -61,7 +61,7 @@ class HTTPError(URLError):
 
     def __exit__(self, a, b, c):
         self.close()
-        return false
+        return False
 
     def __str__(self):
         return "HTTP Error " + str(self.code) + ": " + str(self.msg)

@@ -36,9 +36,9 @@ def _two(n):
         return "0" + str(n)
     return str(n)
 
-def formatdate(timestamp=none):
+def formatdate(timestamp=None):
     # RFC 9110 IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT"
-    if timestamp == none:
+    if timestamp == None:
         timestamp = time()
     var t = time_gmtime(timestamp)
     return _WEEKDAYS[t["weekday"]] + ", " + _two(t["day"]) + " " + _MONTHS[t["month"] - 1] + " " + str(t["year"]) + " " + _two(t["hour"]) + ":" + _two(t["minute"]) + ":" + _two(t["second"]) + " GMT"
@@ -52,9 +52,9 @@ def parsedate(text):
             return time_timegm(time_strptime(s, fmt))
         except ValueError:
             pass
-    return none
+    return None
 
-def html_escape(s, quote=true):
+def html_escape(s, quote=True):
     s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     if quote:
         s = s.replace("\"", "&quot;").replace("'", "&#x27;")
@@ -118,7 +118,7 @@ def _server_responses():
     return out
 
 class HTTPServer(socketserver.TCPServer):
-    allow_reuse_address = true
+    allow_reuse_address = True
 
     def server_bind(self):
         socketserver.TCPServer.server_bind(self)
@@ -131,7 +131,7 @@ class HTTPServer(socketserver.TCPServer):
         self.server_port = a[1]
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = true
+    daemon_threads = True
 
 class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
     sys_version = "Nython/0.2.1"
@@ -146,25 +146,25 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
 
     def setup(self):
         socketserver.StreamRequestHandler.setup(self)
-        self.close_connection = true
-        self.command = none
-        self.path = none
+        self.close_connection = True
+        self.command = None
+        self.path = None
         self.request_version = self.default_request_version
         self.requestline = ""
         self.raw_requestline = b""
-        self.headers = none
+        self.headers = None
         self._headers_buffer = []
 
     def parse_request(self):
-        self.command = none
+        self.command = None
         self.request_version = self.default_request_version
         var version = self.default_request_version
-        self.close_connection = true
+        self.close_connection = True
         var requestline = self.raw_requestline.decode("iso-8859-1").rstrip("\r\n")
         self.requestline = requestline
         var words = requestline.split()
         if len(words) == 0:
-            return false
+            return False
         if len(words) >= 3:
             version = words[-1]
             var ok = version.startswith("HTTP/")
@@ -174,24 +174,24 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
                 ok = len(nums) == 2 and nums[0].isdigit() and nums[1].isdigit() and len(nums[0]) <= 10 and len(nums[1]) <= 10
             if not ok:
                 self.send_error(http.HTTPStatus.BAD_REQUEST, "Bad request version (" + repr(version) + ")")
-                return false
+                return False
             var vn = [int(nums[0]), int(nums[1])]
             if (vn[0] > 1 or (vn[0] == 1 and vn[1] >= 1)) and self.protocol_version >= "HTTP/1.1":
-                self.close_connection = false
+                self.close_connection = False
             if vn[0] >= 2:
                 self.send_error(http.HTTPStatus.HTTP_VERSION_NOT_SUPPORTED, "Invalid HTTP version (" + version[5:] + ")")
-                return false
+                return False
             self.request_version = version
         if not (len(words) >= 2 and len(words) <= 3):
             self.send_error(http.HTTPStatus.BAD_REQUEST, "Bad request syntax (" + repr(requestline) + ")")
-            return false
+            return False
         var command = words[0]
         var path = words[1]
         if len(words) == 2:
-            self.close_connection = true
+            self.close_connection = True
             if command != "GET":
                 self.send_error(http.HTTPStatus.BAD_REQUEST, "Bad HTTP/0.9 request type (" + repr(command) + ")")
-                return false
+                return False
         self.command = command
         self.path = path
         # "//path" is a network path to a URL parser: keep it a path.
@@ -201,25 +201,25 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
             self.headers = http.client.parse_headers(self.rfile)
         except http.client.LineTooLong as e:
             self.send_error(http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE, "Line too long", str(e))
-            return false
+            return False
         except http.client.HTTPException as e:
             self.send_error(http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE, "Too many headers", str(e))
-            return false
+            return False
         var conntype = self.headers.get("Connection", "")
         if conntype.lower() == "close":
-            self.close_connection = true
+            self.close_connection = True
         elif conntype.lower() == "keep-alive" and self.protocol_version >= "HTTP/1.1":
-            self.close_connection = false
+            self.close_connection = False
         var expect = self.headers.get("Expect", "")
         if expect.lower() == "100-continue" and self.protocol_version >= "HTTP/1.1" and self.request_version >= "HTTP/1.1":
             if not self.handle_expect_100():
-                return false
-        return true
+                return False
+        return True
 
     def handle_expect_100(self):
         self.send_response_only(http.HTTPStatus.CONTINUE)
         self.end_headers()
-        return true
+        return True
 
     def handle_one_request(self):
         try:
@@ -231,7 +231,7 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
                 self.send_error(http.HTTPStatus.REQUEST_URI_TOO_LONG)
                 return
             if len(self.raw_requestline) == 0:
-                self.close_connection = true
+                self.close_connection = True
                 return
             if not self.parse_request():
                 return
@@ -243,47 +243,47 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
             self.wfile.flush()
         except TimeoutError as e:
             self.log_error("Request timed out: " + repr(e))
-            self.close_connection = true
+            self.close_connection = True
 
     def handle(self):
-        self.close_connection = true
+        self.close_connection = True
         self.handle_one_request()
         while not self.close_connection:
             self.handle_one_request()
 
-    def send_error(self, code, message=none, explain=none):
+    def send_error(self, code, message=None, explain=None):
         code = int(code)
         var pair = self.responses.get(code, ["???", "???"])
-        if message == none:
+        if message == None:
             message = pair[0]
-        if explain == none:
+        if explain == None:
             explain = pair[1]
         self.log_error("code " + str(code) + ", message " + str(message))
         self.send_response(code, message)
         self.send_header("Connection", "close")
-        var body = none
+        var body = None
         if code >= 200 and code != 204 and code != 205 and code != 304:
-            var content = self.error_message_format % {"code": code, "message": html_escape(str(message), false), "explain": html_escape(str(explain), false)}
+            var content = self.error_message_format % {"code": code, "message": html_escape(str(message), False), "explain": html_escape(str(explain), False)}
             body = content.encode("utf-8", "replace")
             self.send_header("Content-Type", self.error_content_type)
             self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        if self.command != "HEAD" and body != none:
+        if self.command != "HEAD" and body != None:
             self.wfile.write(body)
 
-    def send_response(self, code, message=none):
+    def send_response(self, code, message=None):
         self.log_request(code)
         self.send_response_only(code, message)
         self.send_header("Server", self.version_string())
         self.send_header("Date", self.date_time_string())
 
-    def send_response_only(self, code, message=none):
+    def send_response_only(self, code, message=None):
         code = int(code)
         if self.request_version != "HTTP/0.9":
-            if message == none:
+            if message == None:
                 var pair = self.responses.get(code)
                 message = ""
-                if pair != none:
+                if pair != None:
                     message = pair[0]
             self._headers_buffer.append((self.protocol_version + " " + str(code) + " " + str(message) + "\r\n").encode("iso-8859-1", "strict"))
 
@@ -292,9 +292,9 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
             self._headers_buffer.append((str(keyword) + ": " + str(value) + "\r\n").encode("iso-8859-1", "strict"))
         if str(keyword).lower() == "connection":
             if str(value).lower() == "close":
-                self.close_connection = true
+                self.close_connection = True
             elif str(value).lower() == "keep-alive":
-                self.close_connection = false
+                self.close_connection = False
 
     def end_headers(self):
         if self.request_version != "HTTP/0.9":
@@ -321,7 +321,7 @@ class BaseHTTPRequestHandler(socketserver.StreamRequestHandler):
     def version_string(self):
         return self.server_version + " " + self.sys_version
 
-    def date_time_string(self, timestamp=none):
+    def date_time_string(self, timestamp=None):
         return formatdate(timestamp)
 
     def log_date_time_string(self):
@@ -358,15 +358,15 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     index_pages = ["index.html", "index.htm"]
     extensions_map = _TYPES
 
-    def __init__(self, request, client_address, server, directory=none):
-        if directory == none:
+    def __init__(self, request, client_address, server, directory=None):
+        if directory == None:
             directory = os_getcwd()
         self.directory = directory
         BaseHTTPRequestHandler.__init__(self, request, client_address, server)
 
     def do_GET(self):
         var f = self.send_head()
-        if f != none:
+        if f != None:
             try:
                 self.copyfile(f, self.wfile)
             finally:
@@ -374,7 +374,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         var f = self.send_head()
-        if f != none:
+        if f != None:
             f.close()
 
     def send_head(self):
@@ -387,35 +387,35 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Location", new_url)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                return none
-            var found = false
+                return None
+            var found = False
             for index in self.index_pages:
                 var ip = os_path_join(path, index)
                 if os_isfile(ip):
                     path = ip
-                    found = true
+                    found = True
                     break
             if not found:
                 return self.list_directory(path)
         if path.endswith("/") or not os_isfile(path):
             self.send_error(http.HTTPStatus.NOT_FOUND, "File not found")
-            return none
-        var f = none
+            return None
+        var f = None
         try:
             f = open(path, "rb")
         except OSError:
             self.send_error(http.HTTPStatus.NOT_FOUND, "File not found")
-            return none
+            return None
         try:
             var mtime = int(file_mtime(path) / 1000)
             var ims = self.headers.get("If-Modified-Since")
-            if ims != none and self.headers.get("If-None-Match") == none:
+            if ims != None and self.headers.get("If-None-Match") == None:
                 var since = parsedate(ims)
-                if since != none and mtime <= since:
+                if since != None and mtime <= since:
                     self.send_response(http.HTTPStatus.NOT_MODIFIED)
                     self.end_headers()
                     f.close()
-                    return none
+                    return None
             self.send_response(http.HTTPStatus.OK)
             self.send_header("Content-type", self.guess_type(path))
             self.send_header("Content-Length", str(os_path_getsize(path)))
@@ -427,15 +427,15 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
             raise
 
     def list_directory(self, path):
-        var names = none
+        var names = None
         try:
             names = os_listdir(path)
         except OSError:
             self.send_error(http.HTTPStatus.NOT_FOUND, "No permission to list directory")
-            return none
+            return None
         names = sorted(names, key=lambda a: a.lower())
         var displaypath = urllib.parse.unquote(self.path)
-        displaypath = html_escape(displaypath, false)
+        displaypath = html_escape(displaypath, False)
         var title = "Directory listing for " + displaypath
         var r = ["<!DOCTYPE HTML>", "<html lang=\"en\">", "<head>", "<meta charset=\"utf-8\">",
                  "<title>" + title + "</title>", "</head>", "<body>", "<h1>" + title + "</h1>", "<hr>", "<ul>"]
@@ -446,7 +446,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
             if os_isdir(fullname):
                 shown = name + "/"
                 link = name + "/"
-            r.append("<li><a href=\"" + urllib.parse.quote(link) + "\">" + html_escape(shown, false) + "</a></li>")
+            r.append("<li><a href=\"" + urllib.parse.quote(link) + "\">" + html_escape(shown, False) + "</a></li>")
         r.append("</ul>")
         r.append("<hr>")
         r.append("</body>")

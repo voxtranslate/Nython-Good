@@ -47,8 +47,8 @@ _SIZES = {"b": 1, "B": 1, "u": 2 if _WIN else 4, "h": 2, "H": 2, "i": 4, "I": 4,
 # the buffer natives' item code for each typecode ("u": its wchar_t)
 _CODE = {"b": "b", "B": "B", "u": "H" if _WIN else "I", "h": "h", "H": "H", "i": "i", "I": "I", "l": "l",
          "L": "L", "q": "q", "Q": "Q", "f": "f", "d": "d"}
-_SIGNED = {"b": true, "B": false, "h": true, "H": false, "i": true, "I": false, "l": true, "L": false,
-           "q": true, "Q": false}
+_SIGNED = {"b": True, "B": False, "h": True, "H": False, "i": True, "I": False, "l": True, "L": False,
+           "q": True, "Q": False}
 # CPython's machine format codes (arraymodule.c), little-endian
 _MFORMAT = {"b": 1, "B": 0, "h": 4, "H": 2, "i": 8, "I": 6, "l": 12 if _LONG == 8 else 8,
             "L": 10 if _LONG == 8 else 6, "q": 12, "Q": 10, "f": 14, "d": 16, "u": 18 if _WIN else 20}
@@ -101,7 +101,7 @@ def _range_error(tc, v):
                 return "signed integer is greater than maximum"
             if v < -0x80000000:
                 return "signed integer is less than minimum"
-    return none
+    return None
 
 
 def _conv(tc, v):
@@ -125,7 +125,7 @@ def _conv(tc, v):
             raise TypeError("'" + type(v).__name__ + "' object cannot be interpreted as an integer")
     var n = int(v)
     var msg = _range_error(tc, n)
-    if msg is not none:
+    if msg is not None:
         raise OverflowError(msg)
     return n
 
@@ -186,15 +186,15 @@ def _is_array(x):
 class array:
     """array(typecode [, initializer]) -> array"""
 
-    _ny_ctype = true      # (a C type in CPython: pickle names it as one)
+    _ny_ctype = True      # (a C type in CPython: pickle names it as one)
 
-    def __init__(self, typecode, initializer=none):
+    def __init__(self, typecode, initializer=None):
         _ny_sys_audit("array.__new__", typecode, initializer)   # round 86: CPython's event
         _check_typecode(typecode)
         self._tc = typecode
         self._b = bytearray()
         self._exports = 0
-        if initializer is none:
+        if initializer is None:
             return
         if isinstance(initializer, str):
             if typecode != "u":
@@ -261,7 +261,7 @@ class array:
         def gone():
             arr._exports -= 1
             _ny_buf_unexport(store)
-        return _ny_memview_raw(self, e[0], e[1], false, fmt, sz, (e[1] // sz,), (sz,), gone, store)
+        return _ny_memview_raw(self, e[0], e[1], False, fmt, sz, (e[1] // sz,), (sz,), gone, store)
 
     def __release_buffer__(self, view):
         view.release()
@@ -426,8 +426,8 @@ class array:
     def __contains__(self, v):
         for x in self._items():
             if x == v:
-                return true
-        return false
+                return True
+        return False
 
     def __getitem__(self, i):
         if isinstance(i, slice):
@@ -579,7 +579,7 @@ class array:
             return NotImplemented
         return self._cmp(other) >= 0
 
-    __hash__ = none
+    __hash__ = None
 
     def __repr__(self):
         if len(self) == 0:
@@ -599,8 +599,8 @@ class array:
 
     def __reduce_ex__(self, protocol):
         if protocol < 3:
-            return (array, (self._tc, self.tolist()), none)
-        return (_array_reconstructor, (array, self._tc, _MFORMAT[self._tc], self.tobytes()), none)
+            return (array, (self._tc, self.tolist()), None)
+        return (_array_reconstructor, (array, self._tc, _MFORMAT[self._tc], self.tobytes()), None)
 
 
 def _array_reconstructor(arraytype, typecode, mformat_code, items):

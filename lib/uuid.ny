@@ -54,7 +54,7 @@ class _SafeUUIDMember:
     def __eq__(self, other):
         if isinstance(other, _SafeUUIDMember):
             return self.value == other.value and self.name == other.name
-        return false
+        return False
 
     def __hash__(self):
         return hash(self.name)
@@ -151,7 +151,7 @@ class UUID:
     def __eq__(self, other):
         if isinstance(other, UUID):
             return self.int == other.int
-        return false
+        return False
 
     def __ne__(self, other):
         return not self.__eq__(other)

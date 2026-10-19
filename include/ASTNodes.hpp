@@ -828,6 +828,7 @@ struct FunctionNode : Node {
     // whether the body yields (-1: not known yet).
     int8_t simple_sig = -1, body_yields = -1;
     bool names_distinct = false;   // (with simple_sig) no parameter name twice
+    bool py_rule = false;          // round 86: its body is Python-language source's (NyScope)
     std::vector<std::string> param_names;
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
@@ -851,6 +852,7 @@ struct LambdaNode : Node {
     node_ptr sig;
     int8_t simple_sig = -1;                  // round 81, as FunctionNode's
     bool names_distinct = false;
+    bool py_rule = false;                    // round 86, as FunctionNode's
     std::vector<std::string> param_names;
     LambdaNode(Token t, node_ptr b) : Node(t, NodeType::LAMBDA), params{}, body(b), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }

@@ -103,7 +103,7 @@ class _MetadataProxy:
         return self._mapping.values()
     def items(self):
         return self._mapping.items()
-    def get(self, key, default=none):
+    def get(self, key, default=None):
         return self._mapping.get(key, default)
     def copy(self):
         return dict(self._mapping)
@@ -163,17 +163,17 @@ class InitVar:
 class Field:
     # A field: name and type are filled in when the class is processed.
     def __init__(self, default, default_factory, init, repr, hash, compare, metadata, kw_only):
-        self.name = none
-        self.type = none
+        self.name = None
+        self.type = None
         self.default = default
         self.default_factory = default_factory
         self.init = init
         self.repr = repr
         self.hash = hash
         self.compare = compare
-        self.metadata = _EMPTY_METADATA if metadata is none else _MetadataProxy(metadata)
+        self.metadata = _EMPTY_METADATA if metadata is None else _MetadataProxy(metadata)
         self.kw_only = kw_only
-        self._field_type = none
+        self._field_type = None
 
     def __repr__(self):
         return ("Field(" + "name=" + _r(self.name) + "," + "type=" + _r(self.type) + "," +
@@ -187,7 +187,7 @@ class Field:
     # class by that default)
     def __set_name__(self, owner, name):
         d = self.default
-        if d is MISSING or isinstance(d, (int, float, str, bool, tuple, list, dict)) or d is none:
+        if d is MISSING or isinstance(d, (int, float, str, bool, tuple, list, dict)) or d is None:
             return
         if hasattr(d, "__set_name__") and not _is_type_obj(d):
             d.__set_name__(owner, name)
@@ -211,8 +211,8 @@ class _DataclassParams:
                 "unsafe_hash=" + _r(self.unsafe_hash) + "," + "frozen=" + _r(self.frozen) + ")")
 
 
-def field(*, default=MISSING, default_factory=MISSING, init=true, repr=true,
-          hash=none, compare=true, metadata=none, kw_only=MISSING):
+def field(*, default=MISSING, default_factory=MISSING, init=True, repr=True,
+          hash=None, compare=True, metadata=None, kw_only=MISSING):
     # an object to identify dataclass fields (it is an error to specify both
     # default and default_factory)
     if default is not MISSING and default_factory is not MISSING:
@@ -245,7 +245,7 @@ def _ann_ident(annotation):
         return j
     i = word(0)
     if i == 0:
-        return none
+        return None
     first = s[0:i]
     j = i
     while j < len(s) and s[j] == " ":
@@ -256,28 +256,28 @@ def _ann_ident(annotation):
             j += 1
         k = word(j)
         if k == j:
-            return none
+            return None
         return [first, s[j:k]]
-    return [none, first]
+    return [None, first]
 
 def _str_ann_is(annotation, name, modules):
     if not isinstance(annotation, str):
-        return false
+        return False
     m = _ann_ident(annotation)
-    if m is none or m[1] != name:
-        return false
-    return m[0] is none or m[0] in modules
+    if m is None or m[1] != name:
+        return False
+    return m[0] is None or m[0] in modules
 
 def _is_classvar(a_type):
     # typing.ClassVar / typing.ClassVar[X] - by its _name (CPython's typing
     # objects carry it) or its repr, so any typing module's ClassVar is seen
-    if isinstance(a_type, str) or a_type is none or isinstance(a_type, (int, float)):
-        return false
-    if getattr(a_type, "_name", none) == "ClassVar":
-        return true
-    origin = getattr(a_type, "__origin__", none)
-    if origin is not none and getattr(origin, "_name", none) == "ClassVar":
-        return true
+    if isinstance(a_type, str) or a_type is None or isinstance(a_type, (int, float)):
+        return False
+    if getattr(a_type, "_name", None) == "ClassVar":
+        return True
+    origin = getattr(a_type, "__origin__", None)
+    if origin is not None and getattr(origin, "_name", None) == "ClassVar":
+        return True
     r = repr(a_type)
     return r == "typing.ClassVar" or r.startswith("typing.ClassVar[")
 
@@ -293,11 +293,11 @@ def _own_annotations(cls):
     d = cls.__dict__
     if "__annotations__" in d:
         return d["__annotations__"]
-    ann = getattr(cls, "__annotations__", none)
+    ann = getattr(cls, "__annotations__", None)
     if not ann:
         return {}
     for b in cls.__mro__[1:]:
-        if getattr(b, "__annotations__", none) is ann:
+        if getattr(b, "__annotations__", None) is ann:
             return {}
     return ann
 
@@ -305,13 +305,13 @@ def _own_annotations(cls):
 def _unhashable(v):
     # CPython's proxy for mutability: the default's class has __hash__ None
     if isinstance(v, (list, dict, set, bytearray)):
-        return true
-    if isinstance(v, (int, float, str, bytes, tuple, frozenset, bool)) or v is none:
-        return false
+        return True
+    if isinstance(v, (int, float, str, bytes, tuple, frozenset, bool)) or v is None:
+        return False
     t = type(v)
     if isinstance(t, str):
-        return false
-    return getattr(t, "__hash__", 0) is none
+        return False
+    return getattr(t, "__hash__", 0) is None
 
 
 def _get_field(cls, a_name, a_type, default_kw_only):
@@ -419,9 +419,9 @@ def _field_init(f, frozen, b, self_name, slots):
                 value = default_name
             else:
                 # reading the field uses the class attribute holding the default
-                return none
+                return None
     if f._field_type is _FIELD_INITVAR:
-        return none
+        return None
     return _field_assign(frozen, f.name, value, self_name)
 
 def _init_param(f):
@@ -436,16 +436,16 @@ def _init_param(f):
 
 def _init_fn(b, flds, std_fields, kw_only_fields, frozen, has_post_init, self_name, slots, emit):
     # fields without defaults may not follow fields with defaults
-    seen_default = false
+    seen_default = False
     for f in std_fields:
         if f.init:
             if not (f.default is MISSING and f.default_factory is MISSING):
-                seen_default = true
+                seen_default = True
             elif seen_default:
                 raise TypeError("non-default argument " + repr(f.name) + " follows default argument")
     if not emit:
         # the class defines its own __init__
-        return none
+        return None
     for f in flds:
         b.local("_type_" + f.name, f.type)
     b.local("MISSING", MISSING)
@@ -465,15 +465,15 @@ def _init_fn(b, flds, std_fields, kw_only_fields, frozen, has_post_init, self_na
     if kw_only_fields:
         params.append("*")
         params += [_init_param(f) for f in kw_only_fields]
-    b.add("__init__", [self_name] + params, body, none)
+    b.add("__init__", [self_name] + params, body, None)
 
 def _repr_fn(b, flds):
     b.local("_repr_running", set())
     parts = []
-    first = true
+    first = True
     for f in flds:
         parts.append(repr((", " if not first else "") + f.name + "=") + "+repr(self." + f.name + ")")
-        first = false
+        first = False
     text = "self.__class__.__qualname__+'('" + "".join(["+" + p for p in parts]) + "+')'"
     b.add("__repr__", ["self"], ["_k = id(self)",
                                 "if _k in _repr_running:",
@@ -516,10 +516,10 @@ def _hash_fn(b, flds):
 def _hash_action(unsafe_hash, eq, frozen, has_explicit_hash):
     if not unsafe_hash:
         if not eq:
-            return none
+            return None
         if not frozen:
-            return none if has_explicit_hash else "none"
-        return none if has_explicit_hash else "add"
+            return None if has_explicit_hash else "none"
+        return None if has_explicit_hash else "add"
     return "exception" if has_explicit_hash else "add"
 
 
@@ -545,7 +545,7 @@ def _format_annotation(a):
 def _text_sig(std_fields, kw_only_fields):
     def one(f):
         s = f.name
-        if f.type is not none:
+        if f.type is not None:
             s += ": " + _format_annotation(f.type)
         if f.default is not MISSING:
             s += " = " + repr(f.default)
@@ -566,31 +566,31 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen, match_args, 
     flds = {}
     own = cls.__dict__
     _ny_setattr_raw(cls, _PARAMS, _DataclassParams(init, repr, eq, order, unsafe_hash, frozen))
-    any_frozen_base = false
-    has_dataclass_bases = false
+    any_frozen_base = False
+    has_dataclass_bases = False
     mro = list(cls.__mro__)
     i = len(mro) - 1
     while i > 0:
         b = mro[i]
         i -= 1
-        base_fields = getattr(b, _FIELDS, none)
-        if base_fields is not none and not isinstance(base_fields, (int, str)):
-            has_dataclass_bases = true
+        base_fields = getattr(b, _FIELDS, None)
+        if base_fields is not None and not isinstance(base_fields, (int, str)):
+            has_dataclass_bases = True
             for name in base_fields:
                 f = base_fields[name]
                 flds[f.name] = f
             if getattr(b, _PARAMS).frozen:
-                any_frozen_base = true
+                any_frozen_base = True
     cls_annotations = _own_annotations(cls)
     cls_fields = []
-    KW_ONLY_seen = false
+    KW_ONLY_seen = False
     for name in cls_annotations:
         a_type = cls_annotations[name]
         if _is_kw_only(a_type) or _str_ann_is(a_type, "KW_ONLY", ["dataclasses"]):
             if KW_ONLY_seen:
                 raise TypeError(repr_of(name) + " is KW_ONLY, but KW_ONLY has already been specified")
-            KW_ONLY_seen = true
-            kw_only = true
+            KW_ONLY_seen = True
+            kw_only = True
         else:
             cls_fields.append(_get_field(cls, name, a_type, kw_only))
     for f in cls_fields:
@@ -616,7 +616,7 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen, match_args, 
     _ny_setattr_raw(cls, _FIELDS, flds)
     # Was this class defined with an explicit __hash__?
     class_hash = own.get("__hash__", MISSING)
-    has_explicit_hash = not (class_hash is MISSING or (class_hash is none and "__eq__" in own))
+    has_explicit_hash = not (class_hash is MISSING or (class_hash is None and "__eq__" in own))
     if order and not eq:
         raise ValueError("eq must be true if order is true")
     all_init_fields = [flds[n] for n in flds if flds[n]._field_type is _FIELD or flds[n]._field_type is _FIELD_INITVAR]
@@ -651,13 +651,13 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen, match_args, 
     if action == "exception":
         raise TypeError("Cannot overwrite attribute __hash__ in class " + cls.__name__)
     if action == "add":
-        _hash_fn(b, [f for f in field_list if (f.compare if f.hash is none else f.hash)])
+        _hash_fn(b, [f for f in field_list if (f.compare if f.hash is None else f.hash)])
     made = b.build(cls.__qualname__)
     for n in made:
         _ny_setattr_raw(cls, n, made[n])
     if action == "none":
-        _ny_setattr_raw(cls, "__hash__", none)
-    if not getattr(cls, "__doc__", none):
+        _ny_setattr_raw(cls, "__hash__", None)
+    if not getattr(cls, "__doc__", None):
         _ny_setattr_raw(cls, "__doc__", cls.__name__ + _text_sig(std_init_fields, kw_only_init_fields))
     if match_args and "__match_args__" not in own:
         _ny_setattr_raw(cls, "__match_args__", tuple([f.name for f in std_init_fields]))
@@ -671,7 +671,7 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen, match_args, 
 def _get_slots(cls):
     # the slots a class has (CPython 3.12's _get_slots)
     var slots = cls.__dict__.get("__slots__")
-    if slots is none:
+    if slots is None:
         var out = []
         if getattr(cls, "__weakrefoffset__", -1) != 0:
             out.append("__weakref__")
@@ -710,12 +710,12 @@ def _add_slots(cls, is_frozen, weakref_slot):
     cls_dict["__slots__"] = tuple([n for n in wanted if n not in inherited_slots])
     for field_name in field_names:
         # the defaults stay available through the fields (_MARKER)
-        cls_dict.pop(field_name, none)
-    cls_dict.pop("__dict__", none)
-    cls_dict.pop("__weakref__", none)
-    qualname = getattr(cls, "__qualname__", none)
+        cls_dict.pop(field_name, None)
+    cls_dict.pop("__dict__", None)
+    cls_dict.pop("__weakref__", None)
+    qualname = getattr(cls, "__qualname__", None)
     cls = type(cls)(cls.__name__, cls.__bases__, cls_dict)
-    if qualname is not none:
+    if qualname is not None:
         cls.__qualname__ = qualname
     if is_frozen:
         # for pickling frozen classes with slots
@@ -729,14 +729,14 @@ def repr_of(x):
     return repr(x)
 
 
-def dataclass(cls=none, /, *, init=true, repr=true, eq=true, order=false,
-              unsafe_hash=false, frozen=false, match_args=true,
-              kw_only=false, slots=false, weakref_slot=false):
+def dataclass(cls=None, /, *, init=True, repr=True, eq=True, order=False,
+              unsafe_hash=False, frozen=False, match_args=True,
+              kw_only=False, slots=False, weakref_slot=False):
     # Add dunder methods based on the fields defined in the class.
     def wrap(cls):
         return _process_class(cls, init, repr, eq, order, unsafe_hash, frozen, match_args, kw_only, slots, weakref_slot)
     # See if we're being called as @dataclass or @dataclass().
-    if cls is none:
+    if cls is None:
         return wrap
     return wrap(cls)
 
@@ -744,8 +744,8 @@ def dataclass(cls=none, /, *, init=true, repr=true, eq=true, order=false,
 def fields(class_or_instance):
     # the fields of this dataclass (a class or an instance), as a tuple of
     # Field objects, in definition order; pseudo-fields excluded
-    flds = getattr(class_or_instance, _FIELDS, none)
-    if flds is none or isinstance(flds, (int, str)):
+    flds = getattr(class_or_instance, _FIELDS, None)
+    if flds is None or isinstance(flds, (int, str)):
         raise TypeError("must be called with a dataclass type or instance")
     return tuple([flds[n] for n in flds if flds[n]._field_type is _FIELD])
 
@@ -757,7 +757,7 @@ def is_dataclass(obj):
     # True for a dataclass or an instance of one
     cls = obj if _is_type_obj(obj) else type(obj)
     if isinstance(cls, str):
-        return false
+        return False
     return hasattr(cls, _FIELDS)
 
 
@@ -823,12 +823,12 @@ _KEYWORDS = ["False", "None", "True", "and", "as", "assert", "async", "await", "
              "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
              "return", "try", "while", "with", "yield"]
 
-def make_dataclass(cls_name, fields, *, bases=(), namespace=none, init=true, repr=true, eq=true,
-                   order=false, unsafe_hash=false, frozen=false, match_args=true, kw_only=false,
-                   slots=false, weakref_slot=false):
+def make_dataclass(cls_name, fields, *, bases=(), namespace=None, init=True, repr=True, eq=True,
+                   order=False, unsafe_hash=False, frozen=False, match_args=True, kw_only=False,
+                   slots=False, weakref_slot=False):
     # a new dataclass named cls_name; fields is an iterable of name,
     # (name, type) or (name, type, Field)
-    if namespace is none:
+    if namespace is None:
         namespace = {}
     seen = []
     annotations = {}

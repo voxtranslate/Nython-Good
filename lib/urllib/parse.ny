@@ -50,24 +50,24 @@ class _Result:
             var rest = netloc[close + 1:]
             if rest.startswith(":"):
                 return [host, rest[1:]]
-            return [host, none]
+            return [host, None]
         var colon = netloc.rfind(":")
         if colon >= 0:
             return [netloc[0:colon], netloc[colon + 1:]]
-        return [netloc, none]
+        return [netloc, None]
 
     @property
     def hostname(self):
         var h = self._hostinfo()[0]
         if h == "":
-            return none
+            return None
         return h.lower()
 
     @property
     def port(self):
         var p = self._hostinfo()[1]
-        if p == none or p == "":
-            return none
+        if p == None or p == "":
+            return None
         if not p.isdigit():
             raise ValueError("Port could not be cast to integer value as " + repr(p))
         var n = int(p)
@@ -79,7 +79,7 @@ class _Result:
     def username(self):
         var at = self.netloc.rfind("@")
         if at < 0:
-            return none
+            return None
         var info = self.netloc[0:at]
         var c = info.find(":")
         if c >= 0:
@@ -90,12 +90,12 @@ class _Result:
     def password(self):
         var at = self.netloc.rfind("@")
         if at < 0:
-            return none
+            return None
         var info = self.netloc[0:at]
         var c = info.find(":")
         if c >= 0:
             return info[c + 1:]
-        return none
+        return None
 
     def geturl(self):
         if len(self._names) == 6:
@@ -122,13 +122,13 @@ class _Result:
 
 def _scheme_ok(s):
     if len(s) == 0 or not s[0].isalpha():
-        return false
+        return False
     for c in s:
         if not (c.isalnum() or c in "+-."):
-            return false
-    return true
+            return False
+    return True
 
-def urlsplit(url, scheme="", allow_fragments=true):
+def urlsplit(url, scheme="", allow_fragments=True):
     var rest = url.strip()
     var sch = scheme
     var c = rest.find(":")
@@ -160,7 +160,7 @@ def urlsplit(url, scheme="", allow_fragments=true):
 uses_params = ["", "ftp", "hdl", "prospero", "http", "imap", "https", "shttp", "rtsp", "rtspu",
                "sip", "sips", "mms", "sftp", "tel"]
 
-def urlparse(url, scheme="", allow_fragments=true):
+def urlparse(url, scheme="", allow_fragments=True):
     # round 79: ;params are split off only for the schemes in uses_params,
     # at the first ';' after the last '/' (CPython's _splitparams) - a data:
     # URL ("data:text/html;base64,...") keeps its whole path
@@ -226,7 +226,7 @@ def _remove_dots(path):
         r = "/" + r
     return r
 
-def urljoin(base, url, allow_fragments=true):
+def urljoin(base, url, allow_fragments=True):
     if base == "":
         return url
     if url == "":
@@ -291,10 +291,10 @@ def unquote_to_bytes(string):
         var b = data[i]
         if b == 37 and i + 2 < n + 0 and i + 2 <= n - 1:
             var h = chr(data[i + 1]) + chr(data[i + 2])
-            var ok = true
+            var ok = True
             for c in h:
                 if not (c in "0123456789abcdefABCDEF"):
-                    ok = false
+                    ok = False
             if ok:
                 out.append(int(h, 16))
                 i = i + 3
@@ -311,8 +311,8 @@ def unquote(string, encoding="utf-8", errors="replace"):
 def unquote_plus(string, encoding="utf-8", errors="replace"):
     return unquote(string.replace("+", " "), encoding, errors)
 
-def urlencode(query, doseq=false, safe="", encoding="utf-8", errors="strict", quote_via=none):
-    if quote_via == none:
+def urlencode(query, doseq=False, safe="", encoding="utf-8", errors="strict", quote_via=None):
+    if quote_via == None:
         quote_via = quote_plus
     var pairs = query
     if isinstance(query, "dict"):
@@ -335,9 +335,9 @@ def urlencode(query, doseq=false, safe="", encoding="utf-8", errors="strict", qu
             out.append(ks + "=" + quote_via(v, safe))
     return "&".join(out)
 
-def parse_qsl(qs, keep_blank_values=false, strict_parsing=false, encoding="utf-8", errors="replace", max_num_fields=none, separator="&"):
+def parse_qsl(qs, keep_blank_values=False, strict_parsing=False, encoding="utf-8", errors="replace", max_num_fields=None, separator="&"):
     var out = []
-    if qs == "" or qs == none:
+    if qs == "" or qs == None:
         return out
     for part in qs.split(separator):
         if part == "":
@@ -354,7 +354,7 @@ def parse_qsl(qs, keep_blank_values=false, strict_parsing=false, encoding="utf-8
             out.append((unquote_plus(k, encoding, errors), unquote_plus(v, encoding, errors)))
     return out
 
-def parse_qs(qs, keep_blank_values=false, strict_parsing=false, encoding="utf-8", errors="replace", max_num_fields=none, separator="&"):
+def parse_qs(qs, keep_blank_values=False, strict_parsing=False, encoding="utf-8", errors="replace", max_num_fields=None, separator="&"):
     var d = {}
     for kv in parse_qsl(qs, keep_blank_values, strict_parsing, encoding, errors, max_num_fields, separator):
         if kv[0] in d:

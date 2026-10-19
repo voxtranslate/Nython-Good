@@ -54,9 +54,9 @@ def _tn(x):
 
 def _is_rational(x):
     if isinstance(x, int) or isinstance(x, Fraction):
-        return true
+        return True
     if isinstance(x, float) or isinstance(x, str) or isinstance(x, complex):
-        return false
+        return False
     return hasattr(x, "numerator") and hasattr(x, "denominator")
 
 
@@ -90,7 +90,7 @@ def _parse(text):
     var s = text.strip()
     var n = len(s)
     var i = 0
-    var neg = false
+    var neg = False
     if i < n and (s[i] == "+" or s[i] == "-"):
         neg = s[i] == "-"
         i = i + 1
@@ -126,7 +126,7 @@ def _parse(text):
         i = j
     if i < n and (s[i] == "e" or s[i] == "E"):
         i = i + 1
-        var eneg = false
+        var eneg = False
         if i < n and (s[i] == "+" or s[i] == "-"):
             eneg = s[i] == "-"
             i = i + 1
@@ -304,7 +304,7 @@ def _round_to_figures(n, d, figures):
     # n/d rounded to `figures` significant digits: (negative, significand,
     # exponent)
     if n == 0:
-        return (false, 0, 1 - figures)
+        return (False, 0, 1 - figures)
     var str_n = str(abs(n))
     var str_d = str(d)
     var m = len(str_n) - len(str_d) + (1 if str_d <= str_n else 0)
@@ -320,8 +320,8 @@ def _round_to_figures(n, d, figures):
 def _parse_float_spec(spec):
     # (?:(fill)?(align))?(sign)?(z)?(#)?(0(?=\d))?(width)?([,_])?(\.prec)?(type)
     # -> dict, or None when the spec does not match
-    var r = {"fill": None, "align": None, "sign": "", "z": false, "alt": false,
-             "zeropad": false, "width": None, "sep": None, "prec": None, "type": None}
+    var r = {"fill": None, "align": None, "sign": "", "z": False, "alt": False,
+             "zeropad": False, "width": None, "sep": None, "prec": None, "type": None}
     var n = len(spec)
     var i = 0
     if n >= 2 and spec[1] in "<>=^":
@@ -335,13 +335,13 @@ def _parse_float_spec(spec):
         r["sign"] = spec[i]
         i = i + 1
     if i < n and spec[i] == "z":
-        r["z"] = true
+        r["z"] = True
         i = i + 1
     if i < n and spec[i] == "#":
-        r["alt"] = true
+        r["alt"] = True
         i = i + 1
     if i + 1 < n and spec[i] == "0" and spec[i + 1].isdigit():
-        r["zeropad"] = true
+        r["zeropad"] = True
         i = i + 1
     var j = i
     while j < n and spec[j] in "0123456789":
@@ -392,10 +392,10 @@ def _format_fraction(self, format_spec):
     var trim_zeros = presentation_type in "gG" and not alternate_form
     var trim_point = not alternate_form
     var exponent_indicator = "E" if presentation_type in "EFG" else "e"
-    var negative = false
+    var negative = False
     var significand = 0
     var exponent = 0
-    var scientific = false
+    var scientific = False
     var point_pos = 0
     if presentation_type in "fF%":
         exponent = -precision
@@ -404,7 +404,7 @@ def _format_fraction(self, format_spec):
         var rr = _round_to_exponent(self._numerator, self._denominator, exponent, no_neg_zero)
         negative = rr[0]
         significand = rr[1]
-        scientific = false
+        scientific = False
         point_pos = precision
     else:
         var figures = max(precision, 1) if presentation_type in "gG" else precision + 1
@@ -541,7 +541,7 @@ class Fraction:
         var q1 = 0
         var n = self._numerator
         var d = self._denominator
-        while true:
+        while True:
             var a = n // d
             var q2 = q0 + a * q1
             if q2 > max_denominator:
@@ -736,11 +736,11 @@ class Fraction:
             return self._numerator == other.numerator and self._denominator == other.denominator
         if isinstance(other, complex):
             if other.imag != 0:
-                return false
+                return False
             other = other.real
         if isinstance(other, float):
             if math.isnan(other) or math.isinf(other):
-                return false
+                return False
             var r = other.as_integer_ratio()
             return self._numerator == r[0] and self._denominator == r[1]
         # round 80: NotImplemented, as CPython - the other operand's __eq__

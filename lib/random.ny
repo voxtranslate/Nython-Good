@@ -70,12 +70,12 @@ def _bisect_right(a, x, lo, hi):
 
 def _accumulate(xs):
     var out = []
-    var first = true
+    var first = True
     var total = 0
     for x in xs:
         if first:
             total = x
-            first = false
+            first = False
         else:
             total = total + x
         out.append(total)
@@ -84,11 +84,11 @@ def _accumulate(xs):
 
 def _is_sequence(p):
     if isinstance(p, list) or isinstance(p, tuple) or isinstance(p, str) or isinstance(p, range):
-        return true
+        return True
     if isinstance(p, bytes) or isinstance(p, bytearray):
-        return true
+        return True
     if isinstance(p, dict) or isinstance(p, set) or isinstance(p, frozenset):
-        return false
+        return False
     return hasattr(p, "__getitem__") and hasattr(p, "__len__")
 
 
@@ -116,15 +116,15 @@ class Random:
     # how _randbelow draws: none until first used, then "native" (this
     # module's generator), "bits" (an overridden getrandbits) or "float" (an
     # overridden random() alone, Python's _randbelow_without_getrandbits)
-    _rbmode = none
+    _rbmode = None
 
-    def __init__(self, x=none):
-        self._state = none
-        self.gauss_next = none
+    def __init__(self, x=None):
+        self._state = None
+        self.gauss_next = None
         self.seed(x)
-        self.gauss_next = none
+        self.gauss_next = None
 
-    def seed(self, a=none, version=2):
+    def seed(self, a=None, version=2):
         """Initialize internal state from a seed.
 
         The only supported seed types are None, int, float,
@@ -143,11 +143,11 @@ class Random:
                 a = a.encode()
             a = bytes(a)
             a = int.from_bytes(a + _sha512_digest(a), "big")
-        elif not (a is none or isinstance(a, int) or isinstance(a, float)):
+        elif not (a is None or isinstance(a, int) or isinstance(a, float)):
             raise TypeError("The only supported seed types are: None,\nint, float, str, bytes, and bytearray.")
         # _random.Random.seed: None from the OS, an int by its absolute
         # value, anything else by its hash (as an unsigned 64-bit number)
-        if a is none:
+        if a is None:
             self._state = _mt_seed(int.from_bytes(os_urandom(624 * 4), "little"))
         elif isinstance(a, int):
             self._state = _mt_seed(abs(int(a)))
@@ -156,7 +156,7 @@ class Random:
             if h < 0:
                 h = h + (1 << 64)
             self._state = _mt_seed(h)
-        self.gauss_next = none
+        self.gauss_next = None
 
     def random(self):
         """random() -> x in the interval [0, 1)."""
@@ -201,7 +201,7 @@ class Random:
 
     def _randbelow_mode(self):
         var mode = self._rbmode
-        if mode is none:
+        if mode is None:
             mode = self._pick_randbelow()
             self._rbmode = mode
         return mode
@@ -211,7 +211,7 @@ class Random:
         var mode = self._rbmode
         if mode == "native":
             return _mt_randbelow(self._state, n)
-        if mode is none:
+        if mode is None:
             mode = self._randbelow_mode()
         if mode == "native":
             return _mt_randbelow(self._state, n)
@@ -242,10 +242,10 @@ class Random:
         return self.getrandbits(n * 8).to_bytes(n, "little")
 
     # ── integers ──
-    def randrange(self, start, stop=none, step=1):
+    def randrange(self, start, stop=None, step=1):
         """Choose a random item from range(stop) or range(start, stop[, step])."""
         var istart = start if isinstance(start, int) and not isinstance(start, bool) else _index(start)
-        if stop is none:
+        if stop is None:
             if step != 1:
                 raise TypeError("Missing a non-None stop argument")
             if istart > 0:
@@ -288,7 +288,7 @@ class Random:
         if isinstance(x, list) and self._randbelow_mode() == "native":
             # the same swaps, natively (builtins/pyrandom.cpp)
             _mt_shuffle(self._state, x)
-            return none
+            return None
         var i = len(x) - 1
         while i >= 1:
             var j = self._randbelow(i + 1)
@@ -296,14 +296,14 @@ class Random:
             x[i] = x[j]
             x[j] = t
             i = i - 1
-        return none
+        return None
 
-    def sample(self, population, k, *, counts=none):
+    def sample(self, population, k, *, counts=None):
         """Chooses k unique random elements from a population sequence."""
         if not _is_sequence(population):
             raise TypeError("Population must be a sequence.  For dicts or sets, use sorted(d).")
         var n = len(population)
-        if counts is not none:
+        if counts is not None:
             var cum_counts = _accumulate(counts)
             if len(cum_counts) != n:
                 raise ValueError("The number of counts does not match the population")
@@ -317,7 +317,7 @@ class Random:
             return [population[_bisect_right(cum_counts, s, 0, hi)] for s in selections]
         if not (0 <= k and k <= n):
             raise ValueError("Sample larger than population or is negative")
-        var result = [none] * k
+        var result = [None] * k
         var setsize = 21
         if k > 5:
             setsize = setsize + 4 ** math.ceil(math.log(k * 3, 4))
@@ -337,17 +337,17 @@ class Random:
                 result[i] = population[j]
         return result
 
-    def choices(self, population, weights=none, *, cum_weights=none, k=1):
+    def choices(self, population, weights=None, *, cum_weights=None, k=1):
         """Return a k sized list of population elements chosen with replacement."""
         var n = len(population)
-        if cum_weights is none:
-            if weights is none:
+        if cum_weights is None:
+            if weights is None:
                 var nf = n + 0.0
                 return [population[math.floor(self.random() * nf)] for i in range(k)]
             if isinstance(weights, int) and not isinstance(weights, bool):
                 raise TypeError("The number of choices must be a keyword argument: k=" + str(weights))
             cum_weights = _accumulate(weights)
-        elif weights is not none:
+        elif weights is not None:
             raise TypeError("Cannot specify both weights and cumulative weights")
         if len(cum_weights) != n:
             raise ValueError("The number of weights does not match the population")
@@ -364,11 +364,11 @@ class Random:
         """Get a random number in the range [a, b) or [a, b] depending on rounding."""
         return a + (b - a) * self.random()
 
-    def triangular(self, low=0.0, high=1.0, mode=none):
+    def triangular(self, low=0.0, high=1.0, mode=None):
         """Triangular distribution."""
         var u = self.random()
         var c = 0.5
-        if mode is not none:
+        if mode is not None:
             if high - low == 0:
                 return low
             c = (mode - low) / (high - low)
@@ -383,7 +383,7 @@ class Random:
     def normalvariate(self, mu=0.0, sigma=1.0):
         """Normal distribution.  mu is the mean, and sigma is the standard deviation."""
         var z = 0.0
-        while true:
+        while True:
             var u1 = self.random()
             var u2 = 1.0 - self.random()
             z = NV_MAGICCONST * (u1 - 0.5) / u2
@@ -395,8 +395,8 @@ class Random:
     def gauss(self, mu=0.0, sigma=1.0):
         """Gaussian distribution.  mu is the mean, and sigma is the standard deviation."""
         var z = self.gauss_next
-        self.gauss_next = none
-        if z is none:
+        self.gauss_next = None
+        if z is None:
             var x2pi = self.random() * TWOPI
             var g2rad = math.sqrt(-2.0 * math.log(1.0 - self.random()))
             z = math.cos(x2pi) * g2rad
@@ -418,7 +418,7 @@ class Random:
         var s = 0.5 / kappa
         var r = s + math.sqrt(1.0 + s * s)
         var z = 0.0
-        while true:
+        while True:
             var u1 = self.random()
             z = math.cos(math.pi * u1)
             var d = z / (r + z)
@@ -440,7 +440,7 @@ class Random:
             var ainv = math.sqrt(2.0 * alpha - 1.0)
             var bbb = alpha - LOG4
             var ccc = alpha + ainv
-            while true:
+            while True:
                 var u1 = self.random()
                 if not (1e-7 < u1 and u1 < 0.9999999):
                     continue
@@ -454,7 +454,7 @@ class Random:
         elif alpha == 1.0:
             return -math.log(1.0 - self.random()) * beta
         var x = 0.0
-        while true:
+        while True:
             var u = self.random()
             var b = (math.e + alpha) / math.e
             var p = b * u
@@ -508,12 +508,12 @@ class Random:
             var c = math.log2(1.0 - p)
             if not c:
                 return x
-            while true:
+            while True:
                 y = y + math.floor(math.log2(self.random()) / c) + 1
                 if y > n:
                     return x
                 x = x + 1
-        var setup_complete = false
+        var setup_complete = False
         var spq = math.sqrt(n * p * (1.0 - p))
         var b = 1.15 + 2.53 * spq
         var a = -0.0873 + 0.0248 * b + 0.01 * p
@@ -523,7 +523,7 @@ class Random:
         var lpq = 0.0
         var m = 0
         var h = 0.0
-        while true:
+        while True:
             var u = self.random()
             u = u - 0.5
             var us = 0.5 - math.fabs(u)
@@ -538,7 +538,7 @@ class Random:
                 lpq = math.log(p / (1.0 - p))
                 m = math.floor((n + 1) * p)
                 h = math.lgamma(m + 1) + math.lgamma(n - m + 1)
-                setup_complete = true
+                setup_complete = True
             v = v * (alpha / (a / (us * us) + b))
             if math.log(v) <= h - math.lgamma(k + 1) - math.lgamma(n - k + 1) + (k - m) * lpq:
                 return k
@@ -566,7 +566,7 @@ class SystemRandom(Random):
 
     def seed(self, *args, **kwds):
         "Stub method.  Not used for a system random number generator."
-        return none
+        return None
 
     def _notimplemented(self, *args, **kwds):
         raise NotImplementedError("System entropy source does not have state.")

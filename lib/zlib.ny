@@ -102,7 +102,7 @@ def adler32(data, value=1):
     return _zlib_adler32(_data(data), _int(value, "value") & 0xffffffff)
 
 
-def compress(data, level=-1, wbits=MAX_WBITS, nython_optimal=false):
+def compress(data, level=-1, wbits=MAX_WBITS, nython_optimal=False):
     var d = _data(data)
     if nython_optimal:
         return compress_optimal(d, 15, wbits)
@@ -112,7 +112,7 @@ def compress(data, level=-1, wbits=MAX_WBITS, nython_optimal=false):
         _reraise(e)
 
 
-def compress_optimal(data, iterations=15, wbits=MAX_WBITS, block_splitting=true):
+def compress_optimal(data, iterations=15, wbits=MAX_WBITS, block_splitting=True):
     var d = _data(data)
     try:
         return _zlib_optimal(d, _int(iterations, "iterations"), _int(wbits, "wbits"), bool(block_splitting))
@@ -166,12 +166,12 @@ class Decompress:
         self._h = handle
         self.unused_data = b""
         self.unconsumed_tail = b""
-        self.eof = false
+        self.eof = False
 
     def _take(self, r):
         self.unconsumed_tail = r[1]
         if r[3]:
-            self.eof = true
+            self.eof = True
         if len(r[2]):
             self.unused_data = self.unused_data + r[2]
         return r[0]
@@ -210,15 +210,15 @@ class Decompress:
 
 
 def compressobj(level=Z_DEFAULT_COMPRESSION, method=DEFLATED, wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL,
-                strategy=Z_DEFAULT_STRATEGY, zdict=none):
-    if zdict is not none:
+                strategy=Z_DEFAULT_STRATEGY, zdict=None):
+    if zdict is not None:
         zdict = _data(zdict)
     return Compress(_zlib_cnew(_int(level, "level"), _int(method, "method"), _int(wbits, "wbits"),
                                _int(memLevel, "memLevel"), _int(strategy, "strategy"), zdict))
 
 
 def decompressobj(wbits=MAX_WBITS, zdict=b""):
-    var zd = none
-    if zdict is not none and len(zdict):
+    var zd = None
+    if zdict is not None and len(zdict):
         zd = _data(zdict)
     return Decompress(_zlib_dnew(_int(wbits, "wbits"), zd))

@@ -20,6 +20,13 @@ struct Script;
 struct Node extends INode, public std::enable_shared_from_this<Node> {
 
     NodeType _type;
+    // round 86: 1 when the node is Python-language source's (a .py file, a
+    // file marked `# nython: python`, code compiled from one, a function
+    // that opts in): NyScope marks every node it walks under Python's rule,
+    // and both engines take CPython's path for it where Nython is lenient
+    // (str + non-str, an int iterated, `x is int`, a dict's keys read as
+    // attributes). In what was padding: no node grows.
+    uint8_t  py_src = 0;
     Token    _token;
 	static Script* root;
 

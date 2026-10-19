@@ -43,9 +43,9 @@ def _ascii(data):
     raise TypeError("argument should be bytes, buffer or ASCII string, not '" + type(data).__name__ + "'")
 
 
-def hexlify(data, sep=none, bytes_per_sep=1):
+def hexlify(data, sep=None, bytes_per_sep=1):
     var h = bytes(_bin(data)).hex()
-    if sep is none or len(h) == 0 or bytes_per_sep == 0:
+    if sep is None or len(h) == 0 or bytes_per_sep == 0:
         return h.encode("ascii")
     var s = sep
     if isinstance(s, str):
@@ -80,7 +80,7 @@ def hexlify(data, sep=none, bytes_per_sep=1):
     return s.join(parts).encode("latin-1")
 
 
-def b2a_hex(data, sep=none, bytes_per_sep=1):
+def b2a_hex(data, sep=None, bytes_per_sep=1):
     return hexlify(data, sep, bytes_per_sep)
 
 
@@ -98,7 +98,7 @@ def a2b_hex(hexstr):
     return unhexlify(hexstr)
 
 
-def b2a_base64(data, newline=true):
+def b2a_base64(data, newline=True):
     var e = _hash_b64encode(bytes(_bin(data)))
     if newline:
         return e + b"\n"
@@ -121,12 +121,12 @@ def _a2b_base64_exact(d, strict_mode):
     var quad_pos = 0
     var leftchar = 0
     var pads = 0
-    var padding_started = false
+    var padding_started = False
     var i = 0
     while i < n:
         var ch = d[i]
         if ch == 61:
-            padding_started = true
+            padding_started = True
             if strict_mode and quad_pos == 0:
                 raise Error("Excess padding not allowed")
             if quad_pos >= 2:
@@ -170,13 +170,13 @@ def _a2b_base64_exact(d, strict_mode):
     return bytes(out)
 
 
-def a2b_base64(data, strict_mode=false):
+def a2b_base64(data, strict_mode=False):
     var d = bytes(_ascii(data))
     if not strict_mode:
         # the native decoder for well-formed input; anything it refuses is
         # decided (result or message) by the exact one
         try:
-            return _hash_b64decode(d, none, false)
+            return _hash_b64decode(d, None, False)
         except ValueError:
             pass
     return _a2b_base64_exact(d, strict_mode)
@@ -199,13 +199,13 @@ def _qp_hex(c):
     return [61, ord(_HEXU[c >> 4]), ord(_HEXU[c & 15])]
 
 
-def b2a_qp(data, quotetabs=false, istext=true, header=false):
+def b2a_qp(data, quotetabs=False, istext=True, header=False):
     var d = bytes(_bin(data))
     var n = len(d)
-    var crlf = false
+    var crlf = False
     var p = d.find(b"\n")
     if p > 0 and d[p - 1] == 13:
-        crlf = true
+        crlf = True
     var out = bytearray()
     var i = 0
     var linelen = 0
@@ -264,7 +264,7 @@ def _hexval(c):
     return -1
 
 
-def a2b_qp(data, header=false):
+def a2b_qp(data, header=False):
     var d = bytes(_ascii(data))
     var n = len(d)
     var out = bytearray()
@@ -300,7 +300,7 @@ def a2b_qp(data, header=false):
 
 
 # ── uuencode ────────────────────────────────────────────────────────────────
-def b2a_uu(data, backtick=false):
+def b2a_uu(data, backtick=False):
     var d = bytes(_bin(data))
     var n = len(d)
     if n > 45:

@@ -84,11 +84,11 @@ _FLAG_NAMES = [["re.TEMPLATE", 1], ["re.IGNORECASE", 2], ["re.LOCALE", 4], ["re.
 
 # ── error ────────────────────────────────────────────────────────────────────
 class error(Exception):
-    def __init__(self, msg, pattern=none, pos=none):
+    def __init__(self, msg, pattern=None, pos=None):
         var text = msg
-        var lineno = none
-        var colno = none
-        if pattern != none and pos != none:
+        var lineno = None
+        var colno = None
+        if pattern != None and pos != None:
             text = msg + " at position " + str(pos)
             var nl = "\n"
             if isinstance(pattern, bytes):
@@ -130,7 +130,7 @@ class _Subject:
 def _clip(n, pos, endpos):
     var p = pos
     var e = endpos
-    if e == none or e > n:
+    if e == None or e > n:
         e = n
     if e < 0:
         e = 0
@@ -160,37 +160,37 @@ class Pattern:
             self._names[gi[k + 1]] = gi[k]
             k = k + 2
 
-    def search(self, string, pos=0, endpos=none):
+    def search(self, string, pos=0, endpos=None):
         var d = _re_exec(self.pattern, self._f, string, pos, endpos, 0)
-        if d is none:
-            return none
-        if pos == 0 and endpos is none:
+        if d is None:
+            return None
+        if pos == 0 and endpos is None:
             return Match(self, string, 0, len(string), d)
         var pe = _clip(len(string), pos, endpos)
         return Match(self, string, pe[0], pe[1], d)
 
-    def match(self, string, pos=0, endpos=none):
+    def match(self, string, pos=0, endpos=None):
         var d = _re_exec(self.pattern, self._f, string, pos, endpos, 1)
-        if d is none:
-            return none
-        if pos == 0 and endpos is none:
+        if d is None:
+            return None
+        if pos == 0 and endpos is None:
             return Match(self, string, 0, len(string), d)
         var pe = _clip(len(string), pos, endpos)
         return Match(self, string, pe[0], pe[1], d)
 
-    def fullmatch(self, string, pos=0, endpos=none):
+    def fullmatch(self, string, pos=0, endpos=None):
         var d = _re_exec(self.pattern, self._f, string, pos, endpos, 2)
-        if d is none:
-            return none
-        if pos == 0 and endpos is none:
+        if d is None:
+            return None
+        if pos == 0 and endpos is None:
             return Match(self, string, 0, len(string), d)
         var pe = _clip(len(string), pos, endpos)
         return Match(self, string, pe[0], pe[1], d)
 
-    def findall(self, string, pos=0, endpos=none):
+    def findall(self, string, pos=0, endpos=None):
         return _re_findall(self.pattern, self._f, string, pos, endpos)
 
-    def finditer(self, string, pos=0, endpos=none):
+    def finditer(self, string, pos=0, endpos=None):
         return _finditer(self, _Subject(string), pos, endpos)
 
     def split(self, string, maxsplit=0):
@@ -223,7 +223,7 @@ class Pattern:
 
     def __eq__(self, other):
         if not isinstance(other, Pattern):
-            return false
+            return False
         return self.flags == other.flags and self.pattern == other.pattern and isinstance(self.pattern, bytes) == isinstance(other.pattern, bytes)
 
     def __hash__(self):
@@ -242,9 +242,9 @@ def _finditer(p, subj, pos, endpos):
     # table is shared within a batch.
     var pe = _clip(len(subj.s), pos, endpos)
     var at = pe[0]
-    var adv = false
+    var adv = False
     var batch = 8
-    while true:
+    while True:
         var ms = _re_scan(p.pattern, p._f, subj.s, at, pe[1], batch, adv)
         for d in ms:
             yield Match(p, subj, pe[0], pe[1], d)
@@ -278,7 +278,7 @@ def _subx(p, repl, string, count):
     var want_bytes = isinstance(string, bytes)
     while i < len(pieces):
         var r = repl(Match(p, subj, 0, n, pieces[i]))
-        if r != none:
+        if r != None:
             if want_bytes and not isinstance(r, bytes):
                 raise TypeError("sequence item " + str(len(out)) + ": expected a bytes-like object, " + type(r).__name__ + " found")
             if not want_bytes and not isinstance(r, str):
@@ -319,8 +319,8 @@ class Match:
 
     @property
     def lastgroup(self):
-        if self._d[0] is none:
-            return none
+        if self._d[0] is None:
+            return None
         return self._p._names.get(self._d[0])
 
     def _index(self, g):
@@ -329,7 +329,7 @@ class Match:
                 return g
         elif _is_text(g):
             var i = self._p.groupindex.get(g)
-            if i is not none:
+            if i is not None:
                 return i
         raise IndexError("no such group")
 
@@ -343,22 +343,22 @@ class Match:
     def __getitem__(self, g):
         return self._d[self._t + self._index(g)]
 
-    def groups(self, default=none):
+    def groups(self, default=None):
         var out = []
         for i in range(1, self._p.groups + 1):
             var t = self._d[self._t + i]
-            if t == none:
+            if t == None:
                 out.append(default)
             else:
                 out.append(t)
         return tuple(out)
 
-    def groupdict(self, default=none):
+    def groupdict(self, default=None):
         var r = {}
         var gi = self._p.groupindex
         for name in gi:
             var t = self._d[self._t + gi[name]]
-            if t == none:
+            if t == None:
                 r[name] = default
             else:
                 r[name] = t
@@ -386,7 +386,7 @@ class Match:
         for it in items:
             if isinstance(it, int):
                 var t = self._d[self._t + it]
-                if t != none:
+                if t != None:
                     out.append(t)
             else:
                 out.append(it)
@@ -416,7 +416,7 @@ _cache0 = {}      # flags 0, by pattern alone: the common case, one lookup
 def _compile(pattern, flags):
     if flags == 0:
         var p0 = _cache0.get(pattern)
-        if p0 is not none:
+        if p0 is not None:
             return p0
     if isinstance(pattern, Pattern):
         if flags:
@@ -426,14 +426,14 @@ def _compile(pattern, flags):
         raise TypeError("first argument must be string or compiled pattern")
     var key = ("b" if isinstance(pattern, bytes) else "s", flags, pattern)
     var p = _cache.get(key)
-    if p is not none:
+    if p is not None:
         return p
     var info = _re_compile(pattern, flags)
     if info[0] == -1:
         raise error(info[1], pattern, info[2])
     p = Pattern(pattern, flags, info)
     if len(_cache) >= _MAXCACHE:
-        var oldest = none
+        var oldest = None
         for k in _cache:
             oldest = k
             break

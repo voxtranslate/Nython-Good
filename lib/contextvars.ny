@@ -61,10 +61,10 @@ def _cur_obj():
     # The Context object current on this thread/task: the one run() entered,
     # or the thread's implicit one (made on first need; it only identifies
     # the context for Token checks - no API hands it out, as in CPython).
-    var o = thread_local_get(_KEY_OBJ, none)
-    if o is none:
+    var o = thread_local_get(_KEY_OBJ, None)
+    if o is None:
         o = Context()
-        o._entered = true
+        o._entered = True
         thread_local_set(_KEY_OBJ, o)
     return o
 
@@ -83,31 +83,31 @@ class Context:
     # copy_context() a copy of the current one.
     def __init__(self):
         self._data = _EMPTY
-        self._entered = false
+        self._entered = False
 
     def _live(self):
         # while this context is the current one, set() updates the slot
-        if self._entered and thread_local_get(_KEY_OBJ, none) is self:
+        if self._entered and thread_local_get(_KEY_OBJ, None) is self:
             return _cur_data()
         return self._data
 
     def run(self, callable, *args, **kwargs):
         if self._entered:
             raise RuntimeError("cannot enter context: " + repr(self) + " is already entered")
-        var prev_obj = thread_local_get(_KEY_OBJ, none)
+        var prev_obj = thread_local_get(_KEY_OBJ, None)
         var prev_data = _cur_data()
-        if prev_obj is not none:
+        if prev_obj is not None:
             prev_obj._data = prev_data
-        self._entered = true
+        self._entered = True
         thread_local_set(_KEY_OBJ, self)
         _set_data(self._data)
         try:
             return callable(*args, **kwargs)
         finally:
             self._data = _cur_data()
-            self._entered = false
+            self._entered = False
             _set_data(prev_data)
-            if prev_obj is none:
+            if prev_obj is None:
                 thread_local_del(_KEY_OBJ)
             else:
                 thread_local_set(_KEY_OBJ, prev_obj)
@@ -138,7 +138,7 @@ class Context:
     def __iter__(self):
         return iter(list(self._live().keys()))
 
-    def get(self, key, default=none):
+    def get(self, key, default=None):
         self._check(key)
         var d = self._live()
         if key in d:
@@ -160,11 +160,11 @@ class Context:
         var a = self._live()
         var b = other._live()
         if len(a) != len(b):
-            return false
+            return False
         for k in a:
             if not (k in b) or not (b[k] == a[k]):
-                return false
-        return true
+                return False
+        return True
 
     def __ne__(self, other):
         var r = self.__eq__(other)
@@ -172,7 +172,7 @@ class Context:
             return r
         return not r
 
-    __hash__ = none
+    __hash__ = None
 
     def __repr__(self):
         return "<_contextvars.Context object at " + _addr(self) + ">"
@@ -228,7 +228,7 @@ class ContextVar:
         else:
             nd[self] = token._old
         _set_data(nd)
-        token._used = true
+        token._used = True
 
     def __class_getitem__(cls, item):
         return GenericAlias(cls, item)
@@ -240,7 +240,7 @@ class ContextVar:
         return s + " at " + _addr(self) + ">"
 
 
-_token_maker = [false]
+_token_maker = [False]
 
 
 class Token:
@@ -252,15 +252,15 @@ class Token:
         self._ctx = args[0]
         self._var = args[1]
         self._old = args[2]
-        self._used = false
+        self._used = False
 
     @staticmethod
     def _make(ctx, var_, old):
-        _token_maker[0] = true
+        _token_maker[0] = True
         try:
             return Token(ctx, var_, old)
         finally:
-            _token_maker[0] = false
+            _token_maker[0] = False
 
     @property
     def var(self):

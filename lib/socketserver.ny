@@ -14,12 +14,12 @@ import select
 import threading
 
 class BaseServer:
-    timeout = none
+    timeout = None
 
     def __init__(self, server_address, RequestHandlerClass):
         self.server_address = server_address
         self.RequestHandlerClass = RequestHandlerClass
-        self._shutdown_request = false
+        self._shutdown_request = False
         self._is_shut_down = threading.Event()
         self._is_shut_down.set()
 
@@ -36,12 +36,12 @@ class BaseServer:
                     self._handle_request_noblock()
                 self.service_actions()
         finally:
-            self._shutdown_request = false
+            self._shutdown_request = False
             self._is_shut_down.set()
 
     def shutdown(self):
         # From another thread: serve_forever() returns.
-        self._shutdown_request = true
+        self._shutdown_request = True
         self._is_shut_down.wait()
 
     def service_actions(self):
@@ -49,9 +49,9 @@ class BaseServer:
 
     def handle_request(self):
         var t = self.socket.gettimeout()
-        if t == none:
+        if t == None:
             t = self.timeout
-        elif self.timeout != none:
+        elif self.timeout != None:
             t = min(t, self.timeout)
         var r = select.select([self], [], [], t)
         if len(r[0]) == 0:
@@ -60,7 +60,7 @@ class BaseServer:
         self._handle_request_noblock()
 
     def _handle_request_noblock(self):
-        var pair = none
+        var pair = None
         try:
             pair = self.get_request()
         except OSError:
@@ -78,7 +78,7 @@ class BaseServer:
         pass
 
     def verify_request(self, request, client_address):
-        return true
+        return True
 
     def process_request(self, request, client_address):
         self.finish_request(request, client_address)
@@ -110,16 +110,16 @@ class BaseServer:
 
     def __exit__(self, a, b, c):
         self.server_close()
-        return false
+        return False
 
 class TCPServer(BaseServer):
     address_family = socket.AF_INET
     socket_type = socket.SOCK_STREAM
     request_queue_size = 5
-    allow_reuse_address = false
-    allow_reuse_port = false
+    allow_reuse_address = False
+    allow_reuse_port = False
 
-    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=true):
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
         BaseServer.__init__(self, server_address, RequestHandlerClass)
         self.socket = socket.socket(self.address_family, self.socket_type)
         if bind_and_activate:
@@ -156,7 +156,7 @@ class TCPServer(BaseServer):
         request.close()
 
 class UDPServer(TCPServer):
-    allow_reuse_address = false
+    allow_reuse_address = False
     socket_type = socket.SOCK_DGRAM
     max_packet_size = 8192
 
@@ -176,8 +176,8 @@ class UDPServer(TCPServer):
 class ThreadingMixIn:
     # Each request on a thread of its own (daemon_threads: do not wait for
     # them at exit; block_on_close: server_close() joins them).
-    daemon_threads = false
-    block_on_close = true
+    daemon_threads = False
+    block_on_close = True
 
     def process_request_thread(self, request, client_address):
         try:
@@ -234,12 +234,12 @@ class BaseRequestHandler:
 class StreamRequestHandler(BaseRequestHandler):
     rbufsize = -1
     wbufsize = 0
-    timeout = none
-    disable_nagle_algorithm = false
+    timeout = None
+    disable_nagle_algorithm = False
 
     def setup(self):
         self.connection = self.request
-        if self.timeout != none:
+        if self.timeout != None:
             self.connection.settimeout(self.timeout)
         if self.disable_nagle_algorithm:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

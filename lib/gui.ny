@@ -6023,13 +6023,15 @@ class DataTable:
             return self
         var key = self.columns[col_index]["key"]
         var picked = self.get_selected()
+        # (round 86: a key Python orders - sorted() no longer orders mixed
+        # types by type name - missing, then numbers, then text)
         def cell_key(row):
             var v = row.get(key)
             if v == none:
-                return ""
+                return [0, 0, ""]
             if isinstance(v, "int") or isinstance(v, "float"):
-                return v
-            return string_lower(str(v))
+                return [1, v, ""]
+            return [2, 0, string_lower(str(v))]
         self.rows = sorted(self.rows, key=cell_key, reverse=not ascending)
         self._sort_col = col_index
         self._sort_asc = ascending

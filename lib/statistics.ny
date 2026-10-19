@@ -100,7 +100,7 @@ def _sum(data):
     var kinds = []
     var partials = {}
     var special = None
-    var have_special = false
+    var have_special = False
     var last_kind = None
     for x in data:
         var r = _exact_ratio(x)
@@ -112,7 +112,7 @@ def _sum(data):
         count = count + 1
         if r[1] is None:
             special = r[0] if not have_special else special + r[0]
-            have_special = true
+            have_special = True
         else:
             partials[r[1]] = partials.get(r[1], 0) + r[0]
     var T = _coerce_all(kinds)
@@ -528,7 +528,7 @@ class LinearRegression:
             return self.slope == other.slope and self.intercept == other.intercept
         if isinstance(other, tuple):
             return (self.slope, self.intercept) == other
-        return false
+        return False
 
     def __hash__(self):
         # hashable as the namedtuple it stands for (round 77: a class
@@ -766,7 +766,7 @@ class NormalDist:
 
     def __eq__(self, other):
         if not isinstance(other, NormalDist):
-            return false
+            return False
         return self._mu == other._mu and self._sigma == other._sigma
 
     def __hash__(self):

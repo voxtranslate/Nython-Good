@@ -51,6 +51,11 @@ struct Lexer final extends ILexer{   // round 82: final (direct calls)
     /// are made with TokenClass::Default instead of Literal.
     bool python_strings           = false;
     bool force_python_strings     = false;   // round 83: always (ast.parse: Python's semantics)
+    /// round 86: Python-language source (nython::scope::lexer_python: a .py
+    /// file, `# nython: python`, code compiled from one): Nython's literal
+    /// spellings true/false/none/null/undefined and `elseif` are names.
+    bool python_names             = false;
+    bool force_python_names       = false;   // (an f-string field's lexer: its file's)
     int warnings                  = 0;/// number of errors
     int indent                    = 0;///  current indent level is the number of spaces in the last indent.
     /// Open ( [ { count. Indentation is meaningless inside a bracketed

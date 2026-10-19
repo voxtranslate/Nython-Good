@@ -1307,6 +1307,42 @@ static int scope_report(int argc, char** argv, int from) {
     return status;
 }
 
+// --python-compat-report file... (round 86): for each file's Nython-language
+// code, every construct whose meaning differs from Python's, one line each
+// - `file:line:col: kind: message` (NyScope.cpp, compat_report): str joined
+// with a non-str, an int iterated, `is` with a type, a dict's key read as an
+// attribute, Nython's literal spellings, list.sort()'s value, and the binding
+// differences --scope-report lists. Status 1 when a file could not be read
+// or parsed.
+static int compat_report(int argc, char** argv, int from) {
+    int status = 0;
+    for (int k = from; k < argc; k++) {
+        std::string f = argv[k];
+        struct stat st;
+        if (stat(f.c_str(), &st) != 0) { std::cerr << f << ": no such file\n"; status = 1; continue; }
+        std::ostringstream lines;
+        nython::scope::report_sink() = &lines;
+        try {
+            SourceCode source(f);
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            Parser par(reporter.get(), nullptr, lex.get());
+            lex->tokenize();
+            auto root = par.parse();
+            nython::scope::report_sink() = nullptr;
+            nython::scope::compat_report(root, f, source.sourceCode(), lines.str(), std::cout);
+        } catch (exception::SyntaxError& e) {
+            report_compiler_error("syntax error", e.location(), e.message()); status = 1;
+        } catch (exception::UnexpectedCharError& e) {
+            report_compiler_error("error", e.location(), e.message()); status = 1;
+        } catch (std::exception& e) {
+            std::cerr << f << ": " << e.what() << "\n"; status = 1;
+        }
+        nython::scope::report_sink() = nullptr;
+    }
+    return status;
+}
+
 // -m: a library module's file (a/b.ny, or a package's a/b/__main__.ny),
 // looked up where `import` looks: the working directory and its lib/, then
 // NYTHONPATH and the library beside the interpreter.
@@ -1340,6 +1376,8 @@ static void print_usage() {
         << "  --vm              run on the bytecode VM (default: the interpreter)\n"
         << "  --interp          run on the tree-walking interpreter\n"
         << "  --check           parse (and with --vm, compile) without running\n"
+        << "  --python-compat-report FILE...  list the Nython-language constructs whose\n"
+        << "                    meaning differs from Python's (a portability lint)\n"
         << "  -t, --tokenize    dump the tokens          -a, --ast      dump the AST\n"
         << "  -d, --disasm      dump the VM bytecode     -p, --profile  per-function timings\n"
         << "      --trace OUT   record each executed statement to OUT (JSON lines)\n"
@@ -1414,6 +1452,8 @@ int main(int argc, char** argv, char** env) {
                 // round 85 (hidden; tools/ny_scopecheck.py): where Nython's and
                 // Python's binding rules differ in each file given
                 else if (a == "--scope-report") return scope_report(argc, argv, i + 1);
+                // round 86: Nython-language constructs whose meaning differs from Python's
+                else if (a == "--python-compat-report") return compat_report(argc, argv, i + 1);
                 else if (a == "--profile") profile = true;
                 else if (a == "--trace") {
                     if (i + 1 >= argc) return bad("--trace needs an output file");

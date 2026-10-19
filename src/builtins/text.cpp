@@ -3025,6 +3025,7 @@ Value ny_ast(NythonExecutor& E, std::vector<Value>& args) {
         auto reporter = std::make_shared<Reporter>(source);
         auto lexer = std::make_shared<Lexer>(source);
         lexer->force_python_strings = true;
+        lexer->force_python_names = true;   // round 86: ast.parse is CPython's parser - `true` is a Name
         auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)E.runner, lexer.get());
         lexer->tokenize();
         if (lexer->hasErrors()) {

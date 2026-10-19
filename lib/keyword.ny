@@ -18,10 +18,14 @@
 #                 aliases true/false/none/null, var/let/const, fn/func/fun,
 #                 struct, enum, unless/until/repeat, throw/catch, ...).
 # isnykeyword(s)  s in nykwlist
-# nyhardkwlist    the few of them that are never names: the literal
-#                 spellings true/false/none/null/undefined (as Python's
-#                 True/False/None are hard keywords), `elseif` and `super`
-#                 (`super()` / `super.m()` is Nython's parent reference)
+# nyhardkwlist    the few of them that are never names in Nython-language
+#                 source: the literal spellings true/false/none/null/undefined
+#                 (as Python's True/False/None are hard keywords), `elseif`
+#                 and `super` (`super()` / `super.m()` is Nython's parent
+#                 reference). Round 86: in Python-language source (a .py
+#                 file, `# nython: python`, code compiled from one, an ast
+#                 tree) all of them but `super` are ordinary names, as they
+#                 are to CPython (`true = 3`, `def f(elseif=1)`)
 # nysoftkwlist    nykwlist minus nyhardkwlist: Nython's soft keywords. Each
 #                 is a keyword only where its construct starts (`new A()`,
 #                 `var x = 1`, `ref r = x`, `unless c:`, `loop:`, `fn f()

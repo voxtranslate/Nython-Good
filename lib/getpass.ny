@@ -48,7 +48,7 @@ def getuser():
 
 
 def _write_prompt(prompt, stream):
-    if stream is none:
+    if stream is None:
         stream = sys.stderr
     stream.write(prompt)
     stream.flush()
@@ -66,15 +66,15 @@ def _readline():
     return line
 
 
-def fallback_getpass(prompt="Password: ", stream=none):
-    if stream is none:
+def fallback_getpass(prompt="Password: ", stream=None):
+    if stream is None:
         stream = sys.stderr
     stream.write("Warning: Password input may be echoed.\n")
     _write_prompt(prompt, stream)
     return _readline()
 
 
-def unix_getpass(prompt="Password: ", stream=none):
+def unix_getpass(prompt="Password: ", stream=None):
     """Prompt for a password, with echo turned off.
 
     Args:
@@ -91,7 +91,7 @@ def unix_getpass(prompt="Password: ", stream=none):
     if not stream_isatty(0) or os_system("stty -echo 2>/dev/null") != 0:
         return fallback_getpass(prompt, stream)
     var out = _write_prompt(prompt, stream)
-    var line = none
+    var line = None
     try:
         line = _readline()
     finally:
@@ -101,12 +101,12 @@ def unix_getpass(prompt="Password: ", stream=none):
     return line
 
 
-def win_getpass(prompt="Password: ", stream=none):
+def win_getpass(prompt="Password: ", stream=None):
     """Prompt for password with echo off, using Windows getwch()."""
     return fallback_getpass(prompt, stream)
 
 
-def getpass(prompt="Password: ", stream=none):
+def getpass(prompt="Password: ", stream=None):
     """Prompt for a password, with echo turned off where the terminal
     allows it (see the module comment)."""
     if _WINDOWS:

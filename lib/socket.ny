@@ -85,7 +85,7 @@ INADDR_ANY = _C["INADDR_ANY"]
 INADDR_LOOPBACK = _C["INADDR_LOOPBACK"]
 INADDR_BROADCAST = _C["INADDR_BROADCAST"]
 SOMAXCONN = _C["SOMAXCONN"]
-has_ipv6 = true
+has_ipv6 = True
 
 # Python's names for the errors
 error = OSError
@@ -109,22 +109,22 @@ class SocketIO:
         self.encoding = encoding
         self.buf = b""
         self.pos = 0
-        self.eof = false
-        self.closed = false
+        self.eof = False
+        self.closed = False
 
     def _fill(self):
         if self.eof:
-            return false
+            return False
         var chunk = self.sock.recv(65536)
         if len(chunk) == 0:
-            self.eof = true
-            return false
+            self.eof = True
+            return False
         if self.pos >= len(self.buf):
             self.buf = chunk
         else:
             self.buf = self.buf[self.pos:] + chunk
         self.pos = 0
-        return true
+        return True
 
     def _take(self, n):
         var part = self.buf[self.pos:self.pos + n]
@@ -140,12 +140,12 @@ class SocketIO:
         return data.decode(self.encoding, "replace")
 
     def read(self, n=-1):
-        if n is none or n < 0:
+        if n is None or n < 0:
             var parts = [self._take(len(self.buf))]
             while not self.eof:
                 var d = self.sock.recv(1048576)
                 if len(d) == 0:
-                    self.eof = true
+                    self.eof = True
                     break
                 parts.append(d)
             return self._out(b"".join(parts))
@@ -154,7 +154,7 @@ class SocketIO:
         while have < n and not self.eof:
             var d2 = self.sock.recv(min(n - have, 1048576))
             if len(d2) == 0:
-                self.eof = true
+                self.eof = True
                 break
             parts2.append(d2)
             have = have + len(d2)
@@ -164,7 +164,7 @@ class SocketIO:
         # What is buffered, else one receive.
         if self.pos >= len(self.buf) and not self._fill():
             return self._out(b"")
-        if n is none or n < 0:
+        if n is None or n < 0:
             n = len(self.buf)
         return self._out(self._take(n))
 
@@ -175,7 +175,7 @@ class SocketIO:
 
     def readline(self, limit=-1):
         var scanned = self.pos
-        while true:
+        while True:
             var i = self.buf.find(b"\n", scanned)
             if i >= 0 and (limit < 0 or i + 1 - self.pos <= limit):
                 return self._out(self._take(i + 1 - self.pos))
@@ -189,7 +189,7 @@ class SocketIO:
 
     def readlines(self):
         var out = []
-        while true:
+        while True:
             var line = self.readline()
             if len(line) == 0:
                 return out
@@ -221,14 +221,14 @@ class SocketIO:
         return self.sock.fileno()
 
     def close(self):
-        self.closed = true
+        self.closed = True
 
     def __enter__(self):
         return self
 
     def __exit__(self, a, b, c):
         self.close()
-        return false
+        return False
 
 def _bl(data):
     # a bytes-like argument (round 84: any buffer - memoryview, array ...);
@@ -258,19 +258,19 @@ def _recv_into(sock, buffer, nbytes, flags, what):
 
 class socket:
     # _handle: an existing socket-layer handle (accept, socketpair)
-    def __init__(self, family=AF_INET, type=SOCK_STREAM, proto=0, fileno=none, _handle=none):
+    def __init__(self, family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None, _handle=None):
         self.family = family
         self.type = type
         self.proto = proto
-        self._closed = false
-        self._h = none
+        self._closed = False
+        self._h = None
         # (round 86) CPython's audit events (socketmodule.c): socket.__new__
         # for every socket made - accept()'s and socketpair()'s too
         if _ny_audit_hooks:
             _ny_audit_fire("socket.__new__", (self, int(family), int(type), int(proto)))
-        if _handle is not none:
+        if _handle is not None:
             self._h = _handle
-        elif fileno is none:
+        elif fileno is None:
             self._h = _net_socket(family, type, proto)
         else:
             self._h = _net_fromfd(fileno, family, type)
@@ -309,9 +309,9 @@ class socket:
     def sendall(self, data, flags=0):
         _net_sendall(self._h, _bl(data), flags)
 
-    def sendto(self, data, flags_or_address, address=none):
-        _ny_sys_audit("socket.sendto", self, flags_or_address if address is none else address)
-        if address is none:
+    def sendto(self, data, flags_or_address, address=None):
+        _ny_sys_audit("socket.sendto", self, flags_or_address if address is None else address)
+        if address is None:
             return _net_sendto(self._h, _bl(data), flags_or_address, 0)
         return _net_sendto(self._h, _bl(data), address, flags_or_address)
 
@@ -335,7 +335,7 @@ class socket:
         return _net_gettimeout(self._h)
 
     def setblocking(self, flag):
-        _net_settimeout(self._h, none if flag else 0.0)
+        _net_settimeout(self._h, None if flag else 0.0)
 
     def getblocking(self):
         return self.gettimeout() != 0.0
@@ -359,38 +359,38 @@ class socket:
 
     def close(self):
         if not self._closed:
-            self._closed = true
+            self._closed = True
             _net_close(self._h)
 
     def detach(self):
-        self._closed = true
+        self._closed = True
         return _net_detach(self._h)
 
-    def makefile(self, mode="r", buffering=none, encoding=none, errors=none, newline=none):
-        return SocketIO(self, mode, encoding if encoding is not none else "utf-8")
+    def makefile(self, mode="r", buffering=None, encoding=None, errors=None, newline=None):
+        return SocketIO(self, mode, encoding if encoding is not None else "utf-8")
 
     # Ready to read within timeout seconds (none: no limit)? The same wait a
     # recv would make: parks an async task, releases the GIL in a thread.
-    def wait_readable(self, timeout=none):
+    def wait_readable(self, timeout=None):
         return _net_wait(self._h, 1, timeout) != 0
 
-    def wait_writable(self, timeout=none):
+    def wait_writable(self, timeout=None):
         return _net_wait(self._h, 2, timeout) != 0
 
     # (round 85) sendmsg / recvmsg with ancillary data (SCM_RIGHTS ...):
     # the call is made non-blocking and waited for as send/recv are (the
     # timeout, a parked async task); POSIX only. sendmsg's address (an
     # unconnected datagram socket's destination) is not supported.
-    def sendmsg(self, buffers, ancdata=(), flags=0, address=none):
+    def sendmsg(self, buffers, ancdata=(), flags=0, address=None):
         _ny_sys_audit("socket.sendmsg", self, address)
-        if address is not none:
+        if address is not None:
             raise NotImplementedError("sendmsg(): a destination address is not supported here")
         var data = b"".join([bytes(_bl(b)) if not isinstance(b, str) else b.encode() for b in buffers])
         var anc = []
         for item in ancdata:
             anc.append((item[0], item[1], bytes(_bl(item[2]))))
         var t = self.gettimeout()
-        while true:
+        while True:
             try:
                 return _ny_os_call("sendmsg", self.fileno(), data, anc, flags)
             except BlockingIOError:
@@ -401,10 +401,10 @@ class socket:
 
     def recvmsg(self, bufsize, ancbufsize=0, flags=0):
         var t = self.gettimeout()
-        while true:
+        while True:
             try:
                 var r = _ny_os_call("recvmsg", self.fileno(), bufsize, ancbufsize, flags)
-                return (r[0], list(r[1]), r[2], none)
+                return (r[0], list(r[1]), r[2], None)
             except BlockingIOError:
                 if t == 0.0:
                     raise
@@ -416,7 +416,7 @@ class socket:
 
     def __exit__(self, a, b, c):
         self.close()
-        return false
+        return False
 
     def __repr__(self):
         if self._closed:
@@ -429,12 +429,12 @@ class socket:
         return s + ">"
 
 def _from_handle(h, family, type):
-    return socket(family, type, 0, none, h)
+    return socket(family, type, 0, None, h)
 
-def socketpair(family=none, type=SOCK_STREAM, proto=0):
+def socketpair(family=None, type=SOCK_STREAM, proto=0):
     var fam = family
-    if fam is none:
-        fam = _AF_UNIX if _AF_UNIX is not none else AF_INET
+    if fam is None:
+        fam = _AF_UNIX if _AF_UNIX is not None else AF_INET
     var hs = _net_socketpair(fam, type)
     return (_from_handle(hs[0], fam, type), _from_handle(hs[1], fam, type))
 
@@ -449,40 +449,40 @@ def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 # (smtplib, ftplib, poplib ... take timeout=socket._GLOBAL_DEFAULT_TIMEOUT)
 _GLOBAL_DEFAULT_TIMEOUT = object()
 
-def create_connection(address, timeout=_GLOBAL_DEFAULT_TIMEOUT, source_address=none):
+def create_connection(address, timeout=_GLOBAL_DEFAULT_TIMEOUT, source_address=None):
     # Python's: every address the name resolves to, in order, until one connects
     var host = address[0]
     var port = address[1]
-    var last = none
+    var last = None
     for ai in getaddrinfo(host, port, 0, SOCK_STREAM):
-        var s = none
+        var s = None
         try:
             s = socket(ai[0], ai[1], ai[2])
-            if timeout is not none and timeout is not _GLOBAL_DEFAULT_TIMEOUT:
+            if timeout is not None and timeout is not _GLOBAL_DEFAULT_TIMEOUT:
                 s.settimeout(timeout)
-            if source_address is not none:
+            if source_address is not None:
                 s.bind(source_address)
             s.connect(ai[4])
             return s        # the timeout stays: it applies to every operation, as in Python
         except OSError as e:
             last = e
-            if s is not none:
+            if s is not None:
                 s.close()
-    if last is not none:
+    if last is not None:
         raise last
     raise OSError("getaddrinfo returns an empty list")
 
-def create_server(address, family=AF_INET, backlog=none, reuse_port=false, dualstack_ipv6=false):
+def create_server(address, family=AF_INET, backlog=None, reuse_port=False, dualstack_ipv6=False):
     var s = socket(family, SOCK_STREAM)
     try:
         if sys_platform() != "win32":
             s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        if reuse_port and SO_REUSEPORT is not none:
+        if reuse_port and SO_REUSEPORT is not None:
             s.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)
-        if family == AF_INET6 and IPV6_V6ONLY is not none:
+        if family == AF_INET6 and IPV6_V6ONLY is not None:
             s.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0 if dualstack_ipv6 else 1)
         s.bind(address)
-        s.listen(backlog if backlog is not none else 128)
+        s.listen(backlog if backlog is not None else 128)
     except OSError as e:
         s.close()
         raise e
@@ -505,7 +505,7 @@ def gethostbyaddr(ip):
 
 # round 83: the services database (/etc/services where there is one, else
 # the well-known ports), as getservbyname/getservbyport read it
-_services = none
+_services = None
 _WELL_KNOWN = [("ftp-data", 20, "tcp"), ("ftp", 21, "tcp"), ("ssh", 22, "tcp"), ("telnet", 23, "tcp"),
                ("smtp", 25, "tcp"), ("domain", 53, "tcp"), ("domain", 53, "udp"), ("http", 80, "tcp"),
                ("pop3", 110, "tcp"), ("nntp", 119, "tcp"), ("ntp", 123, "udp"), ("imap", 143, "tcp"),
@@ -514,7 +514,7 @@ _WELL_KNOWN = [("ftp-data", 20, "tcp"), ("ftp", 21, "tcp"), ("ssh", 22, "tcp"), 
 
 def _services_table():
     global _services
-    if _services is not none:
+    if _services is not None:
         return _services
     var table = []
     try:
@@ -538,19 +538,19 @@ def _services_table():
     _services = table
     return table
 
-def getservbyname(servicename, protocolname=none):
+def getservbyname(servicename, protocolname=None):
     _ny_sys_audit("socket.getservbyname", servicename, protocolname)
     for e in _services_table():
-        if e[0] == servicename and (protocolname is none or e[2] == protocolname):
+        if e[0] == servicename and (protocolname is None or e[2] == protocolname):
             return e[1]
     raise OSError("service/proto not found")
 
-def getservbyport(port, protocolname=none):
+def getservbyport(port, protocolname=None):
     if not (0 <= port <= 65535):
         raise OverflowError("getservbyport: port must be 0-65535.")
     _ny_sys_audit("socket.getservbyport", port, protocolname)
     for e in _services_table():
-        if e[1] == port and (protocolname is none or e[2] == protocolname):
+        if e[1] == port and (protocolname is None or e[2] == protocolname):
             return e[0]
     raise OSError("port/proto not found")
 
@@ -609,7 +609,7 @@ timeout = TimeoutError
 gaierror = gaierror
 herror = herror
 SocketType = socket
-if _C.get("AF_BLUETOOTH") is not none or sys_platform() == "linux":
+if _C.get("AF_BLUETOOTH") is not None or sys_platform() == "linux":
     BDADDR_ANY = "00:00:00:00:00:00"
     BDADDR_LOCAL = "00:00:00:FF:FF:FF"
 
@@ -637,17 +637,17 @@ def getprotobyname(protocolname):
     return _ny_os_call("getprotobyname", protocolname)
 
 def has_dualstack_ipv6():
-    if not has_ipv6 or IPV6_V6ONLY is none:
-        return false
+    if not has_ipv6 or IPV6_V6ONLY is None:
+        return False
     try:
         var s = socket(AF_INET6, SOCK_STREAM)
         try:
             s.setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)
-            return true
+            return True
         finally:
             s.close()
     except OSError:
-        return false
+        return False
 
 def if_nameindex():
     return list(_ny_os_call("if_nameindex"))
@@ -668,7 +668,7 @@ def CMSG_LEN(length):
 def CMSG_SPACE(length):
     return _ny_os_call("CMSG_SPACE", _sint(length))
 
-def send_fds(sock, buffers, fds, flags=0, address=none):
+def send_fds(sock, buffers, fds, flags=0, address=None):
     """send_fds(sock, buffers, fds[, flags[, address]]) -> integer
 
     Send the list of file descriptors fds over an AF_UNIX socket.
@@ -719,7 +719,7 @@ def _make_enums():
         out.sort(key=lambda kv: (kv[1], kv[0]))
         return out
     _enums["AddressFamily"] = enum.IntEnum("AddressFamily",
-        pick(lambda n: n.isupper() and (n.startswith("AF_") or (n.startswith("PF_") and false))), module="socket")
+        pick(lambda n: n.isupper() and (n.startswith("AF_") or (n.startswith("PF_") and False))), module="socket")
     _enums["SocketKind"] = enum.IntEnum("SocketKind", pick(lambda n: n.isupper() and n.startswith("SOCK_")), module="socket")
     _enums["MsgFlag"] = enum.IntFlag("MsgFlag", pick(lambda n: n.isupper() and n.startswith("MSG_")), module="socket")
     _enums["AddressInfo"] = enum.IntFlag("AddressInfo", pick(lambda n: n.isupper() and n.startswith("AI_")), module="socket")

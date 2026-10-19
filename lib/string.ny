@@ -84,7 +84,7 @@ def _scan_template(tmpl, delim):
     var i = 0
     if dl == 0:
         return out
-    while true:
+    while True:
         var j = tmpl.find(delim, i)
         if j < 0:
             break
@@ -210,19 +210,19 @@ class Template:
 
     def substitute(self, mapping=_sentinel_dict, /, **kws):
         if id(mapping) == id(_sentinel_dict):
-            return self._substitute(kws, {}, false)
-        return self._substitute(mapping, kws, false)
+            return self._substitute(kws, {}, False)
+        return self._substitute(mapping, kws, False)
 
     def safe_substitute(self, mapping=_sentinel_dict, /, **kws):
         if id(mapping) == id(_sentinel_dict):
-            return self._substitute(kws, {}, true)
-        return self._substitute(mapping, kws, true)
+            return self._substitute(kws, {}, True)
+        return self._substitute(mapping, kws, True)
 
     def is_valid(self):
         for m in self._matches():
             if m.kind == "invalid":
-                return false
-        return true
+                return False
+        return True
 
     def get_identifiers(self):
         var ids = []
@@ -304,12 +304,12 @@ def _formatter_parser(s):
     while i < n:
         var start = i
         var c = ""
-        var markup = false
+        var markup = False
         while i < n:
             c = s[i]
             i = i + 1
             if c == "{" or c == "}":
-                markup = true
+                markup = True
                 break
         var at_end = i >= n
         var ln = i - start
@@ -320,7 +320,7 @@ def _formatter_parser(s):
         if not at_end and markup:
             if s[i] == c:
                 i = i + 1
-                markup = false
+                markup = False
             else:
                 ln = ln - 1
         elif markup:
@@ -356,7 +356,7 @@ def _field_name_split(name):
             key = name[st:i]
             if key == "":
                 raise ValueError("Empty attribute in format string")
-            rest.append((true, key))
+            rest.append((True, key))
         elif c == "[":
             var st2 = i
             while i < n and name[i] != "]":
@@ -368,7 +368,7 @@ def _field_name_split(name):
             if key == "":
                 raise ValueError("Empty attribute in format string")
             var k = _get_integer(key)
-            rest.append((false, k if k != -1 else key))
+            rest.append((False, k if k != -1 else key))
         else:
             raise ValueError("Only '.' or '[' may follow ']' in format field specifier")
     return (first, rest)
@@ -404,7 +404,7 @@ class Formatter:
                 elif field_name.isdigit():
                     if not isinstance(auto_arg_index, bool) and auto_arg_index:
                         raise ValueError("cannot switch from manual field specification to automatic field numbering")
-                    auto_arg_index = false
+                    auto_arg_index = False
                 var got = self.get_field(field_name, args, kwargs)
                 used_args.add(got[1])
                 var obj = self.convert_field(got[0], conversion)

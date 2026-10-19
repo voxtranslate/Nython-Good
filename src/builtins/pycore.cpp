@@ -83,16 +83,10 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             E.pyRaise("TypeError", "'" + E.typeNameOf(v) + "' object cannot be interpreted as an integer" + (what ? std::string(" (") + what + ")" : std::string()));
         return n;
     };
-    // Ordering used by sorted/min/max: Python's where it is defined; values
-    // Python cannot compare fall back to type name then text, so a sort never
-    // fails halfway.
-    auto less = [&](const Value& a, const Value& b) {
-        int c;
-        if (E.orderValues(a, b, c, ctx)) return c < 0;
-        std::string ta = E.typeNameOf(a), tb = E.typeNameOf(b);
-        if (ta != tb) return ta < tb;
-        return E.strOf(a, ctx) < E.strOf(b, ctx);
-    };
+    // Ordering used by sorted/min/max: Python's - values Python cannot
+    // compare are CPython's TypeError (round 86: they fell back to type name
+    // then text, so sorted([1, "a"]) and max("a", 1) answered).
+    auto less = [&](const Value& a, const Value& b) { return E.sortLess(a, b, ctx); };
     auto call1 = [&](const Value& fn, const Value& x) {
         std::vector<Value> a = {x};
         return E.callFunctionValue(fn, a, ctx);
@@ -445,7 +439,9 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         Value bestk = keyv ? call1(*keyv, items[0]) : items[0];
         for (size_t i = 1; i < items.size(); i++) {
             Value k = keyv ? call1(*keyv, items[i]) : items[i];
-            if (id == B_MIN ? less(k, bestk) : less(bestk, k)) { best = i; bestk = k; }
+            // item < best / item > best, as CPython's min_max (round 86: its
+            // TypeError names them in that order)
+            if (E.sortLess(k, bestk, ctx, id == B_MIN ? "<" : ">")) { best = i; bestk = k; }
         }
         return items[best];
     }

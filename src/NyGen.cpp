@@ -236,11 +236,14 @@ void open_dict(Cursor& cu, Container* c, uint8_t kind, bool rev) {
     cu.slot = rev ? c->container->slot_end() : 0;
 }
 
-void open(NythonExecutor& E, const Value& val, Context* ctx, Cursor& cu, bool owns = false) {
+// `py` (round 86): the iteration is Python-language source's - 1 yes, 0 no,
+// -1 its caller's (NythonExecutor::pyCode): an int is then not iterable.
+void open(NythonExecutor& E, const Value& val, Context* ctx, Cursor& cu, bool owns = false, int py = -1) {
     cu = Cursor();
     cu.hold = val;
     if (Gen* g = gen_of(val)) { cu.k = Cursor::GEN; cu.g = g; cu.owns = owns; return; }
     if (val.type == ValueType::INTEGER) {   // the legacy `for i in n` (0 .. n-1)
+        if (py > 0 || (py < 0 && NythonExecutor::pyCode())) raise("TypeError", "'int' object is not iterable");   // round 86
         cu.k = Cursor::RANGE; cu.n = bigint_to_i64(val.value.i); return;
     }
     if (E.isBytesValue(val)) { cu.k = Cursor::VEC; cu.v = E.iterItems(val, ctx); return; }
@@ -678,7 +681,7 @@ bool genexpr_next(NythonExecutor& E, Gen* g, Value& out) {
         if (k + 1 < cn->clauses.size()) {
             Value iv = E.evalNode(cn->clauses[k + 1].iter, g->cc);
             Cursor nc;
-            open(E, iv, g->cc, nc);
+            open(E, iv, g->cc, nc, false, cn->py_src);   // round 86: the comprehension's rule
             g->cur.push_back(std::move(nc));
             continue;
         }
@@ -1011,7 +1014,7 @@ Value make_genexpr(NythonExecutor& E, const node_ptr& comp, Context* ctx) {
             uint64_t s0 = t_serial;
             Value itv = E.evalNode(cn->clauses[0].iter, ctx);
             Cursor c0;
-            open(E, itv, ctx, c0, fresh(itv, cn->clauses[0].iter, NythonExecutor::call_depth_, s0));
+            open(E, itv, ctx, c0, fresh(itv, cn->clauses[0].iter, NythonExecutor::call_depth_, s0), cn->py_src);   // round 86
             g->cur.push_back(std::move(c0));
         }
     } catch (...) {

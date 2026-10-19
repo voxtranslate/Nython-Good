@@ -10,10 +10,10 @@ def _bytes(s):
         return bytes(s)
     return bytes(_ny_bytes_like(s))      # round 84: any buffer (memoryview ...)
 
-def b64encode(s, altchars=none):
+def b64encode(s, altchars=None):
     return _hash_b64encode(_bytes(s), altchars)
 
-def b64decode(s, altchars=none, validate=false):
+def b64decode(s, altchars=None, validate=False):
     try:
         return _hash_b64decode(_bytes(s), altchars, validate)
     except ValueError as e:
@@ -34,7 +34,7 @@ def urlsafe_b64decode(s):
 def b32encode(s):
     return _hash_b32encode(_bytes(s))
 
-def b32decode(s, casefold=false):
+def b32decode(s, casefold=False):
     try:
         return _hash_b32decode(_bytes(s))
     except ValueError as e:
@@ -43,7 +43,7 @@ def b32decode(s, casefold=false):
 def b16encode(s):
     return _bytes(s).hex().upper().encode("ascii")
 
-def b16decode(s, casefold=false):
+def b16decode(s, casefold=False):
     var t = _bytes(s).decode("ascii")
     try:
         return bytes.fromhex(t)

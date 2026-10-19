@@ -8,6 +8,7 @@
 #include "DynamicLang.hpp"
 #include "NyUniNames.hpp"
 #include "NyUniData.hpp"   // PEP 3131 identifiers (round 84)
+#include "NyScope.hpp"     // lexer_python (round 86)
 #include <cstdio>
 #include <sstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
@@ -261,6 +262,18 @@ std::vector<std::string> keyword_spellings() {
 	std::vector<std::string> out;
 	for (auto& k : KeywordTokens) out.push_back(k.value);
 	return out;
+}
+
+// round 86: the keywords that are names in Python-language source -
+// Nython's literal spellings and `elseif` (Lexer::python_names)
+static bool is_nython_literal_word(const std::string& w) {
+	switch (w.size()) {
+		case 4: return w == "true" || w == "none" || w == "null";
+		case 5: return w == "false";
+		case 6: return w == "elseif";
+		case 9: return w == "undefined";
+		default: return false;
+	}
 }
 
 inline bool is_ident_char(char c, bool first = false) {
@@ -669,6 +682,7 @@ const std::vector<Token>& Lexer::tokenize() {   // round 82: the tokens in place
     reset();
     if(source.line_number()<0) source.read();
     python_strings = force_python_strings || python_string_mode(source.fileName(), source.sourceCode());   // round 83: forced by lib/ast.ny's parse
+    python_names = force_python_names || nython::scope::lexer_python(source.fileName(), source.sourceCode());   // round 86
     while (!source.isAtEnd()) { /// this->token.type() != TokenType::End
         this->read_token();
     }
@@ -1397,6 +1411,11 @@ void Lexer::read_token() {
         bool matched_kw = false;
         for(const auto& kw : Keywords()) {   // round 82: by reference (a string copied per keyword per identifier: 8% of the startup)
             if(this->token.value == kw.value) {
+                // round 86: in Python-language source Nython's literal
+                // spellings and `elseif` are ordinary names (`true = 3`,
+                // `def f(elseif=1)`), as they are to CPython; True / False /
+                // None stay the literals
+                if (python_names && is_nython_literal_word(kw.value)) break;
                 this->token.ident = kw.ident;
                 matched_kw = true;
                 break;

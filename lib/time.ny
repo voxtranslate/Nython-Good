@@ -48,7 +48,7 @@ class struct_time:
     n_sequence_fields = 9
     n_unnamed_fields = 0
 
-    def __init__(self, seq, dict=none):
+    def __init__(self, seq, dict=None):
         var items = list(seq)
         if len(items) < 9:
             raise TypeError("time.struct_time() takes an at least 9-sequence (" + str(len(items)) + "-sequence given)")
@@ -64,8 +64,8 @@ class struct_time:
         self.tm_wday = items[6]
         self.tm_yday = items[7]
         self.tm_isdst = items[8]
-        self.tm_zone = items[9] if len(items) > 9 else none
-        self.tm_gmtoff = items[10] if len(items) > 10 else none
+        self.tm_zone = items[9] if len(items) > 9 else None
+        self.tm_gmtoff = items[10] if len(items) > 10 else None
 
     def __len__(self):
         return 9
@@ -84,7 +84,7 @@ class struct_time:
             return self._t == other._t
         if isinstance(other, tuple):
             return self._t == other
-        return false
+        return False
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -135,7 +135,7 @@ def _to_map(t):
 
 
 def _secs(secs):
-    if secs is none:
+    if secs is None:
         return time_now()
     if isinstance(secs, bool) or not (isinstance(secs, int) or isinstance(secs, float)):
         raise TypeError("'" + type(secs).__name__ + "' object cannot be interpreted as an integer")
@@ -162,7 +162,7 @@ def sleep(secs):
     if secs < 0:
         raise ValueError("sleep length must be non-negative")
     time_sleep(secs)
-    return none
+    return None
 
 
 def monotonic():
@@ -219,13 +219,13 @@ class _ClockInfo:
 def get_clock_info(name):
     """Get information of the specified clock."""
     if name == "time":
-        return _ClockInfo("clock_gettime(CLOCK_REALTIME)", false, true, 1e-09)
+        return _ClockInfo("clock_gettime(CLOCK_REALTIME)", False, True, 1e-09)
     if name == "monotonic" or name == "perf_counter":
-        return _ClockInfo("clock_gettime(CLOCK_MONOTONIC)", true, false, 1e-09)
+        return _ClockInfo("clock_gettime(CLOCK_MONOTONIC)", True, False, 1e-09)
     if name == "thread_time" and _sys_platform_posix() and os_platform() == "linux":
-        return _ClockInfo("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false, 1e-09)
+        return _ClockInfo("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", True, False, 1e-09)
     if name == "process_time" or name == "thread_time":
-        return _ClockInfo("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false, 1e-09)
+        return _ClockInfo("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", True, False, 1e-09)
     raise ValueError("unknown clock")
 
 
@@ -288,13 +288,13 @@ if _sys_platform_posix():
 
 
 # ── conversions ──
-def gmtime(secs=none):
+def gmtime(secs=None):
     """Convert seconds since the Epoch to a time tuple expressing UTC."""
     var s = _secs(secs)
     return _from_map(time_gmtime(s), "GMT", 0)
 
 
-def localtime(secs=none):
+def localtime(secs=None):
     """Convert seconds since the Epoch to a time tuple expressing local time."""
     var s = _secs(secs)
     var m = time_localtime(s)
@@ -369,11 +369,11 @@ def _offset_text(gmtoff, colon):
     return sign + ("%02d" % hh) + (":" if colon else "") + ("%02d" % mm)
 
 
-def strftime(format, t=none, utc=false):
+def strftime(format, t=None, utc=False):
     """Convert a time tuple to a string according to a format specification."""
     if not isinstance(format, str):
         raise TypeError("strftime() argument 1 must be str, not " + type(format).__name__)
-    if t is none:
+    if t is None:
         t = localtime()
     elif (isinstance(t, int) or isinstance(t, float)) and not isinstance(t, bool):
         # the old time.strftime(fmt, secs, utc) builtin
@@ -381,13 +381,13 @@ def strftime(format, t=none, utc=false):
     t = _tuple_arg(t, "strftime")
     var m = _checked(t)
     # %z and %Z from the tuple's zone, as CPython hands tm_zone/tm_gmtoff on
-    var zone = getattr(t, "tm_zone", none)
-    var gmtoff = getattr(t, "tm_gmtoff", none)
-    if zone is none or gmtoff is none:
+    var zone = getattr(t, "tm_zone", None)
+    var gmtoff = getattr(t, "tm_gmtoff", None)
+    if zone is None or gmtoff is None:
         var lt = localtime(mktime(t)) if t[8] >= 0 else localtime()
-        if zone is none:
+        if zone is None:
             zone = lt.tm_zone if t[8] >= 0 else ""
-        if gmtoff is none:
+        if gmtoff is None:
             gmtoff = lt.tm_gmtoff
     var out = []
     var i = 0
@@ -401,7 +401,7 @@ def strftime(format, t=none, utc=false):
                 if len(plain) > 0:
                     out.append(time_strftime(plain, m))
                     plain = ""
-                out.append(_offset_text(gmtoff, false) if d == "z" else zone)
+                out.append(_offset_text(gmtoff, False) if d == "z" else zone)
                 i = i + 2
                 continue
             plain = plain + ch + d
@@ -418,9 +418,9 @@ _DAYNAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _MONTHNAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
-def asctime(t=none):
+def asctime(t=None):
     """Convert a time tuple to a string, e.g. 'Sat Jun 06 16:26:11 1998'."""
-    if t is none:
+    if t is None:
         t = localtime()
     t = _tuple_arg(t, "asctime")
     var m = _checked(t)
@@ -428,7 +428,7 @@ def asctime(t=none):
                                            m["day"], m["hour"], m["minute"], m["second"], m["year"])
 
 
-def ctime(secs=none):
+def ctime(secs=None):
     """Convert a time in seconds since the Epoch to a string in local time."""
     return asctime(localtime(secs))
 
@@ -455,7 +455,7 @@ tzname = _zi[3]
 
 def tzset():
     """Initialize, or reinitialize, the local timezone from the TZ variable."""
-    return none
+    return None
 
 
 # ── strptime (Lib/_strptime.py, C locale) ──
@@ -506,7 +506,7 @@ def _alts(directive):
         return [["5", "03"], ["0", "19"], ["14", "d"], ["d"]]
     if directive == "y":
         return [["d", "d"]]
-    return none
+    return None
 
 
 def _class_ok(cls, c):
@@ -552,7 +552,7 @@ def _z_lengths(s, i):
         return [1]
     if not (i < len(s) and (s[i] == "+" or s[i] == "-") and _d(s, i + 1) and _d(s, i + 2)):
         return out
-    for c1 in [true, false]:
+    for c1 in [True, False]:
         var j = i + 3
         if c1:
             if not (j < len(s) and s[j] == ":"):
@@ -562,7 +562,7 @@ def _z_lengths(s, i):
             continue
         j = j + 2
         # the optional seconds group (greedy: tried first)
-        for c2 in [true, false]:
+        for c2 in [True, False]:
             var k = j
             if c2:
                 if not (k < len(s) and s[k] == ":"):
@@ -598,7 +598,7 @@ class _NyStrptime:
         var s = self.data
         var out = []
         var alts = _ALTS.get(directive)
-        if alts is not none:
+        if alts is not None:
             for alt in alts:
                 var n = _match_len(alt, s, i)
                 if n > 0:
@@ -612,7 +612,7 @@ class _NyStrptime:
             for z in tzname:
                 zs.append(z.lower())
             words = _words_by_length(zs)
-        if words is none:
+        if words is None:
             return out
         for w in words:
             if self.low[i:i + len(w)] == w:
@@ -750,7 +750,7 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
     var p = _NyStrptime(data_string, format)
     # a format's tokens are kept, as _strptime keeps its compiled regexes
     var toks = _TOKENS.get(format)
-    if toks is none:
+    if toks is None:
         toks = p.tokens()
         if len(_TOKENS) > 100:
             _TOKENS.clear()
@@ -768,8 +768,8 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
     for tok in toks:
         if tok[0] == "dir" and tok[1] in found and not (tok[1] in order):
             order.append(tok[1])
-    var iso_year = none
-    var year = none
+    var iso_year = None
+    var year = None
     var month = 1
     var day = 1
     var hour = 0
@@ -777,13 +777,13 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
     var second = 0
     var fraction = 0
     var tz = -1
-    var gmtoff = none
+    var gmtoff = None
     var gmtoff_fraction = 0
-    var iso_week = none
-    var week_of_year = none
-    var week_of_year_start = none
-    var weekday = none
-    var julian = none
+    var iso_week = None
+    var week_of_year = None
+    var week_of_year_start = None
+    var weekday = None
+    var julian = None
     for key in order:
         var v = found[key]
         if key == "y":
@@ -862,25 +862,25 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
                 tz = 1
             if tzname[0] == tzname[1] and daylight and fz != "utc" and fz != "gmt":
                 tz = -1
-    if year is none and iso_year is not none:
-        if iso_week is none or weekday is none:
+    if year is None and iso_year is not None:
+        if iso_week is None or weekday is None:
             raise ValueError("ISO year directive '%G' must be used with the ISO week directive '%V' and a weekday directive ('%A', '%a', '%w', or '%u').")
-        if julian is not none:
+        if julian is not None:
             raise ValueError("Day of the year directive '%j' is not compatible with ISO year directive '%G'. Use '%Y' instead.")
-    elif week_of_year is none and iso_week is not none:
-        if weekday is none:
+    elif week_of_year is None and iso_week is not None:
+        if weekday is None:
             raise ValueError("ISO week directive '%V' must be used with the ISO year directive '%G' and a weekday directive ('%A', '%a', '%w', or '%u').")
         raise ValueError("ISO week directive '%V' is incompatible with the year directive '%Y'. Use the ISO year '%G' instead.")
-    var leap_year_fix = false
-    if year is none and month == 2 and day == 29:
+    var leap_year_fix = False
+    if year is None and month == 2 and day == 29:
         year = 1904
-        leap_year_fix = true
-    elif year is none:
+        leap_year_fix = True
+    elif year is None:
         year = 1900
-    if julian is none and weekday is not none:
-        if week_of_year is not none:
+    if julian is None and weekday is not None:
+        if week_of_year is not None:
             julian = _calc_julian_from_U_or_W(year, week_of_year, weekday, week_of_year_start == 0)
-        elif iso_year is not none and iso_week is not none:
+        elif iso_year is not None and iso_week is not None:
             var first = _ord(iso_year, 1, 1)
             var fwd = (first + 6) % 7
             var w1 = first - fwd + (7 if fwd > 3 else 0)
@@ -888,10 +888,10 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
             year = ymd[0]
             month = ymd[1]
             day = ymd[2]
-        if julian is not none and julian <= 0:
+        if julian is not None and julian <= 0:
             year = year - 1
             julian = julian + (366 if _is_leap(year) else 365)
-    if julian is none:
+    if julian is None:
         if day > _days_in_month(year, month):
             raise ValueError("day is out of range for month")
         julian = _ord(year, month, day) - _ord(year, 1, 1) + 1
@@ -900,7 +900,7 @@ def _strptime(data_string, format="%a %b %d %H:%M:%S %Y"):
         year = ymd2[0]
         month = ymd2[1]
         day = ymd2[2]
-    if weekday is none:
+    if weekday is None:
         weekday = _weekday0(year, month, day)
     var tzn = found.get("Z")
     if leap_year_fix:

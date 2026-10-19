@@ -36,10 +36,10 @@ __all__ = ["architecture", "freedesktop_os_release", "libc_ver", "mac_ver", "mac
 
 _WINDOWS = os_platform() == "windows"
 _NYTHON_VERSION = "0.2.1"
-_uname_cache = none
+_uname_cache = None
 _platform_cache = {}
-_libc_cache = none
-_os_release_cache = none
+_libc_cache = None
+_os_release_cache = None
 
 
 class uname_result:
@@ -57,11 +57,11 @@ class uname_result:
         self.release = release
         self.version = version
         self.machine = machine
-        self._processor = none
+        self._processor = None
 
     @property
     def processor(self):
-        if self._processor is none:
+        if self._processor is None:
             self._processor = _unknown_as_blank(_processor_get())
         return self._processor
 
@@ -82,7 +82,7 @@ class uname_result:
             return self._items() == other._items()
         if isinstance(other, tuple):
             return tuple(self._items()) == other
-        return false
+        return False
 
     def __hash__(self):
         return hash(tuple(self._items()))
@@ -108,10 +108,10 @@ def _run_text(cmd):
     try:
         var r = os_run(cmd)
         if r["code"] != 0:
-            return none
+            return None
         return r["stdout"].strip()
     except Exception:
-        return none
+        return None
 
 
 def _processor_get():
@@ -121,7 +121,7 @@ def _processor_get():
             return p
         return ""
     var out = _run_text(["uname", "-p"])
-    if out is none:
+    if out is None:
         return ""
     return out
 
@@ -161,7 +161,7 @@ def uname():
         Entries which cannot be determined are set to ''.
     """
     global _uname_cache
-    if _uname_cache is not none:
+    if _uname_cache is not None:
         return _uname_cache
     var u = os_uname()
     var system = u["sysname"]
@@ -265,7 +265,7 @@ def system_alias(system, release, version):
     return (system, release, version)
 
 
-def libc_ver(executable=none, lib="", version="", chunksize=16384):
+def libc_ver(executable=None, lib="", version="", chunksize=16384):
     """ Tries to determine the libc version that the file executable
         (which defaults to the Python interpreter) is linked against.
 
@@ -275,7 +275,7 @@ def libc_ver(executable=none, lib="", version="", chunksize=16384):
     global _libc_cache
     if _WINDOWS:
         return (lib, version)
-    if _libc_cache is none:
+    if _libc_cache is None:
         var out = _run_text(["getconf", "GNU_LIBC_VERSION"])
         _libc_cache = ["", ""]
         if out:
@@ -287,7 +287,7 @@ def libc_ver(executable=none, lib="", version="", chunksize=16384):
     return (lib, version)
 
 
-def architecture(executable=none, bits="", linkage=""):
+def architecture(executable=None, bits="", linkage=""):
     """ Queries the given executable (defaults to the Python interpreter
         binary) for various architecture information.
 
@@ -318,11 +318,11 @@ def win32_ver(release="", version="", csd="", ptype=""):
 
 
 def win32_edition():
-    return none
+    return None
 
 
 def win32_is_iot():
-    return false
+    return False
 
 
 def mac_ver(release="", versioninfo=("", "", ""), machine=""):
@@ -338,13 +338,13 @@ def freedesktop_os_release():
     """Return operating system identification from freedesktop.org os-release
     """
     global _os_release_cache
-    if _os_release_cache is none:
-        var found = none
+    if _os_release_cache is None:
+        var found = None
         for candidate in ["/etc/os-release", "/usr/lib/os-release"]:
             if os_isfile(candidate):
                 found = candidate
                 break
-        if found is none:
+        if found is None:
             raise OSError("[Errno 2] Unable to read files /etc/os-release, /usr/lib/os-release")
         var info = {"NAME": "Linux", "ID": "linux", "PRETTY_NAME": "Linux"}
         var f = open(found)
@@ -378,7 +378,7 @@ def _platform(*args):
     # No need to report 'unknown' information...
     platform = platform.replace("unknown", "")
     # Fold '--'s and remove trailing '-'
-    while true:
+    while True:
         var cleaned = platform.replace("--", "-")
         if cleaned == platform:
             break
@@ -388,7 +388,7 @@ def _platform(*args):
     return platform
 
 
-def platform(aliased=false, terse=false):
+def platform(aliased=False, terse=False):
     """ Returns a single string identifying the underlying platform
         with as much useful information as possible (but no more :).
 
@@ -407,7 +407,7 @@ def platform(aliased=false, terse=false):
     """
     var key = str(bool(aliased)) + str(bool(terse))
     var cached = _platform_cache.get(key)
-    if cached is not none:
+    if cached is not None:
         return cached
     var u = uname()
     var system = u.system

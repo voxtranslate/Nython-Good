@@ -75,16 +75,16 @@ def _runs(s):
         var part = parts[k]
         if part != "":
             if ws_start >= 0:
-                runs.append((true, ws_start, pos))
+                runs.append((True, ws_start, pos))
                 ws_start = -1
-            runs.append((false, pos, pos + len(part)))
+            runs.append((False, pos, pos + len(part)))
             pos = pos + len(part)
         if k < last:
             if ws_start < 0:
                 ws_start = pos
             pos = pos + 1
     if ws_start >= 0:
-        runs.append((true, ws_start, pos))
+        runs.append((True, ws_start, pos))
     return runs
 
 
@@ -255,22 +255,22 @@ class TextWrapper:
                 if self.max_lines is None or len(lines) + 1 < self.max_lines or (rest_blank and cur_len <= width):
                     lines.append(indent + "".join(cur_line))
                 else:
-                    var placed = false
+                    var placed = False
                     while cur_line:
                         if cur_line[-1].strip() and cur_len + len(self.placeholder) <= width:
                             cur_line.append(self.placeholder)
                             lines.append(indent + "".join(cur_line))
-                            placed = true
+                            placed = True
                             break
                         cur_len = cur_len - len(cur_line[-1])
                         cur_line.pop()
                     if not placed:
-                        var done = false
+                        var done = False
                         if lines:
                             var prev_line = lines[-1].rstrip()
                             if len(prev_line) + len(self.placeholder) <= self.width:
                                 lines[-1] = prev_line + self.placeholder
-                                done = true
+                                done = True
                         if not done:
                             lines.append(indent + self.placeholder.lstrip())
                     break
