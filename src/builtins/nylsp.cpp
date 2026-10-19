@@ -72,6 +72,9 @@ using namespace nython::parser;
 using namespace nython::node;
 
 namespace {
+// (round 86) winnt.h declares a TokenType of its own (TOKEN_INFORMATION_CLASS):
+// this one, found first, is the lexer's
+using TokenType = nython::lexer::TokenType;
 
 // ── text ─────────────────────────────────────────────────────────────────────
 inline bool u8cont(unsigned char c) { return (c & 0xC0) == 0x80; }

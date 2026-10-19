@@ -19,6 +19,7 @@
 # Not here: batches (JSON-RPC arrays are not used by LSP).
 
 import os
+import sys
 import select
 
 __all__ = ["StdioTransport", "SocketTransport", "ProtocolError", "encode_message",
@@ -208,13 +209,44 @@ class _Transport:
 
 
 class StdioTransport(_Transport):
-    """The server's standard input and output (file descriptors 0 and 1)."""
+    """The server's standard input and output (file descriptors 0 and 1).
+
+    Windows' select() takes sockets only (a pipe or a file is WSAENOTSOCK,
+    as CPython's select.select reports), so there a thread reads the input
+    and hands each chunk over through a queue - the read never blocks the
+    server's loop, and a timeout is the queue's."""
     def __init__(self, rfd=0, wfd=1):
         _Transport.__init__(self)
         self.rfd = rfd
         self.wfd = wfd
+        self._chunks = None
+        if sys.platform == "win32":
+            import queue
+            import threading
+            self._chunks = queue.Queue()
+            self._empty = queue.Empty
+            threading.Thread(target=self._pump, name="nylsp-stdin", daemon=True).start()
+
+    def _pump(self):
+        while True:
+            try:
+                data = os.read(self.rfd, 65536)
+            except OSError:
+                data = b""
+            self._chunks.put(data)
+            if len(data) == 0:
+                return
 
     def _read_some(self, timeout):
+        if self._chunks is not None:
+            try:
+                if timeout is None:
+                    return self._chunks.get()
+                if timeout <= 0:
+                    return self._chunks.get_nowait()
+                return self._chunks.get(timeout=timeout)
+            except self._empty:
+                return None
         if timeout is not None:
             r = select.select([self.rfd], [], [], timeout)[0]
             if not r:

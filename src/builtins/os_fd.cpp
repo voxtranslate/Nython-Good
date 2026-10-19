@@ -68,6 +68,19 @@ using nyos::make_int;
 using nyos::make_list;
 
 #ifdef _WIN32
+// (round 86) CPython puts the standard descriptors in binary mode at
+// startup (initconfig.c's config_init_stdio), so os.read(0, n) and
+// os.write(1, b) move bytes as they are - a Language Server's "\r\n\r\n"
+// header arrived as "\n\n" and went out as "\r\r\n". Nython's own text
+// streams keep the CRT's text mode on them (print's "\n" goes out as
+// "\r\n", as CPython's sys.stdout writes it), so a raw read or write of
+// one of them switches it to binary for the call.
+struct RawStdFd {
+    int fd, old = -1;
+    explicit RawStdFd(int f) : fd(f) { if (fd >= 0 && fd <= 2) old = ::_setmode(fd, _O_BINARY); }
+    ~RawStdFd() { if (old >= 0 && old != _O_BINARY) ::_setmode(fd, old); }
+};
+
 std::wstring widen(const std::string& s) {
     if (s.empty()) return std::wstring();
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
@@ -245,6 +258,9 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
         int err = 0;
         {
             nyconc::GilRelease unlocked;
+#ifdef _WIN32
+            RawStdFd raw(fd);
+#endif
             do {
 #ifdef _WIN32
                 got = ::_read(fd, n ? &buf[0] : nullptr, (unsigned)std::min<long long>(n, 0x7fffffff));
@@ -265,6 +281,9 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
         int err = 0;
         {
             nyconc::GilRelease unlocked;
+#ifdef _WIN32
+            RawStdFd raw(fd);
+#endif
             do {
 #ifdef _WIN32
                 put = ::_write(fd, data.data(), (unsigned)std::min<size_t>(data.size(), 0x7fffffff));
