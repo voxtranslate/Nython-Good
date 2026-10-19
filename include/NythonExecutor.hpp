@@ -559,9 +559,11 @@ struct NythonExecutor {
     // dunders is read (int.__new__), "dictview" at the first instance
     // __dict__ read: a program that never does pays nothing for them.
     std::unordered_set<std::string> mirrors_loaded_;
+    int mirror_loading_ = 0;   // (round 86) a chunk runs: the prelude's own (preludeCaller)
     void ensureMirror(const std::string& chunk) {
         if (mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
+        struct Loading { int& n; explicit Loading(int& c) : n(c) { n++; } ~Loading() { n--; } } loading(mirror_loading_);   // round 86
         if (chunk != "base" && chunk != "os" && chunk != "buffer" && chunk != "posix") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix")
         if (chunk == "dictview") ensureMirror("dict");
         try {
@@ -15499,6 +15501,7 @@ public:
     // async generator), which stand where CPython's C code does
     bool preludeCaller(Context* ctx) const {
         if (!prelude_ctx_) return false;
+        if (mirror_loading_) return true;   // a chunk's top level (ensureMirror)
         for (Context* c = ctx; c; c = c->parent) if (c == prelude_ctx_) return true;
         return false;
     }

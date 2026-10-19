@@ -395,6 +395,8 @@ def run(*popenargs, input=none, capture_output=false, timeout=none, check=false,
         plan.inherit = plan.inherit.replace("0", "")
     elif plan.input is not none:
         plan.inherit = plan.inherit.replace("0", "")
+    if _ny_audit_hooks:
+        _audit_popen(args, kwargs.get("executable"), shell, kwargs.get("cwd"), kwargs.get("env"))   # round 86: run() is Popen's
     var cmd = _native_cmd(args, shell)
     var kw = _native_opts(plan, kwargs.get("cwd"), kwargs.get("env"))
     if plan.input is not none:

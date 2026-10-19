@@ -146,12 +146,15 @@ def event_args(event):
 class AuditDenied(PermissionError):
     """An audit policy refused an event: raised from the audited call."""
 
-    def __init__(self, event, args, rule=None, message=None):
+    def __init__(self, event, args=(), rule=None, message=None):
         self.event = event
         self.args_ = tuple(args)
         self.rule = rule
-        text = message if message else "audit policy denies " + event + _short_args(args)
-        PermissionError.__init__(self, text)
+        self._text = message if message else "audit policy denies " + event + _short_args(args)
+        PermissionError.__init__(self, self._text)
+
+    def __str__(self):
+        return self._text
 
 
 class _AnyType:

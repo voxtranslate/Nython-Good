@@ -292,6 +292,20 @@ void VMConc::install(VirtualMachine& vm) {
             return ret_to_vm(r);
         });
     }
+    // (round 86) time.sleep(secs) is audited (CPython 3.13's event), as the
+    // interpreter's (builtins/os_time.cpp); the VM reaches this table's
+    // time_sleep directly
+    {
+        auto it = vm.globals_.find("time_sleep");
+        if (it != vm.globals_.end() && it->second.type == VMType::NATIVE && it->second.native) {
+            NativeFunc inner = it->second.native;
+            VirtualMachine* vp = &vm;
+            it->second = VMVal::make_native([inner, vp](std::vector<VMVal>& a) -> VMVal {
+                if (nyrt::audit_on()) vp->bridge_audit_event("time.sleep", {a.empty() ? VMVal::make_none() : a[0]});
+                return inner(a);
+            });
+        }
+    }
     // The VM's own process natives touch no VM state and write nothing through
     // std::cout, so they release the GIL while the child runs (the
     // interpreter's, reached through the bridge, already do: builtins/os.cpp).

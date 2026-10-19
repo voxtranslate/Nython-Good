@@ -4293,6 +4293,8 @@ public:
             }
             VMVal mode=args.size()>1?args[1]:kwget("mode");
             if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
+            // (round 86) the "open" audit event, as the interpreter's prelude open()
+            if(nyrt::audit_on()&&mode.type==VMType::STRING) audit_helper("_ny_audit_open",{path,mode});
             {
                 // open(fd) and opener= (round 80): the prelude's _ny_open_fd
                 VMVal opener_fn=args.size()>7?args[7]:kwget("opener");

@@ -410,6 +410,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit119 | 85 | round 85 (part F): Python's binding rule in a Python-language file - every binding form, UnboundLocalError, closures/nonlocal, class bodies, comprehensions, generators, decorators, exec/eval/compile/ast from the file; Nython-only: a `.ny` file keeps Nython's rule, the def-line opt-in, `-W nython-scope` / `NY_SCOPE_WARN`, `--scope-report` (63 pass under python3) |
 | vm_audit120 | 19 | round 85 (main session): exceptions the runtime catches and carries on from are freed (for loops, list()/sorted()/unpacking, `__getitem__` iteration, hasattr/getattr/next defaults, `__getattribute__` -> `__getattr__`, yield from, a generator closed inside an except clause), weak references to generators and WeakSets of them (passes under python3) |
 | vm_audit122 | 169 | round 86 (part H): nylsp, the Language Server driven as an editor drives it (stdio JSON-RPC): lifecycle and errors, position encodings, incremental sync, diagnostics (syntax with recovery, NyScope, unbound reads, undefined names/modules, NyxAI rules), completion/resolve, hover, signature help, definition/references across files, scope-correct rename in .ny and .py files, symbols, folding, formatting, semantic tokens and deltas, code actions, inlay hints, cancellation, progress (Nython-only) |
+| vm_audit121 | NNN | round 86 (part G): CPython's audit events - a child under a recording hook, one case per group (builtins, code/function objects, restricted attributes, sys, os, the C modules, shutil/subprocess/socket/ctypes/... ), CPython 3.12's records filtered by tools/audit_events.json per version; a raising hook aborts the call; nothing before a hook; input()'s result on a pty; Nython-only: lib/nyaudit.ny, `--audit-policy`, `--audit-log`, derive (passes under python3.11/3.12) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1750,6 +1751,31 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   "Exception ignored in" reports go to a program's sys.unraisablehook.
 - subprocess starts children with posix_spawn where that means the same as
   fork + exec (`NY_SPAWN_FORK=1` forces fork).
+
+## Round 86, part G: CPython's audit events, and audit policies (see `HANDOFF.md` §0zG)
+
+- `tools/gen_audit_events.py` -> `tools/audit_events.json`: CPython's 191
+  audit events (the docs' `audit-event` directives for 3.11/3.12/3.13, the
+  host Pythons' Lib, probes under a recording hook): args, raised_from,
+  versions, and the `nython` column (where Nython raises each, or why not).
+- **Both engines raise them with CPython's names and arguments**: id,
+  input/result, compile (bytes), exec (the code object), settrace/setprofile,
+  time.sleep, the restricted attributes (object.__getattr__/__setattr__/
+  __delattr__), function.__new__ (`types.FunctionType(compile(...), g)` works),
+  code.replace (new), the frame/traceback/coroutine/async-generator ones, sys's,
+  every audited os function, and the library modules' (shutil, subprocess,
+  socket, ctypes, sqlite3, glob, pathlib, tempfile, urllib, http.client, ...).
+- **An engine audit point**: `nyrt::audit_on()` first (one byte), and
+  nothing when the caller is the prelude (`preludeCaller(ctx)` / VM
+  `prelude_running()`): the prelude stands where CPython's C code does. The
+  engines' own identity for reprs is `_ny_id` / `vm_identity`, not `id()`.
+  A native reached through the VM's bridge raises into the VM's hooks
+  (`NythonExecutor::auditForward`).
+- **`lib/nyaudit.ny`**: allow/deny/log rules over event globs and argument
+  patterns, default-deny capable, frozen once installed, `granted()` for a
+  block, a policy file format, `derive(log)`; `nython --audit-policy FILE`,
+  `nython --audit-log FILE` (JSON lines), `nython -m nyaudit derive LOG`.
+- `sys.audit` checks nothing while no hook exists, as CPython's.
 
 ## Transcripts
 

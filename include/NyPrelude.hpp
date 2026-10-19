@@ -1398,13 +1398,16 @@ def _ny_audit_fire(event, args):
     for h in list(_ny_audit_hooks):
         h(event, args)
 
-def _ny_sys_audit(event, *args):
-    # (round 86) nothing at all - not even the event's type checked - while
-    # no hook exists, as CPython's sys.audit
+def _ny_sys_audit(*args):
+    # sys.audit(event, *args) - (round 86) nothing at all, not even the
+    # event's type checked, while no hook exists, as CPython's
+    if not args:
+        raise TypeError("audit() missing 1 required positional argument: 'event'")
     if _ny_audit_hooks:
+        var event = args[0]
         if not isinstance(event, str):
             raise TypeError("expected str for argument 'event', not " + type(event).__name__)
-        _ny_audit_fire(event, args)
+        _ny_audit_fire(event, args[1:])
 
 def _ny_sys_addaudithook(hook):
     # the existing hooks hear of it first; one raising a RuntimeError keeps
@@ -1803,6 +1806,11 @@ def _ny_open_flags(mode):
         f = 2 if plus else 0
     return f | 524288   # O_CLOEXEC, as CPython opens every file
 
+def _ny_audit_open(path, mode):
+    # the "open" event (round 84; round 86: the VM's native open() raises it
+    # here too): the mode without b/t, the flags CPython computes
+    _ny_audit_fire("open", (path, mode.replace("b", "").replace("t", ""), _ny_open_flags(mode)))
+
 def _ny_open_fd(path, mode, encoding, newline, closefd, opener):
     # open(fd) and open(path, opener=f) (round 80; the VM's open calls this
     # for them too)
@@ -1841,8 +1849,8 @@ def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=no
     # Python's parameters in Python's order (round 77: encoding was third)
     if hasattr(path, "__fspath__"):
         path = path.__fspath__()
-    if len(_ny_audit_hooks) > 0:
-        _ny_audit_fire("open", (path, mode.replace("b", "").replace("t", ""), _ny_open_flags(mode)))   # round 84, as CPython's
+    if _ny_audit_hooks:
+        _ny_audit_open(path, mode)   # round 84, as CPython's
     if (isinstance(path, int) and not isinstance(path, bool)) or opener is not none:
         return _ny_open_fd(path, mode, encoding, newline, closefd, opener)
     if "b" in mode and encoding != "utf-8" and encoding is not none:

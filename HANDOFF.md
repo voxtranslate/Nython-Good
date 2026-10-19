@@ -5,6 +5,8 @@ this file describes it **as it actually is**, including the traps.
 
 Last updated: round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
 Round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
+Last updated: round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
+Round 86, part G — **§0zG** (CPython's audit events (PEP 578) raised where CPython raises them, with its names and arguments, on both engines and in the library - a table generated from CPython's docs and probes (tools/audit_events.json), the prelude-caller rule for engine audit points, events from natives behind the VM's bridge; lib/nyaudit.ny audit policies, `--audit-policy` / `--audit-log`; vm_audit121)
 Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
 Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
 Round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
@@ -189,6 +191,97 @@ Helix, Sublime, Kate ...) gets the analyses Nython's own IDE has:
   `... if false else ...` branch (nylsp flags it).
 
 ---
+## 0zG. Round 86, part G — CPython's audit events everywhere CPython raises them, and audit policies (vm_audit121)
+
+PEP 578's hooks are only as useful as the events the runtime raises. Round 84
+gave Nython `sys.audit`/`sys.addaudithook` and five events; this round raises
+the rest of CPython's, with its names and its arguments, on both engines.
+
+- **The table** (`tools/gen_audit_events.py` -> `tools/audit_events.json`,
+  191 events): the docs' `audit-event` directives (a CPython `Doc/` with
+  `--doc DIR`, else the "Audit events table" they make on docs.python.org for
+  3.11/3.12/3.13 - which version raises what), the host Pythons' `Lib/*.py`
+  (raised from Python: a `sys.audit("name"` there), and probes: every
+  python3.11-3.13 found runs a battery under a hook recording each event's
+  argument types and whether a `sys.audit(` line raised it (dangerous calls -
+  sethostname, ensurepip, a browser - vetoed by the hook). Each record:
+  module, args (3.12's documented names), raised_from, versions, probe_types,
+  docs, platform, and `nython` (where Nython raises it - engine, prelude,
+  library - or why not). The probes found that CPython's docs name two events
+  it never raises (`sys.set_asyncgen_hooks_firstiter/finalizer`: the C code
+  raises `sys.set_asyncgen_hook_firstiter/finalizer`), that POSIX's
+  `os.spawn*` raise os.fork (os.spawn is Windows-only), that a ctypes call
+  raises nothing (`ctypes.call_function` is the private `_ctypes`
+  function's), that `compile` gets the source as bytes, that input()'s
+  result is reported only from a terminal, and that `cpython._PySys_ClearAuditHooks`
+  reaches C hooks only.
+- **The rule for engine audit points**: test `nyrt::audit_on()` (one byte)
+  first; then the event goes to the prelude's `_ny_audit_fire`; and **not
+  when the caller is the prelude** (`NythonExecutor::preludeCaller(ctx)` -
+  the scope chain reaches `prelude_ctx_`; `auditCtx()` gives the running
+  function's scope where no ctx is passed; VM `prelude_running()`): the
+  prelude stands where CPython's C code does, so its own `id()` in a repr,
+  `exec` in a helper or a generator's frame read by an async generator raise
+  nothing. The engine's own identity for reprs is `_ny_id` (interpreter
+  idHex) / `vm_identity` (VM default repr) - not id(), which audits.
+- **A native reached through the VM's builtin bridge** raises into the
+  VM's hooks: `NythonExecutor::auditForward()` (set by main.cpp's
+  install_vm_builtin_bridge) converts the arguments (BridgeConv) and calls
+  `VirtualMachine::bridge_audit_event`; the bridge lambda rethrows a
+  `VMException` as it is (a hook's exception keeps its class).
+- Engine-level events: builtins.id, builtins.input/result (a terminal only),
+  compile (bytes, filename; a tree with None - before lib/ast.ny takes it),
+  exec (the code object: a source is compiled first - `_ny_audit_exec`),
+  sys.settrace/setprofile, time.sleep (3.13's), object.__getattr__ for a
+  function's `__code__`/`__defaults__`/`__kwdefaults__` and a generator's
+  `gi_frame`/`gi_code`, object.__setattr__/__delattr__ for a function's
+  `__code__`/`__defaults__`/`__kwdefaults__` and a class's `__bases__`,
+  `__name__`, `__qualname__`, `__module__`, `__doc__` (setAttr/delAttrValue,
+  set_attr/del_attr: `auditAttrStore`/`audit_attr_store`), function.__new__
+  (`types.FunctionType(code, globals)` now works for a code object compile()
+  made - the prelude's `_ny_function_new`), cpython.run_file/run_command/
+  run_module/run_stdin (to a policy installed by the command line).
+- Prelude: builtins.breakpoint, the frame's f_code, a traceback's tb_frame,
+  a coroutine's cr_frame/cr_code, an async generator's ag_frame/ag_code,
+  `__class__` assignment (`_ny_set_class`), sys._getframe, the new
+  sys._getframemodulename (3.12) / _current_frames / _current_exceptions
+  (the calling thread's only), sys.set_asyncgen_hook_*, sys.excepthook
+  (CPython's rules: a hook's RuntimeError suppresses the report) and
+  sys.unraisablehook, code.replace() (new: copies either kind of code object,
+  code.__new__), and the os module: every function CPython's posixmodule.c
+  audits, with its argument conventions (-1 for a dir_fd not given, uid_t
+  ids, os.putenv/unsetenv/system encoded on POSIX, os.open's flags with
+  O_CLOEXEC); the natives os.system/remove/unlink/rmdir/chmod/chdir/symlink/
+  utime/unsetenv got prelude wrappers that audit and call them, and
+  os.makedirs is CPython's (one os.mkdir per directory).
+- Library: _thread / threading (3.12's start_new_thread), array, marshal,
+  mmap, resource, fcntl (an argument not given is None in the event),
+  syslog, sqlite3 (connect, connect/handle, enable_load_extension,
+  load_extension), pickle.find_class, pdb.Pdb, glob, pathlib (glob, rglob,
+  walk), shutil (each of CPython's - and shutil.chown, which raised
+  NotImplementedError, is CPython's over os.chown), tempfile, subprocess
+  (CPython's executable/args shaping), urllib.Request, http.client, ctypes
+  (dlopen, dlsym, addressof, cdata, cdata/buffer, the buffers, string_at,
+  wstring_at, errno), socket (every audited function and method).
+- `sys.audit` checks nothing while no hook exists (`sys.audit(5)` is None),
+  as CPython's.
+- **`lib/nyaudit.ny`** (Nython's own): declarative policies - `Policy(default=
+  "deny")`, `.allow/.deny/.log(event_glob, *arg_patterns, **named)` by the
+  documented argument names, first match decides, `AuditDenied` (a
+  PermissionError) from the audited call, frozen once installed, `granted()`
+  lends a capability for a with block; a text file format and a JSON form;
+  `derive(log)` writes a policy allowing what a logged run did. After the
+  PEP 578 sandboxing discussions and the object-capability literature
+  (Miller 2006): default-deny, grants attenuated by argument patterns, no
+  self-loosening. `nython --audit-policy FILE` installs one before the
+  program's first statement (cpython.run_* is its first event), `--audit-log
+  FILE` logs every event as JSON lines, `nython -m nyaudit derive LOG`.
+- Not done: msvcrt/winreg/_winapi (no such modules), nntplib and ensurepip
+  (absent), sys.monitoring, xattr-free platforms' os.*xattr, os.startfile/
+  add_dll_directory/listdrives (Windows), ctypes.set_exception (SEH), the
+  import system's own open/compile/exec events for a module's file (Nython's
+  import raises `import` only), input() reading a replaced sys.stdin (it
+  reads the process's stdin whatever sys.stdin is - found, not fixed).
 
 ## 0y3. Round 85 (main session) — exceptions native code swallows, generators as weak references and keys, the harness under Wine, the round 84 suites on Windows (vm_audit120)
 

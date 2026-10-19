@@ -695,6 +695,7 @@ EXPECTED = {
     'sys.addaudithook': [('sys.addaudithook', ())],
     'sys.set_asyncgen_hooks': [('sys.set_asyncgen_hook_finalizer', ()), ('sys.set_asyncgen_hook_firstiter', ()), ('sys.set_asyncgen_hook_firstiter', ()), ('sys.set_asyncgen_hook_finalizer', ()), ('sys.set_asyncgen_hook_firstiter', ())],
     'sys.unraisablehook': [('sys.unraisablehook', ('function', ('<ZeroDivisionError>', 'ZeroDivisionError', 'traceback', None, 'function'))), ('=', ['ZeroDivisionError'])],
+    'time.sleep': [('time.sleep', (0,))],                   # (3.13's event: no record from 3.12)
     '_thread.start_new_thread': [('_thread.start_new_thread', ('function', 'tuple', 'NoneType')), ('=', True)],
     'array.__new__': [('array.__new__', ('i', [1, 2])), ('array.__new__', ('b', None)), ('array.__new__', ('d', (1.5,))), ('=', [[1, 2], [], [1.5]])],
     'marshal': [('marshal.dumps', (1, 4)), ('marshal.loads', ('bytes',)), ('marshal.load', ()), ('marshal.dumps', (2, 4)), ('marshal.dumps', ([1, 'a'], 4)), ('marshal.loads', ('bytes',)), ('=', [1, 'a'])],
@@ -1035,7 +1036,7 @@ print("done")
     prog2 = """import os
 with open("data121.txt", "w") as f:
     f.write("1")
-print(open("data121.txt").read(), sorted(os.listdir("."))[:1])
+print(open("data121.txt").read(), "data121.txt" in os.listdir("."))
 """
     r1 = run_py("prog121b.py", prog2, flags=["--audit-log", log2])
     derived = subprocess.run([sys.executable] + ENGINE + ["-m", "nyaudit", "derive", log2], capture_output=True, text=True, cwd=T).stdout
@@ -1047,10 +1048,10 @@ print(open("data121.txt").read(), sorted(os.listdir("."))[:1])
     check("nython --audit-log: every event logged", [r1.stdout, r1.returncode, derived.startswith("# derived by nyaudit"),
                                                      "default deny" in derived, "allow cpython.run_file" in derived,
                                                      "allow os.listdir" in derived],
-          ["1 ['data121.txt']\n", 0, True, True, True, True])
+          ["1 True\n", 0, True, True, True, True])
     check("a derived policy runs that program and refuses anything else",
           [r2.stdout, r2.returncode, r3.returncode != 0, "PermissionError" in r3.stderr or "AuditDenied" in r3.stderr],
-          ["1 ['data121.txt']\n", 0, True, True])
+          ["1 True\n", 0, True, True])
     r4 = subprocess.run([sys.executable] + ENGINE + ["--audit-log", log2 + ".c", "-c", "pass"], capture_output=True, text=True, cwd=T)
     with open(log2 + ".c") as f:
         firstc = json.loads(f.readline())
