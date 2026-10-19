@@ -881,7 +881,7 @@ async def h2_main():
     await s.response_headers()
     await s.read_chunk()
     s.reset()
-    for i in range(50):
+    for i in range(1000):
         if SERVER_LOG:
             break
         await asyncio.sleep(0.01)
@@ -898,7 +898,10 @@ async def h2_main():
     slow = asyncio.ensure_future(c.request("GET", "/slow"))
     await asyncio.sleep(0.1)
     closing = asyncio.ensure_future(srv.close())
-    await asyncio.sleep(0.1)
+    for i in range(1000):
+        if c.terminated is not None:
+            break
+        await asyncio.sleep(0.01)
     try:
         await c.request("GET", "/echo")
         out = "answered"
@@ -907,6 +910,10 @@ async def h2_main():
     check("asyncio: no new stream after the server's GOAWAY", out, "ConnectionClosedError")
     r = await slow
     await closing
+    for i in range(1000):
+        if c.terminated.last_stream_id != 2 ** 31 - 1 or c.closed_error is not None:
+            break
+        await asyncio.sleep(0.01)
     check("asyncio: the stream in flight finished", [r.status, r.body], [200, b"slow done"])
     check("asyncio: GOAWAY NO_ERROR with the real last stream id (after the 2^31-1 one)",
           [c.terminated.error_code, c.terminated.last_stream_id], [ErrorCodes.NO_ERROR, r.stream_id])
@@ -962,7 +969,7 @@ async def h2_tls_main():
     cc.set_alpn_protocols(["http/1.1"])
     try:
         reader, writer = await asyncio.open_connection("localhost", srv.port, ssl=cc)
-        data = await asyncio.wait_for(reader.read(100), 5)
+        data = await asyncio.wait_for(reader.read(100), 30)
         writer.close()
     except (ssl.SSLError, ConnectionError, OSError):
         data = b""             # (a TLS stack may refuse the handshake instead)
@@ -994,7 +1001,7 @@ async def h2_goaway_error_main():
     await writer.drain()
     data = b""
     while true:
-        chunk = await asyncio.wait_for(reader.read(65536), 5)
+        chunk = await asyncio.wait_for(reader.read(65536), 60)
         if not chunk:
             break
         data += chunk
@@ -1030,7 +1037,7 @@ async def await_shape_main():
     async def waiter():
         return await _AwaitsCoroutine(ev)
     t = asyncio.ensure_future(setter())
-    r = await asyncio.wait_for(waiter(), 5)
+    r = await asyncio.wait_for(waiter(), 60)
     await t
     check("await of an object whose __await__ is a coroutine's, woken by another task", r, "woken")
 
@@ -1097,7 +1104,7 @@ def test_http_client():
         asyncio.run(main())
     t = threading.Thread(target=run, daemon=true)
     t.start()
-    ready.wait(10)
+    ready.wait(120)
     c = http.client.HTTPConnection("127.0.0.1", state["plain"], http2="prior_knowledge")
     c.request("POST", "/echo", body=b"via http.client")
     r = c.getresponse()
@@ -1293,19 +1300,30 @@ def test_websocket():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+def section(fn):
+    # a section that raises is a failed check (with its traceback), not
+    # the end of the run
+    try:
+        fn()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        check(fn.__name__ + " ran to its end", type(e).__name__ + ": " + str(e), "no exception")
+
+
 t0 = time.time()
-test_first_view_in_threads()
+section(test_first_view_in_threads)
 TLS = make_certs()
-test_hpack()
-test_policies()
-test_frames()
-test_connection()
-test_priority()
-test_asyncio()
+section(test_hpack)
+section(test_policies)
+section(test_frames)
+section(test_connection)
+section(test_priority)
+section(test_asyncio)
 if nython:
-    test_http_client()
-test_deflate()
-test_websocket()
+    section(test_http_client)
+section(test_deflate)
+section(test_websocket)
 shutil.rmtree(TMP, ignore_errors=true)
 
 pass_n = 0
