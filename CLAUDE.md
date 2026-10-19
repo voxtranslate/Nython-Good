@@ -409,6 +409,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit118 | 155 | round 85, part E: the rest of posix (statvfs, sysconf/pathconf/confstr, ids, the scheduler, eventfd/memfd/pidfd, splice, copy_file_range, xattrs, posix_spawn, wait3/wait4/waitid, register_at_fork, popen, spawn*, fwalk, a posix module), time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data/send_fds/interfaces/constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt (RFC 7914), locale's catalogs - values asked of the host's python3 (passes under python3) |
 | vm_audit119 | 85 | round 85 (part F): Python's binding rule in a Python-language file - every binding form, UnboundLocalError, closures/nonlocal, class bodies, comprehensions, generators, decorators, exec/eval/compile/ast from the file; Nython-only: a `.ny` file keeps Nython's rule, the def-line opt-in, `-W nython-scope` / `NY_SCOPE_WARN`, `--scope-report` (63 pass under python3) |
 | vm_audit120 | 19 | round 85 (main session): exceptions the runtime catches and carries on from are freed (for loops, list()/sorted()/unpacking, `__getitem__` iteration, hasattr/getattr/next defaults, `__getattribute__` -> `__getattr__`, yield from, a generator closed inside an except clause), weak references to generators and WeakSets of them (passes under python3) |
+| vm_audit122 | 169 | round 86 (part H): nylsp, the Language Server driven as an editor drives it (stdio JSON-RPC): lifecycle and errors, position encodings, incremental sync, diagnostics (syntax with recovery, NyScope, unbound reads, undefined names/modules, NyxAI rules), completion/resolve, hover, signature help, definition/references across files, scope-correct rename in .ny and .py files, symbols, folding, formatting, semantic tokens and deltas, code actions, inlay hints, cancellation, progress (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1650,6 +1651,23 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   of the same name (tkinter's `W` became a widget path); write `var` for
   locals in ported modules. (Round 85: the ported modules are now
   Python-language and bind as CPython does - see below.)
+
+## Round 86, part H: nylsp, a Language Server (see `HANDOFF.md` §0z2)
+
+- `nython -m nylsp` (stdio; `--tcp PORT`) serves LSP 3.17 to any editor:
+  `lib/nylsp/` (protocol, workspace, server) over the native `_ny_lsp(op, ...)`
+  (`src/builtins/nylsp.cpp`: the real parser in ast mode and the engines'
+  own parse, a binding analysis mirroring NyScope for both binding rules, a
+  piece table, semantic tokens). Diagnostics, completion, hover, signature
+  help, definition/references, scope-correct rename by each file's binding
+  rule, symbols, folding, formatting, semantic tokens with deltas, code
+  actions, inlay hints, cancellation, progress.
+- **Error recovery by indentation islands** keeps the analyses working on
+  code that does not parse (a line being typed): the statement around the
+  error is replaced, keeping the line count, by `pass` or `if 1:` so the
+  blocks around it survive.
+- nylsp.cpp includes only the parser/lexer/NyScope headers: keep it so (it
+  compiles in seconds).
 
 ## Round 85 (main session): what native code catches, generators, Windows (see `HANDOFF.md` §0y3)
 

@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
+Last updated: round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
+Round 85 (main session) — **§0y3** (the verification of round 85 merged; exceptions native code swallows let go of, generators weakly referenceable and hashable, the scripted-input harness under Wine, bytes.partition's separator object, the round 84 suites on Windows; vm_audit120)
 Round 85, part F — **§0y2** (Python's binding rule for Python-language source - `.py`, `# nython: python`, code compiled from them, ast trees: a name a function binds is its local, UnboundLocalError; exec in such a function; a census of lib/ (`tools/ny_scopecheck.py`, `--scope-report`) and 435 ported modules marked Python-language; `-W nython-scope` warnings for Nython code; vm_audit119)
 Round 85, part E — **§0y** (the names CPython's system modules have and Nython's lacked, measured by tools/api_diff.py against CPython 3.11/3.12 - 82.5% -> 94.1% of 9676 names: a posix module and the rest of posixmodule.c, time's clocks, signal's masks/waits/set_wakeup_fd, socket's ancillary data and constants, select.epoll, sys's int digit limit and unraisablehook, gc.get_objects/referents/referrers, ssl.RAND_*, hashlib.scrypt; subprocess on posix_spawn; vm_audit118)
 Round 84, part A — **§0x** (memoryview and the buffer protocol on both engines - PEP 3118/688 exporters, casts, N-dim views, exported bytearrays that cannot resize; bytes-like arguments taking any buffer across the engines and the libraries; bytes % args, PEP 461; vm_audit112)
@@ -97,6 +98,95 @@ round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
+
+---
+
+## 0z2. Round 86, part H — nylsp, a Language Server for Nython (vm_audit122)
+
+`examples/vm_audit122.ny` (169 checks, Nython-only: it drives the server as an
+editor does - `sys.executable -m nylsp` as a child with pipes, framed JSON-RPC,
+a fixture workspace under a per-pid temp dir) passes on both engines. Sweep
+470 runs, 0 not ok and `tools/ide_e2e.py` 463 passed in the agent's worktree.
+
+Every editor that speaks the Language Server Protocol (VS Code, Neovim, Emacs,
+Helix, Sublime, Kate ...) gets the analyses Nython's own IDE has:
+`nython -m nylsp` (stdio), `--tcp PORT` (one connection on 127.0.0.1),
+`--log FILE`. The package header (`lib/nylsp/__init__.ny`) lists every method.
+
+- **`lib/nylsp/protocol.ny`**: JSON-RPC 2.0 with LSP's Content-Length framing;
+  JSON-RPC's and LSP's error codes; reads are non-blocking, so a
+  `$/cancelRequest` is seen while a request runs (queued requests are answered
+  RequestCancelled at once, the running one at its next check).
+- **`lib/nylsp/workspace.ny`**: URIs and paths; the workspace scan and a
+  per-module index (exports, imports, mtime, the importers graph) through the
+  engines' own module search (`.ny` before `.py`, packages, relative and
+  quoted imports); `workspace/symbol` by the native `fuzzy_rank`.
+- **`lib/nylsp/server.ny`**: initialize/initialized/shutdown/exit with honest
+  capabilities (exit status 0 after shutdown, 1 otherwise;
+  ServerNotInitialized before initialize, InvalidRequest after shutdown);
+  utf-16 (default), utf-8 and utf-32 position encodings; didOpen/didChange
+  (incremental, UTF-16 ranges applied to a native piece table)/didSave/
+  didClose; publishDiagnostics (syntax errors - several, by the recovery
+  below -, NyScope's const/nonlocal errors, UnboundLocalError reads, the
+  places where Nython's binding rule and Python's disagree as information
+  with quick fixes, undefined names, unknown modules and imported names,
+  NyxAI's review rules as coded warnings; importers re-checked when a
+  module's exports change); completion (scope-aware names, keywords,
+  builtins; after a dot the members of classes/instances/modules/packages/
+  builtin types, bases across files; module names after import; nothing in
+  strings or comments) + resolve; hover (signature, docstring, kind and the
+  type inferred from the binding); signatureHelp (from the text, so it works
+  while the call is typed); definition/declaration/typeDefinition across
+  files through imports and re-exports; references/documentHighlight;
+  prepareRename/rename as a WorkspaceEdit that follows each file's binding
+  rule (Nython's in `.ny`, Python's in `.py`/`# nython: python`), members
+  through instances and subclasses in other modules, keyword arguments
+  (builtins and names outside the workspace refused); documentSymbol
+  (hierarchical) and workspace/symbol; foldingRange (blocks, brackets,
+  `#region`, comment blocks, import groups); formatting/rangeFormatting (the
+  native formatter as Myers hunks); semanticTokens full and delta (the
+  standard legend and modifiers); codeAction (NyxAI's fixes as quick fixes,
+  `source.fixAll.nyxai`, `global x`/`var x` for binding-rule notes);
+  inlayHint (parameter names at call sites); `$/progress` while the
+  workspace is indexed (between requests); `nython/stats`,
+  `nython/analysis`, `nython/documentText`.
+- **`src/builtins/nylsp.cpp`** (+ `include/builtins/nylsp.hpp`), reached by
+  `_ny_lsp(op, ...)` (text.cpp's dispatch; registered in `registerBuiltins`):
+  the real parser twice - ast mode (Python's tree shape with token spans)
+  and the engines' own parse (the SyntaxError, NyScope's errors and report) -;
+  a binding analysis mirroring NyScope for both rules; the piece table; the
+  semantic tokens and their delta; members, type resolution, call sites. It
+  includes only the parser/lexer/NyScope headers, not NythonExecutor.hpp
+  (seconds to compile).
+- **Error recovery by indentation islands** (after Moonen's island grammars,
+  2001, and tree-sitter's recovery): when the source does not parse, the
+  statement around the error is cut out by the indentation and bracket
+  structure and replaced, keeping the line count, by `pass` - or `if 1:` when
+  an indented block follows, so that block stays an island the analysis
+  still sees; a compound header whose bracket never closes is cut alone (its
+  body survives); indentation errors blank their lines; a cut that does not
+  help grows to the enclosing block; at most 10 rounds, each cut a
+  diagnostic. Completion, hover, symbols and tokens keep working on a line
+  being typed.
+- **Incremental**: an edit touches only the piece table; the document is
+  re-parsed when asked; edits inside one line reuse the last analysis; the
+  index re-reads files whose mtime changed and re-checks importers up to
+  three steps. Latency on ide_tools.ny (3070 lines), unloaded: first parse +
+  symbols 50-100 ms, completion 2-15 ms, hover 0-10 ms, typing in a line
+  8-35 ms (median); `self.` in nython_ide.ny's chain (1115 items) ~48 ms
+  fresh, 0-4 ms cached; indexing the repository (1062 files) 10-16 s.
+
+### Not done
+- No inference of other modules' return values, container item types or
+  values through calls (the binding's value and annotations only).
+- Call/type hierarchy, code lens, document links, linked editing, selection
+  ranges, on-type formatting, pull diagnostics, notebooks, file operations,
+  renaming files/modules, semanticTokens/range; names inside f-strings are
+  found and renamed but not coloured; NyxAI review only up to
+  `maxReviewLines` (4000); the IDE does not use nylsp (it keeps its own
+  services).
+- Found, not fixed: lib/gui.ny line 16029 uses an undefined `ACC` in a dead
+  `... if false else ...` branch (nylsp flags it).
 
 ---
 
