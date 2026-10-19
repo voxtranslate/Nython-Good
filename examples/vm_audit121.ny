@@ -857,10 +857,17 @@ except Stop as e:
 r.append(seen[-1])                                       # hooks are called in the order they were added
 print(repr(r))
 """)
-check("no hook, then hooks in order", [r.stdout.strip(), r.returncode],
-      [repr([None, None, [], [("first.event", (1, "two"))], "expected str for argument 'event', not int",
-             "audit() missing 1 required positional argument: 'event'", ["Stop", ((7,),)],
-             ("stop.me", (7,))]), 0])
+def child_value(r):
+    # what a child printed with repr(), read back (its True/None spelling is
+    # Python's: the child is a .py file)
+    import ast
+    try:
+        return ast.literal_eval(r.stdout.strip())
+    except Exception:
+        return r.stdout + r.stderr[-500:]
+check("no hook, then hooks in order", [child_value(r), r.returncode],
+      [[None, None, [], [("first.event", (1, "two"))], "expected str for argument 'event', not int",
+        "audit() missing 1 required positional argument: 'event'", ["Stop", ((7,),)], ("stop.me", (7,))], 0])
 
 # ── the table ────────────────────────────────────────────────────────────
 evs = TABLE
@@ -998,9 +1005,9 @@ out.append([d for e, a, d in p.events if e in ("os.system", "open")][:3])
 out.append(p.denied)
 print(repr(out))
 """)
-    check("nyaudit: an installed policy denies, allows and is frozen", [r.stdout.strip(), r.returncode],
-          [repr([["AuditDenied", "audit policy denies os.system(true)"], "AuditDenied", True,
-                 "the audit policy is installed and frozen: it cannot be changed", ["deny", "deny", "allow"], 2]), 0])
+    check("nyaudit: an installed policy denies, allows and is frozen", [child_value(r), r.returncode],
+          [[["AuditDenied", "audit policy denies os.system(true)"], "AuditDenied", True,
+            "the audit policy is installed and frozen: it cannot be changed", ["deny", "deny", "allow"], 2], 0])
 
     # nython --audit-policy FILE: installed before the program's first statement
     pol = os.path.join(T, "p121.txt")
