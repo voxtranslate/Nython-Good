@@ -491,7 +491,7 @@ struct NythonExecutor {
                 const char* par = nython::ny_builtin_exc_parent(n);
                 src += "class " + n + (par && *par ? std::string("(") + par + ")" : std::string()) + ":\n    pass\n";
             }
-            auto source = SourceCode(src);
+            auto source = SourceCode::from_text(src, "stdin");
             auto reporter = std::make_shared<Reporter>(source);
             auto lex = std::make_shared<Lexer>(source);
             lex->tokenize();
@@ -586,7 +586,7 @@ struct NythonExecutor {
         if (chunk != "base" && chunk != "os" && chunk != "buffer" && chunk != "posix" && chunk != "audit") ensureMirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix"; round 86: nor "audit")
         if (chunk == "dictview") ensureMirror("dict");
         try {
-            auto source = SourceCode(nyrt::builtin_mirror_chunk(chunk));
+            auto source = SourceCode::from_text(nyrt::builtin_mirror_chunk(chunk), "stdin");
             auto reporter = std::make_shared<Reporter>(source);
             auto lex = std::make_shared<Lexer>(source);
             lex->tokenize();

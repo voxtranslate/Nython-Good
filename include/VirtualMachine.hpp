@@ -4232,7 +4232,7 @@ public:
         static nython::node::node_ptr ast;
         std::lock_guard<std::mutex> lk(mu);
         if(ast) return ast;
-        auto source=nython::reader::SourceCode(std::string(nyrt::prelude_source()));
+        auto source=nython::reader::SourceCode::from_text(std::string(nyrt::prelude_source()),"stdin");
         auto reporter=std::make_shared<nython::exception::Reporter>(source);
         auto lx=std::make_shared<nython::lexer::Lexer>(source);
         lx->tokenize();
@@ -6329,7 +6329,7 @@ private:
         if(chunk!="base"&&chunk!="os"&&chunk!="buffer"&&chunk!="posix"&&chunk!="audit") load_mirror("base");   // (round 80: "os" needs no mirror base; round 84: nor "buffer"; round 85: nor "posix"; round 86: nor "audit")
         if(chunk=="dictview") load_mirror("dict");
         try {
-            auto source=nython::reader::SourceCode(nyrt::builtin_mirror_chunk(chunk));
+            auto source=nython::reader::SourceCode::from_text(nyrt::builtin_mirror_chunk(chunk),"stdin");
             auto reporter=std::make_shared<nython::exception::Reporter>(source);
             auto lx=std::make_shared<nython::lexer::Lexer>(source);
             lx->tokenize();

@@ -2249,7 +2249,7 @@ node_ptr Parser::fstringAst(const Token& str_tok, const std::string& raw, const 
             node_ptr expr_node;
             bool field_exact = false;
             {
-                reader::SourceCode sub_src("(" + expr_str + ")");
+                auto sub_src = reader::SourceCode::from_text("(" + expr_str + ")", "stdin");   // (round 86) text, never a path
                 nython::exception::Reporter sub_reporter(sub_src);
                 auto sub_lex = std::make_shared<Lexer>(sub_src);
                 sub_lex->force_python_strings = true;
@@ -2594,7 +2594,7 @@ node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
             }
             node_ptr expr_node;
             try {
-                reader::SourceCode sub_src(expr_str);
+                auto sub_src = reader::SourceCode::from_text(expr_str, "stdin");   // (round 86) f"{x}" read a file named x
                 nython::exception::Reporter sub_reporter(sub_src);
                 auto sub_lex = std::make_shared<Lexer>(sub_src);
                 sub_lex->tokenize();

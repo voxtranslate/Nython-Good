@@ -258,7 +258,7 @@ Value dispatch_lang(NythonExecutor& E, const std::string& name,
         // Apply all REWRITE rules before lexing
         code = reg.apply_rewrites(code);
         try {
-            auto source   = SourceCode(code);
+            auto source   = SourceCode::from_text(code, "stdin");
             auto reporter = std::make_shared<Reporter>(source);
             auto lex      = std::make_shared<Lexer>(source);
             lex->tokenize();

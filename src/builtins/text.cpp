@@ -449,11 +449,8 @@ Value ny_check_syntax(NythonExecutor& E, std::vector<Value>& args) {
         auto lines = lines_of(E, args[0]);
         for (size_t i = 0; i < lines.size(); i++) { if (i) src += '\n'; src += lines[i]; }
     } else src = E.getStringValue(args[0]);
-    // SourceCode(string) treats an existing path as a file to read; a buffer
-    // whose whole text happens to name a file must still be parsed as text.
-    if (nython::utils::FileExists(src)) src += "\n";
     try {
-        auto source = SourceCode(src);
+        auto source = SourceCode::from_text(src, "stdin");
         auto reporter = std::make_shared<Reporter>(source);
         auto lexer = std::make_shared<Lexer>(source);
         auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)E.runner, lexer.get());
@@ -922,11 +919,10 @@ Value text_defuse(NythonExecutor& E, std::vector<Value>& args) {
     } else src = E.getStringValue(args[0]);
     std::vector<std::string> src_lines;
     split_lines(src, src_lines);
-    if (nython::utils::FileExists(src)) src += "\n";
     DefUseWalker W;
     std::string error;
     try {
-        auto source = SourceCode(src);
+        auto source = SourceCode::from_text(src, "stdin");
         auto reporter = std::make_shared<Reporter>(source);
         auto lexer = std::make_shared<Lexer>(source);
         auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)E.runner, lexer.get());
@@ -1722,7 +1718,7 @@ Value ny_facts(NythonExecutor& E, std::vector<Value>& args) {
     std::string error;
     int error_line = 0;
     try {
-        auto source = SourceCode(src + "\n");
+        auto source = SourceCode::from_text(src + "\n", "stdin");
         auto reporter = std::make_shared<Reporter>(source);
         auto lexer = std::make_shared<Lexer>(source);
         auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)E.runner, lexer.get());

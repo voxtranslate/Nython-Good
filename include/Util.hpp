@@ -677,6 +677,13 @@ inline bool FileExists(const std::string& name) {
 	return !name.empty() && (stat (name.c_str(), &buffer) == 0);
 }
 
+// (round 86) a regular file (not a directory, a device or a FIFO): what
+// SourceCode(string) reads as a program file
+inline bool IsRegularFile(const std::string& name) {
+	struct stat buffer;
+	return !name.empty() && stat(name.c_str(), &buffer) == 0 && (buffer.st_mode & S_IFMT) == S_IFREG;
+}
+
 // Pack a list of runes into a std::string
 inline std::string rune_pack_to_str(std::vector<uint32_t> rune_values) {
     std::string str;
