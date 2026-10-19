@@ -24,7 +24,8 @@
 #
 # Policy(default="allow", log=None, freeze=True)
 #     .allow(event, *args, **named) / .deny(event, *args, message=None, **named)
-#     .log(event, *args, **named)       record the event and go on matching
+#     .log(event, *args, **named)       record the event (in the log, else on
+#                                       stderr) and go on matching
 #     .decide(event, args) -> (action, rule)   what the policy would do
 #     .install()                        sys.addaudithook(policy); frozen after
 #     .granted(event, *args, **named)   a with block allowing it (before install)
@@ -349,9 +350,9 @@ class Policy:
             var d = self.decide(event, args)
             decision = d
             if self._log is not None:
-                self._write(event, args, d[0])
+                self._write(self._log, event, args, d[0])
             elif self._logs(event, args):
-                self._write(event, args, d[0])
+                self._write(sys.stderr, event, args, d[0])
             if self.keep:
                 self.events.append((event, tuple(args), d[0]))
                 if len(self.events) > self.keep:
@@ -363,13 +364,11 @@ class Policy:
             var rule = decision[1]
             raise AuditDenied(event, args, rule, rule.message if rule is not None else None)
 
-    def _write(self, event, args, decision):
-        if self._log is None:
-            return
+    def _write(self, out, event, args, decision):
         var rec = {"event": event, "args": [_jsonable(a) for a in args], "decision": decision}
-        self._log.write(json.dumps(rec) + "\n")
+        out.write(json.dumps(rec) + "\n")
         try:
-            self._log.flush()
+            out.flush()
         except Exception:
             pass
 
