@@ -93,12 +93,19 @@ class Document:
         self.deps_dirty = False
         self.review = None
         self.review_edits = -1
+        self.changed_at = 0.0
+        self.python = None
 
     def analyze(self):
         if self.analysis_edits != self.edits:
             self.analysis = J("analyze", self.h)
             self.analysis_edits = self.edits
         return self.analysis
+
+    def is_python(self):
+        if self.python is None:
+            self.python = self.analyze()["python"]
+        return self.python
 
     def text(self):
         return L("text", self.h)
@@ -124,7 +131,9 @@ class Server:
         self.shutdown_requested = False
         self.exit_code = None
         self.client_caps = {}
-        self.options = {"review": True, "undefinedNames": True, "maxReviewLines": 4000, "inlayHints": True}
+        self.options = {"review": True, "undefinedNames": True, "maxReviewLines": 4000, "inlayHints": True,
+                        "diagnosticDelay": 150}
+        self.wait_ms = None         # the idle work waits this long (a debounced publish)
         self.encoding = "utf-16"
         self.next_id = 1
         self.waiting = {}           # our request id -> callback(result, error)
@@ -162,6 +171,7 @@ class Server:
             "textDocument/inlayHint": self.on_inlay_hint,
             "nython/stats": self.on_stats,
             "nython/analysis": self.on_analysis,
+            "nython/documentText": self.on_document_text,
         }
         self.notifications = {
             "initialized": self.on_initialized,
@@ -259,7 +269,7 @@ class Server:
             if self.idle():
                 continue
             try:
-                msg = self.t.read_message(None)
+                msg = self.t.read_message(None if self.wait_ms is None else self.wait_ms / 1000.0)
             except ProtocolError as e:
                 self.send(protocol.error_response(None, e.code, str(e)))
                 continue
@@ -268,7 +278,7 @@ class Server:
                     # the end of input without exit: the client went away
                     self.exit_code = 0 if self.shutdown_requested else 1
                     break
-                continue
+                continue   # (the debounce delay passed)
             if msg.get("method") == "$/cancelRequest":
                 self.on_cancel(msg.get("params") or {})
                 continue
@@ -350,11 +360,20 @@ class Server:
 
     def idle(self):
         """Work done while no message waits: diagnostics, then the index. True
-        when something was done (input is looked at again first)."""
+        when something was done (input is looked at again first). A document's
+        diagnostics wait until it has not changed for diagnosticDelay ms
+        (typing is not slowed down by them)."""
+        self.wait_ms = None
+        now = time_ms()
+        delay = self.options.get("diagnosticDelay", 150) or 0
         for d in list(self.docs.values()):
             if d.published_edits != d.edits or d.deps_dirty:
-                self.publish_diagnostics(d)
-                return True
+                left = delay - (now - d.changed_at) if d.published_edits != d.edits else 0
+                if left <= 0:
+                    self.publish_diagnostics(d)
+                    return True
+                if self.wait_ms is None or left < self.wait_ms:
+                    self.wait_ms = left
         if self.indexing:
             left = self.ws.index_step(25)
             done = self.progress_total - left
@@ -525,6 +544,7 @@ class Server:
                 L("edit", d.h, r["start"]["line"], r["start"]["character"], r["end"]["line"], r["end"]["character"],
                   ch.get("text", ""))
             d.edits += 1
+        d.changed_at = time_ms()
         if v is not None:
             d.version = v
 
@@ -648,8 +668,23 @@ class Server:
             try:
                 from nyxai.review import Reviewer
                 rv = Reviewer()
-                d.review = rv.review_text(d.text(), os.path.basename(d.path))
-                d.review = [f for f in d.review if f.rule != "syntax-error"]
+                # a document that does not parse is reviewed as the error
+                # recovery left it (the same lines; what was cut is not reviewed)
+                wt = J("work_text", d.h)
+                text = wt["text"] or d.text()
+                cut = set(wt["patched"])
+                # a const / nonlocal error stops ny_facts' parse: that line is left out too
+                lines = text.split("\n")
+                for g in d.analyze()["diagnostics"]:
+                    if g["code"] in ("nython-const", "nython-nonlocal"):
+                        gl = g["range"]["start"]["line"]
+                        if gl < len(lines):
+                            lines[gl] = lines[gl][:len(lines[gl]) - len(lines[gl].lstrip())] + "pass"
+                            cut.add(gl)
+                text = "\n".join(lines)
+                d.review = rv.review_text(text, os.path.basename(d.path))
+                d.review = [f for f in d.review if f.rule != "syntax-error" and (f.line - 1) not in cut
+                            and not any((e["line"] - 1) in cut or (e["end"] - 1) in cut for e in f.edits)]
             except Exception as e:
                 self.log("review failed:", repr(e))
                 d.review = []
@@ -861,7 +896,9 @@ class Server:
             items = self.complete_members(d, cx)
         else:
             items = self.complete_names(d, line, ch)
-        return {"isIncomplete": False, "items": self.rank(items, prefix)}
+        items = self.rank(items, prefix)
+        items.sort(key=lambda it: it["sortText"])
+        return {"isIncomplete": False, "items": items}
 
     def rank(self, items, prefix):
         if not prefix:
@@ -915,9 +952,9 @@ class Server:
             seen.add(v["name"])
             s = {"name": v["name"], "kind": v["kind"], "id": v["id"], "detail": v["detail"], "property": v["property"]}
             items.append(self.sym_item(d, s, 1 + min(v["depth"], 2)))
-        # names a star or quoted import brings in
-        e = self.ws.entry(d.path, d.edits)
-        for im in e.imports:
+        # names a star or quoted import brings in (the index's entry as it is: no parse)
+        e = self.ws.files.get(d.path)
+        for im in (e.imports if e is not None else []):
             if im["name"] != "*" and not im["quoted"]:
                 continue
             t = self.ws.resolve_import(d.path, im)
@@ -932,7 +969,7 @@ class Server:
                 items.append(self.sym_item(d, s, 4, {"path": t, "name": n}))
         import keyword
         kws = list(keyword.kwlist)
-        if not d.analyze()["python"]:
+        if not d.is_python():
             kws = kws + _NY_KEYWORDS
         for k in kws:
             if k not in seen:
@@ -1025,15 +1062,24 @@ class Server:
                 pass
         return items
 
+    def sample(self, name):
+        """A value of builtin type `name` (dir() of the type itself lists little)"""
+        samples = {"str": "", "list": [], "dict": {}, "int": 0, "float": 0.0, "bytes": b"", "set": set(),
+                   "tuple": (), "bool": True, "bytearray": bytearray(), "frozenset": frozenset(), "complex": 1j}
+        if name in samples:
+            return samples[name]
+        tp = self.builtins.get(name)
+        return tp if isinstance(tp, type) else None
+
     def builtin_type_items(self, name):
         items = []
-        tp = self.builtins.get(name)
-        if not isinstance(tp, type):
+        v0 = self.sample(name)
+        if v0 is None:
             return items
-        for n in dir(tp):
+        for n in dir(v0):
             if n.startswith("_"):
                 continue
-            v = getattr(tp, n, None)
+            v = getattr(v0, n, None)
             items.append(self.item(n, 2 if callable(v) else 10, name + "." + n, {"typeattr": [name, n]}, 1))
         return items
 
@@ -1079,7 +1125,7 @@ class Server:
                 doc = getattr(v, "__doc__", None) or ""
                 detail = self.builtin_signature(data["builtin"], v) or detail
             elif "typeattr" in data:
-                tp = self.builtins.get(data["typeattr"][0])
+                tp = self.sample(data["typeattr"][0])
                 v = getattr(tp, data["typeattr"][1], None)
                 doc = getattr(v, "__doc__", None) or ""
             elif "modattr" in data:
@@ -1227,7 +1273,7 @@ class Server:
         txt = "(" + word + ") " + prefix + s["name"]
         if t:
             txt += ": " + t
-        if s.get("value") and (k in ("k", "E") or s.get("const") or (s.get("scope") == 0 and k == "v")):
+        if s.get("value") and (k in ("k", "E") or s.get("const") or ((s.get("type") or {}).get("k") == "b" and k in ("v", "A", "F"))):
             txt += " = " + s["value"]
         return txt
 
@@ -1302,6 +1348,15 @@ class Server:
             ext = tg["ext"]
             if ext["k"] in ("x", "X") and not ext["text"]:
                 r = self.follow_import(d.path, tg.get("extImod", ""), tg.get("extIname", ""), 0)
+            elif ext["k"] in ("x", "X") and "." not in ext["text"]:
+                # a member of a class of another module (C.m / C().m)
+                rc = self.follow_import(d.path, tg.get("extImod", ""), tg.get("extIname", ""), 0)
+                if rc is not None and rc[1] is not None and rc[1]["kind"] in ("c", "e", "I", "N"):
+                    m = J("find_member", self.handle_of(rc[0]), rc[1]["name"], ext["text"])
+                    if m is not None:
+                        r = (rc[0], m)
+                        if ext["k"] == "X" and m["kind"] == "M" and not m.get("static"):
+                            bound = True
             elif ext["k"] == "m" and ext["text"]:
                 parts = ext["text"].split(".")
                 mod = tg.get("extImod", "") + ("." + ".".join(parts[:-1]) if len(parts) > 1 else "")
@@ -1447,6 +1502,11 @@ class Server:
             if not include_decl and ref["role"] == "d":
                 continue
             add(tpath, ref["range"])
+        if ts["kind"] == "p":
+            # a parameter of a module-level function: keyword arguments naming
+            # it in the modules that import the function
+            self.kwarg_refs(tpath, ts, add)
+            return [out, tpath, ts]
         local = ts["scope"] != 0 and not ts.get("member")
         if local:
             return [out, tpath, ts]
@@ -1485,8 +1545,7 @@ class Server:
                                 add(upath, im["nameRange"])
                         elif im["sym"] >= 0:
                             for ref in J("refs", h, im["sym"]):
-                                if include_decl or ref["role"] != "d":
-                                    add(upath, ref["range"])
+                                add(upath, ref["range"])
                     elif not im["from"] and im["sym"] >= 0:
                         if ext is None:
                             ext = J("ext", h)
@@ -1514,6 +1573,28 @@ class Server:
                                             else:
                                                 add(upath, x["range"])
         return [out, tpath, ts]
+
+    def kwarg_refs(self, tpath, param, add):
+        fn = self.module_symbol(tpath, param.get("container") or "")
+        if fn is None or fn["body"] != param["scope"] or fn["kind"] not in ("f", "c"):
+            return
+        for upath in sorted(self.ws.importers_of(tpath) | set(od.path for od in self.docs.values() if od.path != tpath)):
+            self.check_cancel()
+            if upath == tpath:
+                continue
+            e = self.ws.entry(upath)
+            binds = [im["sym"] for im in e.imports if im["from"] and im["name"] == fn["name"] and im["sym"] >= 0
+                     and self.ws.resolve_import(upath, im) == tpath]
+            if not binds:
+                continue
+            h = self.handle_of(upath)
+            for call in J("calls", h, 0, 1 << 30):
+                ext = call["target"]["ext"]
+                if ext["k"] != "x" or ext["sym"] not in binds or ext["text"]:
+                    continue
+                for a in call["args"]:
+                    if a is not None and a["kw"] == param["name"] and a.get("kwRange"):
+                        add(upath, a["kwRange"])
 
     def on_references(self, p):
         d = self.doc(p)
@@ -1805,6 +1886,11 @@ class Server:
     def on_analysis(self, p):
         d = self.doc(p)
         return d.analyze()
+
+    def on_document_text(self, p):
+        d = self.doc(p)
+        return {"text": d.text(), "version": d.version, "pieces": int(L("pieces", d.h)),
+                "lines": int(L("line_count", d.h))}
 
 
 def main(argv):

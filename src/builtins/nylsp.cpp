@@ -303,6 +303,11 @@ struct Doc {
     long long edits = 0;       // edits since opened
     std::shared_ptr<Analysis> an;
     bool dirty = true;
+    // edits since the last analysis that stayed inside one line each (none
+    // added or removed a line): completion can use that analysis with the
+    // edited lines' text (analysis_typing)
+    bool same_lines = true;
+    std::set<long long> typed_rows;
     // semantic tokens sent last (for /delta)
     std::vector<uint32_t> last_tokens;
     long long last_tokens_id = 0;
@@ -462,7 +467,9 @@ struct Analysis {
     std::vector<std::set<std::string>> pyl;   // Python's rule: a function's locals
     std::map<int, int> self_cls;              // a method's self symbol -> its class scope
     std::map<int, int> cls_param;             // a classmethod's cls symbol -> its class scope
-    double ms_parse = 0, ms_total = 0;
+    double ms_parse = 0, ms_total = 0, ms_engine = 0, ms_walk = 0, ms_resolve = 0, ms_checks = 0;
+    bool engine_done = false;
+    std::string work_text, fname;   // the text that parsed (after recovery), its file name
     std::string module_doc;
     // the parse, kept: the tree's nodes are referred to (Sym::value ...)
     std::unique_ptr<SourceCode> src;
@@ -2181,6 +2188,42 @@ void add_diag(Analysis& A, int row1, int col1, const std::string& msg, int sever
     A.diags.push_back(d);
 }
 
+// A syntax error the parser reports at the token after the problem - the
+// newline token, which the lexer puts where the next line's code starts,
+// a dedent, the end of the file - is about the code line before: its row
+// (0-based), and whether it moved there.
+int problem_row(const std::vector<std::string>& lines, int row, int col, const std::string& msg, bool& moved) {
+    moved = false;
+    bool at_break = msg.find("NewLine") != std::string::npos || msg.find("newline") != std::string::npos
+                 || msg.find("End") != std::string::npos || msg.find("end of file") != std::string::npos
+                 || msg.find("EOF") != std::string::npos || msg.find("Dedent") != std::string::npos
+                 || msg.find("Indent") != std::string::npos;
+    int r = row - 1;
+    int n = (int)lines.size();
+    bool blank_line = r < 0 || r >= n || blank(lines[(size_t)r]);
+    bool at_start = !blank_line && (col - 1) <= (int)cp_of_byte(lines[(size_t)r], lead(lines[(size_t)r]).size());
+    if (!(at_break && at_start) && !blank_line) return r < 0 ? 0 : r;
+    int p = std::min(r, n) - (blank_line ? 0 : 1);
+    if (p >= n) p = n - 1;
+    while (p >= 0 && (blank(lines[(size_t)p]) || comment_only(lines[(size_t)p]))) p--;
+    if (p < 0) return r < 0 ? 0 : std::min(r, n - 1);
+    moved = true;
+    return p;
+}
+
+void syntax_diag(Analysis& A, const std::vector<std::string>& work, int row, int col, const std::string& msg, const std::string& code) {
+    bool moved;
+    int p = problem_row(work, row, col, msg, moved);
+    if (moved) {
+        const std::string& ln = A.lines[(size_t)p];
+        size_t e = ln.find_last_not_of(" \t\r");
+        int c = (int)cp_of_byte(ln, e == std::string::npos ? 0 : e);
+        add_diag(A, p + 1, c + 1, msg, 1, code, 1);
+        return;
+    }
+    add_diag(A, row, col, msg, 1, code);
+}
+
 std::string syntax_code(const std::string& msg) {
     if (msg.find("constant") != std::string::npos) return "nython-const";
     if (msg.find("nonlocal") != std::string::npos) return "nython-nonlocal";
@@ -2211,9 +2254,10 @@ std::shared_ptr<Analysis> analyze(Doc& d) {
         A->ms_parse += now_ms() - t0;
         if (pe.ok) break;
         if (round == 10) break;
-        int r0 = pe.row - 1;
+        bool moved;
+        int r0 = problem_row(work, pe.row, pe.col, pe.msg, moved);
         bool on_cut = r0 >= 0 && r0 < (int)A->patched.size() && A->patched[(size_t)r0];
-        if (!on_cut) add_diag(*A, pe.row, pe.col, pe.msg, 1, syntax_code(pe.msg));
+        if (!on_cut) syntax_diag(*A, work, pe.row, pe.col, pe.msg, syntax_code(pe.msg));
         if (!cut_island(work, A->patched, r0, pe.msg)) break;
         A->recoveries++;
     }
@@ -2228,43 +2272,8 @@ std::shared_ptr<Analysis> analyze(Doc& d) {
         A->ms_total = now_ms() - t_start;
         return A;
     }
-    // 2. the engines' own checks on what parsed (NyScope: const, nonlocal; the
-    // two binding rules' differences)
-    {
-        std::string report;
-        ParseErr ee = parse_engine(A->recoveries ? join_lines(work) : A->text, fname, report);
-        if (!ee.ok) {
-            int r0 = ee.row - 1;
-            bool on_cut = r0 >= 0 && r0 < (int)A->patched.size() && A->patched[(size_t)r0];
-            if (!on_cut) add_diag(*A, ee.row, ee.col, ee.msg, 1, syntax_code(ee.msg));
-        }
-        // file row col qual name how where outer_row okind uses rule def_line insert_line
-        std::istringstream rs(report);
-        std::string line;
-        while (std::getline(rs, line)) {
-            std::vector<std::string> f;
-            size_t i = 0;
-            while (true) { size_t j = line.find('\t', i); f.push_back(line.substr(i, j == std::string::npos ? std::string::npos : j - i)); if (j == std::string::npos) break; i = j + 1; }
-            if (f.size() < 11 || f[10] != "nython") continue;
-            int row = (int)to_ll(f[1]), col = (int)to_ll(f[2]);
-            const std::string& qual = f[3], &nm = f[4], &how = f[5], &where = f[6];
-            std::string outer = where == "module" ? "the module's '" + nm + "'"
-                                                  : "'" + nm + "' of the enclosing function '" + where.substr(where.find(':') + 1) + "'";
-            if (f[7] != "0" && !f[7].empty()) outer += " (line " + f[7] + ")";
-            std::string msg;
-            if (how == "read")
-                msg = "function '" + qual + "' reads '" + nm + "' before binding it: Nython reads " + outer
-                    + " there, Python's rule would raise UnboundLocalError";
-            else {
-                const char* verb = how == "del" ? "deletes" : how == "aug" ? "augments" : "assigns";
-                std::string decl = where == "module" ? "global" : "nonlocal";
-                msg = "function '" + qual + "' " + verb + " '" + nm + "', rebinding " + outer
-                    + " without a declaration - Python's rule makes it a local: declare '" + decl + " " + nm
-                    + "' to keep rebinding it, or 'var " + nm + "' for a local";
-            }
-            add_diag(*A, row, col, msg, 3, "nython-scope", (int)nm.size());
-        }
-    }
+    A->work_text = A->recoveries ? join_lines(work) : std::string();
+    A->fname = fname;
     // 3. the tokens
     const auto& lt = A->lex->tokens;
     A->toks.reserve(lt.size() + A->parser->ast_extra_toks_.size() + 16);
@@ -2292,14 +2301,19 @@ std::shared_ptr<Analysis> analyze(Doc& d) {
     Walker W(*A, *A->parser);
     int ms = W.new_scope('m', -1, 0, (int)A->nlex - 1);
     A->scopes[(size_t)ms].py = A->python;
+    double tw = now_ms();
     W.block(A->root.get(), ms);
+    A->ms_walk = now_ms() - tw;
     // the module's docstring
     if (A->root) {
         auto st = A->root->statements();
         if (!st.empty() && st[0] && st[0]->type() == NodeType::STRING) A->module_doc = st[0]->tok().value;
     }
+    double tr = now_ms();
     Resolver R(*A);
     R.run(W);
+    A->ms_resolve = now_ms() - tr;
+    double tc = now_ms();
     // rows each scope covers
     for (auto& s : A->scopes) {
         if (s.kind == 'm') { s.r0 = 0; s.r1 = A->lines.empty() ? 0 : (uint32_t)A->lines.size() - 1; continue; }
@@ -2350,16 +2364,84 @@ std::shared_ptr<Analysis> analyze(Doc& d) {
                  "local variable '" + e.name + "' is read before it is assigned (UnboundLocalError when this runs first)",
                  2, "unbound-local", (int)(k.ecol - k.col));
     }
+    A->ms_checks = now_ms() - tc;
     A->ms_total = now_ms() - t_start;
     return A;
+}
+
+// The engines' own checks on what parsed (NyScope: const, nonlocal; the two
+// binding rules' differences), added to the diagnostics once - only when the
+// diagnostics are asked for: a third parse, which completion need not wait for.
+void engine_checks(Analysis& A) {
+    if (A.engine_done) return;
+    A.engine_done = true;
+    double t0 = now_ms();
+    {
+        std::string report;
+        ParseErr ee = parse_engine(A.recoveries ? A.work_text : A.text, A.fname, report);
+        if (!ee.ok) {
+            int r0 = ee.row - 1;
+            bool on_cut = r0 >= 0 && r0 < (int)A.patched.size() && A.patched[(size_t)r0];
+            std::vector<std::string> wl;
+            split_lines(A.recoveries ? A.work_text : A.text, wl);
+            if (!on_cut) syntax_diag(A, wl, ee.row, ee.col, ee.msg, syntax_code(ee.msg));
+        }
+        // file row col qual name how where outer_row okind uses rule def_line insert_line
+        std::istringstream rs(report);
+        std::string line;
+        while (std::getline(rs, line)) {
+            std::vector<std::string> f;
+            size_t i = 0;
+            while (true) { size_t j = line.find('\t', i); f.push_back(line.substr(i, j == std::string::npos ? std::string::npos : j - i)); if (j == std::string::npos) break; i = j + 1; }
+            if (f.size() < 11 || f[10] != "nython") continue;
+            int row = (int)to_ll(f[1]), col = (int)to_ll(f[2]);
+            const std::string& qual = f[3], &nm = f[4], &how = f[5], &where = f[6];
+            std::string outer = where == "module" ? "the module's '" + nm + "'"
+                                                  : "'" + nm + "' of the enclosing function '" + where.substr(where.find(':') + 1) + "'";
+            if (f[7] != "0" && !f[7].empty()) outer += " (line " + f[7] + ")";
+            std::string msg;
+            if (how == "read")
+                msg = "function '" + qual + "' reads '" + nm + "' before binding it: Nython reads " + outer
+                    + " there, Python's rule would raise UnboundLocalError";
+            else {
+                const char* verb = how == "del" ? "deletes" : how == "aug" ? "augments" : "assigns";
+                std::string decl = where == "module" ? "global" : "nonlocal";
+                msg = "function '" + qual + "' " + verb + " '" + nm + "', rebinding " + outer
+                    + " without a declaration - Python's rule makes it a local: declare '" + decl + " " + nm
+                    + "' to keep rebinding it, or 'var " + nm + "' for a local";
+            }
+            add_diag(A, row, col, msg, 3, "nython-scope", (int)nm.size());
+        }
+    }
+    A.ms_engine = now_ms() - t0;
 }
 
 Analysis& analysis_of(Doc& d) {
     if (!d.an || d.dirty) {
         d.an = analyze(d);
         d.dirty = false;
+        d.same_lines = true;
+        d.typed_rows.clear();
     }
     return *d.an;
+}
+
+// For completion and signature help while a line is being typed: when every
+// edit since the last analysis stayed inside one line, that analysis (its
+// scopes, its symbols) with the edited lines' current text - no parse. The
+// document stays dirty, so anything that needs its tokens parses it.
+Analysis& analysis_typing(Doc& d) {
+    if (d.an && d.dirty && d.same_lines && d.pt.line_count() == d.an->lines.size()) {
+        Analysis& A = *d.an;
+        for (long long r : d.typed_rows) {
+            if (r < 0 || r >= (long long)A.lines.size()) continue;
+            A.lines[(size_t)r] = d.pt.line((size_t)r);
+            A.line_ascii[(size_t)r] = ascii(A.lines[(size_t)r]) ? 1 : 0;
+        }
+        d.typed_rows.clear();
+        return A;
+    }
+    return analysis_of(d);
 }
 
 // ── positions in the client's encoding ───────────────────────────────────────
@@ -2543,6 +2625,7 @@ void sym_json(J& j, Analysis& A, int id, bool full = true) {
 // ── queries ──────────────────────────────────────────────────────────────────
 std::string op_analyze(Doc& d) {
     Analysis& A = analysis_of(d);
+    engine_checks(A);
     J j;
     j.obj();
     j.key("diagnostics").arr();
@@ -2572,6 +2655,10 @@ std::string op_analyze(Doc& d) {
     j.key("scopes").num((long long)A.scopes.size());
     j.key("msParse").raw(nyjson::number(A.ms_parse));
     j.key("msTotal").raw(nyjson::number(A.ms_total));
+    j.key("msEngine").raw(nyjson::number(A.ms_engine));
+    j.key("msWalk").raw(nyjson::number(A.ms_walk));
+    j.key("msResolve").raw(nyjson::number(A.ms_resolve));
+    j.key("msChecks").raw(nyjson::number(A.ms_checks));
     j.key("moduleDoc").str(A.module_doc);
     j.end_obj();
     return j.s;
@@ -2742,11 +2829,14 @@ std::vector<uint32_t> semantic_data(Analysis& A) {
             push(k.row, k.col, k.ecol, callee ? T_METHOD : T_PROPERTY, 0);
             continue;
         }
-        if (k.cls == TokenClass::Keyword || k.type == TokenType::True || k.type == TokenType::False || k.type == TokenType::None) {
+        auto b = g_builtins.find(k.val);
+        bool called = i + 1 < A.nlex && A.toks[i + 1].type == TokenType::ParenOpen && A.toks[i + 1].row == k.row
+                      && A.toks[i + 1].col == k.ecol;
+        if ((k.cls == TokenClass::Keyword || k.type == TokenType::True || k.type == TokenType::False || k.type == TokenType::None)
+            && !(called && b != g_builtins.end())) {
             push(k.row, k.col, k.ecol, T_KEYWORD, 0);
             continue;
         }
-        auto b = g_builtins.find(k.val);
         if (b != g_builtins.end()) {
             int type = b->second == 'c' ? T_CLASS : b->second == 'f' ? T_FUNCTION : T_VARIABLE;
             push(k.row, k.col, k.ecol, type, M_DEFAULTLIB);
@@ -2896,7 +2986,7 @@ std::string op_at(Doc& d, long long line, long long ch) {
 }
 
 std::string op_sym(Doc& d, long long id) {
-    Analysis& A = analysis_of(d);
+    Analysis& A = analysis_typing(d);
     if (id < 0 || id >= (long long)A.syms.size()) return "null";
     J j;
     sym_json(j, A, (int)id);
@@ -2918,7 +3008,7 @@ std::string op_refs(Doc& d, long long id) {
 }
 
 std::string op_visible(Doc& d, long long line, long long ch) {
-    Analysis& A = analysis_of(d);
+    Analysis& A = analysis_typing(d);
     uint32_t row = line < 0 ? 0 : (uint32_t)line;
     uint32_t cp = cp_col(A, line, ch);
     int s = scope_at(A, row, cp);
@@ -2959,7 +3049,7 @@ void members_into(Analysis& A, Resolver& R, int cls, std::set<std::string>& seen
 }
 
 std::string op_members(Doc& d, long long id) {
-    Analysis& A = analysis_of(d);
+    Analysis& A = analysis_typing(d);
     if (id < 0 || id >= (long long)A.syms.size()) return "{\"members\":[],\"externalBases\":[]}";
     Resolver R(A);
     J j;
@@ -3069,6 +3159,7 @@ std::string op_calls(Doc& d, long long l0, long long l1) {
             const Tk& k = A.toks[(size_t)g.tok];
             j.obj().key("pos"); pos_json(j, A, k.row, k.col);
             j.key("kw").str(g.kw).key("star").num(g.star);
+            if (!g.kw.empty() && g.kwtok >= 0) { j.key("kwRange"); tok_range(j, A, g.kwtok); }
             // the argument's own text when it is a plain name (a hint repeating it is noise)
             j.key("name").str(is_word(k.val) && (g.tok + 1 >= (int)A.nlex || (A.toks[(size_t)g.tok + 1].type == TokenType::Comma
                                      || A.toks[(size_t)g.tok + 1].type == TokenType::ParenClose)) ? k.val : std::string());
@@ -3216,7 +3307,7 @@ std::vector<std::string> dotted_before(const std::string& s, size_t e, size_t& s
 }
 
 std::string op_call_at(Doc& d, long long line, long long ch) {
-    Analysis& A = analysis_of(d);
+    Analysis& A = analysis_typing(d);
     if (line < 0 || line >= (long long)A.lines.size()) return "null";
     uint32_t row = (uint32_t)line;
     uint32_t cp = cp_col(A, line, ch);
@@ -3290,7 +3381,7 @@ std::string op_call_at(Doc& d, long long line, long long ch) {
 
 // ── the completion context ───────────────────────────────────────────────────
 std::string op_context(Doc& d, long long line, long long ch) {
-    Analysis& A = analysis_of(d);
+    Analysis& A = analysis_typing(d);
     J j;
     j.obj();
     if (line < 0 || line >= (long long)A.lines.size()) { j.key("none").boolean(true); j.end_obj(); return j.s; }
@@ -3364,6 +3455,15 @@ std::string op_context(Doc& d, long long line, long long ch) {
         j.key("receiverParts").arr(); for (auto& p : parts) j.str(p); j.end_arr();
         Resolver R(A);
         auto r = resolve_dotted(A, R, scope, parts);
+        if (parts.empty()) {
+            // a literal before the dot: "s".upper, [1].append, {}.get
+            size_t q = k - 1;
+            while (q > 0 && (s[q - 1] == ' ' || s[q - 1] == '\t')) q--;
+            char before = q > 0 ? s[q - 1] : 0;
+            const char* lit = before == '"' || before == '\'' ? "str" : before == ']' ? "list" : before == '}' ? "dict"
+                            : before == ')' ? "tuple" : nullptr;
+            if (lit) { r.first.k = 'b'; r.first.sym = -1; r.first.text = lit; }
+        }
         j.key("receiverType"); ty_json(j, A, r.first);
         j.key("receiverSym").num(r.second);
         if (r.first.sym >= 0 && (r.first.k == 'm' || r.first.k == 'x' || r.first.k == 'X')) {
@@ -3426,7 +3526,7 @@ std::string op_find(Doc& d, const std::string& name) {
 
 // a member `attr` of the module-level class `cls` (its bases in this file too)
 std::string op_find_member(Doc& d, const std::string& cls, const std::string& attr) {
-    Analysis& A = analysis_of(d);
+    Analysis& A = analysis_typing(d);
     if (A.scopes.empty()) return "null";
     auto it = A.scopes[0].syms.find(cls);
     if (it == A.scopes[0].syms.end() || A.syms[(size_t)it->second].body < 0) return "null";
@@ -3451,10 +3551,12 @@ std::string op_edit(Doc& d, const std::vector<std::string>& a) {
     // edit h sl sc el ec text
     long long sl = to_ll(a[2], -1), sc = to_ll(a[3], 0), el = to_ll(a[4], -1), ec = to_ll(a[5], 0);
     const std::string& text = a[6];
-    if (sl < 0) d.pt.reset(text);
+    if (sl < 0) { d.pt.reset(text); d.same_lines = false; }
     else {
         size_t o0 = offset_of(d.pt, sl, sc), o1 = offset_of(d.pt, el, ec);
         if (o1 < o0) std::swap(o0, o1);
+        if (sl != el || text.find('\n') != std::string::npos || text.find('\r') != std::string::npos) d.same_lines = false;
+        else d.typed_rows.insert(sl);
         d.pt.replace(o0, o1 - o0, text);
     }
     d.edits++;
@@ -3518,7 +3620,7 @@ std::string call(const std::vector<std::string>& a) {
     if (op == "docs") return std::to_string(g_docs.size());
     need(2);
     Doc& d = doc_of(a);
-    if (op == "set_text") { need(3); d.pt.reset(a[2]); d.dirty = true; d.edits++; return std::string(); }
+    if (op == "set_text") { need(3); d.pt.reset(a[2]); d.dirty = true; d.same_lines = false; d.edits++; return std::string(); }
     if (op == "set_path") { need(3); d.path = a[2]; d.dirty = true; return std::string(); }
     if (op == "edit") { need(7); return op_edit(d, a); }
     if (op == "text") return d.pt.text();
@@ -3542,6 +3644,15 @@ std::string call(const std::vector<std::string>& a) {
     if (op == "call_at") { need(4); return op_call_at(d, to_ll(a[2]), to_ll(a[3])); }
     if (op == "context") { need(4); return op_context(d, to_ll(a[2]), to_ll(a[3])); }
     if (op == "folds") return op_folds(d);
+    if (op == "work_text") {
+        // the text that parsed after error recovery ("" when it all did), and the rows cut out
+        Analysis& A = analysis_of(d);
+        J j;
+        j.obj().key("text").str(A.recoveries ? A.work_text : std::string()).key("patched").arr();
+        for (size_t r = 0; r < A.patched.size(); r++) if (A.patched[r]) j.num((long long)r);
+        j.end_arr().end_obj();
+        return j.s;
+    }
     if (op == "find") { need(3); return op_find(d, a[2]); }
     if (op == "find_member") { need(4); return op_find_member(d, a[2], a[3]); }
     throw std::runtime_error("_ny_lsp: unknown operation '" + op + "'");

@@ -88,8 +88,8 @@
 #   $/progress: work done progress while the workspace is indexed (after
 #       window/workDoneProgress/create, when the client supports it); the
 #       index is built between requests, a few files at a time
-#   nython/stats, nython/analysis: the server's timings and a document's
-#       analysis (Nython's own requests)
+#   nython/stats, nython/analysis, nython/documentText: the server's timings, a
+#       document's analysis and its text (Nython's own requests)
 #
 # Error recovery (the innovation; cf. Moonen's island grammars, 2001, and
 # tree-sitter's error recovery, which keeps the well-formed subtrees around
