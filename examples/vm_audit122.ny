@@ -729,6 +729,29 @@ check("references across the include", refs(p_ibase, 4, 4), [["inc_base.ny", 4, 
 check("rename a base class's method across the include (the subclass's self.hello)",
       edits_of(rename(p_ibase, 1, 8, "greet")), [["inc_base.ny", 1, 8, 13, "greet"], ["inc_main.ny", 4, 20, 25, "greet"]])
 
+# ── the engines' module search; files changed on disk; `# nython: python` ───
+write("dual.ny", "def which():\n    return \"ny\"\n")
+write("dual.py", "def which():\n    return \"py\"\n")
+write("extra.ny", "def one():\n    return 1\n")
+MODS = "from pyapp import show\nimport dual\nfrom extra import two\nprint(show(), dual.which(), two())\n"
+p_mods = write("mods.ny", MODS)
+open_doc(p_mods, MODS)
+d_mods = c.diagnostics(uri(p_mods))
+check("a name a closed module does not define", brief(d_mods["diagnostics"]), [[2, 18, 2, "unresolved-import-name", "nython"]])
+check("definition in a .py module", defn("textDocument/definition", p_mods, 3, col(MODS, 3, "show")), [["pyapp.py", 6, 4]])
+check(".ny before .py, as the engines search", defn("textDocument/definition", p_mods, 3, col(MODS, 3, "which")),
+      [["dual.ny", 0, 4]])
+write("extra.ny", "def one():\n    return 1\n\ndef two():\n    return 2\n")
+c.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": uri(os.path.join(root, "extra.ny")), "type": 2}]})
+d_mods2 = c.diagnostics(uri(p_mods))
+check("the file changed on disk (didChangeWatchedFiles): its importer is checked again", d_mods2["diagnostics"], [])
+check("... and goes to the new definition", defn("textDocument/definition", p_mods, 3, col(MODS, 3, "two")), [["extra.ny", 3, 4]])
+MARKED = "# nython: python\nx = 1\n\ndef f():\n    x = 2\n    return x\n"
+p_marked = write("marked.ny", MARKED)
+open_doc(p_marked, MARKED)
+c.diagnostics(uri(p_marked))
+check("a .ny file marked `# nython: python` binds as Python (f's x is its own)", spots(rename(p_marked, 1, 0, "y")), [[1, 0]])
+
 # ── symbols ──────────────────────────────────────────────────────────────────
 ds = c.req("textDocument/documentSymbol", {"textDocument": {"uri": uri(p_geo)}})
 def tree(syms):

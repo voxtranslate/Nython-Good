@@ -620,11 +620,22 @@ class Server:
             self.after_change(path)
 
     def after_change(self, path):
-        """A module's exports may have changed: re-check the open documents that import it."""
-        for imp in self.ws.importers_of(path):
-            for d in self.docs.values():
-                if d.path == imp:
-                    d.deps_dirty = True
+        """A module's exports may have changed: re-check the open documents that
+        import it, directly or through modules that re-export (three steps)."""
+        seen = set([path])
+        level = [path]
+        for step in range(3):
+            nxt = []
+            for p in level:
+                for imp in self.ws.importers_of(p):
+                    if imp in seen:
+                        continue
+                    seen.add(imp)
+                    nxt.append(imp)
+                    for d in self.docs.values():
+                        if d.path == imp:
+                            d.deps_dirty = True
+            level = nxt
 
     # ── diagnostics ──
     def publish_diagnostics(self, d):
