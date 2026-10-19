@@ -589,7 +589,38 @@ positional arguments count now) and 112 more identity tests of class
 variables (`t is int` after `t = type(v)`, `for b in cls.__mro__: if b is
 object`, `member_type is int`) were is-type lines.
 
-**Cost** (instructions, cachegrind; machine load does not enter): [TABLE]
+**Cost** (instructions executed, valgrind cachegrind, new / base 4406438 -
+machine load does not enter; tools/bench's programs, all Nython-language):
+
+| | VM | interpreter |
+|---|---|---|
+| `-c pass` (startup) | 1.0009 | 1.0013 |
+| bm_closures | 1.0003 | 1.0015 |
+| bm_deltablue | 0.9999 | 0.9997 |
+| bm_dict_str | 1.0010 | 0.9999 |
+| bm_exceptions | 1.0007 | 0.9999 |
+| bm_fannkuch | 0.9985 | 1.0000 |
+| bm_fib | 1.0002 | 1.0016 |
+| bm_generators | 1.0004 | 1.0009 |
+| bm_nbody | 1.0012 | 0.9986 |
+| bm_raytrace | 1.0004 | 0.9979 |
+| bm_richards | 1.0006 | 0.9976 |
+| bm_spectral_norm | 1.0001 | 1.0008 |
+| bm_str_case | 1.0015 | 0.9988 |
+
+Within ±0.2% everywhere. `tools/bench/run.py --base` (wall time, the
+machine shared with other agents): geometric mean 0.98x, 0.98x, 1.00x on
+the VM in three runs and 1.00x on the interpreter - noise, the base
+against a copy of itself gave 1.01x. What it took (each found with callgrind diffs
+against the base): startup +1.25M instructions with the lexer's literal
+test inside the keyword loop (now after it, +0.27M: the scope pass's mark
+and Node's byte); deltablue +3.3M with the dict-key test inside
+getAttrValue (now a post-check, `pyDictKeyRead`); closures +0.4% (VM)
+with set checks in sort_less and a direction argument (now none, and a
+template); fib +0.26% (interpreter) from a seventh argument to binaryOp,
+which put it on the stack and gave evalBinary a frame pointer (now
+`opcRule`); hasattr/getattr asked pyCode() on every call (now only for a
+container receiver whose read succeeded).
 
 **Not done**
 - `[*5]` / `f(*5)` in Python-language source say "'int' object is not
@@ -601,10 +632,18 @@ object`, `member_type is int`) were is-type lines.
   opt-in changes semantics, not tokens.
 - Two sets in sorted()/min()/max() are compared item by item (both
   engines, as before), not by inclusion.
+- The lint's is-type cannot tell a variable holding a class or a function
+  from a value it does not see bound (6 lines in the library run above).
 - Found, not fixed: type names in messages are the module-qualified class
   names (`can only concatenate str (not "m.Obj") to str`, `'m.Obj' object
   has no attribute 'x'`) for a class defined in an imported module, on
   both engines; CPython says `Obj`.
+
+**Verified**: vm_audit124 219 passed on both engines, 151 under python3
+(the shared part; Nython-only checks skipped there); vm_audit53/72/74/76/
+79-83/96/97/104/109/110/119/120 pass on both; sweep 470 runs, 0 not ok;
+`tools/ide_e2e.py` 463 passed, 0 failed; ide_lint, ny_classcheck, cbp
+check clean.
 
 ---
 
