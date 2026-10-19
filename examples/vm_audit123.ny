@@ -1035,6 +1035,30 @@ async def await_shape_main():
     check("await of an object whose __await__ is a coroutine's, woken by another task", r, "woken")
 
 
+def test_first_view_in_threads():
+    # the first memoryview loads the buffer machinery (a prelude chunk);
+    # threads making their first views at once each wait for it (round 86)
+    errors = []
+    go = threading.Event()
+
+    def worker():
+        go.wait()
+        try:
+            for i in range(30):
+                m = memoryview(b"abcdef")
+                if len(m) != 6 or m[1:3].tobytes() != b"bc":
+                    errors.append("wrong view")
+        except Exception as e:
+            errors.append(type(e).__name__)
+    ts = [threading.Thread(target=worker) for i in range(6)]
+    for t in ts:
+        t.start()
+    go.set()
+    for t in ts:
+        t.join()
+    check("memoryviews made by six threads at once, the first ones in the process", errors, [])
+
+
 def test_asyncio():
     asyncio.run(await_shape_main())
     asyncio.run(h2_main())
@@ -1270,6 +1294,7 @@ def test_websocket():
 
 # ═══════════════════════════════════════════════════════════════════════════
 t0 = time.time()
+test_first_view_in_threads()
 TLS = make_certs()
 test_hpack()
 test_policies()

@@ -309,8 +309,8 @@ the websockets package's (permessage-deflate factories, asyncio
 connect/serve) where an API was needed. Every sans-I/O module is written in
 the subset of the language CPython also runs, so vm_audit123 loads them in
 python3 with a `sys.meta_path` finder (SourceFileLoader over the `.ny`
-files) and runs the same checks there: **241 checks; 241 pass on the
-interpreter, the VM and python3** (232 under python3: the http.client /
+files) and runs the same checks there: **242 checks; 242 pass on the
+interpreter and the VM, 233 under python3** (the http.client /
 urllib and lib/websocket.ny sections are Nython-only).
 
 Interop was checked outside the test as well (not in the suite: they need
@@ -407,7 +407,8 @@ window of 8 bits, as it says; we accept it - below).
    'memoryview' has no len()", half the runs of the http.client test, whose
    server runs on another thread). A thread finding a chunk being loaded by
    another waits for it (GIL released, 200 us steps); the loading thread
-   carries on as before.
+   carries on as before. vm_audit123 has six threads make the process's
+   first memoryviews at once: the round 85 binary failed it in 4 runs of 4.
 
 ### Not done
 
