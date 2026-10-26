@@ -398,10 +398,11 @@ struct Collector {
         case NodeType::CALL: {
             auto* c = static_cast<CallNode*>(n.get());
             // round 87: a starred display's helper in Python-language source
-            // takes no int as an iterable (its _py form, the engines' natives)
+            // takes no int as an iterable (its _py form, the engines' natives;
+            // the prelude's for a starred comprehension target's iterable)
             if (s->py && c->callee && c->callee->type() == NodeType::VARIABLE) {
                 auto* v = static_cast<VariableNode*>(c->callee.get());
-                if (v->name == "_ny_list_cat" || v->name == "_ny_set_cat") {
+                if (v->name == "_ny_list_cat" || v->name == "_ny_set_cat" || v->name == "_ny_star_iter") {
                     // a new node: the VM compiles a name from its token
                     Token t = v->token();
                     t.value = v->name + "_py";

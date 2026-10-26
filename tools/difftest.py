@@ -30,7 +30,8 @@ Misherghi and Su 2006: a subexpression replaced by one of its children or by
 a constant), keeping the program interesting: the same tag still differs the
 same way (its signature - the engine, the kind of each side's line and the
 exception types - is unchanged, so the reduction does not wander to another
-bug). Findings are grouped by signature and written to --out as runnable
+bug). Findings are grouped by signature (a difference both engines make the
+same way is one finding, "interp+vm") and written to --out as runnable
 programs with the outputs each implementation gave.
 
 Exit status: 0 when nothing differed, 1 otherwise.
@@ -44,7 +45,12 @@ import re
 import subprocess
 import sys
 import tempfile
+import warnings
 from concurrent.futures import ThreadPoolExecutor
+
+# the reducer compiles candidates such as `1.5[0:1]`: CPython's "perhaps you
+# missed a comma?" warnings about them are noise here
+warnings.simplefilter("ignore", SyntaxWarning)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BIN = os.path.join(REPO, "build", "nython-cli")
@@ -671,6 +677,7 @@ def main():
     ap.add_argument("--reduce", metavar="PROG")
     ap.add_argument("--print", metavar="SEED", type=int, help="print the program a seed generates")
     args = ap.parse_args()
+    args.bin = os.path.abspath(args.bin)
     if args.lang == "ny" and args.engines == "interp,vm":
         pass
     os.makedirs(args.out, exist_ok=True)
@@ -704,36 +711,42 @@ def main():
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
         for seed, src, outs, dis in ex.map(lambda s: one(s, args, work), range(args.seed, args.seed + args.count)):
             for (eng, t), (a, b) in dis.items():
+                # the same disagreement on every engine is one finding,
+                # reduced on the first of them
+                same = sorted([eng] + [e for (e, t2), (a2, b2) in dis.items() if t2 == t and e != eng and b2 == b])
+                if eng != same[0]:
+                    continue
+                label = "+".join(same)
                 sig = signature(eng, a, b)
                 # finer: the exception types / first words of each side
-                key = (eng, (a or "")[:60], (b or "")[:60]) if sig[1] == sig[2] == "value" else sig + ((a or "").split("\n")[0][:40],)
-                groups.setdefault(key, []).append((seed, t, src, a, b, sig))
+                key = (label, (a or "")[:60], (b or "")[:60]) if sig[1] == sig[2] == "value" else (label,) + sig + ((a or "").split("\n")[0][:40],)
+                groups.setdefault(key, []).append((seed, t, src, a, b, sig, label))
     print("%d programs, %d disagreeing observations in %d groups" % (
         args.count, sum(len(v) for v in groups.values()), len(groups)))
     findings = []
     seen_src = set()
     for i, (key, items) in enumerate(sorted(groups.items(), key=lambda kv: -len(kv[1]))):
-        seed, t, src, a, b, sig = items[0]
+        seed, t, src, a, b, sig, label = items[0]
         red = src
         if not args.no_reduce and i < args.max_reduce:
             red = Reducer(src, sig[0], t, sig, args, work).run()
-        h = hashlib.sha1(red.encode()).hexdigest()[:10]
+        h = hashlib.sha1((red + "\0" + label + "\0" + t).encode()).hexdigest()[:10]   # (one finding per program, engines and tag)
         if h in seen_src:
             continue
         seen_src.add(h)
         outs = outputs(red, args, work)
         path = os.path.join(args.out, "finding_%s.py" % h)
         with open(path, "w") as f:
-            f.write("# difftest finding: %s (seed %d, tag %s, %d occurrences)\n" % (sig[0], seed, t, len(items)))
+            f.write("# difftest finding: %s (seed %d, tag %s, %d occurrences)\n" % (label, seed, t, len(items)))
             for name, lines in outs.items():
                 for ln in lines:
                     if ln.startswith(t + " ") or not re.match(r"t\d+ ", ln):
                         f.write("# %-8s %s\n" % (name, ln))
             f.write(red)
-        findings.append((len(items), sig, path, a, b))
-    for n, sig, path, a, b in findings:
-        print("%4d x %-6s python3: %s\n         nython:  %s\n         %s" % (
-            n, sig[0], (a or "<missing>").split("\n")[0][:110], (b or "<missing>").split("\n")[0][:110], path))
+        findings.append((len(items), label, path, a, b))
+    for n, label, path, a, b in findings:
+        print("%4d x %-9s %s: %s\n         nython:  %s\n         %s" % (
+            n, label, ref, (a or "<missing>").split("\n")[0][:110], (b or "<missing>").split("\n")[0][:110], path))
     return 1 if findings else 0
 
 

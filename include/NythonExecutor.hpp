@@ -2423,6 +2423,29 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── BINARY OPERATORS ───────────────────────────────────────────────
+    // round 87: dict(seq) / d.update(seq) of pairs, CPython's messages naming
+    // the element (#i) that is no pair
+    void dictUpdatePairs(Container* dc, const Value& seq, Context* ctx) {
+        int64_t el = 0;
+        for (auto& pairv : iterItems(seq, ctx)) {
+            if (pairv.type == ValueType::INTEGER || pairv.type == ValueType::DOUBLE || pairv.type == ValueType::BOOLEAN || pairv.type == ValueType::NONE)
+                pyRaise("TypeError", "cannot convert dictionary update sequence element #" + std::to_string(el) + " to a sequence");
+            std::vector<Value> kv = iterItems(pairv, ctx);
+            if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element #" + std::to_string(el) + " has length " + std::to_string(kv.size()) + "; 2 is required");
+            dictSet(dc, kv[0], kv[1]);
+            el++;
+        }
+    }
+    // round 87: `x[a:b]` of a value with no slice method (the parser's
+    // x.slice(a, b)): CPython's TypeError
+    [[noreturn]] void notSubscriptable(const Value& obj, Context* ctx) {
+        if (classNodeOfValue(obj)) {
+            Value n;
+            if (getAttrValue(obj, "__name__", ctx, n) && isStringValue(n))
+                pyRaise("TypeError", "type '" + getStringValue(n) + "' is not subscriptable");
+        }
+        pyRaise("TypeError", "'" + typeNameOf(obj) + "' object is not subscriptable");
+    }
     // Arithmetic between types that have no such operator: TypeError, as in
     // Python and on the VM (binop). 1 + none used to give none here and 1
     // there; an instance added to anything concatenated its handle's text.
@@ -2586,7 +2609,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         case OP_LSHIFT: case OP_RSHIFT:
             if (nums) return numArith(opc, x, y);
-            return intValue(0);
+            unsupportedOperands(opc, lv, rv);   // round 87: CPython's TypeError (it gave 0)
         case OP_EQ: return Value(valuesEqual(lv, rv, 0));
         case OP_NE: return Value(!valuesEqual(lv, rv, 0));
         case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
@@ -2964,6 +2987,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value new_val = evalNode(an->value_node, ctx, pend);
         if (pend && raisedBy(new_val)) return NONE_VALUE;   // round 82: the value raised (evalP)
         Value result;
+        try {   // round 87: CPython's TypeError names the in-place operator (augRethrow)
         // Two numbers (round 81): binaryOp's answer without its other checks
         // (no container, bytes or object is involved), then the store.
         if (astSpecOn() && an->plain_op && opc != OP_UNKNOWN && isNumType(old_val.type) && isNumType(new_val.type)
@@ -3041,8 +3065,20 @@ public:   // NythonExecutor is a struct: members default to public
                 else result = binaryOp(opcRule(opc, an->py_src), old_val, new_val, ctx);   // round 86: the node's rule
             }
         }
+        } catch (std::string& e) { augRethrow(e, opc); }
         storeAugTarget(an, kind, obj, idx, result, ctx);
         return result;
+    }
+    // round 87: `x //= "a"` - CPython's TypeError names the in-place operator
+    // ("unsupported operand type(s) for //=: 'int' and 'str'"; "**=", not "**
+    // or pow()"); the other errors pass as they are. Called in the handler:
+    // the exception caught is rethrown, its text changed.
+    [[noreturn]] void augRethrow(std::string& e, int opc) {
+        const char* sym = opSymbol(opc);
+        const std::string pre = std::string("__exc__:TypeError:unsupported operand type(s) for ") + (opc == OP_POW ? "** or pow()" : sym) + ": ";
+        if (opc != OP_UNKNOWN && e.compare(0, pre.size(), pre) == 0)
+            e = std::string("__exc__:TypeError:unsupported operand type(s) for ") + sym + "=: " + e.substr(pre.size());
+        throw;
     }
     // The store of `t op= v`: an item, an attribute (an instance's field
     // through the target's cache - round 81) or a name.
@@ -3839,6 +3875,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (it != C.end() && valuesEqual(it->second, args[0], 0)) { out = intValue(k); return true; }
             }
             if (name == "indexOf") { out = intValue(-1); return true; }
+            if (tup) pyRaise("ValueError", "tuple.index(x): x not in tuple");   // round 87: CPython's
             pyRaise("ValueError", reprOf(args[0], ctx) + " is not in list");
         }
         if (name == "count") {
@@ -3966,11 +4003,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (name == "update" || name == "merge") {
             if (!args.empty()) {
                 if (Container* src = contOf(args[0]); src && seqLen(src) < 0 && !nygen::is_gen(args[0])) dictUpdate(cont, src);
-                else for (auto& pairv : iterItems(args[0], ctx)) {
-                    std::vector<Value> kv = iterItems(pairv, ctx);
-                    if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
-                    dictSet(cont, kv[0], kv[1]);
-                }
+                else dictUpdatePairs(cont, args[0], ctx);
             }
             for (auto& [k, v] : kw) dictSet(cont, makeStringValue(k), v);
             out = name == "merge" ? obj : NONE_VALUE;
@@ -7213,6 +7246,10 @@ public:   // NythonExecutor is a struct: members default to public
             if (moduleGetattr(obj, dynamic_cast<Container*>(obj.value.gc), method_name, ctx, target))
                 return callFunctionValue(target, args, ctx, kw_in);
         }
+        // round 87: x[a:b] is x.slice(a, b) to the parser - a value with no
+        // such method is not subscriptable (CPython's TypeError; it said
+        // "'float' object has no attribute 'slice'")
+        if (method_name == "slice") notSubscriptable(obj, ctx);
         // Any other value without such a method raises too: `none.m()` and
         // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
         // spelling.
@@ -11250,6 +11287,10 @@ public:
                         out = makeStringValue(dot == std::string::npos ? std::string("__main__") : nm.substr(0, dot));
                         return true;
                     }
+                    // round 87: an instance has no __name__ / __qualname__ of
+                    // its own (they are the type's; it read its class's, the
+                    // VM's AttributeError)
+                    if (t.rfind("__instance__:", 0) == 0) return false;
                     // a nested class's __qualname__ is Outer.Inner, a class in
                     // a function's f.<locals>.C (round 79: the parser's)
                     if (is_class && attr == "__qualname__") {
@@ -16816,6 +16857,10 @@ public:
         static const std::unordered_set<std::string> takes = {
             "list","tuple","set","sorted","min","max","sum","any","all","enumerate","zip","frozenset"};   // reversed: pycore's (round 78)
         if (name == "issubclass" && args.size() >= 2) {
+            // round 87: a number or None as a class: CPython's TypeError (it read false)
+            auto scalar = [](const Value& v) { return v.type == ValueType::INTEGER || v.type == ValueType::DOUBLE || v.type == ValueType::BOOLEAN || v.type == ValueType::NONE; };
+            if (scalar(args[0])) pyRaise("TypeError", "issubclass() arg 1 must be a class");
+            if (scalar(args[1])) pyRaise("TypeError", "issubclass() arg 2 must be a class, a tuple of classes, or a union");
             auto cls_name = [&](const Value& v) -> std::string {
                 if (v.type == ValueType::USERDATA && v.value.p) {
                     std::string t = fnTag(func_names, v.value.p);
@@ -16884,7 +16929,7 @@ public:
         // absence; other errors propagate.
         if ((name == "hasattr" || name == "getattr" || name == "setattr" || name == "delattr") && args.size() >= 2) {
             if (!isStringValue(args[1]))
-                pyRaise("TypeError", name + "(): attribute name must be string, not '" + typeNameOf(args[1]) + "'");
+                pyRaise("TypeError", "attribute name must be string, not '" + typeNameOf(args[1]) + "'");   // round 87: CPython's words
             std::string an = getStringValue(args[1]);
             if (name == "setattr") {
                 if (args.size() != 3) pyRaise("TypeError", "setattr expected 3 arguments, got " + std::to_string(args.size()));

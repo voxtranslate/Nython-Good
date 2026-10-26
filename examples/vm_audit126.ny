@@ -26,6 +26,16 @@
 #     its module and __qualname__, as CPython's.
 # 10. A TLS handshake still running when asyncio.run() ends is cancelled and
 #     its socket closed (client and server side).
+# 11. (the false DeadlockError of vm_audit104 under Wine: vm_audit104 itself,
+#     run in a loop under Wine)
+# 12. More of the same kind, found by tools/difftest.py: & | ^ << >> of
+#     values that are no numbers (they gave 0), x[a:b] of a value that is
+#     not subscriptable, dict(seq)'s messages, tuple.index, the attribute
+#     name's type, list.append()'s arity, isinstance/issubclass of a number,
+#     the in-place operator in an augmented assignment's TypeError, `1 //
+#     'ab'` (read as a comment), a value sent through yield from to an
+#     iterator without send(), a starred comprehension target given an int,
+#     the __qualname__ of a lambda in a lambda, an instance's __name__.
 #
 # Items 7 and 8 run as a Python-language child (a .py file) on the same
 # engine. The checks pass under python3 too (the Nython-only ones are marked):
@@ -504,6 +514,8 @@ t("super() after del", lambda: Kid().m())
 def shadow(super):
     return super(4)
 t("a parameter called", lambda: shadow(lambda v: v * 3))
+t("[a for a, *b in n]", lambda: [a for a, *b in n])
+t("1 // 'ab'", lambda: 1 // 'ab')
 '''
 EXPECTED78 = [
     "d.k ! AttributeError 'dict' object has no attribute 'k'",
@@ -535,6 +547,8 @@ EXPECTED78 = [
     "a module's own def super() = 'mine'",
     "super() after del = 'kid+base'",
     "a parameter called = 12",
+    "[a for a, *b in n] ! TypeError 'int' object is not iterable",
+    "1 // 'ab' ! TypeError unsupported operand type(s) for //: 'int' and 'str'",
 ]
 out78, err78 = run_py(CHILD78, "child126.py")
 lines78 = out78.strip().split("\n")
@@ -683,6 +697,135 @@ if CERTS is not None:
     raw10.close()
     check("a server's TLS handshake left running by asyncio.run(): a task of the loop, cancelled, the connection closed",
           [r10b, state10b["handshake tasks"], got10b, took10b < 20], [[], 1, b"", True])
+
+# ── 12. more of the kind, found by tools/difftest.py ─────────────────────────
+class C12:
+    pass
+o12 = C12()
+none12 = None
+f12 = 1.5
+j12 = 1j
+ops12 = [
+    err(lambda: f12 << 1), err(lambda: j12 >> 1), err(lambda: (1, 2) << {}), err(lambda: none12 >> 1),
+    err(lambda: [1] | 1), err(lambda: "a" ^ "b"), err(lambda: o12 & 1), err(lambda: 1 << o12),
+    err(lambda: [1, 2] - [1]), err(lambda: [1] | [2]),
+]
+check("& | ^ << >> of values that are no numbers: CPython's TypeError (they gave 0; two lists' - | were set operations on the VM)", ops12, [
+    ("TypeError", "unsupported operand type(s) for <<: 'float' and 'int'"),
+    ("TypeError", "unsupported operand type(s) for >>: 'complex' and 'int'"),
+    ("TypeError", "unsupported operand type(s) for <<: 'tuple' and 'dict'"),
+    ("TypeError", "unsupported operand type(s) for >>: 'NoneType' and 'int'"),
+    ("TypeError", "unsupported operand type(s) for |: 'list' and 'int'"),
+    ("TypeError", "unsupported operand type(s) for ^: 'str' and 'str'"),
+    ("TypeError", "unsupported operand type(s) for &: 'C12' and 'int'"),
+    ("TypeError", "unsupported operand type(s) for <<: 'int' and 'C12'"),
+    ("TypeError", "unsupported operand type(s) for -: 'list' and 'list'"),
+    ("TypeError", "unsupported operand type(s) for |: 'list' and 'list'")])
+sl12 = [err(lambda: f12[1:2]), err(lambda: j12[::-1]), err(lambda: none12[0:1]), err(lambda: o12[1:]),
+        err(lambda: C12[1:2])]
+check("x[a:b] of a value that is not subscriptable: TypeError (it was an AttributeError naming 'slice')", sl12, [
+    ("TypeError", "'float' object is not subscriptable"),
+    ("TypeError", "'complex' object is not subscriptable"),
+    ("TypeError", "'NoneType' object is not subscriptable"),
+    ("TypeError", "'C12' object is not subscriptable"),
+    ("TypeError", "type 'C12' is not subscriptable")])
+d12 = {}
+du12 = [err(lambda: dict([1])), err(lambda: dict([(1, 2), [1, 2, 3]])), err(lambda: dict(["ab", "c"])),
+        err(lambda: d12.update([(1, 2), "x"])), dict([(1, 2), "ab"]), err(lambda: dict([(1, 2), None]))]
+check("dict(seq) / d.update(seq): CPython's messages, the element's index in them", du12, [
+    ("TypeError", "cannot convert dictionary update sequence element #0 to a sequence"),
+    ("ValueError", "dictionary update sequence element #1 has length 3; 2 is required"),
+    ("ValueError", "dictionary update sequence element #1 has length 1; 2 is required"),
+    ("ValueError", "dictionary update sequence element #1 has length 1; 2 is required"),
+    {1: 2, "a": "b"},
+    ("TypeError", "cannot convert dictionary update sequence element #1 to a sequence")])
+t12 = (1, 2)
+l12 = [1, 2]
+ap12 = []
+msg12 = [err(lambda: t12.index(9)), err(lambda: l12.index(9)), err(lambda: getattr(o12, 5)),
+         err(lambda: hasattr(o12, None)), err(lambda: setattr(o12, 1, 2)), err(lambda: ap12.append()),
+         err(lambda: isinstance(1, 2)), err(lambda: isinstance(1, None)), err(lambda: issubclass(1, int)),
+         err(lambda: issubclass(int, 2.5)), isinstance(1, (int, 2)), issubclass(bool, (int, 2))]
+check("tuple.index, getattr/hasattr/setattr's name, list.append()'s arity, isinstance/issubclass of a non-class: CPython's messages",
+      msg12, [
+    ("ValueError", "tuple.index(x): x not in tuple"),
+    ("ValueError", "9 is not in list"),
+    ("TypeError", "attribute name must be string, not 'int'"),
+    ("TypeError", "attribute name must be string, not 'NoneType'"),
+    ("TypeError", "attribute name must be string, not 'int'"),
+    ("TypeError", "list.append() takes exactly one argument (0 given)"),
+    ("TypeError", "isinstance() arg 2 must be a type, a tuple of types, or a union"),
+    ("TypeError", "isinstance() arg 2 must be a type, a tuple of types, or a union"),
+    ("TypeError", "issubclass() arg 1 must be a class"),
+    ("TypeError", "issubclass() arg 2 must be a class, a tuple of classes, or a union"),
+    True, True])
+
+def aug12(src):
+    try:
+        exec(src, {})
+    except TypeError as e:
+        return str(e)
+    return "no error"
+augs12 = [aug12('x = 1\nx //= "a"'), aug12('x = 1\nx **= "a"'), aug12('x = 1.5\nx <<= 1'),
+          aug12('x = {1}\nx -= [1]'), aug12('x = 1\nx += None'), aug12('x = [1]\nx @= 2'),
+          aug12('x = None\nx |= 1'), aug12('class C:\n    pass\nx = C()\nx += 1'), aug12('x = 1\nx ^= "s"'),
+          aug12('x = 1\nx *= None'), aug12('x = 1\nx %= []'), aug12('x = 1\nx /= "a"'),
+          aug12('x = 1\nx -= "a"'), aug12('x = 7\nx //= 2\nassert x == 3'), err(lambda: 1 // "ab"), err(lambda: 1 // 'ab')]
+check("an augmented assignment's TypeError names the in-place operator; `1 // 'ab'` is a division (it read as a comment)",
+      augs12, [
+    "unsupported operand type(s) for //=: 'int' and 'str'",
+    "unsupported operand type(s) for **=: 'int' and 'str'",
+    "unsupported operand type(s) for <<=: 'float' and 'int'",
+    "unsupported operand type(s) for -=: 'set' and 'list'",
+    "unsupported operand type(s) for +=: 'int' and 'NoneType'",
+    "unsupported operand type(s) for @=: 'list' and 'int'",
+    "unsupported operand type(s) for |=: 'NoneType' and 'int'",
+    "unsupported operand type(s) for +=: 'C' and 'int'",
+    "unsupported operand type(s) for ^=: 'int' and 'str'",
+    "unsupported operand type(s) for *=: 'int' and 'NoneType'",
+    "unsupported operand type(s) for %=: 'int' and 'list'",
+    "unsupported operand type(s) for /=: 'int' and 'str'",
+    "unsupported operand type(s) for -=: 'int' and 'str'",
+    "no error",
+    ("TypeError", "unsupported operand type(s) for //: 'int' and 'str'"),
+    ("TypeError", "unsupported operand type(s) for //: 'int' and 'str'")])
+def yf12(src):
+    r = yield from src
+    return r
+def send12(src):
+    g = yf12(src)
+    next(g)
+    try:
+        g.send(5)
+    except AttributeError as e:
+        return str(e)
+    except StopIteration:
+        return "stop"
+    return "sent"
+yfs12 = [send12("ab"), send12([1, 2]), send12((1, 2)), send12(range(3)), send12(x for x in [1, 2]),
+         send12(map(str, [1, 2])), list(yf12([1, 2]))]
+check("a value sent through yield from to an iterator with no send(): CPython's AttributeError (it was dropped)",
+      yfs12, ["'str_ascii_iterator' object has no attribute 'send'", "'list_iterator' object has no attribute 'send'",
+              "'tuple_iterator' object has no attribute 'send'", "'range_iterator' object has no attribute 'send'",
+              "sent", "'map' object has no attribute 'send'", [1, 2]])
+check("an instance has no __name__ / __qualname__ of its own (the interpreter read its class's)",
+      [err(lambda: o12.__name__), err(lambda: o12.__qualname__), err(lambda: ValueError("x").__name__),
+       C12.__name__, type(o12).__qualname__, o12.__class__.__name__],
+      [("AttributeError", "'C12' object has no attribute '__name__'"),
+       ("AttributeError", "'C12' object has no attribute '__qualname__'"),
+       ("AttributeError", "'ValueError' object has no attribute '__name__'"), "C12", "C12", "C12"])
+fq12 = lambda: (lambda: 1)
+class Q12:
+    m = lambda self: (lambda: 4)
+def gq12():
+    return lambda: (lambda: 2)
+check("a lambda in a lambda: CPython's __qualname__ (it was <lambda>)",
+      [fq12().__qualname__, (lambda: [lambda: 3])()[0].__qualname__, Q12().m().__qualname__, gq12()().__qualname__],
+      ["<lambda>.<locals>.<lambda>", "<lambda>.<locals>.<lambda>", "Q12.<lambda>.<locals>.<lambda>",
+       "gq12.<locals>.<lambda>.<locals>.<lambda>"])
+check("a starred comprehension target given an int: CPython's TypeError (the int was counted up to)",
+      [err(lambda: [a for a, *b in [5]]), [[a, b] for a, *b in ["xy", [1]]]],
+      [("TypeError", "cannot unpack non-iterable int object"), [["x", ["y"]], [1, []]]])
 
 # ── done ──────────────────────────────────────────────────────────────────────
 shutil.rmtree(T, ignore_errors=True)

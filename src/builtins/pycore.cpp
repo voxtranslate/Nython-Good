@@ -547,11 +547,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
                     E.dictSet(dc, k, E.callMethod(args[0], "__getitem__", ka, ctx));
                 }
             } else {
-                for (auto& pairv : E.iterItems(args[0], ctx)) {
-                    std::vector<Value> kv = E.iterItems(pairv, ctx);
-                    if (kv.size() != 2) E.pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
-                    E.dictSet(dc, kv[0], kv[1]);
-                }
+                E.dictUpdatePairs(dc, args[0], ctx);   // round 87: CPython's messages
             }
         }
         // Keyword arguments in the order they were written (kw itself is

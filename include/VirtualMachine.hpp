@@ -1471,7 +1471,7 @@ private:
                 auto it=idunder.find(an->op);
                 if(it!=idunder.end()) emit(Op::INPLACE_TRY,C().add_name(it->second),l);
             }
-            emit(aug_op(an->op),0,l);
+            emit(aug_op(an->op),2,l);   // round 87: arg 2 - an augmented assignment's (binop_aug's messages)
             // Store back
             store(an->target,l); break;
         }
@@ -9440,7 +9440,8 @@ private:
                 push(binop(nypy::A_MUL,lv,r)); break; }
             case Op::BINARY_MATMUL: { VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__matmul__","__rmatmul__",res)){ push(std::move(res)); break; } }
-                throw_exception(make_exception("TypeError",{VMVal::make_str("unsupported operand type(s) for @")}));
+                // (round 87: the operands' types, and @= for an augmented assignment)
+                throw_exception(make_exception("TypeError",{VMVal::make_str(std::string("unsupported operand type(s) for @")+(ins.arg==2?"=":"")+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'")}));
                 break; }
             case Op::BINARY_DIV: case Op::BINARY_MOD: case Op::BINARY_POW: case Op::BINARY_FLOOR_DIV:
             case Op::BINARY_AND: case Op::BINARY_OR: case Op::BINARY_XOR: case Op::BINARY_LSHIFT: case Op::BINARY_RSHIFT: {
@@ -9475,7 +9476,7 @@ private:
                     std::vector<VMVal> a{l, r};
                     push(vm_call(load_var("_ny_union"), a, std::nullopt, nullptr)); break;
                 }
-                push(binop(aop,l,r)); break; }
+                push(ins.arg==2?binop_aug(aop,l,r):binop(aop,l,r)); break; }
             // Compares
             case Op::COMPARE_EQ: {
                 NY_QUICKEN();   // round 80
@@ -10067,6 +10068,17 @@ private:
                         if(!is_stop_iteration(e.value)) throw;
                         if(e.value.type==VMType::INSTANCE&&e.value.map&&e.value.map->count("value")) result=(*e.value.map)["value"];
                     }
+                } else if(sent.type!=VMType::NONE&&!(it.type==VMType::INSTANCE&&[&]{ VMVal ms; return class_lookup(it.class_name,"send",ms); }())){
+                    // round 87: a value sent through `yield from` to an
+                    // iterator with no send() - CPython's AttributeError (the
+                    // value was dropped and the iterator stepped)
+                    VMVal t=type_object_of(it);
+                    std::string tn=vm_type_name(it);
+                    if(t.type==VMType::NATIVE&&t.class_name.rfind("__rtype__:",0)==0){
+                        const nyrt::RuntimeType* rt=nyrt::runtime_type(t.class_name.substr(10));
+                        if(rt) tn=rt->name;
+                    }
+                    throw_exception(make_exception("AttributeError",{VMVal::make_str("'"+tn+"' object has no attribute 'send'")}));
                 } else if(it.type==VMType::INSTANCE){
                     VMVal m;
                     bool use_send = sent.type!=VMType::NONE && class_lookup(it.class_name,"send",m);
@@ -10397,20 +10409,20 @@ private:
                 if(l.type==VMType::INT&&r.type==VMType::INT&&l.s.empty()&&r.s.empty()){
                     int64_t res; if(!nypy::add_ovf(l.i,r.i,res)){ push(VMVal::make_int(res)); break; }
                 }
-                push(binop_inplace(nypy::A_ADD,l,r)); break;
+                push(binop_aug(nypy::A_ADD,l,r)); break;
             }
             case Op::ISUB: {
                 NY_QUICKEN();   // round 80
                 VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){ VMVal res=ni_none(call_dunder(l,"__isub__",{r})); if(res.type==VMType::NONE) res=ni_none(call_dunder(l,"__sub__",{r})); if(res.type!=VMType::NONE){push(res);break;} }
                 if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__sub__","__rsub__",res)){push(res);break;} }
-                push(binop(nypy::A_SUB,l,r)); break; }
+                push(binop_aug(nypy::A_SUB,l,r)); break; }
             case Op::IMUL: {
                 NY_QUICKEN();   // round 80
                 VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){ VMVal res=ni_none(call_dunder(l,"__imul__",{r})); if(res.type==VMType::NONE) res=ni_none(call_dunder(l,"__mul__",{r})); if(res.type!=VMType::NONE){push(res);break;} }
                 if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__mul__","__rmul__",res)){push(res);break;} }
-                push(binop_inplace(nypy::A_MUL,l,r)); break; }
+                push(binop_aug(nypy::A_MUL,l,r)); break; }
             case Op::IDIV: { VMVal r=pop(),l=pop(); push(binop(nypy::A_DIV,l,r)); break; }
             case Op::IMOD: { VMVal r=pop(),l=pop(); push(binop(nypy::A_MOD,l,r)); break; }
 
@@ -11662,32 +11674,14 @@ private:
         case nypy::A_MOD:
             if(l.type==VMType::STRING) return VMVal::make_str(percent_format(l.s,r));
             break;
-        case nypy::A_SUB: case nypy::A_AND: case nypy::A_OR: case nypy::A_XOR:
-            // Sets are deduplicated lists here.
-            if(l.type==VMType::LIST&&r.type==VMType::LIST&&l.list&&r.list){
-                std::unordered_set<std::string> other,seen;
-                for(auto& v:*r.list) other.insert(v.repr());
-                std::vector<VMVal> res;
-                if(op==nypy::A_OR){
-                    for(auto& v:*l.list) if(seen.insert(v.repr()).second) res.push_back(v);
-                    for(auto& v:*r.list) if(seen.insert(v.repr()).second) res.push_back(v);
-                } else {
-                    for(auto& v:*l.list){
-                        bool in=other.count(v.repr())>0;
-                        if((op==nypy::A_AND)==in||(op==nypy::A_XOR&&!in)) res.push_back(v);
-                    }
-                    if(op==nypy::A_XOR){
-                        std::unordered_set<std::string> mine; for(auto& v:*l.list) mine.insert(v.repr());
-                        for(auto& v:*r.list) if(!mine.count(v.repr())) res.push_back(v);
-                    }
-                }
-                return VMVal::make_list(std::move(res));
-            }
-            break;
+        // (round 87: two lists' - | & ^ were set operations on the VM only,
+        // from before sets were a type; a TypeError now, as on the
+        // interpreter and in CPython)
         default: break;
         }
-        if(op==nypy::A_DIV||op==nypy::A_FLOORDIV||op==nypy::A_MOD||op==nypy::A_POW||op==nypy::A_SUB||op==nypy::A_ADD||op==nypy::A_MUL)
-            raise_native_exception("TypeError",std::string("unsupported operand type(s) for ")+(op==nypy::A_POW?"** or pow()":nypy::arith_symbol(op))+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        // every operator (round 87: & | ^ << >> of values that are no
+        // numbers gave 0)
+        raise_native_exception("TypeError",std::string("unsupported operand type(s) for ")+(op==nypy::A_POW?"** or pow()":nypy::arith_symbol(op))+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
         return VMVal::make_int(0);
     }
     // In place: `L += it` extends and `L *= n` repeats the list object itself,
@@ -11723,6 +11717,21 @@ private:
             }
         }
         return binop(op,l,r);
+    }
+    // round 87: an augmented assignment's operation - CPython's TypeError
+    // names the in-place operator ("for //=:", "**=" rather than "** or
+    // pow()"); the other errors pass as they are
+    VMVal binop_aug(int op, VMVal& l, const VMVal& r) {
+        try { return binop_inplace(op,l,r); }
+        catch(VMException&) { throw; }
+        catch(std::runtime_error& e) {
+            const char* sym=nypy::arith_symbol(op);
+            std::string pre=std::string("TypeError: unsupported operand type(s) for ")+(op==nypy::A_POW?"** or pow()":sym)+": ";
+            std::string w=e.what();
+            if(w.compare(0,pre.size(),pre)==0)
+                raise_native_exception("TypeError",std::string("unsupported operand type(s) for ")+sym+"=: "+w.substr(pre.size()));
+            throw;
+        }
     }
     // A value as the shared formatter sees it (NyFormat.hpp); conv 's'/'r'/'a'
     // passes its str/repr/ascii text.
@@ -13897,6 +13906,7 @@ private:
             }
             // No such method: AttributeError (the call returned none, which
             // hid misspelt method names).
+            if(method=="slice") not_subscriptable(obj);   // round 87: x[a:b] (the parser's x.slice(a, b))
             throw_exception(make_exception("AttributeError",{VMVal::make_str(
                 "'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+method+"'")}));
         }
@@ -13943,6 +13953,9 @@ private:
                 }
                 VMVal target;
                 if(lookup_attr(obj, method, target)) return vm_call(target, args, std::nullopt, kwargs);
+            }
+            if(!is_ctor_name(method) && class_reg_.count(obj.class_name)){
+                if(method=="slice") not_subscriptable(obj);   // round 87: C[a:b]
             }
             if(!is_ctor_name(method) && class_reg_.count(obj.class_name))
                 throw_exception(make_exception("AttributeError",{VMVal::make_str(
@@ -14031,7 +14044,25 @@ private:
         // Nothing else has methods: none.m(), 5.m(), f.m() raise
         // AttributeError (they returned none, or called a global native of
         // that name with the receiver dropped). x?.m() is the graceful form.
+        if(method=="slice") not_subscriptable(obj);   // round 87: x[a:b] (the parser's x.slice(a, b))
         return missing_attr(obj, method);
+    }
+    // round 87: dict(seq) / d.update(seq) - CPython's messages, naming the
+    // element (#i) that is no sequence (kv null) or no pair
+    void dict_pair_check(const VMVal& pr, int64_t el, const std::vector<VMVal>* kv){
+        if(!kv){
+            if(pr.type==VMType::INT||pr.type==VMType::FLOAT||pr.type==VMType::BOOL||pr.type==VMType::NONE)
+                raise_native_exception("TypeError","cannot convert dictionary update sequence element #"+std::to_string(el)+" to a sequence");
+            return;
+        }
+        if(kv->size()!=2) raise_native_exception("ValueError","dictionary update sequence element #"+std::to_string(el)+" has length "+std::to_string(kv->size())+"; 2 is required");
+    }
+    // round 87: `x[a:b]` of a value with no slice method: CPython's TypeError
+    // (it said "'float' object has no attribute 'slice'")
+    [[noreturn]] void not_subscriptable(const VMVal& obj){
+        if(obj.type==VMType::CLASS)
+            raise_native_exception("TypeError","type '"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' is not subscriptable");
+        raise_native_exception("TypeError","'"+vm_type_name(obj)+"' object is not subscriptable");
     }
 
     // The builtin type a native stands for ("int" for int, "dict" for dict ...),
@@ -14281,11 +14312,12 @@ private:
         if(m=="update"||m=="merge"){
             if(!a.empty()){
                 if(a[0].type==VMType::MAP&&a[0].map){ for(auto& [k,v]:*a[0].map) if(!vm_internal_key(k)) mp[k]=v; }
-                else for(auto& pr:iter_items(a[0])){
+                else { int64_t el=0; for(auto& pr:iter_items(a[0])){
+                    dict_pair_check(pr,el,nullptr);
                     std::vector<VMVal> kv=iter_items(pr);
-                    if(kv.size()!=2) raise_native_exception("ValueError","dictionary update sequence element has length "+std::to_string(kv.size())+"; 2 is required");
+                    dict_pair_check(pr,el,&kv); el++;
                     mp[vkey(kv[0])]=kv[1];
-                }
+                } }
             }
             if(kw.map) for(auto& [k,v]:*kw.map) mp[k]=v;
             return m=="merge"?obj:VMVal::make_none();
@@ -15277,7 +15309,7 @@ private:
         // property / __getattr__ raises) as absence; other errors propagate.
         auto attr_name=[this](std::vector<VMVal>& a, const char* fn)->std::string{
             if(a[1].type!=VMType::STRING)
-                raise_native_exception("TypeError",std::string(fn)+"(): attribute name must be string, not '"+vm_type_name(a[1])+"'");
+                raise_native_exception("TypeError","attribute name must be string, not '"+vm_type_name(a[1])+"'");   // round 87: CPython's words
             return a[1].s;
         };
         globals_["hasattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
@@ -16220,7 +16252,7 @@ private:
         if(obj.b&&mutating.count(m)) raise_native_exception("AttributeError","'tuple' object has no attribute '"+m+"'");
         auto& L=*obj.list;
         int64_t n=(int64_t)L.size();
-        auto nargs=[&](size_t k,const char* what){ if(a.size()!=k) raise_native_exception("TypeError",std::string(what)+" takes exactly "+std::to_string(k)+" argument ("+std::to_string(a.size())+" given)"); };
+        auto nargs=[&](size_t k,const char* what){ if(a.size()!=k) raise_native_exception("TypeError",std::string(what)+" takes exactly "+(k==1?std::string("one"):std::to_string(k))+" argument ("+std::to_string(a.size())+" given)"); };
         if(m=="append"||m=="push"){ nargs(1,"list.append()"); L.push_back(a[0]); out=VMVal::make_none(); return true; }
         if(m=="extend"){ nargs(1,"list.extend()"); std::vector<VMVal> more=iter_items(a[0]); L.insert(L.end(),more.begin(),more.end()); out=VMVal::make_none(); return true; }
         if(m=="remove"){
@@ -16257,6 +16289,7 @@ private:
             if(a.size()>=3&&a[2].type!=VMType::NONE){ en=index_of(a[2],"slice"); if(en<0) en+=n; en=std::min(en,n); }
             for(int64_t k=st;k<en;k++) if(L[(size_t)k]==a[0]){ out=VMVal::make_int(k); return true; }
             if(m=="indexOf"){ out=VMVal::make_int(-1); return true; }
+            if(obj.b) raise_native_exception("ValueError","tuple.index(x): x not in tuple");   // round 87: CPython's
             raise_native_exception("ValueError",vm_repr(a[0])+" is not in list");
         }
         if(m=="count"){ nargs(1,"count()"); int64_t c=0; for(auto& v:L) if(v==a[0]) c++; out=VMVal::make_int(c); return true; }
@@ -16832,11 +16865,12 @@ private:
                         (*d.map)[vm->vkey(k)]=vm->vm_call_method(a[0],"__getitem__",ka);
                     }
                 }
-                else for(auto& pr:vm->iter_items(a[0])){
+                else { int64_t el=0; for(auto& pr:vm->iter_items(a[0])){
+                    vm->dict_pair_check(pr,el,nullptr);
                     std::vector<VMVal> kv=vm->iter_items(pr);
-                    if(kv.size()!=2) vm->raise_native_exception("ValueError","dictionary update sequence element has length "+std::to_string(kv.size())+"; 2 is required");
+                    vm->dict_pair_check(pr,el,&kv); el++;
                     (*d.map)[vm->vkey(kv[0])]=kv[1];
-                }
+                } }
             }
             if(kw.map) for(auto& [k,v]:*kw.map) (*d.map)[k]=v;
             return d;
@@ -17211,6 +17245,10 @@ private:
         tag_type_builtins();
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
+            // round 87: a number or None as the class: CPython's TypeError (a
+            // string still names a type, Nython's spelling)
+            if(a[1].type==VMType::INT||a[1].type==VMType::FLOAT||a[1].type==VMType::BOOL||a[1].type==VMType::NONE)
+                raise_native_exception("TypeError","isinstance() arg 2 must be a type, a tuple of types, or a union");
             // a runtime type object (NoneType, function, method, generator,
             // list_iterator ...): exactly that kind - round 77
             if(a[1].type==VMType::NATIVE&&a[1].class_name.rfind("__rtype__:",0)==0){
@@ -17295,6 +17333,10 @@ private:
         });
         // issubclass(B, A): B's MRO contains A (a tuple of classes: any).
         globals_["issubclass"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // round 87: a number or None as a class: CPython's TypeError
+            auto scalar=[](const VMVal& v){ return v.type==VMType::INT||v.type==VMType::FLOAT||v.type==VMType::BOOL||v.type==VMType::NONE; };
+            if(a.size()>=2&&scalar(a[0])) raise_native_exception("TypeError","issubclass() arg 1 must be a class");
+            if(a.size()>=2&&scalar(a[1])) raise_native_exception("TypeError","issubclass() arg 2 must be a class, a tuple of classes, or a union");
             // issubclass(C, (A, B)): any of them, each asked as itself - an
             // ABC's __subclasscheck__ too (round 77)
             if(a.size()>=2&&a[1].type==VMType::LIST&&a[1].list&&!a[1].is_set()){

@@ -156,7 +156,7 @@ q.w = 1
 del q.w
 check("del attr", hasattr(q, "w"), false)
 check("delattr missing", err(lambda: delattr(q, "w")), "AttributeError: 'Point' object has no attribute 'w'")
-check("getattr name type", err(lambda: getattr(p, 5)), "TypeError: getattr(): attribute name must be string, not 'int'")
+check("getattr name type", err(lambda: getattr(p, 5)), "TypeError: attribute name must be string, not 'int'")
 e = {"a": 1}
 check("get", e.get("a"), 1)
 check("get missing", e.get("z"), none)

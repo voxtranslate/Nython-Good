@@ -1253,15 +1253,22 @@ void Lexer::read_token() {
                         break;
                     }
                     // Disambiguate: // as floor div vs // as comment
-                    bool is_floordiv = false;
+                    // (round 87: Python-language source has no // comments,
+                    // and an operand that starts with a quote, a bracket, a
+                    // brace or ~ makes it floor division - `1 // 'a'`, `x //
+                    // [2]` read as a comment)
+                    bool is_floordiv = python_names;
+                    auto operand_start = [](char c) {
+                        return c == '\'' || c == '"' || c == '[' || c == '{' || c == '~';
+                    };
                     if (c2 == ' ' || c2 == '\t') {
                         char c3 = source.peek_char(1);
                         if ((c3 >= '0' && c3 <= '9') || c3 == '(' || c3 == '-'
-                            || (c3 >= 'a' && c3 <= 'z') || (c3 >= 'A' && c3 <= 'Z') || c3 == '_')
+                            || (c3 >= 'a' && c3 <= 'z') || (c3 >= 'A' && c3 <= 'Z') || c3 == '_' || operand_start(c3))
                             is_floordiv = true;
                     } else if ((c2 >= '0' && c2 <= '9') || c2 == '(' || c2 == '-'
                                || (c2 >= 'a' && c2 <= 'z') || (c2 >= 'A' && c2 <= 'Z')
-                               || c2 == '_' || c2 == '$') {
+                               || c2 == '_' || c2 == '$' || operand_start(c2)) {
                         is_floordiv = true;
                     }
                     if (is_floordiv) {

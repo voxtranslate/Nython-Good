@@ -652,6 +652,10 @@ def _ny_star_shape(item, spec):
     # Python unpacks (spec: 1 for the starred element, 0 a name, a list a
     # nested tuple; Parser::starTargetSpec)
     var vals = None
+    if type(item) is int:
+        # round 87: an int is not unpacked, in Nython code either (list()
+        # here would count up to it)
+        raise TypeError("cannot unpack non-iterable " + type(item).__name__ + " object")
     try:
         vals = list(item)
     except TypeError:
@@ -679,6 +683,13 @@ def _ny_star_shape(item, spec):
 def _ny_star_iter(it, spec):
     for item in it:
         yield _ny_star_shape(item, spec)
+
+def _ny_star_iter_py(it, spec):
+    # round 87: the form NyScope names in Python-language source - an int
+    # is no iterable there (`[a for a, *b in 5]` counted up to it)
+    if type(it) is int:
+        raise TypeError("'" + type(it).__name__ + "' object is not iterable")
+    return _ny_star_iter(it, spec)
 
 def _ny_function_str(f):
     # CPython's _PyObject_FunctionStr (round 87): how a call's errors name

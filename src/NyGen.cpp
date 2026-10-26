@@ -1095,6 +1095,17 @@ Value yield_from(NythonExecutor& E, const Value& src, Context* ctx) {
                 E.forgetRaised(s, false);   // round 85
                 got = false;
             }
+        } else if (m == Mode::Send && !(cu.k == Cursor::GEN && cu.g && cu.g->kind == Kind::GenExpr)) {
+            // round 87: a value sent through `yield from` to an iterator
+            // with no send() - CPython's AttributeError (the value was
+            // dropped and the iterator stepped); a generator expression
+            // takes it as next() does
+            Value itv = cu.it;
+            if (cu.k != Cursor::INST) { std::vector<Value> a{src}; itv = E.callBuiltin("iter", a, ctx); }
+            Value t = E.typeObjectOf(itv), n;
+            std::string tn = E.getAttrValue(t, "__name__", ctx, n) && E.isStringValue(n) ? E.getStringValue(n) : E.typeNameOf(itv);
+            g->delegate = NONE_VALUE;
+            raise("AttributeError", "'" + tn + "' object has no attribute 'send'");
         } else {
             got = step(E, cu, v, ctx);
             if (!got && cu.k == Cursor::END) result = cu.stop_value;

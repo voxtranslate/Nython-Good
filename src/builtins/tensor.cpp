@@ -91,6 +91,11 @@ Value builtin_isinstance(NythonExecutor& E, std::vector<Value>& args, Context* c
     auto& instance_to_class= E.instance_to_class;
     auto& class_by_name    = E.class_by_name;
     auto& class_parent     = E.class_parent;
+    // round 87: a number or None as the class: CPython's TypeError (it read
+    // false; a string still names a type, Nython's spelling)
+    if (args.size() >= 2 && (args[1].type == ValueType::INTEGER || args[1].type == ValueType::DOUBLE
+                             || args[1].type == ValueType::BOOLEAN || args[1].type == ValueType::NONE))
+        E.pyRaise("TypeError", "isinstance() arg 2 must be a type, a tuple of types, or a union");
     // a runtime type object (NoneType, function, method, generator,
     // list_iterator ...): exactly that kind - round 77
     if (args.size() >= 2 && E.runtimeTypeOf(args[1])) {
