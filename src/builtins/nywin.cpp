@@ -283,7 +283,10 @@ Ret r_open(Engine&, const Args& a) {
     LSTATUS r;
     {
         GilRelease unlocked;
-        if (I(a, 4)) r = RegCreateKeyExW(key, sub.c_str(), (DWORD)I(a, 2), nullptr, 0, (REGSAM)I(a, 3), nullptr, &out, nullptr);
+        // create 2: CreateKey, RegCreateKeyW's (the most access allowed, as
+        // CPython's); 1: CreateKeyEx with the access asked for
+        if (I(a, 4) == 2) r = RegCreateKeyW(key, sub.c_str(), &out);
+        else if (I(a, 4)) r = RegCreateKeyExW(key, sub.c_str(), (DWORD)I(a, 2), nullptr, 0, (REGSAM)I(a, 3), nullptr, &out, nullptr);
         else r = RegOpenKeyExW(key, sub.c_str(), (DWORD)I(a, 2), (REGSAM)I(a, 3), &out);
     }
     if (r != ERROR_SUCCESS) raise_reg(r);

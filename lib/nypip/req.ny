@@ -124,7 +124,12 @@ class ReqFile:
     def _line(self, line, base, where, constraint):
         import shlex
         if line.startswith("-"):
-            parts = shlex.split(line, posix=True)
+            if os.name == "nt":
+                # (a backslash is a path separator there, not an escape)
+                parts = [p[1:-1] if len(p) > 1 and p[0] == p[-1] and p[0] in "\"'" else p
+                         for p in shlex.split(line, posix=False)]
+            else:
+                parts = shlex.split(line, posix=True)
             i = 0
             while i < len(parts):
                 p = parts[i]

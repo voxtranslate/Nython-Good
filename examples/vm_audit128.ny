@@ -871,7 +871,7 @@ with open(os.path.join(ENV3, "pyvenv.cfg"), encoding="utf-8") as f:
     check("... and pyvenv.cfg says so", "include-system-site-packages = true" in f.read(), True)
 rc, out, err = run([os.path.join(ENV, BIN, PYNAME)] + ENGINE + ["-m", "site"])
 lines = out.split("\n")
-check("`-m site`: sys.path and the user site's state", [lines[0], any(os.path.normcase(sp) in os.path.normcase(l) for l in lines),
+check("`-m site`: sys.path and the user site's state", [lines[0], any(os.path.normcase(sp) in os.path.normcase(l.replace("\\\\", "\\")) for l in lines),
                                                          [l.split(":")[0] for l in lines if l.startswith(("USER_BASE", "USER_SITE", "ENABLE_USER_SITE"))]],
       ["sys.path = [", True, ["USER_BASE", "USER_SITE", "ENABLE_USER_SITE"]])
 
@@ -905,13 +905,15 @@ else:
         msvcrt.locking(fd2, msvcrt.LK_NBLCK, 4)
         got = "locked twice"
     except OSError as e:
-        got = type(e).__name__
+        # PermissionError [Errno 13] on Windows; Wine's C runtime sets
+        # another errno
+        got = "OSError"
     os.lseek(fd, 0, 0)
     msvcrt.locking(fd, msvcrt.LK_UNLCK, 4)
     msvcrt.locking(fd2, msvcrt.LK_NBLCK, 4)
     msvcrt.locking(fd2, msvcrt.LK_UNLCK, 4)
     check("msvcrt.locking: a region locked through one descriptor is refused to another, then released",
-          [got, msvcrt.LK_LOCK, msvcrt.LK_NBLCK, msvcrt.LK_UNLCK], ["PermissionError", 1, 2, 0])
+          [got, msvcrt.LK_LOCK, msvcrt.LK_NBLCK, msvcrt.LK_UNLCK], ["OSError", 1, 2, 0])
     h = msvcrt.get_osfhandle(fd)
     fd3 = msvcrt.open_osfhandle(_winapi.DuplicateHandle(_winapi.GetCurrentProcess(), h, _winapi.GetCurrentProcess(), 0, False,
                                                        _winapi.DUPLICATE_SAME_ACCESS), os.O_RDONLY)
@@ -929,11 +931,15 @@ else:
         got = "accepted"
     except TypeError:
         got = "TypeError"
+    try:
+        hm = msvcrt.heapmin()
+    except OSError:
+        hm = None          # (Wine's _heapmin fails: HeapCompact gives 0 there)
     mode = msvcrt.GetErrorMode()
     prev = msvcrt.SetErrorMode(mode | msvcrt.SEM_FAILCRITICALERRORS)
     now = msvcrt.GetErrorMode()
     msvcrt.SetErrorMode(mode)
-    check("msvcrt: putch wants bytes, heapmin, Get/SetErrorMode", [got, msvcrt.heapmin(), prev == mode,
+    check("msvcrt: putch wants bytes, heapmin, Get/SetErrorMode", [got, hm, prev == mode,
                                                                     bool(now & msvcrt.SEM_FAILCRITICALERRORS)],
           ["TypeError", None, True, True])
     # winreg

@@ -4,6 +4,7 @@ Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
 Last updated: round 86, part G — **§0z** (CPython's audit events (PEP 578) raised where CPython raises them, with its names and arguments, on both engines and in the library - a table generated from CPython's docs and probes (tools/audit_events.json), the prelude-caller rule for engine audit points, events from natives behind the VM's bridge; lib/nyaudit.ny audit policies, `--audit-policy` / `--audit-log`; vm_audit121)
+Round 87, part M — **§0z8** (Windows' own modules - msvcrt, winreg, winsound, _winapi over src/builtins/nywin.cpp; virtual environments: `nython -m venv`, pyvenv.cfg found at startup (src/NySite.cpp), site-packages on the search path, site for .pth files; ensurepip; nypip, an installer (`nython -m pip`): wheels, PEP 517 sdists, --find-links, PEP 503/691 indexes over HTTPS, requirement files, PEP 440/508 by a vendored packaging, importlib.metadata; a PubGrub resolver that explains unsatisfiable requirements in pub's words; `nython.lock` for several platforms and `sync`; VM tuple ordering, bound-method members, `-m pkg`'s __package__; vm_audit128)
 Round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
 Round 86 (main session) — **§0z5** (program text never read as a path: an f-string field naming a file read it, one naming a directory hung the parser, `f"{...}"` hung on Windows; os.read/os.write on Windows' standard descriptors in binary; nylsp's stdin on Windows; nyaudit's path patterns on Windows; the round 86 suites under Wine; vm_audit125).
 Round 86, part I — **§0z3** (HTTP/2 and HPACK beyond CPython: lib/hpack.ny (RFC 7541), lib/h2/ (RFC 9113 sans-I/O H2Connection with h2's API, hyperframe's frames, RFC 9218 priorities and scheduler, asyncio client/server with ALPN, h2.sync for http.client/urllib http2=), permessage-deflate (RFC 7692) for websocket.ny and a new websocket_asyncio.ny; HPACK admission control; two engine fixes - awaiting a coroutine's own __await__, prelude chunks loaded under threads; vm_audit123)
@@ -659,6 +660,245 @@ Verified merged (G, H, I, the main session's fixes and J): sweep 478 runs,
 0 not ok; `tools/ide_e2e.py` 463 passed; memory probe, lint, class check,
 cbp (80 units) and the API baseline clean; under Wine (64-bit) vm_audit124
 219, vm_audit119 85 and vm_audit125 14 pass on both engines.
+
+## 0z8. Round 87, part M — Windows' own modules, virtual environments, and an installer with a PubGrub resolver (vm_audit128)
+
+**What there is now.**
+
+| | where | what |
+|---|---|---|
+| `msvcrt`, `winreg`, `winsound`, `_winapi` | `lib/*.ny` over `src/builtins/nywin.cpp` (`_msvcrt_*`, `_winreg_*`, `_winsound_*`, `_winapi_*`, registered with `nyconc::register_extension`) | CPython's modules on Windows; elsewhere `import` raises ModuleNotFoundError as CPython's |
+| `venv` | `lib/venv/` (CPython 3.12's, adapted), `lib/venv/scripts/{common,posix,nt}` | `nython -m venv DIR [--clear] [--system-site-packages] [--without-pip] [--prompt P] [--upgrade-deps] [--symlinks/--copies]` |
+| virtual environments at startup | `src/NySite.cpp` (`nyrt::site_init`, called by main.cpp), `nyrt::SiteState`, `nyrt::base_executable()`, `nyrt::stdlib_dirs()` | pyvenv.cfg found beside / above the program's launcher; sys.prefix / exec_prefix / base_prefix / `_base_executable`; site-packages after the standard library on the search path |
+| `site` | `lib/site.ny` | run at startup only when a site-packages directory holds a `.pth` file or a sitecustomize / usercustomize module (the prelude's `_ny_site_startup`, from the engines' audit-startup hook); a venv's own layout in getsitepackages |
+| `ensurepip` | `lib/ensurepip/` | installs nypip itself (a wheel made from lib/nypip + lib/pip) with its commands |
+| the installer | `lib/nypip/` (+ `lib/pip/` alias) | install / uninstall / list / show / freeze / check / download / wheel / lock / sync |
+| PEP 440 / 508 / tags | `lib/nypip/_packaging/` | packaging 24.0 vendored (Apache-2.0 / BSD), two "Nython:" changes |
+| resolver | `lib/nypip/pubgrub.ny`, `lib/nypip/resolver.ny` | PubGrub with pub's explanations |
+| `importlib.metadata` | `lib/importlib/metadata/` | CPython 3.12's package, one "Nython:" change |
+| `sysconfig` | `lib/sysconfig.ny` | `posix_venv` / `nt_venv` schemes (`venv` the OS's) |
+
+**Virtual environments: how the engines find one.** CPython's getpath, cut
+down (src/NySite.cpp): the program's own path - `__NYVENV_LAUNCHER__` if a
+wrapper set it (read once and unset, as macOS's `__PYVENV_LAUNCHER__`), else
+argv[0] made absolute *without resolving links* (searched on PATH when it
+has no separator), else (Windows) GetModuleFileName - and a `pyvenv.cfg`
+beside it or one directory up. On POSIX the environment's `bin/nython` is a
+symbolic link to the installation's binary (`build/nython-cli`), so
+`/proc/self/exe` is still the installation (the library is found from it)
+while argv[0] names the environment. On Windows `Scripts\nython.exe` is a
+copy (a hard link where the file system allows) with the DLLs beside the
+installation's binary (SDL3, libstdc++ ...): its own path is the
+environment's, and pyvenv.cfg's `home` names the installation, whose binary
+becomes `base_executable()` - **`library_dirs()` locates the standard
+library from `base_executable()` when it is set, never from
+`executable_path()`** (which is the environment's launcher there). Then:
+
+- `sys.executable` is the launcher, `sys._base_executable` the installation's
+  binary, `sys.prefix`/`exec_prefix` the environment, `base_prefix` the
+  installation (`_ny_sys_info("venv")`, the prelude's `_ny_sys_extend`).
+- The site-packages directories that exist (`SiteState::site_dirs`) are
+  appended to `library_dirs()` - after the standard library, so a package
+  never shadows a library module, and every import path (both engines'
+  module search, `-m`, `sys.path`) finds them without `import site`.
+  `stdlib_dirs()` is the old list without them (`_ny_sys_info("prefix")`
+  reads it: the last library directory used to be the installation's lib).
+- In an environment: its `lib/nython3.12/site-packages`
+  (`Lib\site-packages`); with `include-system-site-packages = true`, or
+  outside one, also the user's (`$PYTHONUSERBASE` or ~/.local/lib/nython3.12/site-packages,
+  `%APPDATA%\Nython\Nython312\site-packages`; not with -s, -E or
+  `NYTHONNOUSERSITE`) and the installation's `lib/site-packages`. `-S`: none.
+- `site` itself runs at startup only when one of them holds a `*.pth` file
+  or a sitecustomize / usercustomize module (`SiteState::run_site`): the
+  engines' `auditStartup` / `audit_startup` call the prelude's
+  `_ny_site_startup` (after an `--audit-policy` is installed, before the
+  `cpython.run_*` event - CPython's order). Importing site runs its `main()`
+  (CPython's), which keeps `sys.path[0] == ""` for -c and the prompt (CPython
+  runs site before putting it there). So a program that installs nothing
+  pays two `stat` calls at startup.
+
+**`-m pkg` sets `__package__`** (both engines, `nyrt::main_package()`): the
+package for `pkg/__main__` and `pkg.mod`, as runpy - CPython's own
+`venv/__main__.py` does `from . import main`, which raised "attempted relative
+import with no known parent package".
+
+**nypip.** Pure-Python wheels are installed per the binary distribution
+format: Wheel-Version 1.x, Root-Is-Purelib, every file checked against
+RECORD before anything is written (md5/sha1 refused), `.data/<key>/`
+directories to the scheme (headers / scripts / data / purelib / platlib),
+`#!python` script lines rewritten to `sys.executable` (pip's `/bin/sh`
+`'''exec'` trampoline for a path the kernel cannot take), console and GUI
+scripts from entry_points.txt - **POSIX: an executable script whose first
+lines are the shebang, a coding line and `# nython: python`; Windows: a
+`.cmd` beside a `-script.py`** (pip makes `.exe` launchers; Nython has no
+launcher binary to copy) -, then INSTALLER, REQUESTED, direct_url.json (PEP
+610) and the installed RECORD with every file's sha256 and size. Uninstall
+removes RECORD's files and the directories they leave empty below
+site-packages. Wheel tags on Nython are pure-Python only (`sys_tags()`:
+py312-none-<platform> ... py30-none-any): no compiled extension loads.
+
+Sources: `--find-links` (directories, file pages, URLs), indexes over the
+simple API - **PEP 691 JSON asked for by content negotiation, PEP 503 HTML
+otherwise** - with PEP 592 yanked files (skipped unless the requirement pins
+that version), PEP 658/714 metadata files (`.metadata`, hash-checked; the
+resolver reads dependencies from them without downloading wheels) and every
+file's hash. HTTPS through `urllib` (the `*_proxy` / `no_proxy` variables)
+with a verifying context: the system CA bundle (`SSL_CERT_FILE`), `--cert` or
+`PIP_CERT`; verification is never turned off. Checked by hand against PyPI
+(through python3 running nypip, downloading only): `requests==2.31.0` and its
+four dependencies, flask/jinja2/werkzeug resolutions.
+
+Sdists and source trees are built by PEP 517: pyproject.toml's
+`[build-system]` (`requires`, `build-backend`, `backend-path` inside the
+tree; none means setuptools' legacy backend), the requirements installed by
+nypip itself into a fresh directory (build isolation), each hook run by
+`lib/nypip/_in_process.ny` in a subprocess of this interpreter with **`-S`**
+(no site-packages: the environment's packages are not the build's) and that
+directory on NYTHONPATH, its answer through JSON files (pyproject_hooks'
+protocol). A backend written in Python runs; setuptools was not tried (its
+build would run code downloaded from PyPI). `nypip.backend` is a flit-style
+backend for pure-Python projects from `[project]` (PEP 621) - ensurepip and
+the test build with it. An sdist's PKG-INFO stands for its metadata when it
+is Metadata-Version 2.2+ and Requires-Dist is not Dynamic (PEP 643), else
+the wheel is built first.
+
+Requirement files: requirements, paths and URLs, `-r` / `-c` (relative to
+the file), `-i`, `--extra-index-url`, `--no-index`, `-f`, `--pre`,
+per-line `--hash` (a line with one turns on hash checking: every
+requirement must be pinned with `==` and hashed, as pip's
+`--require-hashes`), comments, continuations, `${VAR}`; `-e` is refused.
+
+**PubGrub** (`lib/nypip/pubgrub.ny`, after pub's solver.md and
+failure.dart). Version sets are **bit masks over a package's candidate
+versions** (its universe, ascending), so set algebra is exact whatever
+PEP 440 does (pre-releases, post-releases and local versions make specifier
+sets no finite union of intervals); pre-releases are a per-package policy
+(`--pre`, a direct requirement naming one, or nothing else available), as
+uv. A requirement that matches no candidate is not a term (its negation
+would always hold and conflict resolution needs a satisfier): the versions
+depending on it are forbidden outright by an external incompatibility
+written "a 2.0 depends on b>=3, which doesn't match any versions" (or
+"which doesn't exist"); Requires-Python another Python's is the same
+("requires Python>=3.99 (the Python version is 3.12.0)"). Extras are
+packages of their own (`a[x]` depends on `a==v` and the extra's
+requirements). Adjacent versions with the same dependency are merged into
+one incompatibility when their metadata is known without a download (local
+files, or already fetched) - that is what makes "every version of a depends
+on ..." appear; over an index only fetched versions merge. Decisions take
+the package with the fewest candidates, newest version first (the installed
+version, or the lock's, when allowed). The explanation is failure.dart's
+`_visit`: "Because ... and ..., X." lines, numbered lines for derivations
+used twice, "And because", "So, because", "Thus,", collapsing, and the
+requiresBoth / requiresThrough / requiresForbidden phrasings; the root is
+"you require ...". vm_audit128 checks pub's documented examples word for
+word (with "you require" for "root depends on").
+
+**The lock file** (`nypip lock` -> `nython.lock`): one resolution per target
+platform (linux / windows / macos by default; `--platform` to choose): each
+target's marker environment (os_name, sys_platform, platform_system,
+platform_machine) and wheel tags (manylinux_2_x / linux, win_amd64,
+macosx_*_arm64 / universal2) with this Python's version, then merged: a
+package every target needs carries no marker, one some targets need gets
+`sys_platform == "..." or ...`. Each package lists its version, its
+dependencies and every file a target installs (the wheel each target's
+tags pick, or the sdist) with URL and sha256 (the index's, else computed).
+The layout is PEP 751's (lock-version, environments, `[[packages]]` with
+name, version, marker, requires-python, dependencies, wheels, sdist) and the
+inputs are kept under `[tool.nypip]`. `nypip sync [FILE]` selects the
+packages whose marker holds here, the best wheel by this platform's tags,
+downloads each file checking its sha256 (always), installs them, and
+uninstalls what the environment's site-packages has that the lock does not
+list (nypip/pip themselves kept).
+
+**importlib.metadata** is CPython 3.12's package. Nython's change: the
+engines' own finders on sys.meta_path (`_NyNativeFinder`) have no
+`find_distributions`; the "path" one is answered as CPython's PathFinder
+answers (`importlib.machinery.PathFinder.find_distributions` ->
+`MetadataPathFinder`). Engine gaps it found (fixed): see below.
+
+**Windows' own modules** (src/builtins/nywin.cpp; Windows only, nothing
+compiled elsewhere): handles cross as ints and the .ny modules show them
+unsigned (CPython's `PyLong_FromVoidPtr`: `HKEY_CURRENT_USER` is
+18446744071562067969 on 64-bit) and pass them back signed (`_s`/`_u`).
+Errors are the OSError subclass of the Windows error's errno with
+`[WinError N]` and FormatMessage's text without its final period (CPython's).
+Every blocking call (waits, ConnectNamedPipe, synchronous ReadFile /
+WriteFile, getch, PlaySound, RegConnectRegistry) is inside a
+`nyconc::GilRelease`. Vista API level: GetErrorMode, RegDeleteKeyExW, the
+reflection calls, CancelIoEx, the process-thread attribute list (a handle
+list for CreateProcess), NeedCurrentDirectoryForExePathW and LCMapStringEx
+are looked up with GetProcAddress; winmm (PlaySound) is loaded at run time,
+so the link line (nython.cbp) is unchanged; `LCMAP_TITLECASE` (Windows 7)
+is defined by value. `_winapi`'s overlapped operations are records in a
+native table (`Ov`: OVERLAPPED with an event, the buffer, pending state)
+the `Overlapped` object holds by id; one still pending when the object is
+collected is cancelled and waited for before its memory goes. msvcrt has
+no CrtSetReportFile/Mode (CPython's debug builds only). The audit events
+are raised by the .ny modules (`sys.audit`, nothing to pay without a hook);
+tools/audit_events.json's nython column says "library" for them now.
+
+**Engine fixes found on the way** (both engines unless noted):
+
+- VM: tuples and lists were ordered by asking `<` both ways of each item
+  pair (`cmp_val`), so an item whose `__lt__` holds of an *equal* one -
+  packaging's `NegativeInfinity`, in every Version's sort key - made
+  `(N, x) > (N, y)` false: `Version("1.0+abc") > Version("1.0")` was false
+  on the VM, and half of PEP 440's specifiers were wrong there. Now CPython's
+  rule (`seq_order`): the first index whose items differ by `==` decides,
+  compared with the operator itself; `cmp_val` and sorted()'s
+  `sort_order` skip instance items equal by `__eq__` (sorted() put
+  `(Version("1.0_dev1"), ...)` before `(Version("1.0-dev-1"), ...)`).
+- VM: `obj.m.__func__(...)` (a bound method's members *called*) raised
+  AttributeError: `vm_call_method` never asked `lookup_attr` for a bound
+  method receiver.
+- Interpreter: `getattr(C, "__subclasses__")` / `C.mro` read as values raised
+  AttributeError (the call form worked): importlib.metadata reads every name
+  of a class's MRO.
+- `-m pkg`: no `__package__` (above).
+- nypip's markers: `platform.python_version()` is Nython's own 0.2.1 (a
+  deliberate choice, round 83); the marker environment takes
+  python_version / python_full_version from sys.version_info (the language
+  level), as PyPy's platform does.
+
+**Verification.** `examples/vm_audit128.ny`: 91 checks on both engines
+(Linux), 56 under python3.11, 3.12 and 3.13 (A, B, C, D, E with python3's
+venv, G and H with wheels installed into it by nypip's installer
+in-process: CPython's importlib.metadata reads what nypip writes), 120
+under Wine on both engines. The full sweep (`tools/sweep.py --timeout 900 -j 2 --base
+/tmp/t87/nython_base`): 480 runs, 0 not ok, no regression (the base binary
+in /tmp/t87 failed 137 runs: outside a checkout it finds no library of its
+own for the programs the suites start). cbp check (82 units), class check,
+the API baseline (rewritten: venv, ensurepip, importlib.metadata now
+counted; 94.1% of 9739 names) clean. Startup (`-c pass`, valgrind):
+194.75M instructions, base 194.34M (+0.2%: the prelude's lines; site_init
+is four `stat` calls). By hand against PyPI (HTTPS through the proxy's CA
+bundle, Nython running nypip): `pip download requests==2.31.0` (the
+pure-Python `charset_normalizer-3.5.2-py3-none-any` chosen where python3
+takes the cp311 one) and `pip install -t DIR requests==2.31.0`: five
+real-world wheels' RECORDs verified and installed, `pip list` over them.
+**Windows (Wine, 64-bit; `tools/cross_windows.sh build`)**: vm_audit128 120
+passed on both engines - everything the Linux run checks, with the
+environment's `Scripts\nython.exe` a hard link beside copies of the DLLs,
+`.cmd` commands, `Lib\site-packages`, the user site under
+`Nython312`, plus msvcrt / winreg (a key under
+`HKEY_CURRENT_USER\Software\NythonTest_<pid>`, deleted after) / winsound /
+_winapi; vm_audit71, 96, 107, 109 and 125 (startup, `-m`, sys facts, site
+and sysconfig) still pass there on both engines. Two things Wine does its
+own way, which the test accepts: msvcrt's `_locking` on a region another
+descriptor holds sets errno 2, not 13 (any OSError is checked), and
+`_heapmin()` fails (HeapCompact gives 0: OSError, as CPython would raise
+it). Found under Wine and fixed: `CreateKey` opened its key with KEY_WRITE
+only (CPython uses RegCreateKeyW: the most access allowed - QueryValueEx on
+it was "Access denied"), and requirement files' option lines were split
+by POSIX shlex rules (a `--find-links C:\x` path lost its backslashes).
+
+**Not done.** setuptools as a build backend was not run (it is code
+from PyPI); editable installs (`-e`, PEP 660); `pip install --user` was not
+tested; a persistent download cache; console-script `.exe` launchers on
+Windows; the 32-bit Windows build of nywin.cpp was not compiled (no i686
+MinGW here); `winreg.LoadKey` / `SaveKey` need privileges Wine does not
+grant (not tested); merging adjacent versions in explanations over an HTTP
+index (only already-fetched metadata merges).
 
 ## 0z5. Round 86 (main session) — program text is never a path, raw standard descriptors on Windows, the round 86 suites under Wine (vm_audit125)
 

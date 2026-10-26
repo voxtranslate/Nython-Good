@@ -5826,6 +5826,24 @@ both engines and under python3).
 | ctypes: `strtod(b"3.25xyz", byref(end))` left `end` pointing at freed memory | a `bytes` argument was copied into a temporary C string freed after the call (CPython passes the bytes object's own buffer, which lives as long as the object) | C strings made from bytes are kept in a 512-entry cache keyed by their contents (`_cstr_cached`) |
 | ctypes: a `BigEndianStructure` subclass was laid out little-endian | its byte order was read from the class's own attributes only | read through the MRO |
 
+## Round 87
+
+### Round 87, part M — Windows' own modules, venv, nypip (`HANDOFF.md` §0z8)
+
+New test: `vm_audit128` (91 checks; both engines, 56 under python3.11-3.13, 120 under Wine (both engines)).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No `msvcrt`, `winreg`, `winsound` or `_winapi` | - | `lib/*.ny` over `src/builtins/nywin.cpp` (Windows only), CPython's API, errors and audit events |
+| No virtual environments: no `venv`, `site` never read a pyvenv.cfg, nothing installed was importable | - | `lib/venv/`, `src/NySite.cpp` at startup (pyvenv.cfg beside / above the unresolved launcher path; site-packages after the standard library on the search path; `site` run only for .pth files / sitecustomize / usercustomize), `sysconfig`'s `posix_venv` / `nt_venv` |
+| No way to install a package | - | `lib/nypip/` (`nython -m pip` / `nypip`, `lib/pip/`), `lib/ensurepip/`; a PubGrub resolver with pub's explanations; `nython.lock` for several platforms and `sync` |
+| No `importlib.metadata` | - | CPython 3.12's package; the engines' path finder answers `find_distributions` |
+| `nython -m pkg` with `from . import x` in pkg/`__main__`: "attempted relative import with no known parent package" (both engines) | the main module had no `__package__` | `nyrt::main_package()`: the package for `pkg/__main__` and `pkg.mod`, as runpy |
+| VM: `Version("1.0+abc") > Version("1.0")` False; tuples holding an object whose `__lt__` is true of an equal one ordered wrong, by the operators and by sorted() / min() / max() | lists/tuples compared by asking `<` both ways of every item pair (`cmp_val`); `sort_order` skipped only items identical as values, not equal by `__eq__` | CPython's rule (`seq_order`): the first items unequal by `==` decide, compared with the operator itself; `sort_order` and `cmp_val` skip objects equal by `__eq__` |
+| VM: `g.m.__func__(other, x)` raised AttributeError ('method' object has no attribute '__func__'); `self.lookup.cache_clear()` (importlib.metadata) likewise | `vm_call_method` did not look a bound method's members up | it asks `lookup_attr` (as a read does) and calls what it finds |
+| Interpreter: `getattr(C, "__subclasses__")`, `C.mro` as a value raised AttributeError (calling them worked) | the read path skipped object's classmethods that only the call path's `findClassMember` routes | read through `findClassMember` and bound to the class |
+| PEP 508 markers / Requires-Python evaluated against Python 0.2.1 | `platform.python_version()` is Nython's own version | nypip's marker environment takes the language level from `sys.version_info` |
+
 ## Round 86, part J — Python-language source behaves as CPython where Nython is lenient (`HANDOFF.md` §0z4)
 
 Full detail in `HANDOFF.md` §0z. New test: `vm_audit124` (both engines; its shared part under python3).

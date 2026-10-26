@@ -156,7 +156,8 @@ def _open(key, sub_key, reserved, access, create, event):
 
 def CreateKey(key, sub_key, /):
     """Creates or opens the specified key."""
-    return _open(key, sub_key, 0, KEY_WRITE, 1, "winreg.CreateKey")
+    # (RegCreateKeyW, as CPython: the access allowed; the event says KEY_WRITE)
+    return _open(key, sub_key, 0, KEY_WRITE, 2, "winreg.CreateKey")
 
 
 def CreateKeyEx(key, sub_key, reserved=0, access=KEY_WRITE):

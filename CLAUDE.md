@@ -414,6 +414,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit123 | 242 | round 86, part I: HPACK (RFC 7541 Appendix C byte for byte, the Huffman code, size updates, decoder errors, Nython's SmartIndexing on a header corpus), HTTP/2 frames byte for byte with hyperframe, two H2Connections in memory (SETTINGS, CONTINUATION, padding, flow control, RST_STREAM, GOAWAY, PING, push refused, malformed field blocks, connection/stream errors, RFC 9218), the RFC 9218 scheduler's order, h2.client/h2.server over localhost (multiplexing, flow control stopping and resuming, resets, graceful GOAWAY, TLS with ALPN h2), http.client/urllib with http2= (Nython-only), permessage-deflate (RFC 7692's examples, negotiation, takeover, window bits, RSV1, a bomb), websocket.ny (Nython-only) and websocket_asyncio.ny round trips (233 pass under python3) |
 | vm_audit124 | 219 | round 86 (part J): a Python-language probe as a `.py` module, a `# nython: python` module and exec(compile(src, "x.py")) - `is` identity, + with no str/non-str or list/tuple mixing, no int iterated anywhere, dict keys not attributes (d.a, getattr, hasattr, setattr, d.a = v), list.sort() None, assignment past a list's end, sum of strs, literal spellings and `elseif` as names, exec'd code's rule; every file: sorted/min/max/list.sort ordering's TypeErrors, `[1, 2]["0"]`, seq * non-int / list + int / str index / unpacking messages; Nython-only: Nython code unchanged, an int iterated by every consumer, `--python-compat-report` (151 pass under python3) |
 | vm_audit125 | 14 | round 86 (main session): program text is never read as a path - f-string and `${...}` fields naming a file or a directory in the working directory (one read the file, one hung the parser), `f"{...}"`, ast.parse of such fields, the editor's syntax check; os.read/os.write and subprocess move bytes as they are (Windows' standard descriptors in binary, subprocess pipes untranslated; text mode reads universal newlines) (11 pass under python3) |
+| vm_audit128 | 91 | round 87, part M: PEP 440 / 508 against packaging on 1,233 versions (str, segments, flags, order, equality), specifiers' contains / filter, markers in two environments, requirements; PubGrub on pub's examples with its explanations word for word; wheels written, read, RECORD-checked (a corrupt one refused), installed and uninstalled; a localhost index (PEP 503 HTML and PEP 691 JSON by content negotiation, yanked files, PEP 658 metadata, hashes); `-m venv` (layout, pyvenv.cfg, activation scripts, the environment's interpreter, ensurepip); `-m pip` install / list / show / freeze / check / download / uninstall, requirement files with markers and hashes, sdists built by in-tree and isolated PEP 517 backends, an unsatisfiable install explained, `lock` for three platforms and `sync`; importlib.metadata; site (.pth files, sitecustomize, -S, the user site with --system-site-packages, `-m site`); msvcrt / winreg / winsound / _winapi under Wine (56 pass under python3.11-3.13, 120 under Wine (both engines)) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1900,3 +1901,42 @@ caused the Nython lexer to error. All replaced with ASCII equivalents.
 - `nython_ide.ny` — NythonIDE class + launch (imports the two below)
 - `ide_editor.ny` — EditorBuffer, SyntaxHighlighter, RichEditor, OutputConsole
 - `ide_workshop.ny` — LangWorkshopPanel
+
+## Round 87, part M: Windows' own modules, venv, nypip (see `HANDOFF.md` §0z8)
+
+- **`msvcrt`, `winreg`, `winsound`, `_winapi`** are `lib/*.ny` over
+  `src/builtins/nywin.cpp` (Windows only; POSIX gets CPython's
+  ModuleNotFoundError). Handles are ints, unsigned in Python (`_u`) and
+  signed to the natives (`_s`). Newer-than-Vista calls go through
+  GetProcAddress; winmm is loaded at run time (the .cbp's link libraries are
+  unchanged).
+- **Virtual environments** (`nython -m venv`): `src/NySite.cpp`'s
+  `nyrt::site_init` finds pyvenv.cfg beside or above the program's
+  *unresolved* path (POSIX: `bin/nython` is a symlink; Windows: a copy whose
+  pyvenv.cfg `home` names the installation). **Locate the standard library
+  from `nyrt::base_executable()` when set, never from `executable_path()`**
+  (the environment's launcher). Existing site-packages directories are
+  appended to `library_dirs()` (after the standard library;
+  `nyrt::stdlib_dirs()` is the list without them); `site` runs at startup
+  only when one holds a `.pth` file or sitecustomize/usercustomize
+  (`SiteState::run_site`, the prelude's `_ny_site_startup` from the engines'
+  audit-startup hook).
+- **`-m pkg`** gives the main module `__package__` (`nyrt::main_package()`),
+  so `from . import x` in a `__main__` works.
+- **nypip** (`nython -m pip`, `lib/nypip/`, `lib/pip/` its alias; `nython -m
+  ensurepip`): wheels (PEP 427, RECORD checked), sdists by PEP 517 in a
+  subprocess run with `-S` and the build requirements on NYTHONPATH,
+  `--find-links`, PEP 503/691 indexes over verified HTTPS, requirement files,
+  uninstall / list / show / freeze / check / download / wheel, `lock` (PEP
+  751 layout, several platforms) / `sync`. **Version sets in the PubGrub
+  resolver are bit masks over the candidates**, never intervals (PEP 440 is
+  no interval algebra); a requirement nothing matches forbids its depender
+  outright. `lib/nypip/_packaging/` is packaging 24.0 (keep it verbatim
+  except "Nython:" changes: sys_tags pure-Python only, the marker
+  environment's python_version from sys.version_info - Nython's
+  `platform.python_version()` is 0.2.1). nypip and pubgrub are written in
+  the subset CPython runs (vm_audit128 loads them under python3).
+- `importlib.metadata` is CPython 3.12's; the engines' `_NyNativeFinder`
+  ("path") is given `PathFinder.find_distributions`.
+- `tools/gen_vm_audit128_pep440.py` regenerates the PEP 440/508 table from the
+  host's `packaging`.
