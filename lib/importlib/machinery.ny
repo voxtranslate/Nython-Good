@@ -245,6 +245,13 @@ class PathFinder:
     def invalidate_caches():
         pass
 
+    @staticmethod
+    def find_distributions(*args, **kwargs):
+        """(round 87) importlib.metadata's distributions on sys.path, as
+        CPython's PathFinder answers them: MetadataPathFinder's."""
+        from importlib.metadata import MetadataPathFinder
+        return MetadataPathFinder.find_distributions(*args, **kwargs)
+
     @classmethod
     def find_spec(cls, fullname, path=None, target=None):
         if path is None:

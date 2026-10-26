@@ -36,18 +36,55 @@ inline std::string& script_path() {
     static std::string p;
     return p;
 }
-// Absolute path of the running interpreter binary (sys.executable).
+// (round 87) `-m pkg` / `-m pkg.mod`: the main module's __package__ ("pkg"),
+// so its relative imports resolve, as runpy sets it; "" otherwise.
+inline std::string& main_package() {
+    static std::string p;
+    return p;
+}
+// Absolute path of the running interpreter binary (sys.executable). (Round
+// 87: started through a virtual environment, the environment's own nython -
+// its launcher - and base_executable() the installation's binary.)
 inline std::string& executable_path() {
     static std::string p;
     return p;
 }
+// (round 87) sys._base_executable: the installation's binary, by which the
+// standard library is found; "" when it is executable_path() itself.
+inline std::string& base_executable() {
+    static std::string p;
+    return p;
+}
+// (round 87) virtual environments (PEP 405) and site-packages, decided once
+// at startup by site_init (src/NySite.cpp, called by main.cpp): the
+// environment whose pyvenv.cfg sits beside or above the program's launcher
+// (sys.prefix), and the site-packages directories that exist - the
+// environment's, then (outside one, or with include-system-site-packages)
+// the user's and the installation's, unless -S / -s. They follow the
+// standard library on the search path (library_dirs), so `import name`
+// finds an installed package with no `import site`. When one holds a .pth
+// file or a sitecustomize / usercustomize module, run_site is set and the
+// engines import site before the program runs (the prelude's
+// _ny_site_startup), as CPython's startup does.
+struct SiteState {
+    std::string venv;                    // the environment's directory, "" outside one
+    std::string venv_cfg;                // its pyvenv.cfg
+    bool system_site = true;             // include-system-site-packages
+    std::vector<std::string> site_dirs;  // existing site-packages, each ending with a separator
+    bool run_site = false;
+    bool site_done = false;              // _ny_site_startup ran (once)
+};
+inline SiteState& site_state() { static SiteState s; return s; }
+void site_init(const std::string& argv0);
 // Where `import name` also looks for name.ny, after the importing file's
 // directory and the working directory (round 77): every directory of
 // NYTHONPATH (':'-separated, ';' on Windows), then the standard library
 // beside the interpreter - <exe dir>/lib and <exe dir>/../lib (the build
 // directory sits in the project), so a program anywhere finds `import
 // socket`. Each entry ends with a separator.
-inline std::vector<std::string> library_dirs() {
+// (round 87) stdlib_dirs: those without the site-packages directories that
+// library_dirs() adds after them.
+inline std::vector<std::string> stdlib_dirs() {
     std::vector<std::string> out;
     auto add = [&](std::string d) {
         if (d.empty()) return;
@@ -70,7 +107,7 @@ inline std::vector<std::string> library_dirs() {
             a = b + 1;
         }
     }
-    std::string exe = executable_path();
+    std::string exe = base_executable().empty() ? executable_path() : base_executable();
     size_t cut = exe.find_last_of("/\\");
     if (cut != std::string::npos) {
         std::string dir = exe.substr(0, cut + 1);
@@ -82,6 +119,15 @@ inline std::vector<std::string> library_dirs() {
         std::string comp = c2 == std::string::npos ? p : p.substr(c2 + 1);
         if (comp.empty() || comp == "." || comp == ".." || c2 == std::string::npos) add(dir + "../lib");
         else add(p.substr(0, c2 + 1) + "lib");
+    }
+    return out;
+}
+inline std::vector<std::string> library_dirs() {
+    std::vector<std::string> out = stdlib_dirs();
+    for (auto& d : site_state().site_dirs) {
+        bool seen = false;
+        for (auto& o : out) if (o == d) { seen = true; break; }
+        if (!seen) out.push_back(d);
     }
     return out;
 }

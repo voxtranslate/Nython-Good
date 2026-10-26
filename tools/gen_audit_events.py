@@ -98,9 +98,20 @@ NYTHON = {
     "os.chdir": "prelude", "os.link": "prelude", "os.symlink": "prelude", "os.truncate": "prelude",
     "os.utime": "prelude", "os.putenv": "prelude", "os.unsetenv": "prelude", "os.walk": "prelude",
     "os.fwalk": "prelude", "os.lockf": "prelude",
+    # round 87: Windows' own modules (lib/msvcrt.ny, winreg.ny, _winapi.ny)
+    # and ensurepip
+    "ensurepip.bootstrap": "library",
+    "msvcrt.locking": "library", "msvcrt.open_osfhandle": "library", "msvcrt.get_osfhandle": "library",
+    "winreg.ConnectRegistry": "library", "winreg.CreateKey": "library", "winreg.DeleteKey": "library",
+    "winreg.DeleteValue": "library", "winreg.DisableReflectionKey": "library",
+    "winreg.EnableReflectionKey": "library", "winreg.EnumKey": "library", "winreg.EnumValue": "library",
+    "winreg.ExpandEnvironmentStrings": "library", "winreg.LoadKey": "library", "winreg.OpenKey": "library",
+    "winreg.OpenKey/result": "library", "winreg.PyHKEY.Detach": "library", "winreg.QueryInfoKey": "library",
+    "winreg.QueryReflectionKey": "library", "winreg.QueryValue": "library", "winreg.SaveKey": "library",
+    "winreg.SetValue": "library",
+    "_winapi.CreateFile": "library", "_winapi.CreateNamedPipe": "library", "_winapi.OpenProcess": "library",
 }
 ABSENT = {
-    "ensurepip.bootstrap": "absent: Nython has no ensurepip (no pip to bootstrap)",
     "nntplib.connect": "absent: no nntplib (removed from CPython in 3.13)",
     "nntplib.putline": "absent: no nntplib (removed from CPython in 3.13)",
     "sys.monitoring.register_callback": "absent: no sys.monitoring (PEP 669)",

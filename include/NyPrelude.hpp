@@ -1389,6 +1389,17 @@ def _ny_audit_startup(policy, log):
     import nyaudit
     nyaudit._cli_install(policy, log)
 
+def _ny_site_startup():
+    # (round 87) a site-packages directory holds .pth files or a
+    # sitecustomize / usercustomize module (nyrt::SiteState): lib/site.ny
+    # (its main(), run when it is imported) processes them before the
+    # program runs, as CPython's startup imports site; an error is reported
+    # and the program still runs
+    try:
+        import site
+    except Exception as e:
+        _ny_stderr.write("Error in site startup: " + _ny_format_exc(e, True, [], {}))
+
 def _ny_builtins_module():
     # round 84: the builtins module (lib/builtins.ny) - sys.modules["builtins"],
     # a builtin function's __self__
@@ -3956,12 +3967,16 @@ def _ny_sys_extend(sysmod):
     else:
         sysmod.thread_info = _NySysThreadInfo(("nt", None, None))
     sysmod.pycache_prefix = None
-    # where the standard library is: <prefix>/lib (no virtual environments)
+    # where the standard library is: <prefix>/lib; (round 87) a virtual
+    # environment's directory is sys.prefix, the installation's
+    # sys.base_prefix (src/NySite.cpp)
     var root = _ny_sys_info("prefix")
-    sysmod.prefix = root
-    sysmod.exec_prefix = root
+    var venv = _ny_sys_info("venv")
+    sysmod.prefix = root if venv[0] is None else venv[0]
+    sysmod.exec_prefix = sysmod.prefix
     sysmod.base_prefix = root
     sysmod.base_exec_prefix = root
+    sysmod._base_executable = venv[2]
     sysmod.platlibdir = "lib"
     sysmod.__name__ = "sys"
     _ny_sys_ref[0] = sysmod

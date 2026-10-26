@@ -77,14 +77,26 @@ _INSTALL_SCHEMES = {
         "scripts": "{base}/build",
         "data": "{base}",
     },
-    "venv": {
+    # (round 87) a virtual environment (lib/venv): CPython's layout, with
+    # the installation's standard library
+    "posix_venv": {
         "stdlib": "{installed_base}/lib",
-        "platstdlib": "{platbase}/lib",
-        "purelib": "{base}/lib/site-packages",
-        "platlib": "{platbase}/lib/site-packages",
-        "include": "{installed_base}/include",
-        "platinclude": "{installed_platbase}/include",
+        "platstdlib": "{installed_platbase}/lib",
+        "purelib": "{base}/lib/nython{py_version_short}/site-packages",
+        "platlib": "{platbase}/lib/nython{py_version_short}/site-packages",
+        "include": "{installed_base}/include/nython{py_version_short}",
+        "platinclude": "{installed_platbase}/include/nython{py_version_short}",
         "scripts": "{base}/bin",
+        "data": "{base}",
+    },
+    "nt_venv": {
+        "stdlib": "{installed_base}/lib",
+        "platstdlib": "{installed_base}/lib",
+        "purelib": "{base}/Lib/site-packages",
+        "platlib": "{base}/Lib/site-packages",
+        "include": "{installed_base}/Include",
+        "platinclude": "{installed_base}/Include",
+        "scripts": "{base}/Scripts",
         "data": "{base}",
     },
     "nt_user": {
@@ -115,6 +127,9 @@ _INSTALL_SCHEMES = {
         "data": "{userbase}",
     },
 }
+
+# the OS's own venv scheme is "venv", as CPython's
+_INSTALL_SCHEMES["venv"] = _INSTALL_SCHEMES["nt_venv" if os.name == "nt" else "posix_venv"]
 
 _SCHEME_KEYS = ("stdlib", "platstdlib", "purelib", "platlib", "include", "scripts", "data")
 _CONFIG_VARS = None

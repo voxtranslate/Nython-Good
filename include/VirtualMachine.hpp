@@ -5875,10 +5875,40 @@ private:
         }
         if(a.type==VMType::LIST&&b.type==VMType::LIST&&a.list&&b.list){
             size_t n=std::min(a.list->size(),b.list->size());
-            for(size_t k=0;k<n;k++){ int c=cmp_val((*a.list)[k],(*b.list)[k]); if(c) return c; }
+            for(size_t k=0;k<n;k++){
+                const VMVal& x=(*a.list)[k]; const VMVal& y=(*b.list)[k];
+                // (round 87) == decides which items differ, as CPython's
+                // sequence comparison (an item whose __lt__ holds of an equal
+                // one - packaging's NegativeInfinity - is not "less")
+                if((x.type==VMType::INSTANCE||y.type==VMType::INSTANCE)&&vm_eq(x,y)) continue;
+                int c=cmp_val(x,y); if(c) return c;
+            }
             return a.list->size()<b.list->size()?-1:(a.list->size()>b.list->size()?1:0);
         }
         return cmp_basic(a,b);
+    }
+    // (round 87) CPython's list/tuple ordering for < <= > >= (op 0..3): the
+    // first index whose items differ (by ==) decides, compared there with
+    // the operator itself - an item's own __gt__ answers `>` -, else the
+    // lengths. (cmp_val's three-way answer asks __lt__ both ways.)
+    bool seq_order(const VMVal& a, const VMVal& b, int op, int depth=0) {
+        size_t na=a.list?a.list->size():0, nb=b.list?b.list->size():0, n=std::min(na,nb);
+        for(size_t k=0;k<n;k++){
+            const VMVal& x=(*a.list)[k]; const VMVal& y=(*b.list)[k];
+            if(vm_eq(x,y)) continue;
+            static const char* const fwd[]={"__lt__","__le__","__gt__","__ge__"};
+            static const char* const rev[]={"__gt__","__ge__","__lt__","__le__"};
+            static const char* const sym[]={"<","<=",">",">="};
+            if(x.type==VMType::INSTANCE||y.type==VMType::INSTANCE){
+                VMVal r;
+                if(rich_compare(x,y,fwd[op],rev[op],r)) return vm_truthy(r);
+                order_unsupported(sym[op],x,y);
+            }
+            if(x.type==VMType::LIST&&y.type==VMType::LIST&&!x.is_set()&&!y.is_set()&&depth<100) return seq_order(x,y,op,depth+1);
+            int c=cmp_val(x,y);
+            return op==0?c<0:op==1?c<=0:op==2?c>0:c>=0;
+        }
+        return op==0?na<nb:op==1?na<=nb:op==2?na>nb:na>=nb;
     }
     static int cmp_basic(const VMVal& a, const VMVal& b) {
         if(a.type==VMType::INT&&b.type==VMType::INT) return a.i<b.i?-1:(a.i>b.i?1:0);
@@ -5998,7 +6028,7 @@ private:
         if(a.type==VMType::INSTANCE||b.type==VMType::INSTANCE) order_unsupported("<",a,b);
         if((a.type==VMType::BYTES)!=(b.type==VMType::BYTES))
             raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(a)+"' and '"+vm_type_name(b)+"'");
-        if(a.type==VMType::LIST&&b.type==VMType::LIST) return cmp_val(a,b)<0;
+        if(a.type==VMType::LIST&&b.type==VMType::LIST) return seq_order(a,b,0);
         return a<b;
     }
     // ==, through __eq__ (either side); __ne__ falls back to not __eq__.
@@ -6640,6 +6670,13 @@ private:
                                      st.log.empty()?VMVal::make_none():VMVal::make_str(st.log)};
                 vm_call(fn,a,std::nullopt);
             }
+        }
+        // (round 87) .pth files / sitecustomize / usercustomize, as the
+        // interpreter's auditStartup
+        if(nyrt::site_state().run_site&&!nyrt::site_state().site_done){
+            nyrt::site_state().site_done=true;
+            VMVal fn=load_var("_ny_site_startup");
+            if(fn.type==VMType::FUNCTION){ std::vector<VMVal> a; vm_call(fn,a,std::nullopt); }
         }
         if(nyrt::audit_on()&&!st.event.empty()){
             std::vector<VMVal> args;
@@ -9407,7 +9444,7 @@ private:
                     raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } order_unsupported("<",lv,r); }
                 order_check("<",lv,r);   // round 77
-                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? seq_order(lv,r,0) : lv<r)); break;
             }
             case Op::COMPARE_LE: {
                 NY_QUICKEN();   // round 80
@@ -9417,7 +9454,7 @@ private:
                     raise_native_exception("TypeError","'<=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } order_unsupported("<=",lv,r); }
                 order_check("<=",lv,r);   // round 77
-                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? seq_order(lv,r,1) : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
                 NY_QUICKEN();   // round 80
@@ -9427,7 +9464,7 @@ private:
                     raise_native_exception("TypeError","'>' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } order_unsupported(">",lv,r); }
                 order_check(">",lv,r);   // round 77
-                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? seq_order(lv,r,2) : lv>r)); break;
             }
             case Op::COMPARE_GE: {
                 NY_QUICKEN();   // round 80
@@ -9437,7 +9474,7 @@ private:
                     raise_native_exception("TypeError","'>=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } order_unsupported(">=",lv,r); }
                 order_check(">=",lv,r);   // round 77
-                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>=0 : lv>=r)); break;
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? seq_order(lv,r,3) : lv>=r)); break;
             }
             case Op::COMPARE_IN:       { VMVal c=pop(),it=pop(); push(VMVal::make_bool(op_in(it,c))); break; }
             case Op::COMPARE_NOT_IN:   { VMVal c=pop(),it=pop(); push(VMVal::make_bool(!op_in(it,c))); break; }
@@ -13425,6 +13462,13 @@ private:
         if(method=="__call__"&&(obj.type==VMType::FUNCTION||(obj.type==VMType::MAP&&obj.class_name=="__bound_method__")
                                 ||(obj.type==VMType::NATIVE&&obj.builtin_type_name().empty()&&obj.class_name.rfind("__rtype__:",0)!=0)))
             return vm_call(obj,args,std::nullopt,kwargs);
+        // (round 87) m.__func__(...), and the function's other members,
+        // called through a bound method as reading them works (lookup_attr):
+        // `g.m.__func__(other, x)` raised AttributeError
+        if(obj.type==VMType::MAP&&obj.class_name=="__bound_method__"&&obj.map){
+            VMVal target;
+            if(lookup_attr(obj,method,target)) return vm_call(target,args,std::nullopt,kwargs);
+        }
         // A value stored as an attribute of a function: f.cache_info(),
         // f.register(int). It was looked for as a method of the function and
         // not found (AttributeError), though reading it worked.
@@ -16002,6 +16046,9 @@ private:
             for(size_t k=0;k<n;k++){
                 const VMVal& p=(*x.list)[k]; const VMVal& q=(*y.list)[k];
                 if(p==q) continue;
+                // (round 87) objects equal by __eq__ are equal items too
+                // (CPython's sequence comparison): packaging's sort keys
+                if((p.type==VMType::INSTANCE||q.type==VMType::INSTANCE)&&vm_eq(p,q)) continue;
                 return sort_order<GT>(p,q);
             }
             return GT?x.list->size()>y.list->size():x.list->size()<y.list->size();
@@ -17114,6 +17161,8 @@ private:
         globals_["__name__"]=VMVal::make_str("__main__");
         globals_["__file__"]=VMVal::make_str(nyrt::script_path());
         globals_["__spec__"]=VMVal::make_none();   // a script run directly (round 81)
+        if(!nyrt::main_package().empty())   // (round 87) -m pkg: its relative imports
+            globals_["__package__"]=VMVal::make_str(nyrt::main_package());
         globals_["println"]=globals_["print"];
 
         // ── Map / collection builtins ─────────────────────────────────────

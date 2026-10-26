@@ -883,6 +883,8 @@ public:   // NythonExecutor is a struct: members default to public
         global_ctx->defineByName("__name__", makeStringValue("__main__"));
         global_ctx->defineByName("__file__", makeStringValue(nyrt::script_path()));
         global_ctx->defineByName("__spec__", NONE_VALUE);   // a script run directly (round 81)
+        if (!nyrt::main_package().empty())   // (round 87) -m pkg: its relative imports
+            global_ctx->defineByName("__package__", makeStringValue(nyrt::main_package()));
         // Math constants
         global_ctx->defineByName("PI", Value(3.14159265358979323846));
         global_ctx->defineByName("E", Value(2.71828182845904523536));
@@ -10419,6 +10421,19 @@ public:
                     }
                 }
               }
+              // (round 87) C.__subclasses__ / C.mro read through a class
+              // (getattr(C, "__subclasses__")): object's classmethods bound
+              // to C - the call form found them (findClassMember), a read
+              // did not (importlib.metadata reads every name of the MRO)
+              if (!was_inst && (attr == "__subclasses__" || attr == "mro") && !mro.empty()) {
+                  Value cv; Node* owner = nullptr;
+                  if (findClassMember(mro.front(), attr, cv, &owner) && cv.type == ValueType::USERDATA) {
+                      if (!bind) { out = cv; return true; }
+                      Value clsv; clsv.type = ValueType::USERDATA; clsv.value.p = class_ptr;
+                      out = makeBoundClassMethod(cv, clsv);
+                      return true;
+                  }
+              }
               // round 80: object's members, after the MRO (objectMember)
               {
                   Value cv; Node* owner = nullptr;
@@ -15668,6 +15683,13 @@ public:
                                      st.log.empty() ? NONE_VALUE : makeStringValue(st.log)};
                 callFunctionValue(fn, a, global_ctx);
             }
+        }
+        // (round 87) a site-packages directory's .pth files / sitecustomize /
+        // usercustomize (nyrt::SiteState): site runs before the program
+        if (nyrt::site_state().run_site && !nyrt::site_state().site_done) {
+            nyrt::site_state().site_done = true;
+            Value fn = global_ctx->getByName("_ny_site_startup");
+            if (fn.type == ValueType::USERDATA) { std::vector<Value> a; callFunctionValue(fn, a, global_ctx); }
         }
         if (nyrt::audit_on() && !st.event.empty()) {
             std::vector<Value> args;

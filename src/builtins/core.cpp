@@ -826,9 +826,17 @@ Value dispatch_core(NythonExecutor& E,
                 return NONE_VALUE;
 #endif
             }
+            if (k == "venv") {
+                // (round 87) [the virtual environment's directory or None,
+                // include-system-site-packages, sys._base_executable]
+                auto& st = nyrt::site_state();
+                const std::string& be = nyrt::base_executable().empty() ? nyrt::executable_path() : nyrt::base_executable();
+                return E.makeListValue({st.venv.empty() ? NONE_VALUE : E.makeStringValue(st.venv),
+                                        Value(st.system_site), E.makeStringValue(be)});
+            }
             if (k == "prefix") {
                 // the directory holding the standard library's lib/
-                auto dirs = nyrt::library_dirs();
+                auto dirs = nyrt::stdlib_dirs();
                 std::string d = dirs.empty() ? std::string() : dirs.back();
                 while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
                 size_t cut = d.find_last_of("/\\");

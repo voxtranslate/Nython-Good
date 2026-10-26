@@ -1555,6 +1555,9 @@ int main(int argc, char** argv, char** env) {
             i++;
             break;
         }
+        // (round 87) a virtual environment's pyvenv.cfg, the site-packages
+        // directories (src/NySite.cpp) - after -S / -s / -E are known
+        nyrt::site_init(g_argv0);
         if (const char* ub = getenv("NYTHONUNBUFFERED")) if (*ub) setenv_default_unbuffered();
         // (round 85) PYTHONINTMAXSTRDIGITS, when -X did not set the limit
         if (nyrt::cli_flags().int_max_str_digits < 0 && !nyrt::cli_flags().ignore_environment)
@@ -1597,6 +1600,15 @@ int main(int argc, char** argv, char** env) {
             std::string path;
             if (!find_module_file(target, path)) { std::cerr << "nython: No module named " << target << "\n"; return 1; }
             prog.path = path;
+            // (round 87) __package__ as runpy sets it: the package for
+            // pkg/__main__ and pkg.mod, "" for a top-level module
+            {
+                size_t sl = path.find_last_of("/\\");
+                std::string base = sl == std::string::npos ? path : path.substr(sl + 1);
+                bool is_main = base == "__main__.ny" || base == "__main__.py";
+                size_t dot = target.rfind('.');
+                nyrt::main_package() = is_main ? target : dot == std::string::npos ? std::string() : target.substr(0, dot);
+            }
             nyrt::set_command_line(path, argc, argv, i);
         } else if (mode == "stdin") {
             prog.is_file = false; prog.name = "<stdin>";

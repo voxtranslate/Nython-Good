@@ -25,8 +25,15 @@
 # site-packages for the user - not CPython's site-packages (Nython imports
 # .py modules, but CPython's compiled extensions would not load).
 #
-# Not here: nothing of CPython's module. Nython does not import site at
-# startup (CPython does, unless -S); a program imports it to get main().
+# Round 87: a virtual environment's pyvenv.cfg is read by the engines at
+# startup (src/NySite.cpp: sys.prefix, the site-packages directories on the
+# search path); this module is imported at startup only when one of those
+# directories holds a .pth file or a sitecustomize / usercustomize module
+# (CPython imports it always, unless -S). getsitepackages() gives a virtual
+# environment's lib/nythonX.Y/site-packages (Lib\site-packages), the
+# installation's lib/site-packages otherwise.
+#
+# Not here: nothing of CPython's module.
 
 """Append module search paths for third-party packages to sys.path.
 
@@ -393,7 +400,15 @@ def getsitepackages(prefixes=None):
         if not prefix or prefix in seen:
             continue
         seen.add(prefix)
-        sitepackages.append(os.path.join(prefix, "lib", "site-packages"))
+        if os.path.isfile(os.path.join(prefix, "pyvenv.cfg")):
+            # (round 87) a virtual environment has CPython's layout
+            # (lib/venv): lib/nythonX.Y/site-packages, Lib\site-packages
+            if os.sep == "/":
+                sitepackages.append(os.path.join(prefix, "lib", "nython%d.%d" % sys.version_info[:2], "site-packages"))
+            else:
+                sitepackages.append(os.path.join(prefix, "Lib", "site-packages"))
+        else:
+            sitepackages.append(os.path.join(prefix, "lib", "site-packages"))
     return sitepackages
 
 def addsitepackages(known_paths, prefixes=None):
@@ -553,7 +568,9 @@ def venv(known_paths):
         # addsitepackages will process site_prefix again if its in PREFIXES,
         # but that's ok; known_paths will prevent anything being added twice
         if system_site == "true":
-            PREFIXES.insert(0, sys.prefix)
+            # (round 87) the installation's site-packages after the
+            # environment's (sys.prefix is the environment already here)
+            PREFIXES = [sys.prefix, sys.base_prefix]
         else:
             PREFIXES = [sys.prefix]
             ENABLE_USER_SITE = False
@@ -609,6 +626,11 @@ def main():
     """
     global ENABLE_USER_SITE
 
+    # (round 87) the engines run this at startup when a site-packages
+    # directory needs it (src/NySite.cpp): sys.path[0] - the script's
+    # directory, or "" for -c and the prompt - is left as it is, as
+    # CPython's site runs before sys.path[0] is put there
+    first = sys.path.pop(0) if sys.path and sys.path[0] == "" else None
     orig_path = sys.path[:]
     known_paths = removeduppaths()
     if orig_path != sys.path:
@@ -626,6 +648,8 @@ def main():
     sethelper()
     if not sys.flags.isolated:
         enablerlcompleter()
+    if first is not None:
+        sys.path.insert(0, first)
     execsitecustomize()
     if ENABLE_USER_SITE:
         execusercustomize()

@@ -145,6 +145,7 @@
         <Unit filename="src/NyUniNames.cpp" />
         <Unit filename="src/NyUniData.cpp" />
         <Unit filename="src/VMGC.cpp" />
+        <Unit filename="src/NySite.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
         <Unit filename="src/builtins/core.cpp" />
@@ -193,6 +194,7 @@
         <Unit filename="src/builtins/nycurses.cpp" />
         <Unit filename="src/builtins/pycore.cpp" />
         <Unit filename="src/builtins/gui_harness.cpp" />
+        <Unit filename="src/builtins/nywin.cpp" />
         <Unit filename="src/NyConc.cpp" />
         <Unit filename="src/VMConc.cpp" />
         <!-- ═══════════ Key headers (for IDE navigation) ═══════════ -->

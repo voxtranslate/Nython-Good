@@ -84,7 +84,7 @@
    "probe_types": {},
    "docs": [],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "_winapi.CreateNamedPipe": {
    "module": "_winapi",
@@ -107,7 +107,7 @@
    "probe_types": {},
    "docs": [],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "_winapi.OpenProcess": {
    "module": "_winapi",
@@ -129,7 +129,7 @@
    "probe_types": {},
    "docs": [],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "array.__new__": {
    "module": "array",
@@ -1114,7 +1114,7 @@
    "docs": [
     "ensurepip.html#ensurepip.bootstrap"
    ],
-   "nython": "absent: Nython has no ensurepip (no pip to bootstrap)"
+   "nython": "library"
   },
   "exec": {
    "module": "builtins",
@@ -1933,7 +1933,7 @@
     "msvcrt.html#msvcrt.get_osfhandle"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "msvcrt.locking": {
    "module": "msvcrt",
@@ -1958,7 +1958,7 @@
     "msvcrt.html#msvcrt.locking"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "msvcrt.open_osfhandle": {
    "module": "msvcrt",
@@ -1982,7 +1982,7 @@
     "msvcrt.html#msvcrt.open_osfhandle"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "nntplib.connect": {
    "module": "nntplib",
@@ -5624,7 +5624,7 @@
     "winreg.html#winreg.ConnectRegistry"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.CreateKey": {
    "module": "winreg",
@@ -5650,7 +5650,7 @@
     "winreg.html#winreg.CreateKeyEx"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.DeleteKey": {
    "module": "winreg",
@@ -5676,7 +5676,7 @@
     "winreg.html#winreg.DeleteKeyEx"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.DeleteValue": {
    "module": "winreg",
@@ -5700,7 +5700,7 @@
     "winreg.html#winreg.DeleteValue"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.DisableReflectionKey": {
    "module": "winreg",
@@ -5723,7 +5723,7 @@
     "winreg.html#winreg.DisableReflectionKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.EnableReflectionKey": {
    "module": "winreg",
@@ -5746,7 +5746,7 @@
     "winreg.html#winreg.EnableReflectionKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.EnumKey": {
    "module": "winreg",
@@ -5770,7 +5770,7 @@
     "winreg.html#winreg.EnumKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.EnumValue": {
    "module": "winreg",
@@ -5794,7 +5794,7 @@
     "winreg.html#winreg.EnumValue"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.ExpandEnvironmentStrings": {
    "module": "winreg",
@@ -5817,7 +5817,7 @@
     "winreg.html#winreg.ExpandEnvironmentStrings"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.LoadKey": {
    "module": "winreg",
@@ -5842,7 +5842,7 @@
     "winreg.html#winreg.LoadKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.OpenKey": {
    "module": "winreg",
@@ -5867,7 +5867,7 @@
     "winreg.html#winreg.OpenKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.OpenKey/result": {
    "module": "winreg",
@@ -5892,7 +5892,7 @@
     "winreg.html#winreg.OpenKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.PyHKEY.Detach": {
    "module": "winreg",
@@ -5915,7 +5915,7 @@
     "winreg.html#winreg.PyHKEY.Detach"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.QueryInfoKey": {
    "module": "winreg",
@@ -5938,7 +5938,7 @@
     "winreg.html#winreg.QueryInfoKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.QueryReflectionKey": {
    "module": "winreg",
@@ -5961,7 +5961,7 @@
     "winreg.html#winreg.QueryReflectionKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.QueryValue": {
    "module": "winreg",
@@ -5987,7 +5987,7 @@
     "winreg.html#winreg.QueryValueEx"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.SaveKey": {
    "module": "winreg",
@@ -6011,7 +6011,7 @@
     "winreg.html#winreg.SaveKey"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   },
   "winreg.SetValue": {
    "module": "winreg",
@@ -6038,7 +6038,7 @@
     "winreg.html#winreg.SetValueEx"
    ],
    "platform": "windows",
-   "nython": "absent: Windows only"
+   "nython": "library"
   }
  }
 }
