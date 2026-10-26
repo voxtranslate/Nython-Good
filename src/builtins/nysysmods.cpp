@@ -121,6 +121,91 @@ Value ints(NythonExecutor& E, std::initializer_list<int64_t> v) {
 
 #define K(name) kv.push_back({#name, (int64_t)(name)})
 
+#ifdef _WIN32
+// (round 87) Windows: the socket error names take the Windows Sockets codes,
+// as CPython's errnomodule.c gives them there - it #undefs <errno.h>'s
+// VS2010 values and falls back to WSAE* for a name the CRT lacks - so a
+// socket's OSError (errno 10048) == errno.EADDRINUSE, and errno.ESHUTDOWN
+// (asyncore) exists. Nothing after the table uses these names.
+#undef EADDRINUSE
+#define EADDRINUSE WSAEADDRINUSE
+#undef EADDRNOTAVAIL
+#define EADDRNOTAVAIL WSAEADDRNOTAVAIL
+#undef EAFNOSUPPORT
+#define EAFNOSUPPORT WSAEAFNOSUPPORT
+#undef EALREADY
+#define EALREADY WSAEALREADY
+#undef ECONNABORTED
+#define ECONNABORTED WSAECONNABORTED
+#undef ECONNREFUSED
+#define ECONNREFUSED WSAECONNREFUSED
+#undef ECONNRESET
+#define ECONNRESET WSAECONNRESET
+#undef EDESTADDRREQ
+#define EDESTADDRREQ WSAEDESTADDRREQ
+#undef EHOSTUNREACH
+#define EHOSTUNREACH WSAEHOSTUNREACH
+#undef EINPROGRESS
+#define EINPROGRESS WSAEINPROGRESS
+#undef EISCONN
+#define EISCONN WSAEISCONN
+#undef ELOOP
+#define ELOOP WSAELOOP
+#undef EMSGSIZE
+#define EMSGSIZE WSAEMSGSIZE
+#undef ENETDOWN
+#define ENETDOWN WSAENETDOWN
+#undef ENETRESET
+#define ENETRESET WSAENETRESET
+#undef ENETUNREACH
+#define ENETUNREACH WSAENETUNREACH
+#undef ENOBUFS
+#define ENOBUFS WSAENOBUFS
+#undef ENOPROTOOPT
+#define ENOPROTOOPT WSAENOPROTOOPT
+#undef ENOTCONN
+#define ENOTCONN WSAENOTCONN
+#undef ENOTSOCK
+#define ENOTSOCK WSAENOTSOCK
+#undef EOPNOTSUPP
+#define EOPNOTSUPP WSAEOPNOTSUPP
+#undef EPROTONOSUPPORT
+#define EPROTONOSUPPORT WSAEPROTONOSUPPORT
+#undef EPROTOTYPE
+#define EPROTOTYPE WSAEPROTOTYPE
+#undef ETIMEDOUT
+#define ETIMEDOUT WSAETIMEDOUT
+#undef EWOULDBLOCK
+#define EWOULDBLOCK WSAEWOULDBLOCK
+#ifndef ESHUTDOWN
+#define ESHUTDOWN WSAESHUTDOWN
+#endif
+#ifndef ETOOMANYREFS
+#define ETOOMANYREFS WSAETOOMANYREFS
+#endif
+#ifndef EHOSTDOWN
+#define EHOSTDOWN WSAEHOSTDOWN
+#endif
+#ifndef ESOCKTNOSUPPORT
+#define ESOCKTNOSUPPORT WSAESOCKTNOSUPPORT
+#endif
+#ifndef EPFNOSUPPORT
+#define EPFNOSUPPORT WSAEPFNOSUPPORT
+#endif
+#ifndef EUSERS
+#define EUSERS WSAEUSERS
+#endif
+#ifndef EDQUOT
+#define EDQUOT WSAEDQUOT
+#endif
+#ifndef ESTALE
+#define ESTALE WSAESTALE
+#endif
+#ifndef EREMOTE
+#define EREMOTE WSAEREMOTE
+#endif
+#endif
+
 // ── errno: CPython's errnomodule.c order (a later name for the same value
 // wins errorcode: EAGAIN over EWOULDBLOCK, EDEADLOCK over EDEADLK, ENOTSUP
 // over EOPNOTSUPP, as CPython gives on Linux) ───────────────────────────────

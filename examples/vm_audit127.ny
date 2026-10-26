@@ -28,6 +28,7 @@
 #     ./build/nython-cli --vm examples/vm_audit127.ny
 
 import sys
+import errno
 import os
 import io
 import re
@@ -114,7 +115,7 @@ def child(args, inp=None):
     # [exit status, stdout] of this Python run with args in T (T's path cut
     # out of what it printed)
     r = subprocess.run([sys.executable] + ENGINE + args, cwd=T, capture_output=True, timeout=600, input=inp)
-    out = r.stdout.decode("utf-8", "replace").replace("\r\n", "\n").replace(T + os.sep, "")
+    out = r.stdout.decode("utf-8", "replace").replace("\r\n", "\n").replace(T + os.sep, "").replace(T + "/", "")
     return [r.returncode, tbnorm(out)]
 
 
@@ -135,7 +136,7 @@ def captured(f, *args, **kw):
         r = f(*args, **kw)
     if isinstance(r, tuple):
         r = tuple(r)   # doctest's TestResults as a plain tuple
-    return [tbnorm(buf.getvalue().replace(T + os.sep, "")), r]
+    return [tbnorm(buf.getvalue().replace(T + os.sep, "").replace(T + "/", "")), r]
 
 
 def plain(x):
@@ -490,7 +491,7 @@ def run_test(t, flags=0, verbose=False):
     out = []
     r = doctest.DocTestRunner(verbose=verbose, optionflags=flags)
     res = r.run(t, out=out.append)
-    return [tbnorm("".join(out).replace(T + os.sep, "")), tuple(res)]
+    return [tbnorm("".join(out).replace(T + os.sep, "").replace(T + "/", "")), tuple(res)]
 
 def dt(text, globs=None, name="t"):
     return _parser.get_doctest(text, dict(globs or {}), name, "t.py", 0)
@@ -663,10 +664,10 @@ if have('doctest'):
     ck('DocFileSuite', lambda: suite_result(doctest.DocFileSuite(os.path.join(T, 'dtsample.txt'), module_relative=False)),
        [1, 1, 0, ['dtsample_txt']])
 if have('doctest'):
-    ck("a DocTestCase's failure message", lambda: (lambda r: (doctest.DocTestSuite(dtsample).run(r), tbnorm(r.failures[0][1].split('\n', 1)[1].replace(T + os.sep, '')))[1])(unittest.TestResult()),
+    ck("a DocTestCase's failure message", lambda: (lambda r: (doctest.DocTestSuite(dtsample).run(r), tbnorm(r.failures[0][1].split('\n', 1)[1].replace(T + os.sep, '').replace(T + '/', '')))[1])(unittest.TestResult()),
        'AssertionError: Failed doctest test for dtsample.__test__.extra\n  File "dtsample.py", line unknown line number, in extra\n\n----------------------------------------------------------------------\nFile "dtsample.py", line ?, in dtsample.__test__.extra\nFailed example:\n    y + 1\nExpected:\n    12\nGot:\n    11\n\n')
 if have('doctest'):
-    ck('DocTestCase id / repr / shortDescription', lambda: [(c.id(), repr(c), c.shortDescription().replace(T + os.sep, '')) for c in list(doctest.DocTestSuite(dtpass))],
+    ck('DocTestCase id / repr / shortDescription', lambda: [(c.id(), repr(c), c.shortDescription().replace(T + os.sep, '').replace(T + '/', '')) for c in list(doctest.DocTestSuite(dtpass))],
        [('dtpass', 'dtpass ()', 'Doctest: dtpass'), ('dtpass.ok', 'ok (dtpass)', 'Doctest: dtpass.ok')])
 if have('doctest'):
     ck('set_unittest_reportflags', lambda: [doctest.set_unittest_reportflags(doctest.REPORT_NDIFF), doctest.set_unittest_reportflags(0), err(lambda: doctest.set_unittest_reportflags(doctest.ELLIPSIS))],
@@ -802,7 +803,7 @@ def pipe_demo():
     t3.append('uniq > $OUT', '-f')
     return [copied, written, read, repr(t).split(" at ")[0], t.steps, t2.steps,
             t.makepipeline("in", "out"), t3.makepipeline("in", "out"), re.sub(re.escape(tempfile.gettempdir()) + r"/\w+", "TMP", t3.makepipeline("", ""))]
-if have('pipes'):
+if have('pipes') and os.name != 'nt':   # /bin/sh pipelines: CPython's test_pipes is POSIX-only
     ck('pipes.Template: copy, open for writing and reading, makepipeline', lambda: pipe_demo(),
        ['HELLO\nyMAS BOX\n', 'WRITTEN THROUGH\n', 'HELLO\nyMAS BOX\n', "<Template instance, steps=[('tr a-z A-Z', '--'), ('sed s/X/y/', '--')]>", [('tr a-z A-Z', '--'), ('sed s/X/y/', '--')], [('cat', '--'), ('tr a-z A-Z', '--'), ('sed s/X/y/', '--')], 'tr a-z A-Z <in |\nsed s/X/y/ >out', 'IN=in; sort $IN |\n{ OUT=out; uniq > $OUT; }', "trap 'rm -f TMP TMP; exit' 1 2 3 13 14 15\ncat >TMP\nIN=TMP; sort $IN |\n{ OUT=TMP; uniq > $OUT; }\ncat <TMP\nrm -f TMP TMP"])
 if have('pipes'):
@@ -1097,8 +1098,8 @@ if have('smtpd'):
     ck('smtpd + asyncore + asynchat: a mail delivered, DebuggingServer, a line protocol', lambda: async_demo(),
        [250, ['8BITMIME', 'HELP', 'SIZE 33554432'], {}, 'SMTPRecipientsRefused: {}', (250, b'OK'), (252, b'Cannot VRFY user, but will accept message and attempt delivery'), [['127.0.0.1', 'alice@example.org', ['bob@example.org', 'carol@example.org'], b'Subject: hi\n\nHello Bob.\n.dot line', [('mail_options', ['SIZE=38']), ('rcpt_options', [])]], ['chat', b'hello', b'\r\n'], ['chat', b'world', b'\r\n'], ['chat', b'BYE', b'\r\n']], '---------- MESSAGE FOLLOWS ----------\nSubject: dbg\nX-Peer: HOST\n\nline one\n------------ END MESSAGE ------------\n', b'HELLO\r\nWORLD\r\nbye\r\n'])
 if have('asyncore'):
-    ck('asyncore helpers', lambda: (lambda a: [a.compact_traceback.__name__, sorted(a._DISCONNECTED), repr(a.ExitNow('x')), callable(a.loop), a.dispatcher().connected, a.dispatcher().accepting])(__import__('asyncore')),
-       ['compact_traceback', [9, 32, 103, 104, 107, 108], "ExitNow('x')", True, False, False])
+    ck('asyncore helpers', lambda: (lambda a: [a.compact_traceback.__name__, sorted(a._DISCONNECTED) == sorted([errno.ECONNRESET, errno.ENOTCONN, errno.ESHUTDOWN, errno.ECONNABORTED, errno.EPIPE, errno.EBADF]), repr(a.ExitNow('x')), callable(a.loop), a.dispatcher().connected, a.dispatcher().accepting])(__import__('asyncore')),
+       ['compact_traceback', True, "ExitNow('x')", True, False, False])
 if have('asynchat'):
     ck('asynchat.async_chat defaults', lambda: (lambda c: [c.ac_in_buffer_size, c.ac_out_buffer_size, c.use_encoding, c.encoding, err(lambda: c().get_terminator()).split(':')[0]])(__import__('asynchat').async_chat),
        [65536, 65536, 0, 'latin-1', 'AttributeError'])
@@ -1196,7 +1197,7 @@ def spwd_demo():
         ok = ok and one == e and one.sp_nam == one.sp_namp and one.sp_pwd == one.sp_pwdp and len(one) == 9
         ok = ok and all(isinstance(x, int) for x in one[2:]) and isinstance(one[1], str)
     return r + [len(allp) > 0, ok, type(allp[0]).__name__, repr(allp[0]).startswith("spwd.struct_spwd(sp_namp=")]
-if have('spwd'):
+if have('spwd') and os.name != 'nt':
     ck('spwd: getspnam / getspall agree, struct_spwd, errors', lambda: spwd_demo(),
        [11, 9, "KeyError: 'getspnam(): name not found'", 'TypeError: getspnam() argument must be str, not int', True, True, 'struct_spwd', True])
 
@@ -1216,11 +1217,16 @@ def oss_demo():
             os.environ["AUDIODEV"] = old
     return [[(n, getattr(o, n)) for n in names], o.control_labels, o.control_names,
             err(lambda: o.open("x")), err(lambda: o.open("/nonexistent127/dsp", "w")),
-            e1.replace(T + os.sep, ""), err(lambda: o.openmixer("/nonexistent127/mixer")),
+            e1.replace(T + os.sep, "").replace(T + "/", ""), err(lambda: o.openmixer("/nonexistent127/mixer")),
             o.error is o.OSSAudioError, issubclass(o.OSSAudioError, Exception)]
-if have('ossaudiodev'):
+if have('ossaudiodev') and os.name != 'nt':
     ck('ossaudiodev: constants, labels, the errors of a system without OSS', lambda: oss_demo(),
        [[('AFMT_AC3', 1024), ('AFMT_A_LAW', 2), ('AFMT_IMA_ADPCM', 4), ('AFMT_MPEG', 512), ('AFMT_MU_LAW', 1), ('AFMT_QUERY', 0), ('AFMT_S16_BE', 32), ('AFMT_S16_LE', 16), ('AFMT_S16_NE', 16), ('AFMT_S8', 64), ('AFMT_U16_BE', 256), ('AFMT_U16_LE', 128), ('AFMT_U8', 8), ('SNDCTL_COPR_HALT', 3222553351), ('SNDCTL_COPR_LOAD', 3484435201), ('SNDCTL_COPR_RCODE', 3222553347), ('SNDCTL_COPR_RCVMSG', 2409906953), ('SNDCTL_COPR_RDATA', 3222553346), ('SNDCTL_COPR_RESET', 17152), ('SNDCTL_COPR_RUN', 3222553350), ('SNDCTL_COPR_SENDMSG', 3483648776), ('SNDCTL_COPR_WCODE', 1075069701), ('SNDCTL_COPR_WDATA', 1075069700), ('SNDCTL_DSP_BIND_CHANNEL', 3221508161), ('SNDCTL_DSP_CHANNELS', 3221508102), ('SNDCTL_DSP_GETBLKSIZE', 3221508100), ('SNDCTL_DSP_GETCAPS', 2147766287), ('SNDCTL_DSP_GETCHANNELMASK', 3221508160), ('SNDCTL_DSP_GETFMTS', 2147766283), ('SNDCTL_DSP_GETIPTR', 2148290577), ('SNDCTL_DSP_GETISPACE', 2148552717), ('SNDCTL_DSP_GETODELAY', 2147766295), ('SNDCTL_DSP_GETOPTR', 2148290578), ('SNDCTL_DSP_GETOSPACE', 2148552716), ('SNDCTL_DSP_GETSPDIF', 2147766339), ('SNDCTL_DSP_GETTRIGGER', 2147766288), ('SNDCTL_DSP_MAPINBUF', 2148552723), ('SNDCTL_DSP_MAPOUTBUF', 2148552724), ('SNDCTL_DSP_NONBLOCK', 20494), ('SNDCTL_DSP_POST', 20488), ('SNDCTL_DSP_PROFILE', 1074024471), ('SNDCTL_DSP_RESET', 20480), ('SNDCTL_DSP_SAMPLESIZE', 3221508101), ('SNDCTL_DSP_SETDUPLEX', 20502), ('SNDCTL_DSP_SETFMT', 3221508101), ('SNDCTL_DSP_SETFRAGMENT', 3221508106), ('SNDCTL_DSP_SETSPDIF', 1074024514), ('SNDCTL_DSP_SETSYNCRO', 20501), ('SNDCTL_DSP_SETTRIGGER', 1074024464), ('SNDCTL_DSP_SPEED', 3221508098), ('SNDCTL_DSP_STEREO', 3221508099), ('SNDCTL_DSP_SUBDIVIDE', 3221508105), ('SNDCTL_DSP_SYNC', 20481), ('SNDCTL_FM_4OP_ENABLE', 1074024719), ('SNDCTL_FM_LOAD_INSTR', 1076384007), ('SNDCTL_MIDI_INFO', 3228848396), ('SNDCTL_MIDI_MPUCMD', 3223416066), ('SNDCTL_MIDI_MPUMODE', 3221515521), ('SNDCTL_MIDI_PRETIME', 3221515520), ('SNDCTL_SEQ_CTRLRATE', 3221508355), ('SNDCTL_SEQ_GETINCOUNT', 2147766533), ('SNDCTL_SEQ_GETOUTCOUNT', 2147766532), ('SNDCTL_SEQ_GETTIME', 2147766547), ('SNDCTL_SEQ_NRMIDIS', 2147766539), ('SNDCTL_SEQ_NRSYNTHS', 2147766538), ('SNDCTL_SEQ_OUTOFBAND', 1074286866), ('SNDCTL_SEQ_PANIC', 20753), ('SNDCTL_SEQ_PERCMODE', 1074024710), ('SNDCTL_SEQ_RESET', 20736), ('SNDCTL_SEQ_RESETSAMPLES', 1074024713), ('SNDCTL_SEQ_SYNC', 20737), ('SNDCTL_SEQ_TESTMIDI', 1074024712), ('SNDCTL_SEQ_THRESHOLD', 1074024717), ('SNDCTL_SYNTH_CONTROL', 3483652373), ('SNDCTL_SYNTH_ID', 3230421268), ('SNDCTL_SYNTH_INFO', 3230421250), ('SNDCTL_SYNTH_MEMAVL', 3221508366), ('SNDCTL_SYNTH_REMOVESAMPLE', 3222032662), ('SNDCTL_TMR_CONTINUE', 21508), ('SNDCTL_TMR_METRONOME', 1074025479), ('SNDCTL_TMR_SELECT', 1074025480), ('SNDCTL_TMR_SOURCE', 3221509126), ('SNDCTL_TMR_START', 21506), ('SNDCTL_TMR_STOP', 21507), ('SNDCTL_TMR_TEMPO', 3221509125), ('SNDCTL_TMR_TIMEBASE', 3221509121), ('SOUND_MIXER_ALTPCM', 10), ('SOUND_MIXER_BASS', 1), ('SOUND_MIXER_CD', 8), ('SOUND_MIXER_DIGITAL1', 17), ('SOUND_MIXER_DIGITAL2', 18), ('SOUND_MIXER_DIGITAL3', 19), ('SOUND_MIXER_IGAIN', 12), ('SOUND_MIXER_IMIX', 9), ('SOUND_MIXER_LINE', 6), ('SOUND_MIXER_LINE1', 14), ('SOUND_MIXER_LINE2', 15), ('SOUND_MIXER_LINE3', 16), ('SOUND_MIXER_MIC', 7), ('SOUND_MIXER_MONITOR', 24), ('SOUND_MIXER_NRDEVICES', 25), ('SOUND_MIXER_OGAIN', 13), ('SOUND_MIXER_PCM', 4), ('SOUND_MIXER_PHONEIN', 20), ('SOUND_MIXER_PHONEOUT', 21), ('SOUND_MIXER_RADIO', 23), ('SOUND_MIXER_RECLEV', 11), ('SOUND_MIXER_SPEAKER', 5), ('SOUND_MIXER_SYNTH', 3), ('SOUND_MIXER_TREBLE', 2), ('SOUND_MIXER_VIDEO', 22), ('SOUND_MIXER_VOLUME', 0)], ['Vol  ', 'Bass ', 'Trebl', 'Synth', 'Pcm  ', 'Spkr ', 'Line ', 'Mic  ', 'CD   ', 'Mix  ', 'Pcm2 ', 'Rec  ', 'IGain', 'OGain', 'Line1', 'Line2', 'Line3', 'Digital1', 'Digital2', 'Digital3', 'PhoneIn', 'PhoneOut', 'Video', 'Radio', 'Monitor'], ['vol', 'bass', 'treble', 'synth', 'pcm', 'speaker', 'line', 'mic', 'cd', 'mix', 'pcm2', 'rec', 'igain', 'ogain', 'line1', 'line2', 'line3', 'dig1', 'dig2', 'dig3', 'phin', 'phout', 'video', 'radio', 'monitor'], "OSSAudioError: mode must be 'r', 'w', or 'rw'", "FileNotFoundError: [Errno 2] No such file or directory: '/nonexistent127/dsp'", "OSError: [Errno 25] Inappropriate ioctl for device: 'not_a_dsp'", "FileNotFoundError: [Errno 2] No such file or directory: '/nonexistent127/mixer'", True, True])
+
+if NYTHON and os.name == "nt":
+    # Unix-only modules, absent on Windows as CPython's are
+    ck('spwd / ossaudiodev / nis on Windows: no such module', lambda: [err(lambda: __import__(m)) for m in ("spwd", "ossaudiodev", "nis")],
+       ["ModuleNotFoundError: No module named 'spwd'", "ModuleNotFoundError: No module named 'ossaudiodev'", "ModuleNotFoundError: No module named 'nis'"])
 
 # ── lib2to3 ──────────────────────────────────────────────────────────────────
 PY2_SRC = """\
