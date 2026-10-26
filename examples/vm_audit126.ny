@@ -35,7 +35,8 @@
 #     the in-place operator in an augmented assignment's TypeError, `1 //
 #     'ab'` (read as a comment), a value sent through yield from to an
 #     iterator without send(), a starred comprehension target given an int,
-#     the __qualname__ of a lambda in a lambda, an instance's __name__.
+#     the __qualname__ of a lambda in a lambda, an instance's __name__, a
+#     set's *= and += (it became a list), divmod() of non-numbers.
 #
 # Items 7 and 8 run as a Python-language child (a .py file) on the same
 # engine. The checks pass under python3 too (the Nython-only ones are marked):
@@ -622,16 +623,24 @@ if ssl_mod is not None and getattr(ssl_mod, "HAS_TLS", True):
             state10["outcome"] = type(e).__name__
     async def main10():
         state10["task"] = asyncio.create_task(client10())
-        await asyncio.sleep(0.3)
+        # the server's end, in the loop: run() ends only once the ClientHello
+        # is here, so the handshake is surely in progress (a sleep raced the
+        # client under load)
+        loop = asyncio.get_running_loop()
+        lsock.setblocking(False)
+        conn, _ = await asyncio.wait_for(loop.sock_accept(lsock), 30)
+        state10["conn"] = conn
+        state10["hello"] = await asyncio.wait_for(loop.sock_recv(conn, 5), 30)
+        await asyncio.sleep(0.1)
         return "main done"
     t0 = time.monotonic()
     r10 = asyncio.run(main10())
     took10 = time.monotonic() - t0
-    lsock.settimeout(10)
-    conn10, _ = lsock.accept()
+    conn10 = state10["conn"]
+    conn10.setblocking(True)
     conn10.settimeout(10)
+    hello = state10["hello"]
     try:
-        hello = conn10.recv(5)
         rest = b""
         while True:
             more = conn10.recv(65536)
@@ -640,9 +649,9 @@ if ssl_mod is not None and getattr(ssl_mod, "HAS_TLS", True):
             rest += more
         closed10 = "closed"
     except socket.timeout:
-        hello, closed10 = b"", "still open"
+        closed10 = "still open"
     except OSError:
-        hello, closed10 = b"", "closed"
+        closed10 = "closed"
     conn10.close()
     lsock.close()
     check("a client's TLS handshake left running by asyncio.run(): cancelled, its socket closed, at once",
@@ -681,7 +690,13 @@ if CERTS is not None:
         port = server.sockets[0].getsockname()[1]
         raw = socket.create_connection(("127.0.0.1", port), timeout=10)
         state10b["raw"] = raw
-        await asyncio.sleep(0.3)
+        # until the server has taken the connection (a fixed sleep raced it
+        # under load)
+        for _ in range(400):
+            await asyncio.sleep(0.05)
+            if [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]:
+                break
+        await asyncio.sleep(0.1)
         state10b["handshake tasks"] = len([t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
         return served
     t0 = time.monotonic()
@@ -823,6 +838,33 @@ check("a lambda in a lambda: CPython's __qualname__ (it was <lambda>)",
       [fq12().__qualname__, (lambda: [lambda: 3])()[0].__qualname__, Q12().m().__qualname__, gq12()().__qualname__],
       ["<lambda>.<locals>.<lambda>", "<lambda>.<locals>.<lambda>", "Q12.<lambda>.<locals>.<lambda>",
        "gq12.<locals>.<lambda>.<locals>.<lambda>"])
+def setaug12(op):
+    x = {1}
+    try:
+        if op == "*":
+            x *= 2
+        else:
+            x += {"b": 2}
+    except TypeError as e:
+        return [str(e), x]
+    return ["no error", x]
+class DM12:
+    def __floordiv__(self, o):
+        return 1
+    def __mod__(self, o):
+        return 2
+import decimal as decimal12, array as array12
+check("a set's *= / += and * (it became a list), (1,) ** {1}, divmod() of non-numbers, a library class's name in messages",
+      [setaug12("*"), setaug12("+"), err(lambda: {1} * 2), err(lambda: (1,) ** {1}), err(lambda: divmod(o12, 1)),
+       err(lambda: divmod(DM12(), 1)), err(lambda: decimal12.Decimal(1) + 1.5), err(lambda: hash(array12.array("i")))],
+      [["unsupported operand type(s) for *=: 'set' and 'int'", {1}],
+       ["unsupported operand type(s) for +=: 'set' and 'dict'", {1}],
+       ("TypeError", "unsupported operand type(s) for *: 'set' and 'int'"),
+       ("TypeError", "unsupported operand type(s) for ** or pow(): 'tuple' and 'set'"),
+       ("TypeError", "unsupported operand type(s) for divmod(): 'C12' and 'int'"),
+       ("TypeError", "unsupported operand type(s) for divmod(): 'DM12' and 'int'"),
+       ("TypeError", "unsupported operand type(s) for +: 'decimal.Decimal' and 'float'"),
+       ("TypeError", "unhashable type: 'array.array'")])
 check("a starred comprehension target given an int: CPython's TypeError (the int was counted up to)",
       [err(lambda: [a for a, *b in [5]]), [[a, b] for a, *b in ["xy", [1]]]],
       [("TypeError", "cannot unpack non-iterable int object"), [["x", ["y"]], [1, []]]])

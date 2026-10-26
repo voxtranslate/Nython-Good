@@ -5830,7 +5830,7 @@ both engines and under python3).
 
 ### Round 87, part K — the semantic gaps round 86 found, and a differential tester (`HANDOFF.md` §0z6)
 
-New test: `vm_audit126` (NN checks; both engines, all of them under python3.11/3.12). New tool: `tools/difftest.py` (differential testing against CPython with generated programs and delta debugging).
+New test: `vm_audit126` (62 checks; both engines, all of them under python3.11/3.12). New tool: `tools/difftest.py` (differential testing against CPython with generated programs and delta debugging).
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -5842,7 +5842,7 @@ New test: `vm_audit126` (NN checks; both engines, all of them under python3.11/3
 | `f(*None)`, `[*None]`, `f(**1)`, `{**1}`, `f(**{1: 2})`, `f(a=1, **{"a": 2})`: Nython's messages or none; an int after `*` iterated in Python-language source | no CPython checks | CPython's messages in its order ("Value after * must be an iterable", "argument after ** must be a mapping", "keywords must be strings", "got multiple values for keyword argument"); the starred displays' helpers are natives with `_py` forms |
 | In a `.py` file `{"f": g}.f()`, `del d.k`, `delattr(d, "k")` worked | part J made reads and stores strict only | AttributeError |
 | In a `.py` file `super = 1`, `def f(super=3)`, `lambda super: ...` were syntax errors | `super` a keyword everywhere | a name unless `(` follows; a `super(...)` that sees a binding of the name calls it; the builtin called by its name works |
-| Messages said "'pkg.mod.Obj' object is not callable"; a nested class's repr was `<class '__main__.Inner'>` wherever it was defined | the module-qualified class key; no module recorded for nested classes | the class's `__name__` in messages; reprs from `__module__` + `__qualname__` |
+| Messages said "'pkg.mod.Obj' object is not callable"; a nested class's repr was `<class '__main__.Inner'>` wherever it was defined | the module-qualified class key; no module recorded for nested classes | the class's `__name__` in messages (a library class keeps "module.Class", as the C type it stands for: 'decimal.Decimal'); reprs from `__module__` + `__qualname__` |
 | A server's TLS handshake outlived `asyncio.run()` and ran the connection callback on a closed loop | an internal task, invisible to `_cancel_all_tasks` | a task of the loop (cancelled, the socket closed) |
 | vm_audit104 under Wine: a false DeadlockError in about one run in two | a task posted to a loop from another thread left the loop thread marked `blocked_forever` until it woke | `new_task_locked` / `async_loop_stop` clear the mark as `make_ready` does |
 | `None >> 1`, `1.5 << 1`, `(1,) << {}` gave 0; on the VM `[1] \| 1`, `"a" ^ "b"`, `x ^= "s"` too, and `[1, 2] - [1]` was a set difference | fallbacks that returned 0; list set operations from before sets were a type (VM only) | CPython's TypeError on both engines |
@@ -5854,6 +5854,7 @@ New test: `vm_audit126` (NN checks; both engines, all of them under python3.11/3
 | `g.send(5)` while `g` delegated by `yield from` to a list/str/map: the value was dropped and the iterator stepped | the plain-iterator branch ignored the sent value | "'list_iterator' object has no attribute 'send'" |
 | `[a for a, *b in [5]]` gave `[0]`; in a `.py` file `[a for a, *b in 5]` iterated the int | the prelude's `list(item)` and `for item in it` in Nython code | "cannot unpack non-iterable int object" / "'int' object is not iterable" |
 | `(lambda: (lambda: 1))().__qualname__` was "<lambda>" | the parser pushed no scope for a lambda's body | "<lambda>.<locals>.<lambda>" |
+| `x = {1}; x *= 2` gave `[1, 1]` (interpreter, `{1} * 2` too) / a set holding 1 twice (VM); VM `x += {"b": 2}` added the keys; `divmod(obj, 1)` used `//` and `%` | a set taken for a sequence; divmod fell back to the two operators | CPython's TypeErrors |
 | `obj.__name__` of an instance gave its class's name (interpreter) | the tag-derived special attribute served instances too | AttributeError, as CPython and the VM |
 
 ## Round 86, part J — Python-language source behaves as CPython where Nython is lenient (`HANDOFF.md` §0z4)

@@ -370,6 +370,13 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             std::vector<Value> a0 = {args[0]};
             return E.callMethod(args[1], "__rdivmod__", a0, ctx);
         }
+        {
+            // round 87: CPython's TypeError (it said "for //"; a class with
+            // // and % but no __divmod__ is no exception)
+            NythonExecutor::Num x, y;
+            if (!NythonExecutor::asNum(args[0], x) || !NythonExecutor::asNum(args[1], y))
+                E.pyRaise("TypeError", "unsupported operand type(s) for divmod(): '" + E.typeNameOf(args[0]) + "' and '" + E.typeNameOf(args[1]) + "'");
+        }
         Value q = E.binaryOp(NythonExecutor::OP_FLOORDIV, args[0], args[1], ctx);
         Value r = E.binaryOp(NythonExecutor::OP_MOD, args[0], args[1], ctx);
         return E.makeListValue({q, r}, true);

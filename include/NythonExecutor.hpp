@@ -432,7 +432,7 @@ struct NythonExecutor {
     // round 87: a class as CPython's messages name it - its __name__ (a
     // module's class is keyed "module.Class": "'Obj' object is not callable",
     // where it said 'pkg.mod.Obj')
-    static std::string msgClassName(const std::string& n) { return nyrt::bare_class_name(nyrt::shown_class_name(n)); }
+    static std::string msgClassName(const std::string& n) { return nyrt::message_class_name(nyrt::shown_class_name(n)); }
     // round 84: a function CPython implements in C, marked when the module
     // binding it had run (sealCModule): static, and "__nybuiltin__"
     static bool isNyBuiltinTag(const std::string& t) {
@@ -2567,7 +2567,7 @@ public:   // NythonExecutor is a struct: members default to public
                     return makeStringValue(nypy::repeat_str(s, n));
                 }
                 if (Container* c = contOf(*seq)) {
-                    if (seqLen(c) >= 0) {
+                    if (seqLen(c) >= 0 && !isSetCont(c)) {   // (round 87: a set is no sequence - {1} * 2 gave [1, 1])
                         std::vector<Value> items = seqItems(c), out;
                         for (int64_t t = 0; t < n; t++) out.insert(out.end(), items.begin(), items.end());
                         return makeListValue(out, isTupleCont(c));

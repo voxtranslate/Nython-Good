@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+#include <mutex>
 #include <exception>
 #include <stdexcept>
 #include <new>
@@ -232,6 +234,36 @@ inline std::string shown_class_name(const std::string& n) {
 inline std::string bare_class_name(const std::string& n) {
     size_t dot = n.rfind('.');
     return dot == std::string::npos ? n : n.substr(dot + 1);
+}
+// round 87: a class as messages name it (CPython's tp_name). A class
+// statement's is its __name__ - a program's module's class is keyed
+// "pkg.mod.Obj" and the messages said so; a class of the installation's own
+// library keeps "module.Class", as the C types the library stands for name
+// themselves ('array.array', 'decimal.Decimal'). Which top-level modules are
+// the library's is looked up once each (<exe dir>/lib, <exe dir>/../lib).
+inline bool installation_module(const std::string& top) {
+    static std::mutex mu;
+    static std::unordered_map<std::string, bool> known;
+    std::lock_guard<std::mutex> g(mu);
+    auto it = known.find(top);
+    if (it != known.end()) return it->second;
+    bool found = false;
+    std::string exe = executable_path();
+    size_t cut = exe.find_last_of("/\\");
+    if (cut != std::string::npos && !top.empty()) {
+        std::string dir = exe.substr(0, cut + 1);
+        for (const std::string& lib : {dir + "lib/", dir + "../lib/"})
+            for (const std::string& f : {lib + top + ".ny", lib + top + "/__init__.ny"})
+                if (FILE* fp = std::fopen(f.c_str(), "rb")) { std::fclose(fp); found = true; }
+    }
+    known[top] = found;
+    return found;
+}
+inline std::string message_class_name(const std::string& shown) {
+    size_t dot = shown.rfind('.');
+    if (dot == std::string::npos) return shown;
+    if (installation_module(shown.substr(0, shown.find('.')))) return shown;
+    return shown.substr(dot + 1);
 }
 
 // The parser's decorator temporaries (`__decN__ = D` before a decorated def,

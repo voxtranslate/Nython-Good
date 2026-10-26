@@ -663,7 +663,7 @@ cbp (80 units) and the API baseline clean; under Wine (64-bit) vm_audit124
 
 ## 0z6. Round 87, part K — the semantic gaps round 86 found, and a differential tester (vm_audit126, `tools/difftest.py`)
 
-`examples/vm_audit126.ny` (NN checks) passes on both engines and under python3
+`examples/vm_audit126.ny` (62 checks) passes on both engines and under python3
 (all of them there: the Python-language parts run as a `.py` child on the same
 engine, the rest is valid Python whose meaning agrees). Sweep: SWEEP.
 
@@ -790,11 +790,16 @@ too).
 **9. Class names in messages**: a class of an imported module is keyed
 "pkg.mod.Obj" (round 77) and the messages used that key ("'pkg.mod.Obj'
 object is not callable"). They use the class's `__name__` now, as CPython's
-tp_name: `msgClassName` (interpreter: typeNameOf for instances, the
+tp_name of a class statement - except a class of the installation's own
+library, which keeps "module.Class" as the C types it stands for name
+themselves ('array.array', 'decimal.Decimal'; `nyrt::message_class_name`
+looks each top-level module up once in <exe dir>/lib and ../lib):
+`msgClassName` (interpreter: typeNameOf for instances, the
 not-iterable / not-subscriptable / no attribute / not callable / unary /
 item assignment / unpack / `__init_subclass__` messages, "type object 'Obj'
 has no attribute") and `bare_class_name(shown_class_name(...))` at the VM's
-(vm_type_name, attr_error_text, unary_dunder - which used the raw key). Reprs
+(`message_class_name(shown_class_name(...))`: vm_type_name, attr_error_text,
+unary_dunder - which used the raw key). Reprs
 were module + qualname for a module's top-level classes only: a nested class
 or one a function made said `<class '__main__.Inner'>` and `__module__`
 "__main__" wherever it was defined. Now `<class 'pkg.mod.Obj.Inner'>` and
@@ -826,7 +831,10 @@ executor's worker back at its queue: 'asyncio_0') ran the all-threads-blocked
 check, saw the loop thread still marked, and raised. Under Wine the woken
 thread runs late, so the window is wide. `new_task_locked` and
 `async_loop_stop` now clear the loop thread's mark as `make_ready` does (and
-wake a polling loop). The detector is unchanged. WINE.
+wake a polling loop). The detector is unchanged. Under Wine vm_audit104 then
+passed 40 runs of 40 (20 per engine, 102 checks each, no DeadlockError);
+vm_audit126 passes there too (58 checks per engine: the POSIX-only ones and
+the TLS server's, which needs the openssl command, are skipped).
 
 **12. More of the same kind** - what `tools/difftest.py` (below) and probes
 written from its findings turned up, fixed on both engines:
@@ -866,7 +874,9 @@ written from its findings turned up, fixed on both engines:
 - A value sent through `yield from` to an iterator without `send()` (a
   list's, a str's, map's, an object without send) was dropped and the
   iterator stepped; CPython raises "'list_iterator' object has no attribute
-  'send'" (NyGen.cpp's yield_from, the VM's YIELD_FROM_OP; a generator
+  'send'" (NyGen.cpp's yield_from; the VM's YIELD_FROM_OP, where a list's
+  or a range's iterator is a native generator - `GenState::native` - and a
+  str's is named at the first entry as iter() names it; a generator
   expression still takes it as next() does).
 - `[a for a, *b in [5]]` counted up to 5 (the prelude's `_ny_star_shape`
   listed the item, Nython code iterating an int): "cannot unpack
@@ -878,6 +888,13 @@ written from its findings turned up, fixed on both engines:
   `<lambda>.<locals>.<lambda>` (the parser pushes the lambda's qualname
   while it parses the body, as for a def) - the callee in "argument after *"
   messages too.
+- `x = {1}; x *= 2` made x the list `[1, 1]` (interpreter; `{1} * 2` too) or a
+  set holding 1 twice (VM), and on the VM `x += {"b": 2}` added the dict's
+  keys: CPython's TypeErrors (a set is no sequence to repeat or extend);
+  `(1,) ** {1}` said "for **" on the VM; `divmod(obj, 1)` said "for //" on
+  the interpreter, and both engines used `//` and `%` of a class without
+  `__divmod__` - CPython's "unsupported operand type(s) for divmod()" (the
+  VM's fallback was for timedelta, which has its own `__divmod__` now).
 - `obj.__name__` / `obj.__qualname__` of an instance read its class's on
   the interpreter (the tag-derived special attribute); CPython and the VM
   raise AttributeError (an instance's own field or a class attribute of
@@ -903,11 +920,13 @@ compares the interpreter with the VM on `.ny` programs. Generated programs
 are deterministic (no ids, hashes of strings, set orders, time), and
 `PYTHONHASHSEED=0` is set.
 
-Its first runs (180 programs) gave about 60 disagreement groups; the ones
-fixed are item 12 (and the class-name messages of item 9, which it found
-first). The rest is under "Not done". Run it after any change to operators,
-calls, generators or messages: a clean run is `0` groups for the units the
-engines agree on.
+On seeds 1-120 (`--count 120 --seed 1`) it gave 590 disagreeing
+observations in 120 groups before item 12's fixes and 147 in 27 groups after
+them; most of what is left is one cause (a builtin subclass's constructor
+iterating an int, under "Not done"), and the rest is listed there too
+(`int.is_integer` is new in 3.12: run it with python3.12 for that unit).
+Item 9's class names were its first finding. Run it after a change to
+operators, calls, generators or messages, and compare the group list.
 
 ### Not done
 
@@ -916,7 +935,9 @@ engines agree on.
   `D(2)` a dict-update error, `C1(2) + 1` (CPython: "'int' object is not
   iterable"). The prelude's mirror classes (`_NyB_list` ...) are
   Nython-language code and do the iterating; they would need the caller's
-  rule.
+  rule. The same for their operators: in a `.py` file `1 + S("1")` (a str
+  subclass) is "11" and `1 + L()` names 'list' (CPython: TypeErrors naming
+  'S' / 'L').
 - `abs(S("s"))` / `ord(L())` for a str/list subclass name the payload's type
   ("bad operand type for abs(): 'str'", CPython 'S'): builtins are handed the
   value, not the instance.

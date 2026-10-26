@@ -7525,7 +7525,7 @@ private:
         bool has_kw=kw.type==VMType::MAP&&kw.map&&!kw.map->empty();
         VMVal ns=vm_call(f,a,std::nullopt,has_kw?&kw:nullptr);
         if(ns.type!=VMType::INSTANCE&&ns.type!=VMType::MAP)
-            raise_native_exception("TypeError",nyrt::bare_class_name(nyrt::shown_class_name(class_key(meta)))+".__prepare__() must return a mapping, not "+vm_type_name(ns));
+            raise_native_exception("TypeError",nyrt::message_class_name(nyrt::shown_class_name(class_key(meta)))+".__prepare__() must return a mapping, not "+vm_type_name(ns));
         return std::make_shared<VMVal>(ns);
     }
     VMVal prepare_store(const VMVal& ns, const std::string& name, const VMVal& v, int& skip) {
@@ -7799,7 +7799,7 @@ private:
             std::vector<VMVal> a{clsv};
             vm_call(m, a, std::nullopt, has_kw?&kw:nullptr);
         } else if(has_kw)
-            raise_native_exception("TypeError", nyrt::bare_class_name(nyrt::shown_class_name(cname))+".__init_subclass__() takes no keyword arguments");
+            raise_native_exception("TypeError", nyrt::message_class_name(nyrt::shown_class_name(cname))+".__init_subclass__() takes no keyword arguments");
     }
     // The bases given by expressions (placeholders "\x06<i>"): a class, a
     // builtin type, or an object whose __mro_entries__ (PEP 560) names them.
@@ -9306,7 +9306,7 @@ private:
                     }
                 }
                 if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
-                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object is not subscriptable")}));}
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object is not subscriptable")}));}
                 if(obj.type==VMType::CLASS&&!class_meta_.empty()){ VMVal r; if(meta_call(obj,"__getitem__",{idx},r)){ push(std::move(r)); break; } }
                 if(obj.type==VMType::CLASS||obj.type==VMType::NATIVE){ VMVal cg; if(class_subscript(obj,idx,cg)){ push(std::move(cg)); break; } }
                 push(get_sub(obj,idx)); break;
@@ -9318,7 +9318,7 @@ private:
                 else if(obj.type!=VMType::INSTANCE&&idx.type==VMType::INSTANCE&&nyrt::shown_class_name(idx.class_name)=="slice")
                     idx=VMVal::make_list(slice_parts(idx));
                 if(obj.type==VMType::INSTANCE){bool f=false;call_dunder_f(obj,"__setitem__",{idx,val},f);if(f) break;
-                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object does not support item assignment")}));}
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object does not support item assignment")}));}
                 set_sub(obj,idx,std::move(val)); break;
             }
             case Op::DELETE_SUBSCR: {
@@ -9329,7 +9329,7 @@ private:
                 if(obj.type==VMType::INSTANCE){
                     bool f=false; call_dunder_f(obj,"__delitem__",{key},f);
                     if(f) break;
-                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object doesn't support item deletion")}));
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object doesn't support item deletion")}));
                 }
                 else if(obj.type==VMType::MAP&&obj.map){
                     if(obj.map->erase(vkey(key))==0) throw_exception(make_exception("KeyError",{key}));   // the key itself (round 77)
@@ -10037,7 +10037,15 @@ private:
                 GenState& gs=*gsp;
                 int mode=0;
                 VMVal sent, exc;
-                if(!gs.in_yield_from) it=vm_iter_open(it);
+                if(!gs.in_yield_from){
+                    const bool str=it.type==VMType::STRING;
+                    bool ascii=true;
+                    if(str) for(unsigned char ch:it.s) if(ch>=0x80){ ascii=false; break; }
+                    it=vm_iter_open(it);
+                    // named as iter() names it (round 87: the message of a send
+                    // to it, yield_from_no_send)
+                    if(str&&it.type==VMType::ITERATOR&&it.s.empty()) it.s=nyrt::iterator_type_for("str", ascii);
+                }
                 else {
                     mode=gs.mode; sent=gs.sent; exc=gs.pending;
                     gs.sent=VMVal::make_none(); gs.pending=VMVal::make_none();
@@ -10055,6 +10063,9 @@ private:
                 bool got=false;
                 if(it.type==VMType::GENERATOR&&it.gen){
                     GenState& sub=*it.gen;
+                    // round 87: a list's / range's ... iterator (a native
+                    // generator) has no send()
+                    if(mode==0&&sent.type!=VMType::NONE&&sub.native) yield_from_no_send(it);
                     if(mode==1){
                         if(sub.done||!sub.started){ if(!sub.started) gen_finish(sub); throw_exception(exc); }
                         got=gen_resume(sub,1,exc,v);
@@ -10069,16 +10080,7 @@ private:
                         if(e.value.type==VMType::INSTANCE&&e.value.map&&e.value.map->count("value")) result=(*e.value.map)["value"];
                     }
                 } else if(sent.type!=VMType::NONE&&!(it.type==VMType::INSTANCE&&[&]{ VMVal ms; return class_lookup(it.class_name,"send",ms); }())){
-                    // round 87: a value sent through `yield from` to an
-                    // iterator with no send() - CPython's AttributeError (the
-                    // value was dropped and the iterator stepped)
-                    VMVal t=type_object_of(it);
-                    std::string tn=vm_type_name(it);
-                    if(t.type==VMType::NATIVE&&t.class_name.rfind("__rtype__:",0)==0){
-                        const nyrt::RuntimeType* rt=nyrt::runtime_type(t.class_name.substr(10));
-                        if(rt) tn=rt->name;
-                    }
-                    throw_exception(make_exception("AttributeError",{VMVal::make_str("'"+tn+"' object has no attribute 'send'")}));
+                    yield_from_no_send(it);   // round 87
                 } else if(it.type==VMType::INSTANCE){
                     VMVal m;
                     bool use_send = sent.type!=VMType::NONE && class_lookup(it.class_name,"send",m);
@@ -10195,7 +10197,7 @@ private:
                     try { nv=call_dunder_f(it_copy,"__next__",{},found); }
                     catch(VMException& e){ if(is_stop_iteration(e.value)) stop_iter=true; else throw; }
                     if(!stop_iter && !found)
-                        throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::bare_class_name(nyrt::shown_class_name(it_copy.class_name))+"' object is not an iterator")}));
+                        throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::message_class_name(nyrt::shown_class_name(it_copy.class_name))+"' object is not an iterator")}));
                     if(stop_iter){ pop(); fr.ip=ins.arg; break; }
                     push(nv); break;
                 }
@@ -11425,7 +11427,7 @@ private:
                 if(v.class_name.rfind("__rtype__:",0)==0||!v.builtin_type_name().empty()) return "type";
                 return "builtin_function_or_method";
             case VMType::CLASS: return "type";
-            case VMType::INSTANCE: return nyrt::bare_class_name(nyrt::shown_class_name(v.class_name));
+            case VMType::INSTANCE: return nyrt::message_class_name(nyrt::shown_class_name(v.class_name));
             // Python's names: zip, map, list_iterator ... (round 77)
             case VMType::GENERATOR: return v.gen&&v.gen->native?v.gen->name:"generator";
             case VMType::ITERATOR: return v.s.empty()?"iterator":v.s;
@@ -11609,7 +11611,7 @@ private:
             // | & - ^ between sets (round 77); anything else is a TypeError
             char so=op==nypy::A_OR?'|':op==nypy::A_AND?'&':op==nypy::A_SUB?'-':op==nypy::A_XOR?'^':0;
             if(so&&l.is_set()&&r.is_set()) return set_op(so,l,r);
-            static const char* names[]={"?","+","-","*","/","//","%","**","&","|","^","<<",">>"};
+            static const char* names[]={"?","+","-","*","/","//","%","** or pow()","&","|","^","<<",">>"};   // (round 87: CPython's "** or pow()")
             std::string sym=(op>=1&&op<=12)?names[op]:"?";
             if(l.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                 raise_native_exception("TypeError","unsupported operand type(s) for "+sym+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
@@ -11702,7 +11704,7 @@ private:
             nycall([&]{ nypy::ba_assign(l.bdata_mut(),nypy::repeat_str(l.bdata(),times),l.ba_exports()); return 0; });   // round 84
             return l;
         }
-        if(l.type==VMType::LIST&&!l.b&&l.list){
+        if(l.type==VMType::LIST&&!l.b&&l.list&&!l.is_set()){   // (round 87: a set's += / *= extended it as a list)
             if(op==nypy::A_ADD){
                 std::vector<VMVal> more=iter_items(r);
                 l.list->insert(l.list->end(),more.begin(),more.end());
@@ -11917,7 +11919,7 @@ private:
                         }
                         return out;
                     }
-                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::bare_class_name(nyrt::shown_class_name(v.class_name))+"' object is not iterable")}));
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::message_class_name(nyrt::shown_class_name(v.class_name))+"' object is not iterable")}));
                 }
                 while(true){
                     try { out.push_back(call_dunder(iterator,"__next__",{})); }
@@ -12954,11 +12956,11 @@ private:
         }
     }
     std::string attr_error_text(const VMVal& obj, const std::string& attr){
-        if(obj.type==VMType::INSTANCE) return "'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+attr+"'";
+        if(obj.type==VMType::INSTANCE) return "'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+attr+"'";
         if(obj.type==VMType::SUPER_PROXY) return "'super' object has no attribute '"+attr+"'";   // round 78
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
-            return "type object '"+nyrt::bare_class_name(nyrt::shown_class_name(cname))+"' has no attribute '"+attr+"'";   // round 87: its __name__
+            return "type object '"+nyrt::message_class_name(nyrt::shown_class_name(cname))+"' has no attribute '"+attr+"'";   // round 87: its __name__
         }
         // round 84: a module's, as CPython says it (it read "'dict' object")
         if(is_module_ns(obj)&&!is_property_desc(obj)&&obj.class_name.rfind("__",0)!=0){
@@ -13216,7 +13218,7 @@ private:
         // an instance of a class with __slots__ and no __dict__ takes no
         // other attribute (round 79; its slots were stored above)
         if(!slot_flags_.empty()&&is_dictless(obj))
-            raise_native_exception("AttributeError","'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+attr+"'");
+            raise_native_exception("AttributeError","'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+attr+"'");
         // obj.__dict__ = d: the fields become d's items (round 77; it stored
         // a field named __dict__)
         if(attr=="__dict__"&&obj.type==VMType::INSTANCE&&obj.map){
@@ -13427,7 +13429,7 @@ private:
                 throw;
             }
             if(f) return true;
-            raise_native_exception("TypeError","'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object is not subscriptable");
+            raise_native_exception("TypeError","'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object is not subscriptable");
         }
         out=get_sub(obj,idx);
         return true;
@@ -13556,7 +13558,7 @@ private:
             }
             if(class_lookup(callee.class_name, "__call__", m)) return invoke_method(m, callee, args, callee.class_name, kwargs);
             (void)found;
-            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::bare_class_name(nyrt::shown_class_name(callee.class_name))+"' object is not callable")}));
+            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::message_class_name(nyrt::shown_class_name(callee.class_name))+"' object is not callable")}));
         }
         // A method bound to its instance (obj.m read as a value), or a
         // classmethod bound to its class.
@@ -13908,7 +13910,7 @@ private:
             // hid misspelt method names).
             if(method=="slice") not_subscriptable(obj);   // round 87: x[a:b] (the parser's x.slice(a, b))
             throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                "'"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+method+"'")}));
+                "'"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' object has no attribute '"+method+"'")}));
         }
         // Class.method(...): a static method or a Nython method without self
         // takes the arguments as they are, a classmethod gets the class, and
@@ -13959,7 +13961,7 @@ private:
             }
             if(!is_ctor_name(method) && class_reg_.count(obj.class_name))
                 throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                    "type object '"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' has no attribute '"+method+"'")}));
+                    "type object '"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' has no attribute '"+method+"'")}));
         }
         // str/list/dict methods and natives take keywords as a trailing map
         // marked "__kwargs__" (take_kwargs): L.sort(reverse=true),
@@ -14047,6 +14049,18 @@ private:
         if(method=="slice") not_subscriptable(obj);   // round 87: x[a:b] (the parser's x.slice(a, b))
         return missing_attr(obj, method);
     }
+    // round 87: a value sent through `yield from` to an iterator with no
+    // send() - CPython's AttributeError, the iterator named as type() names
+    // it (the value was dropped and the iterator stepped)
+    [[noreturn]] void yield_from_no_send(const VMVal& it){
+        VMVal t=type_object_of(it);
+        std::string tn=vm_type_name(it);
+        if(t.type==VMType::NATIVE&&t.class_name.rfind("__rtype__:",0)==0){
+            const nyrt::RuntimeType* rt=nyrt::runtime_type(t.class_name.substr(10));
+            if(rt) tn=rt->name;
+        }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str("'"+tn+"' object has no attribute 'send'")}));
+    }
     // round 87: dict(seq) / d.update(seq) - CPython's messages, naming the
     // element (#i) that is no sequence (kv null) or no pair
     void dict_pair_check(const VMVal& pr, int64_t el, const std::vector<VMVal>* kv){
@@ -14061,7 +14075,7 @@ private:
     // (it said "'float' object has no attribute 'slice'")
     [[noreturn]] void not_subscriptable(const VMVal& obj){
         if(obj.type==VMType::CLASS)
-            raise_native_exception("TypeError","type '"+nyrt::bare_class_name(nyrt::shown_class_name(obj.class_name))+"' is not subscriptable");
+            raise_native_exception("TypeError","type '"+nyrt::message_class_name(nyrt::shown_class_name(obj.class_name))+"' is not subscriptable");
         raise_native_exception("TypeError","'"+vm_type_name(obj)+"' object is not subscriptable");
     }
 
@@ -15484,7 +15498,7 @@ private:
             std::string n=a[1].type==VMType::STRING?a[1].s:std::string();
             auto it=n.empty()?a[0].map->end():a[0].map->find(n);
             if(it==a[0].map->end())
-                raise_native_exception("AttributeError","'"+nyrt::bare_class_name(nyrt::shown_class_name(a[0].class_name))+"' object has no attribute '"+n+"'");
+                raise_native_exception("AttributeError","'"+nyrt::message_class_name(nyrt::shown_class_name(a[0].class_name))+"' object has no attribute '"+n+"'");
             return it->second; });
         globals_["_ny_mark_slots"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()>=2&&a[0].type==VMType::CLASS&&a[1].type==VMType::INT) slot_flags_[class_key(a[0])]=(int)a[1].i;
@@ -16731,12 +16745,10 @@ private:
         def("divmod",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
             if(a.size()<2) vm->raise_native_exception("TypeError","divmod expected 2 arguments");
             if(a[0].type==VMType::INSTANCE||a[1].type==VMType::INSTANCE){
-                // __divmod__ / __rdivmod__, else the objects' // and %
-                // (divmod(timedelta, timedelta) was a TypeError)
-                VMVal res,q,r;
+                // __divmod__ / __rdivmod__ (round 87: not the objects' // and
+                // %, as CPython - timedelta has its own __divmod__ now)
+                VMVal res;
                 if(vm->binary_dunder(a[0],a[1],"__divmod__","__rdivmod__",res)) return res;
-                if(vm->binary_dunder(a[0],a[1],"__floordiv__","__rfloordiv__",q)&&vm->binary_dunder(a[0],a[1],"__mod__","__rmod__",r))
-                    return VMVal::make_tuple({q,r});
                 vm->raise_native_exception("TypeError","unsupported operand type(s) for divmod(): '"+vm_type_name(a[0])+"' and '"+vm_type_name(a[1])+"'");
             }
             return VMVal::make_tuple({vm->binop(nypy::A_FLOORDIV,a[0],a[1]),vm->binop(nypy::A_MOD,a[0],a[1])});
