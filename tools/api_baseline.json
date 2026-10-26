@@ -2060,7 +2060,7 @@
   },
   "xml.parsers": {
    "both": "",
-   "cpython": 0
+   "cpython": 1
   },
   "xml.parsers.expat": {
    "both": "EXPAT_VERSION ErrorString ExpatError ParserCreate XMLParserType XML_PARAM_ENTITY_PARSING_ALWAYS XML_PARAM_ENTITY_PARSING_NEVER XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE error features native_encoding version_info",
