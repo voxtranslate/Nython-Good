@@ -1591,6 +1591,20 @@ def getmodule(object, _filename=None):
     # imported (or the main program's globals for __main__)
     if ismodule(object):
         return object
+    # round 87: the module itself when it is in sys.modules, as CPython's
+    # (doctest's DocTestFinder asks `module is getmodule(obj)`); a copy of
+    # the globals otherwise, as before
+    # (functions, classes, methods and builtins: the objects whose
+    # __module__ CPython reads - a property or another builtin object has
+    # none there)
+    var modname = None
+    if isfunction(object) or isclass(object) or ismethod(object) or isbuiltin(object):
+        modname = getattr(object, "__module__", None)
+    if isinstance(modname, str):
+        var sysmod = __import__("sys")
+        var mod = sysmod.modules.get(modname)
+        if mod is not None and ismodule(mod):
+            return mod
     var g = None
     if ismethod(object):
         object = object.__func__

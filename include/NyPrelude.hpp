@@ -3235,17 +3235,20 @@ class _NyMainModule(_NyModuleType):
     # the program's globals() itself
     def __init__(self):
         object.__setattr__(self, "__name__", "__main__")
-        object.__setattr__(self, "__doc__", None)
         object.__setattr__(self, "__package__", None)
         object.__setattr__(self, "__loader__", None)
         object.__setattr__(self, "__spec__", None)
+    @property
+    def __doc__(self):
+        # (round 87) the program's docstring, or None: its global __doc__
+        return _ny_main_globals().get("__doc__")
     def __getattr__(self, name):
         var g = _ny_main_globals()
         if name in g:
             return g[name]
         raise AttributeError("module '__main__' has no attribute '" + name + "'")
     def __setattr__(self, name, value):
-        if name in ("__name__", "__doc__", "__package__", "__loader__", "__spec__"):
+        if name in ("__name__", "__package__", "__loader__", "__spec__"):
             object.__setattr__(self, name, value)
         _ny_main_set(name, value)
     def __delattr__(self, name):
@@ -3898,6 +3901,19 @@ def _ny_prompt_display(value):
         raise RuntimeError("lost sys.displayhook")
     h(value)
     return True
+
+def _ny_single_display(value):
+    # (round 87) an expression statement's value in code compiled in
+    # "single" mode (NySingleMode.hpp): sys.displayhook shows it, as
+    # CPython's PRINT_EXPR does - None too (the hook ignores it)
+    var s = _ny_sys_ref[0]
+    if s is None:
+        return _ny_displayhook(value)
+    var h = getattr(s, "displayhook", None)
+    if h is None:
+        raise RuntimeError("lost sys.displayhook")
+    h(value)
+    return None
 
 def _ny_sys_extend(sysmod):
     # the Python-level members of sys: the language level Nython implements

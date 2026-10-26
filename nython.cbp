@@ -169,6 +169,7 @@
         <Unit filename="src/NyPreludePosix.cpp" />
         <Unit filename="src/NyPreludeAudit.cpp" />
         <Unit filename="src/builtins/hashing.cpp" />
+        <Unit filename="src/builtins/nycrypt.cpp" />
         <Unit filename="src/builtins/pymath.cpp" />
         <Unit filename="src/builtins/pyjson.cpp" />
         <Unit filename="src/builtins/pyrandom.cpp" />

@@ -1,6 +1,8 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
 # nython: python    (Python's binding rule: a name a function binds is its local - round 85)
-# lib/re.ny - Python's re (round 77): regular expressions.
+# lib/re/__init__.ny - Python's re (round 77; a package since round 87, its
+# re._parser / _compiler / _constants / _casefix CPython's, loaded on first use):
+# regular expressions.
 #
 #     import re
 #     m = re.search(r"(?P<key>\w+)\s*=\s*(\d+)", line)
@@ -489,3 +491,17 @@ def purge():
     _cache.clear()
     _cache0.clear()
     _re_purge()
+
+
+# (round 87) re is a package, as CPython's: re._parser, re._compiler,
+# re._constants and re._casefix are CPython's pure-Python parser and
+# compiler (sre_parse / sre_compile / sre_constants alias them), imported
+# on first use - the matcher above never needs them.
+_SUBMODULES = ("_parser", "_compiler", "_constants", "_casefix")
+
+
+def __getattr__(name):
+    if name in _SUBMODULES:
+        __import__("re." + name)
+        return __import__("sys").modules["re." + name]
+    raise AttributeError(f"module 're' has no attribute {name!r}")

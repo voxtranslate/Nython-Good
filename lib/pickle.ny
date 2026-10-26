@@ -713,7 +713,10 @@ class Pickler:
         if t is str:
             self._save_str(obj)
             return
-        if t is dict:
+        if t is dict or t is _NyInstanceDict or t is _NyGlobalsDict:
+            # (round 87: an instance's live __dict__ - and globals() - pickle
+            # as the dict they stand for, as CPython's real dicts do;
+            # lib2to3's grammar pickles its own __dict__)
             self._save_dict(obj)
             return
         if t is set:

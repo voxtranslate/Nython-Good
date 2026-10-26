@@ -112,6 +112,7 @@ static std::string utf8_lower(const std::string& s) {
 
 #include "Context.hpp"
 #include "ASTNodes.hpp"
+#include "NySingleMode.hpp"   // compile(..., "single") (round 87)
 #include "Interpreter.hpp"
 #include "Class.hpp"
 #include "VirtualMachine.hpp"
@@ -938,6 +939,10 @@ public:   // NythonExecutor is a struct: members default to public
 
     Value execute(node_ptr ast) {
         if (!ast) return NONE_VALUE;
+        if (!main_ast_) {   // round 87: the program's docstring, or None, is __main__.__doc__
+            std::string doc;
+            global_ctx->defineByName("__doc__", nython::node::module_docstring(ast, doc) ? makeStringValue(doc) : NONE_VALUE);
+        }
         main_ast_ = ast.get();   // round 81: the module frame's code block (f_lineno jumps)
         try {
             return evalNode(ast, global_ctx);
@@ -4755,8 +4760,15 @@ public:   // NythonExecutor is a struct: members default to public
                     v = it->second;
                 }
                 for (auto& step : f.chain) {
-                    if (step.first == '.') v = attrOf(v, step.second);
-                    else {
+                    if (step.first == '.') {
+                        // round 87: any attribute (a class's, a property's, a
+                        // method), as getattr reads it - "{0.month}" of a date
+                        // raised AttributeError; the VM read them
+                        Value nv;
+                        if (!getAttrValue(v, step.second, ctx, nv))
+                            pyRaise("AttributeError", "'" + typeNameOf(v) + "' object has no attribute '" + step.second + "'");
+                        v = nv;
+                    } else {
                         bool digits = !step.second.empty() && std::all_of(step.second.begin(), step.second.end(), [](char c) { return c >= '0' && c <= '9'; });
                         v = getItem(v, digits ? intValue((int64_t)std::stoll(step.second)) : makeStringValue(step.second), ctx);
                     }
@@ -10988,7 +11000,18 @@ public:
                             // round 84: an instance's is its class's, as Python
                             // finds it in the class's namespace
                             if (t.rfind("__instance__:", 0) == 0)
-                                if (Node* icn = classNodeOfInstance(obj)) return getAttrValue(classValueOfNode(icn), "__module__", ctx, out);
+                                if (Node* icn = classNodeOfInstance(obj)) {
+                                    // round 87: an instance of a builtin type has
+                                    // none (CPython's property(), range(3) ...:
+                                    // doctest's finder took a property for
+                                    // another module's); staticmethod and
+                                    // classmethod objects carry their function's
+                                    if (auto* icc = dynamic_cast<ClassNode*>(icn)) {
+                                        std::string cnm = shownClassName(icc->name);
+                                        if (nyrt::is_python_builtin_class(cnm) && cnm != "staticmethod" && cnm != "classmethod") return false;
+                                    }
+                                    return getAttrValue(classValueOfNode(icn), "__module__", ctx, out);
+                                }
                             return false;
                         }
                         // the builtin exceptions and object are builtins' (round
@@ -13883,6 +13906,10 @@ public:
         module_ctxs_.push_back(mctx);
         mctx->defineByName("__name__", makeStringValue(module_name));
         mctx->defineByName("__file__", makeStringValue(filepath));
+        {   // round 87: the module's docstring, or None (NySingleMode.hpp)
+            std::string doc;
+            mctx->defineByName("__doc__", nython::node::module_docstring(ast, doc) ? makeStringValue(doc) : NONE_VALUE);
+        }
         {   // round 80: __package__ (relative imports, importlib) and a package's __path__
             bool pkg = nyrt::is_package_init(filepath);
             size_t dot = module_name.rfind('.');
@@ -15733,7 +15760,7 @@ public:
         std::string mode = is_exec ? "exec" : "eval", fname = "<string>";
         int crule = -1;
         std::string src = snippetSource(args[0], mode, fname, who, &crule);
-        if (mode == "exec") is_exec = true;    // eval(compile(..., "exec")) runs it
+        if (mode == "exec" || mode == "single") is_exec = true;    // eval(compile(..., "exec")) runs it
         if (!is_exec) {
             size_t b = src.find_first_not_of(" \t");
             src = b == std::string::npos ? std::string() : src.substr(b);
@@ -15752,6 +15779,7 @@ public:
         }
         if (!ast) return NONE_VALUE;
         if (!is_exec && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
+        if (mode == "single") nython::node::single_display(ast);   // round 87: interactive code shows its values
         if (top_locals) {
             // a scope of its own over the function's: it reads the
             // function's variables, and what it binds is dropped with it
@@ -15908,7 +15936,9 @@ public:
         }
         if (mode == "eval" && ast && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
         Value cls = global_ctx->getByName("_NyCode");
-        std::vector<Value> a{makeStringValue(src), makeStringValue(fname), makeStringValue(mode == "single" ? "exec" : mode), Value(py)};
+        // (round 87: a "single" code object stays one - exec shows its
+        // expression statements' values, NySingleMode.hpp)
+        std::vector<Value> a{makeStringValue(src), makeStringValue(fname), makeStringValue(mode), Value(py)};
         return callFunctionValue(cls, a, ctx);
     }
 

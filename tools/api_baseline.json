@@ -1,6 +1,10 @@
 {
  "comment": "tools/api_diff.py --write-baseline: per module, the CPython names each Nython engine has",
  "modules": {
+  "__future__": {
+   "both": "CO_FUTURE_ABSOLUTE_IMPORT CO_FUTURE_ANNOTATIONS CO_FUTURE_BARRY_AS_BDFL CO_FUTURE_DIVISION CO_FUTURE_GENERATOR_STOP CO_FUTURE_PRINT_FUNCTION CO_FUTURE_UNICODE_LITERALS CO_FUTURE_WITH_STATEMENT CO_GENERATOR_ALLOWED CO_NESTED absolute_import all_feature_names annotations barry_as_FLUFL division generator_stop generators nested_scopes print_function unicode_literals with_statement",
+   "cpython": 21
+  },
   "_codecs_cn": {
    "both": "getcodec",
    "cpython": 1
@@ -33,6 +37,10 @@
    "both": "BUFFER_SIZE BaseStream DecompressReader",
    "cpython": 3
   },
+  "_crypt": {
+   "both": "crypt",
+   "cpython": 1
+  },
   "_curses": {
    "both": "ALL_MOUSE_EVENTS A_ALTCHARSET A_ATTRIBUTES A_BLINK A_BOLD A_CHARTEXT A_COLOR A_DIM A_HORIZONTAL A_INVIS A_ITALIC A_LEFT A_LOW A_NORMAL A_PROTECT A_REVERSE A_RIGHT A_STANDOUT A_TOP A_UNDERLINE A_VERTICAL BUTTON1_CLICKED BUTTON1_DOUBLE_CLICKED BUTTON1_PRESSED BUTTON1_RELEASED BUTTON1_TRIPLE_CLICKED BUTTON2_CLICKED BUTTON2_DOUBLE_CLICKED BUTTON2_PRESSED BUTTON2_RELEASED BUTTON2_TRIPLE_CLICKED BUTTON3_CLICKED BUTTON3_DOUBLE_CLICKED BUTTON3_PRESSED BUTTON3_RELEASED BUTTON3_TRIPLE_CLICKED BUTTON4_CLICKED BUTTON4_DOUBLE_CLICKED BUTTON4_PRESSED BUTTON4_RELEASED BUTTON4_TRIPLE_CLICKED BUTTON5_CLICKED BUTTON5_DOUBLE_CLICKED BUTTON5_PRESSED BUTTON5_RELEASED BUTTON5_TRIPLE_CLICKED BUTTON_ALT BUTTON_CTRL BUTTON_SHIFT COLOR_BLACK COLOR_BLUE COLOR_CYAN COLOR_GREEN COLOR_MAGENTA COLOR_RED COLOR_WHITE COLOR_YELLOW ERR KEY_A1 KEY_A3 KEY_B2 KEY_BACKSPACE KEY_BEG KEY_BREAK KEY_BTAB KEY_C1 KEY_C3 KEY_CANCEL KEY_CATAB KEY_CLEAR KEY_CLOSE KEY_COMMAND KEY_COPY KEY_CREATE KEY_CTAB KEY_DC KEY_DL KEY_DOWN KEY_EIC KEY_END KEY_ENTER KEY_EOL KEY_EOS KEY_EXIT KEY_F0 KEY_F1 KEY_F10 KEY_F11 KEY_F12 KEY_F13 KEY_F14 KEY_F15 KEY_F16 KEY_F17 KEY_F18 KEY_F19 KEY_F2 KEY_F20 KEY_F21 KEY_F22 KEY_F23 KEY_F24 KEY_F25 KEY_F26 KEY_F27 KEY_F28 KEY_F29 KEY_F3 KEY_F30 KEY_F31 KEY_F32 KEY_F33 KEY_F34 KEY_F35 KEY_F36 KEY_F37 KEY_F38 KEY_F39 KEY_F4 KEY_F40 KEY_F41 KEY_F42 KEY_F43 KEY_F44 KEY_F45 KEY_F46 KEY_F47 KEY_F48 KEY_F49 KEY_F5 KEY_F50 KEY_F51 KEY_F52 KEY_F53 KEY_F54 KEY_F55 KEY_F56 KEY_F57 KEY_F58 KEY_F59 KEY_F6 KEY_F60 KEY_F61 KEY_F62 KEY_F63 KEY_F7 KEY_F8 KEY_F9 KEY_FIND KEY_HELP KEY_HOME KEY_IC KEY_IL KEY_LEFT KEY_LL KEY_MARK KEY_MAX KEY_MESSAGE KEY_MIN KEY_MOUSE KEY_MOVE KEY_NEXT KEY_NPAGE KEY_OPEN KEY_OPTIONS KEY_PPAGE KEY_PREVIOUS KEY_PRINT KEY_REDO KEY_REFERENCE KEY_REFRESH KEY_REPLACE KEY_RESET KEY_RESIZE KEY_RESTART KEY_RESUME KEY_RIGHT KEY_SAVE KEY_SBEG KEY_SCANCEL KEY_SCOMMAND KEY_SCOPY KEY_SCREATE KEY_SDC KEY_SDL KEY_SELECT KEY_SEND KEY_SEOL KEY_SEXIT KEY_SF KEY_SFIND KEY_SHELP KEY_SHOME KEY_SIC KEY_SLEFT KEY_SMESSAGE KEY_SMOVE KEY_SNEXT KEY_SOPTIONS KEY_SPREVIOUS KEY_SPRINT KEY_SR KEY_SREDO KEY_SREPLACE KEY_SRESET KEY_SRIGHT KEY_SRSUME KEY_SSAVE KEY_SSUSPEND KEY_STAB KEY_SUNDO KEY_SUSPEND KEY_UNDO KEY_UP OK REPORT_MOUSE_POSITION baudrate beep can_change_color cbreak color_content color_pair curs_set def_prog_mode def_shell_mode delay_output doupdate echo endwin erasechar error filter flash flushinp get_escdelay get_tabsize getmouse getsyx getwin halfdelay has_colors has_extended_color_support has_ic has_il has_key init_color init_pair initscr intrflush is_term_resized isendwin keyname killchar longname meta mouseinterval mousemask napms ncurses_version newpad newwin nl nocbreak noecho nonl noqiflush noraw pair_content pair_number putp qiflush raw reset_prog_mode reset_shell_mode resetty resize_term resizeterm savetty set_escdelay set_tabsize setsyx setupterm start_color termattrs termname tigetflag tigetnum tigetstr tparm typeahead unctrl unget_wch ungetch ungetmouse update_lines_cols use_default_colors use_env version window",
    "cpython": 299
@@ -57,6 +65,10 @@
    "both": "Blob Connection Cursor DataError DatabaseError Error IntegrityError InterfaceError InternalError LEGACY_TRANSACTION_CONTROL NotSupportedError OperationalError PARSE_COLNAMES PARSE_DECLTYPES PrepareProtocol ProgrammingError Row SQLITE_ABORT SQLITE_ABORT_ROLLBACK SQLITE_ALTER_TABLE SQLITE_ANALYZE SQLITE_ATTACH SQLITE_AUTH SQLITE_AUTH_USER SQLITE_BUSY SQLITE_BUSY_RECOVERY SQLITE_BUSY_SNAPSHOT SQLITE_BUSY_TIMEOUT SQLITE_CANTOPEN SQLITE_CANTOPEN_CONVPATH SQLITE_CANTOPEN_DIRTYWAL SQLITE_CANTOPEN_FULLPATH SQLITE_CANTOPEN_ISDIR SQLITE_CANTOPEN_NOTEMPDIR SQLITE_CANTOPEN_SYMLINK SQLITE_CONSTRAINT SQLITE_CONSTRAINT_CHECK SQLITE_CONSTRAINT_COMMITHOOK SQLITE_CONSTRAINT_FOREIGNKEY SQLITE_CONSTRAINT_FUNCTION SQLITE_CONSTRAINT_NOTNULL SQLITE_CONSTRAINT_PINNED SQLITE_CONSTRAINT_PRIMARYKEY SQLITE_CONSTRAINT_ROWID SQLITE_CONSTRAINT_TRIGGER SQLITE_CONSTRAINT_UNIQUE SQLITE_CONSTRAINT_VTAB SQLITE_CORRUPT SQLITE_CORRUPT_INDEX SQLITE_CORRUPT_SEQUENCE SQLITE_CORRUPT_VTAB SQLITE_CREATE_INDEX SQLITE_CREATE_TABLE SQLITE_CREATE_TEMP_INDEX SQLITE_CREATE_TEMP_TABLE SQLITE_CREATE_TEMP_TRIGGER SQLITE_CREATE_TEMP_VIEW SQLITE_CREATE_TRIGGER SQLITE_CREATE_VIEW SQLITE_CREATE_VTABLE SQLITE_DBCONFIG_DEFENSIVE SQLITE_DBCONFIG_DQS_DDL SQLITE_DBCONFIG_DQS_DML SQLITE_DBCONFIG_ENABLE_FKEY SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION SQLITE_DBCONFIG_ENABLE_QPSG SQLITE_DBCONFIG_ENABLE_TRIGGER SQLITE_DBCONFIG_ENABLE_VIEW SQLITE_DBCONFIG_LEGACY_ALTER_TABLE SQLITE_DBCONFIG_LEGACY_FILE_FORMAT SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE SQLITE_DBCONFIG_RESET_DATABASE SQLITE_DBCONFIG_TRIGGER_EQP SQLITE_DBCONFIG_TRUSTED_SCHEMA SQLITE_DBCONFIG_WRITABLE_SCHEMA SQLITE_DELETE SQLITE_DENY SQLITE_DETACH SQLITE_DONE SQLITE_DROP_INDEX SQLITE_DROP_TABLE SQLITE_DROP_TEMP_INDEX SQLITE_DROP_TEMP_TABLE SQLITE_DROP_TEMP_TRIGGER SQLITE_DROP_TEMP_VIEW SQLITE_DROP_TRIGGER SQLITE_DROP_VIEW SQLITE_DROP_VTABLE SQLITE_EMPTY SQLITE_ERROR SQLITE_ERROR_MISSING_COLLSEQ SQLITE_ERROR_RETRY SQLITE_ERROR_SNAPSHOT SQLITE_FORMAT SQLITE_FULL SQLITE_FUNCTION SQLITE_IGNORE SQLITE_INSERT SQLITE_INTERNAL SQLITE_INTERRUPT SQLITE_IOERR SQLITE_IOERR_ACCESS SQLITE_IOERR_AUTH SQLITE_IOERR_BEGIN_ATOMIC SQLITE_IOERR_BLOCKED SQLITE_IOERR_CHECKRESERVEDLOCK SQLITE_IOERR_CLOSE SQLITE_IOERR_COMMIT_ATOMIC SQLITE_IOERR_CONVPATH SQLITE_IOERR_CORRUPTFS SQLITE_IOERR_DATA SQLITE_IOERR_DELETE SQLITE_IOERR_DELETE_NOENT SQLITE_IOERR_DIR_CLOSE SQLITE_IOERR_DIR_FSYNC SQLITE_IOERR_FSTAT SQLITE_IOERR_FSYNC SQLITE_IOERR_GETTEMPPATH SQLITE_IOERR_LOCK SQLITE_IOERR_MMAP SQLITE_IOERR_NOMEM SQLITE_IOERR_RDLOCK SQLITE_IOERR_READ SQLITE_IOERR_ROLLBACK_ATOMIC SQLITE_IOERR_SEEK SQLITE_IOERR_SHMLOCK SQLITE_IOERR_SHMMAP SQLITE_IOERR_SHMOPEN SQLITE_IOERR_SHMSIZE SQLITE_IOERR_SHORT_READ SQLITE_IOERR_TRUNCATE SQLITE_IOERR_UNLOCK SQLITE_IOERR_VNODE SQLITE_IOERR_WRITE SQLITE_LIMIT_ATTACHED SQLITE_LIMIT_COLUMN SQLITE_LIMIT_COMPOUND_SELECT SQLITE_LIMIT_EXPR_DEPTH SQLITE_LIMIT_FUNCTION_ARG SQLITE_LIMIT_LENGTH SQLITE_LIMIT_LIKE_PATTERN_LENGTH SQLITE_LIMIT_SQL_LENGTH SQLITE_LIMIT_TRIGGER_DEPTH SQLITE_LIMIT_VARIABLE_NUMBER SQLITE_LIMIT_VDBE_OP SQLITE_LIMIT_WORKER_THREADS SQLITE_LOCKED SQLITE_LOCKED_SHAREDCACHE SQLITE_LOCKED_VTAB SQLITE_MISMATCH SQLITE_MISUSE SQLITE_NOLFS SQLITE_NOMEM SQLITE_NOTADB SQLITE_NOTFOUND SQLITE_NOTICE SQLITE_NOTICE_RECOVER_ROLLBACK SQLITE_NOTICE_RECOVER_WAL SQLITE_OK SQLITE_OK_LOAD_PERMANENTLY SQLITE_OK_SYMLINK SQLITE_PERM SQLITE_PRAGMA SQLITE_PROTOCOL SQLITE_RANGE SQLITE_READ SQLITE_READONLY SQLITE_READONLY_CANTINIT SQLITE_READONLY_CANTLOCK SQLITE_READONLY_DBMOVED SQLITE_READONLY_DIRECTORY SQLITE_READONLY_RECOVERY SQLITE_READONLY_ROLLBACK SQLITE_RECURSIVE SQLITE_REINDEX SQLITE_ROW SQLITE_SAVEPOINT SQLITE_SCHEMA SQLITE_SELECT SQLITE_TOOBIG SQLITE_TRANSACTION SQLITE_UPDATE SQLITE_WARNING SQLITE_WARNING_AUTOINDEX Warning adapt adapters complete_statement connect converters enable_callback_tracebacks enable_shared_cache register_adapter register_converter sqlite_version threadsafety",
    "cpython": 198
   },
+  "_sre": {
+   "both": "CODESIZE MAGIC MAXGROUPS MAXREPEAT ascii_iscased ascii_tolower compile copyright getcodesize unicode_iscased unicode_tolower",
+   "cpython": 12
+  },
   "_thread": {
    "both": "LockType RLock TIMEOUT_MAX allocate allocate_lock daemon_threads_allowed error exit exit_thread get_ident get_native_id interrupt_main stack_size start_new start_new_thread",
    "cpython": 15
@@ -80,6 +92,10 @@
   "ast": {
    "both": "AST Add And AnnAssign Assert Assign AsyncFor AsyncFunctionDef AsyncWith Attribute AugAssign AugLoad AugStore Await BinOp BitAnd BitOr BitXor BoolOp Break Bytes Call ClassDef Compare Constant Continue Del Delete Dict DictComp Div Eq ExceptHandler Expr Expression ExtSlice FloorDiv For FormattedValue FunctionDef FunctionType GeneratorExp Global Gt GtE If IfExp Import ImportFrom In Index Interactive Invert Is IsNot JoinedStr LShift Lambda List ListComp Load Lt LtE MatMult Match MatchAs MatchClass MatchMapping MatchOr MatchSequence MatchSingleton MatchStar MatchValue Mod Module Mult Name NameConstant NamedExpr NodeTransformer NodeVisitor Nonlocal Not NotEq NotIn Num Or Param ParamSpec Pass Pow PyCF_ALLOW_TOP_LEVEL_AWAIT PyCF_ONLY_AST PyCF_TYPE_COMMENTS RShift Raise Return Set SetComp Slice Starred Store Str Sub Subscript Suite Try TryStar Tuple TypeAlias TypeIgnore TypeVar TypeVarTuple UAdd USub UnaryOp While With Yield YieldFrom alias arg arguments boolop cmpop comprehension copy_location dump excepthandler expr expr_context fix_missing_locations get_docstring get_source_segment increment_lineno iter_child_nodes iter_fields keyword literal_eval main match_case mod operator parse pattern slice stmt type_ignore type_param unaryop unparse walk withitem",
    "cpython": 158
+  },
+  "asynchat": {
+   "both": "async_chat deque find_prefix_at_end simple_producer",
+   "cpython": 4
   },
   "asyncio": {
    "both": "ALL_COMPLETED AbstractEventLoop AbstractEventLoopPolicy AbstractServer Barrier BaseEventLoop BaseProtocol BaseTransport BoundedSemaphore BrokenBarrierError BufferedProtocol CancelledError Condition DatagramProtocol DatagramTransport DefaultEventLoopPolicy Event FIRST_COMPLETED FIRST_EXCEPTION Future Handle IncompleteReadError InvalidStateError LifoQueue LimitOverrunError Lock PriorityQueue Protocol Queue QueueEmpty QueueFull ReadTransport Runner SelectorEventLoop Semaphore SendfileNotAvailableError Server StreamReader StreamReaderProtocol StreamWriter SubprocessProtocol SubprocessTransport Task TaskGroup Timeout TimeoutError TimerHandle Transport WriteTransport all_tasks as_completed base_events coroutines create_eager_task_factory create_subprocess_exec create_subprocess_shell create_task current_task eager_task_factory ensure_future events exceptions futures gather get_event_loop get_event_loop_policy get_running_loop iscoroutine iscoroutinefunction isfuture locks new_event_loop open_connection open_unix_connection protocols queues run run_coroutine_threadsafe runners set_event_loop set_event_loop_policy shield sleep start_server start_unix_server streams subprocess taskgroups tasks timeout timeout_at timeouts to_thread transports wait wait_for wrap_future",
@@ -144,6 +160,10 @@
   "asyncio.transports": {
    "both": "BaseTransport DatagramTransport ReadTransport SubprocessTransport Transport WriteTransport",
    "cpython": 6
+  },
+  "asyncore": {
+   "both": "EAGAIN EALREADY EBADF ECONNABORTED ECONNRESET EINPROGRESS EINVAL EISCONN ENOTCONN EPIPE ESHUTDOWN EWOULDBLOCK ExitNow close_all compact_traceback dispatcher dispatcher_with_send errorcode file_dispatcher file_wrapper loop poll poll2 poll3 read readwrite socket_map write",
+   "cpython": 28
   },
   "atexit": {
    "both": "register unregister",
@@ -274,6 +294,10 @@
    "both": "add_extension clear_extension_cache constructor dispatch_table pickle pickle_complex remove_extension",
    "cpython": 8
   },
+  "crypt": {
+   "both": "METHOD_BLOWFISH METHOD_CRYPT METHOD_MD5 METHOD_SHA256 METHOD_SHA512 crypt methods mksalt",
+   "cpython": 8
+  },
   "csv": {
    "both": "Dialect DictReader DictWriter Error QUOTE_ALL QUOTE_MINIMAL QUOTE_NONE QUOTE_NONNUMERIC QUOTE_NOTNULL QUOTE_STRINGS Sniffer excel excel_tab field_size_limit get_dialect list_dialects reader register_dialect unix_dialect unregister_dialect writer",
    "cpython": 21
@@ -341,6 +365,10 @@
   "dis": {
    "both": "Bytecode COMPILER_FLAG_NAMES EXTENDED_ARG HAVE_ARGUMENT Instruction Positions UNKNOWN cmp_op code_info deoptmap dis disassemble disco distb findlabels findlinestarts get_instructions hasarg hascompare hasconst hasfree hasjabs hasjrel haslocal hasname main opmap opname pretty_flags show_code stack_effect",
    "cpython": 51
+  },
+  "doctest": {
+   "both": "BLANKLINE_MARKER COMPARISON_FLAGS DONT_ACCEPT_BLANKLINE DONT_ACCEPT_TRUE_FOR_1 DebugRunner DocFileCase DocFileSuite DocFileTest DocTest DocTestCase DocTestFailure DocTestFinder DocTestParser DocTestRunner DocTestSuite ELLIPSIS ELLIPSIS_MARKER Example FAIL_FAST IGNORE_EXCEPTION_DETAIL NORMALIZE_WHITESPACE OPTIONFLAGS_BY_NAME OutputChecker REPORTING_FLAGS REPORT_CDIFF REPORT_NDIFF REPORT_ONLY_FIRST_FAILURE REPORT_UDIFF SKIP SkipDocTestCase TestResults UnexpectedException debug debug_script debug_src master register_optionflag run_docstring_examples script_from_examples set_unittest_reportflags testfile testmod testsource",
+   "cpython": 43
   },
   "email": {
    "both": "message_from_binary_file message_from_bytes message_from_file message_from_string",
@@ -1066,9 +1094,13 @@
    "both": "test test_bmp test_exr test_gif test_jpeg test_pbm test_pgm test_png test_ppm test_rast test_rgb test_tiff test_webp test_xbm testall tests what",
    "cpython": 17
   },
+  "imp": {
+   "both": "C_BUILTIN C_EXTENSION IMP_HOOK NullImporter PKG_DIRECTORY PY_CODERESOURCE PY_COMPILED PY_FROZEN PY_RESOURCE PY_SOURCE SEARCH_ERROR acquire_lock cache_from_source create_dynamic find_module get_frozen_object get_magic get_suffixes get_tag init_builtin init_frozen is_builtin is_frozen is_frozen_package load_compiled load_dynamic load_module load_package load_source lock_held new_module release_lock reload source_from_cache",
+   "cpython": 35
+  },
   "importlib": {
    "both": "import_module invalidate_caches reload",
-   "cpython": 4
+   "cpython": 6
   },
   "importlib.abc": {
    "both": "ExecutionLoader FileLoader Finder InspectLoader Loader MetaPathFinder PathEntryFinder ResourceLoader SourceLoader Traversable TraversableResources",
@@ -1119,7 +1151,7 @@
    "cpython": 106
   },
   "io": {
-   "both": "BufferedIOBase BytesIO DEFAULT_BUFFER_SIZE IOBase RawIOBase SEEK_CUR SEEK_END SEEK_SET StringIO TextIOBase TextIOWrapper UnsupportedOperation open open_code text_encoding",
+   "both": "BufferedIOBase BytesIO DEFAULT_BUFFER_SIZE IOBase IncrementalNewlineDecoder RawIOBase SEEK_CUR SEEK_END SEEK_SET StringIO TextIOBase TextIOWrapper UnsupportedOperation open open_code text_encoding",
    "cpython": 22
   },
   "ipaddress": {
@@ -1145,6 +1177,290 @@
   "keyword": {
    "both": "iskeyword issoftkeyword kwlist softkwlist",
    "cpython": 4
+  },
+  "lib2to3": {
+   "both": "",
+   "cpython": 0
+  },
+  "lib2to3.btm_matcher": {
+   "both": "BMNode BottomMatcher defaultdict reduce_tree type_repr",
+   "cpython": 5
+  },
+  "lib2to3.btm_utils": {
+   "both": "MinNode TYPE_ALTERNATIVES TYPE_ANY TYPE_GROUP get_characteristic_subpattern pattern_symbols pysyms python_symbols rec_test reduce_tree syms tokens",
+   "cpython": 12
+  },
+  "lib2to3.fixer_base": {
+   "both": "BaseFix ConditionalFix PatternCompiler does_tree_import",
+   "cpython": 4
+  },
+  "lib2to3.fixer_util": {
+   "both": "ArgList Assign Attr BlankLine Call Comma Dot FromImport ImportAndCall KeywordArg LParen Leaf ListComp Name Newline Node Number RParen String Subscript attr_chain consuming_calls does_tree_import find_binding find_indentation find_root in_special_context is_import is_list is_probably_builtin is_tuple make_suite p0 p1 p2 parenthesize pats_built syms touch_import",
+   "cpython": 39
+  },
+  "lib2to3.fixes": {
+   "both": "",
+   "cpython": 0
+  },
+  "lib2to3.fixes.fix_apply": {
+   "both": "Call Comma FixApply parenthesize",
+   "cpython": 4
+  },
+  "lib2to3.fixes.fix_asserts": {
+   "both": "BaseFix FixAsserts NAMES Name",
+   "cpython": 4
+  },
+  "lib2to3.fixes.fix_basestring": {
+   "both": "FixBasestring Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_buffer": {
+   "both": "FixBuffer Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_dict": {
+   "both": "Call Dot FixDict Name iter_exempt",
+   "cpython": 5
+  },
+  "lib2to3.fixes.fix_except": {
+   "both": "Assign Attr FixExcept Name find_excepts is_list is_tuple syms",
+   "cpython": 8
+  },
+  "lib2to3.fixes.fix_exec": {
+   "both": "Call Comma FixExec Name",
+   "cpython": 4
+  },
+  "lib2to3.fixes.fix_execfile": {
+   "both": "ArgList Call Comma Dot FixExecfile LParen Name Node RParen String syms",
+   "cpython": 11
+  },
+  "lib2to3.fixes.fix_exitfunc": {
+   "both": "Attr Call Comma FixExitfunc Name Newline syms",
+   "cpython": 7
+  },
+  "lib2to3.fixes.fix_filter": {
+   "both": "ArgList FixFilter ListComp Name Node in_special_context parenthesize syms",
+   "cpython": 8
+  },
+  "lib2to3.fixes.fix_funcattrs": {
+   "both": "FixFuncattrs Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_future": {
+   "both": "BlankLine FixFuture",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_getcwdu": {
+   "both": "FixGetcwdu Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_has_key": {
+   "both": "FixHasKey Name parenthesize",
+   "cpython": 3
+  },
+  "lib2to3.fixes.fix_idioms": {
+   "both": "BlankLine CMP Call Comma FixIdioms Name Node TYPE syms",
+   "cpython": 9
+  },
+  "lib2to3.fixes.fix_import": {
+   "both": "FixImport FromImport dirname exists join sep syms traverse_imports",
+   "cpython": 8
+  },
+  "lib2to3.fixes.fix_imports": {
+   "both": "FixImports MAPPING Name alternates attr_chain build_pattern",
+   "cpython": 6
+  },
+  "lib2to3.fixes.fix_imports2": {
+   "both": "FixImports2 MAPPING",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_input": {
+   "both": "Call FixInput Name context",
+   "cpython": 4
+  },
+  "lib2to3.fixes.fix_intern": {
+   "both": "FixIntern ImportAndCall touch_import",
+   "cpython": 3
+  },
+  "lib2to3.fixes.fix_isinstance": {
+   "both": "FixIsinstance",
+   "cpython": 1
+  },
+  "lib2to3.fixes.fix_itertools": {
+   "both": "FixItertools Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_itertools_imports": {
+   "both": "BlankLine FixItertoolsImports syms",
+   "cpython": 3
+  },
+  "lib2to3.fixes.fix_long": {
+   "both": "FixLong is_probably_builtin",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_map": {
+   "both": "ArgList Call FixMap ListComp Name Node in_special_context syms",
+   "cpython": 8
+  },
+  "lib2to3.fixes.fix_metaclass": {
+   "both": "FixMetaclass Leaf Node find_metas fixup_indent fixup_parse_tree fixup_simple_stmt has_metaclass remove_trailing_newline syms",
+   "cpython": 10
+  },
+  "lib2to3.fixes.fix_methodattrs": {
+   "both": "FixMethodattrs MAP Name",
+   "cpython": 3
+  },
+  "lib2to3.fixes.fix_ne": {
+   "both": "FixNe",
+   "cpython": 1
+  },
+  "lib2to3.fixes.fix_next": {
+   "both": "Call FixNext Name bind_warning find_assign find_binding is_assign_target is_subtree syms",
+   "cpython": 9
+  },
+  "lib2to3.fixes.fix_nonzero": {
+   "both": "FixNonzero Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_numliterals": {
+   "both": "FixNumliterals Number",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_operator": {
+   "both": "Call FixOperator Name String invocation touch_import",
+   "cpython": 6
+  },
+  "lib2to3.fixes.fix_paren": {
+   "both": "FixParen LParen RParen",
+   "cpython": 3
+  },
+  "lib2to3.fixes.fix_print": {
+   "both": "Call Comma FixPrint Name String parend_expr",
+   "cpython": 6
+  },
+  "lib2to3.fixes.fix_raise": {
+   "both": "ArgList Attr Call FixRaise Name is_tuple",
+   "cpython": 6
+  },
+  "lib2to3.fixes.fix_raw_input": {
+   "both": "FixRawInput Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_reduce": {
+   "both": "FixReduce touch_import",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_reload": {
+   "both": "FixReload ImportAndCall touch_import",
+   "cpython": 3
+  },
+  "lib2to3.fixes.fix_renames": {
+   "both": "FixRenames LOOKUP MAPPING Name alternates attr_chain build_pattern",
+   "cpython": 7
+  },
+  "lib2to3.fixes.fix_repr": {
+   "both": "Call FixRepr Name parenthesize",
+   "cpython": 4
+  },
+  "lib2to3.fixes.fix_set_literal": {
+   "both": "FixSetLiteral syms",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_standarderror": {
+   "both": "FixStandarderror Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_sys_exc": {
+   "both": "Attr Call FixSysExc Name Node Number Subscript syms",
+   "cpython": 8
+  },
+  "lib2to3.fixes.fix_throw": {
+   "both": "ArgList Attr Call FixThrow Name is_tuple",
+   "cpython": 6
+  },
+  "lib2to3.fixes.fix_tuple_params": {
+   "both": "Assign FixTupleParams Name Newline Number Subscript find_params is_docstring map_to_index simplify_args syms tuple_name",
+   "cpython": 12
+  },
+  "lib2to3.fixes.fix_types": {
+   "both": "FixTypes Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_unicode": {
+   "both": "FixUnicode",
+   "cpython": 1
+  },
+  "lib2to3.fixes.fix_urllib": {
+   "both": "Comma FixImports FixUrllib FromImport MAPPING Name Newline Node alternates build_pattern find_indentation syms",
+   "cpython": 12
+  },
+  "lib2to3.fixes.fix_ws_comma": {
+   "both": "FixWsComma",
+   "cpython": 1
+  },
+  "lib2to3.fixes.fix_xrange": {
+   "both": "Call FixXrange Name consuming_calls",
+   "cpython": 4
+  },
+  "lib2to3.fixes.fix_xreadlines": {
+   "both": "FixXreadlines Name",
+   "cpython": 2
+  },
+  "lib2to3.fixes.fix_zip": {
+   "both": "ArgList FixZip Name Node in_special_context syms",
+   "cpython": 6
+  },
+  "lib2to3.main": {
+   "both": "StdoutRefactoringTool diff_texts main warn",
+   "cpython": 6
+  },
+  "lib2to3.patcomp": {
+   "both": "PatternCompiler PatternSyntaxError TOKEN_MAP compile_pattern pattern_convert tokenize_wrapper",
+   "cpython": 6
+  },
+  "lib2to3.pgen2": {
+   "both": "",
+   "cpython": 7
+  },
+  "lib2to3.pgen2.driver": {
+   "both": "Driver load_grammar load_packaged_grammar main",
+   "cpython": 4
+  },
+  "lib2to3.pgen2.grammar": {
+   "both": "Grammar opmap opmap_raw",
+   "cpython": 3
+  },
+  "lib2to3.pgen2.literals": {
+   "both": "escape evalString simple_escapes test",
+   "cpython": 4
+  },
+  "lib2to3.pgen2.parse": {
+   "both": "ParseError Parser",
+   "cpython": 2
+  },
+  "lib2to3.pgen2.pgen": {
+   "both": "DFAState NFAState ParserGenerator PgenGrammar generate_grammar",
+   "cpython": 5
+  },
+  "lib2to3.pgen2.token": {
+   "both": "AMPER AMPEREQUAL ASYNC AT ATEQUAL AWAIT BACKQUOTE CIRCUMFLEX CIRCUMFLEXEQUAL COLON COLONEQUAL COMMA COMMENT DEDENT DOT DOUBLESLASH DOUBLESLASHEQUAL DOUBLESTAR DOUBLESTAREQUAL ENDMARKER EQEQUAL EQUAL ERRORTOKEN GREATER GREATEREQUAL INDENT ISEOF ISNONTERMINAL ISTERMINAL LBRACE LEFTSHIFT LEFTSHIFTEQUAL LESS LESSEQUAL LPAR LSQB MINEQUAL MINUS NAME NEWLINE NL NOTEQUAL NT_OFFSET NUMBER N_TOKENS OP PERCENT PERCENTEQUAL PLUS PLUSEQUAL RARROW RBRACE RIGHTSHIFT RIGHTSHIFTEQUAL RPAR RSQB SEMI SLASH SLASHEQUAL STAR STAREQUAL STRING TILDE VBAR VBAREQUAL tok_name",
+   "cpython": 66
+  },
+  "lib2to3.pgen2.tokenize": {
+   "both": "AMPER AMPEREQUAL ASYNC AT ATEQUAL AWAIT BACKQUOTE BOM_UTF8 Binnumber Bracket CIRCUMFLEX CIRCUMFLEXEQUAL COLON COLONEQUAL COMMA COMMENT Comment ContStr DEDENT DOT DOUBLESLASH DOUBLESLASHEQUAL DOUBLESTAR DOUBLESTAREQUAL Decnumber Double Double3 ENDMARKER EQEQUAL EQUAL ERRORTOKEN Expfloat Exponent Floatnumber Funny GREATER GREATEREQUAL Hexnumber INDENT ISEOF ISNONTERMINAL ISTERMINAL Ignore Imagnumber Intnumber LBRACE LEFTSHIFT LEFTSHIFTEQUAL LESS LESSEQUAL LPAR LSQB MINEQUAL MINUS NAME NEWLINE NL NOTEQUAL NT_OFFSET NUMBER N_TOKENS Name Number OP Octnumber Operator PERCENT PERCENTEQUAL PLUS PLUSEQUAL PlainToken Pointfloat PseudoExtras PseudoToken RARROW RBRACE RIGHTSHIFT RIGHTSHIFTEQUAL RPAR RSQB SEMI SLASH SLASHEQUAL STAR STAREQUAL STRING Single Single3 Special StopTokenizing String TILDE Token TokenError Triple Untokenizer VBAR VBAREQUAL Whitespace any detect_encoding endprogs generate_tokens group maybe printtoken single_quoted tabsize tok_name tokenize tokenize_loop triple_quoted untokenize",
+   "cpython": 113
+  },
+  "lib2to3.pygram": {
+   "both": "Symbols pattern_grammar pattern_symbols python_grammar python_grammar_no_print_and_exec_statement python_grammar_no_print_statement python_symbols",
+   "cpython": 7
+  },
+  "lib2to3.pytree": {
+   "both": "Base BasePattern HUGE Leaf LeafPattern NegatedPattern Node NodePattern StringIO WildcardPattern convert generate_matches type_repr",
+   "cpython": 13
+  },
+  "lib2to3.refactor": {
+   "both": "FixerError MultiprocessRefactoringTool MultiprocessingUnsupported RefactoringTool chain find_root get_all_fix_names get_fixers_from_package",
+   "cpython": 8
   },
   "linecache": {
    "both": "cache checkcache clearcache getline getlines lazycache updatecache",
@@ -1238,6 +1554,10 @@
    "both": "NetrcParseError netrc",
    "cpython": 2
   },
+  "nntplib": {
+   "both": "ArticleInfo GroupInfo NNTP NNTPDataError NNTPError NNTPPermanentError NNTPProtocolError NNTPReplyError NNTPTemporaryError NNTP_PORT NNTP_SSL NNTP_SSL_PORT decode_header",
+   "cpython": 13
+  },
   "ntpath": {
    "both": "ALLOW_MISSING abspath altsep basename commonpath commonprefix curdir defpath devnull dirname exists expanduser expandvars extsep getatime getctime getmtime getsize isabs isdir isfile isjunction islink ismount join lexists normcase normpath pardir pathsep realpath relpath samefile sameopenfile samestat sep split splitdrive splitext splitroot supports_unicode_filenames",
    "cpython": 42
@@ -1262,6 +1582,10 @@
    "both": "CLD_CONTINUED CLD_DUMPED CLD_EXITED CLD_KILLED CLD_STOPPED CLD_TRAPPED CLONE_FILES CLONE_FS CLONE_NEWCGROUP CLONE_NEWIPC CLONE_NEWNET CLONE_NEWNS CLONE_NEWPID CLONE_NEWTIME CLONE_NEWUSER CLONE_NEWUTS CLONE_SIGHAND CLONE_SYSVSEM CLONE_THREAD CLONE_VM DirEntry EFD_CLOEXEC EFD_NONBLOCK EFD_SEMAPHORE EX_CANTCREAT EX_CONFIG EX_DATAERR EX_IOERR EX_NOHOST EX_NOINPUT EX_NOPERM EX_NOUSER EX_OK EX_OSERR EX_OSFILE EX_PROTOCOL EX_SOFTWARE EX_TEMPFAIL EX_UNAVAILABLE EX_USAGE F_LOCK F_OK F_TEST F_TLOCK F_ULOCK GRND_NONBLOCK GRND_RANDOM MFD_ALLOW_SEALING MFD_CLOEXEC MFD_HUGETLB MFD_HUGE_16GB MFD_HUGE_16MB MFD_HUGE_1GB MFD_HUGE_1MB MFD_HUGE_256MB MFD_HUGE_2GB MFD_HUGE_2MB MFD_HUGE_32MB MFD_HUGE_512KB MFD_HUGE_512MB MFD_HUGE_64KB MFD_HUGE_8MB MFD_HUGE_MASK MFD_HUGE_SHIFT NGROUPS_MAX O_ACCMODE O_APPEND O_ASYNC O_CLOEXEC O_CREAT O_DIRECT O_DIRECTORY O_DSYNC O_EXCL O_FSYNC O_LARGEFILE O_NDELAY O_NOATIME O_NOCTTY O_NOFOLLOW O_NONBLOCK O_PATH O_RDONLY O_RDWR O_RSYNC O_SYNC O_TMPFILE O_TRUNC O_WRONLY POSIX_FADV_DONTNEED POSIX_FADV_NOREUSE POSIX_FADV_NORMAL POSIX_FADV_RANDOM POSIX_FADV_SEQUENTIAL POSIX_FADV_WILLNEED POSIX_SPAWN_CLOSE POSIX_SPAWN_DUP2 POSIX_SPAWN_OPEN PRIO_PGRP PRIO_PROCESS PRIO_USER P_ALL P_NOWAIT P_NOWAITO P_PGID P_PID P_PIDFD P_WAIT PathLike RTLD_DEEPBIND RTLD_GLOBAL RTLD_LAZY RTLD_LOCAL RTLD_NODELETE RTLD_NOLOAD RTLD_NOW RWF_APPEND RWF_DSYNC RWF_HIPRI RWF_NOWAIT RWF_SYNC R_OK SCHED_BATCH SCHED_FIFO SCHED_IDLE SCHED_OTHER SCHED_RESET_ON_FORK SCHED_RR SEEK_CUR SEEK_DATA SEEK_END SEEK_HOLE SEEK_SET SPLICE_F_MORE SPLICE_F_MOVE SPLICE_F_NONBLOCK ST_APPEND ST_MANDLOCK ST_NOATIME ST_NODEV ST_NODIRATIME ST_NOEXEC ST_NOSUID ST_RDONLY ST_RELATIME ST_SYNCHRONOUS ST_WRITE TMP_MAX WCONTINUED WCOREDUMP WEXITED WEXITSTATUS WIFCONTINUED WIFEXITED WIFSIGNALED WIFSTOPPED WNOHANG WNOWAIT WSTOPPED WSTOPSIG WTERMSIG WUNTRACED W_OK XATTR_CREATE XATTR_REPLACE XATTR_SIZE_MAX X_OK abort access altsep chdir chmod chown chroot close closerange confstr confstr_names copy_file_range cpu_count ctermid curdir defpath device_encoding devnull dup dup2 environ environb error eventfd eventfd_read eventfd_write execl execle execlp execlpe execv execve execvp execvpe extsep fchdir fchmod fchown fdatasync fdopen fork forkpty fpathconf fsdecode fsencode fspath fstat fstatvfs fsync ftruncate fwalk get_blocking get_exec_path get_inheritable get_terminal_size getcwd getcwdb getegid getenv getenvb geteuid getgid getgrouplist getgroups getloadavg getlogin getpgid getpgrp getpid getppid getpriority getrandom getresgid getresuid getsid getuid getxattr initgroups isatty kill killpg lchown linesep link listdir listxattr lockf login_tty lseek lstat major makedev makedirs memfd_create minor mkdir mkfifo mknod name nice open openpty pardir path pathconf pathconf_names pathsep pidfd_open pipe pipe2 popen posix_fadvise posix_fallocate posix_spawn posix_spawnp pread preadv putenv pwrite pwritev read readlink readv register_at_fork remove removedirs removexattr rename renames replace rmdir scandir sched_get_priority_max sched_get_priority_min sched_getaffinity sched_getparam sched_getscheduler sched_param sched_rr_get_interval sched_setaffinity sched_setparam sched_setscheduler sched_yield sendfile sep set_blocking set_inheritable setegid seteuid setgid setgroups setns setpgid setpgrp setpriority setregid setresgid setresuid setreuid setsid setuid setxattr spawnl spawnle spawnlp spawnlpe spawnv spawnve spawnvp spawnvpe splice stat stat_result statvfs statvfs_result strerror supports_bytes_environ supports_dir_fd supports_effective_ids supports_fd supports_follow_symlinks symlink sync sysconf sysconf_names system tcgetpgrp tcsetpgrp terminal_size times times_result truncate ttyname umask uname uname_result unlink unsetenv unshare urandom utime wait wait3 wait4 waitid waitid_result waitpid waitstatus_to_exitcode walk write writev",
    "cpython": 378
   },
+  "ossaudiodev": {
+   "both": "AFMT_AC3 AFMT_A_LAW AFMT_IMA_ADPCM AFMT_MPEG AFMT_MU_LAW AFMT_QUERY AFMT_S16_BE AFMT_S16_LE AFMT_S16_NE AFMT_S8 AFMT_U16_BE AFMT_U16_LE AFMT_U8 OSSAudioError SNDCTL_COPR_HALT SNDCTL_COPR_LOAD SNDCTL_COPR_RCODE SNDCTL_COPR_RCVMSG SNDCTL_COPR_RDATA SNDCTL_COPR_RESET SNDCTL_COPR_RUN SNDCTL_COPR_SENDMSG SNDCTL_COPR_WCODE SNDCTL_COPR_WDATA SNDCTL_DSP_BIND_CHANNEL SNDCTL_DSP_CHANNELS SNDCTL_DSP_GETBLKSIZE SNDCTL_DSP_GETCAPS SNDCTL_DSP_GETCHANNELMASK SNDCTL_DSP_GETFMTS SNDCTL_DSP_GETIPTR SNDCTL_DSP_GETISPACE SNDCTL_DSP_GETODELAY SNDCTL_DSP_GETOPTR SNDCTL_DSP_GETOSPACE SNDCTL_DSP_GETSPDIF SNDCTL_DSP_GETTRIGGER SNDCTL_DSP_MAPINBUF SNDCTL_DSP_MAPOUTBUF SNDCTL_DSP_NONBLOCK SNDCTL_DSP_POST SNDCTL_DSP_PROFILE SNDCTL_DSP_RESET SNDCTL_DSP_SAMPLESIZE SNDCTL_DSP_SETDUPLEX SNDCTL_DSP_SETFMT SNDCTL_DSP_SETFRAGMENT SNDCTL_DSP_SETSPDIF SNDCTL_DSP_SETSYNCRO SNDCTL_DSP_SETTRIGGER SNDCTL_DSP_SPEED SNDCTL_DSP_STEREO SNDCTL_DSP_SUBDIVIDE SNDCTL_DSP_SYNC SNDCTL_FM_4OP_ENABLE SNDCTL_FM_LOAD_INSTR SNDCTL_MIDI_INFO SNDCTL_MIDI_MPUCMD SNDCTL_MIDI_MPUMODE SNDCTL_MIDI_PRETIME SNDCTL_SEQ_CTRLRATE SNDCTL_SEQ_GETINCOUNT SNDCTL_SEQ_GETOUTCOUNT SNDCTL_SEQ_GETTIME SNDCTL_SEQ_NRMIDIS SNDCTL_SEQ_NRSYNTHS SNDCTL_SEQ_OUTOFBAND SNDCTL_SEQ_PANIC SNDCTL_SEQ_PERCMODE SNDCTL_SEQ_RESET SNDCTL_SEQ_RESETSAMPLES SNDCTL_SEQ_SYNC SNDCTL_SEQ_TESTMIDI SNDCTL_SEQ_THRESHOLD SNDCTL_SYNTH_CONTROL SNDCTL_SYNTH_ID SNDCTL_SYNTH_INFO SNDCTL_SYNTH_MEMAVL SNDCTL_SYNTH_REMOVESAMPLE SNDCTL_TMR_CONTINUE SNDCTL_TMR_METRONOME SNDCTL_TMR_SELECT SNDCTL_TMR_SOURCE SNDCTL_TMR_START SNDCTL_TMR_STOP SNDCTL_TMR_TEMPO SNDCTL_TMR_TIMEBASE SOUND_MIXER_ALTPCM SOUND_MIXER_BASS SOUND_MIXER_CD SOUND_MIXER_DIGITAL1 SOUND_MIXER_DIGITAL2 SOUND_MIXER_DIGITAL3 SOUND_MIXER_IGAIN SOUND_MIXER_IMIX SOUND_MIXER_LINE SOUND_MIXER_LINE1 SOUND_MIXER_LINE2 SOUND_MIXER_LINE3 SOUND_MIXER_MIC SOUND_MIXER_MONITOR SOUND_MIXER_NRDEVICES SOUND_MIXER_OGAIN SOUND_MIXER_PCM SOUND_MIXER_PHONEIN SOUND_MIXER_PHONEOUT SOUND_MIXER_RADIO SOUND_MIXER_RECLEV SOUND_MIXER_SPEAKER SOUND_MIXER_SYNTH SOUND_MIXER_TREBLE SOUND_MIXER_VIDEO SOUND_MIXER_VOLUME control_labels control_names error open openmixer",
+   "cpython": 118
+  },
   "pathlib": {
    "both": "Path PosixPath PurePath PurePosixPath PureWindowsPath WindowsPath",
    "cpython": 10
@@ -1277,6 +1601,10 @@
   "pickletools": {
    "both": "ArgumentDescriptor OpcodeInfo StackObject TAKEN_FROM_ARGUMENT1 TAKEN_FROM_ARGUMENT4 TAKEN_FROM_ARGUMENT4U TAKEN_FROM_ARGUMENT8U UP_TO_NEWLINE anyobject bytearray8 bytes1 bytes4 bytes8 bytes_types code2op decimalnl_long decimalnl_short dis float8 floatnl genops int4 long1 long4 markobject opcodes optimize pybool pybuffer pybytearray pybytes pybytes_or_str pydict pyfloat pyfrozenset pyint pyinteger_or_bool pylist pylong pynone pyset pystring pytuple pyunicode read_bytearray8 read_bytes1 read_bytes4 read_bytes8 read_decimalnl_long read_decimalnl_short read_float8 read_floatnl read_int4 read_long1 read_long4 read_string1 read_string4 read_stringnl read_stringnl_noescape read_stringnl_noescape_pair read_uint1 read_uint2 read_uint4 read_uint8 read_unicodestring1 read_unicodestring4 read_unicodestring8 read_unicodestringnl stackslice string1 string4 stringnl stringnl_noescape stringnl_noescape_pair uint1 uint2 uint4 uint8 unicodestring1 unicodestring4 unicodestring8 unicodestringnl",
    "cpython": 82
+  },
+  "pipes": {
+   "both": "FILEIN_FILEOUT FILEIN_STDOUT SINK SOURCE STDIN_FILEOUT STDIN_STDOUT Template makepipeline stepkinds",
+   "cpython": 9
   },
   "pkgutil": {
    "both": "ModuleInfo extend_path find_loader get_data get_importer get_loader iter_importer_modules iter_importers iter_modules read_code resolve_name walk_packages",
@@ -1334,6 +1662,18 @@
    "both": "Doc ErrorDuringImport Helper ModuleScanner TextDoc TextRepr allmethods apropos classify_class_attrs classname cli cram describe doc getdoc getpager help importfile isdata ispackage ispath locate pager parentname pathdirs pipepager plain plainpager plaintext render_doc replace resolve safeimport sort_attributes source_synopsis splitdoc stripid synopsis tempfilepager text ttypager visiblename writedoc writedocs",
    "cpython": 48
   },
+  "pydoc_data": {
+   "both": "",
+   "cpython": 0
+  },
+  "pydoc_data.topics": {
+   "both": "topics",
+   "cpython": 1
+  },
+  "pyexpat": {
+   "both": "EXPAT_VERSION ErrorString ExpatError ParserCreate XMLParserType XML_PARAM_ENTITY_PARSING_ALWAYS XML_PARAM_ENTITY_PARSING_NEVER XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE error errors features model native_encoding version_info",
+   "cpython": 15
+  },
   "queue": {
    "both": "Empty Full LifoQueue PriorityQueue Queue SimpleQueue",
    "cpython": 6
@@ -1349,6 +1689,22 @@
   "re": {
    "both": "A ASCII DEBUG DOTALL I IGNORECASE L LOCALE M MULTILINE Match NOFLAG Pattern RegexFlag S T TEMPLATE U UNICODE VERBOSE X compile error escape findall finditer fullmatch match purge search split sub subn",
    "cpython": 35
+  },
+  "re._casefix": {
+   "both": "",
+   "cpython": 0
+  },
+  "re._compiler": {
+   "both": "ANY ANY_ALL ASSERT ASSERT_NOT AT ATCODES ATOMIC_GROUP AT_BEGINNING AT_BEGINNING_LINE AT_BEGINNING_STRING AT_BOUNDARY AT_END AT_END_LINE AT_END_STRING AT_LOCALE AT_LOC_BOUNDARY AT_LOC_NON_BOUNDARY AT_MULTILINE AT_NON_BOUNDARY AT_UNICODE AT_UNI_BOUNDARY AT_UNI_NON_BOUNDARY BIGCHARSET BRANCH CATEGORY CATEGORY_DIGIT CATEGORY_LINEBREAK CATEGORY_LOC_NOT_WORD CATEGORY_LOC_WORD CATEGORY_NOT_DIGIT CATEGORY_NOT_LINEBREAK CATEGORY_NOT_SPACE CATEGORY_NOT_WORD CATEGORY_SPACE CATEGORY_UNI_DIGIT CATEGORY_UNI_LINEBREAK CATEGORY_UNI_NOT_DIGIT CATEGORY_UNI_NOT_LINEBREAK CATEGORY_UNI_NOT_SPACE CATEGORY_UNI_NOT_WORD CATEGORY_UNI_SPACE CATEGORY_UNI_WORD CATEGORY_WORD CHARSET CHCODES CH_LOCALE CH_UNICODE FAILURE GROUPREF GROUPREF_EXISTS GROUPREF_IGNORE GROUPREF_LOC_IGNORE GROUPREF_UNI_IGNORE IN INFO IN_IGNORE IN_LOC_IGNORE IN_UNI_IGNORE JUMP LITERAL LITERAL_IGNORE LITERAL_LOC_IGNORE LITERAL_UNI_IGNORE MAGIC MARK MAXCODE MAXGROUPS MAXREPEAT MAX_REPEAT MAX_UNTIL MIN_REPEAT MIN_REPEAT_ONE MIN_UNTIL NEGATE NOT_LITERAL NOT_LITERAL_IGNORE NOT_LITERAL_LOC_IGNORE NOT_LITERAL_UNI_IGNORE OPCODES OP_IGNORE OP_LOCALE_IGNORE OP_UNICODE_IGNORE POSSESSIVE_REPEAT POSSESSIVE_REPEAT_ONE RANGE RANGE_UNI_IGNORE REPEAT REPEAT_ONE SRE_FLAG_ASCII SRE_FLAG_DEBUG SRE_FLAG_DOTALL SRE_FLAG_IGNORECASE SRE_FLAG_LOCALE SRE_FLAG_MULTILINE SRE_FLAG_TEMPLATE SRE_FLAG_UNICODE SRE_FLAG_VERBOSE SRE_INFO_CHARSET SRE_INFO_LITERAL SRE_INFO_PREFIX SUBPATTERN SUCCESS compile dis error isstring",
+   "cpython": 106
+  },
+  "re._constants": {
+   "both": "ANY ANY_ALL ASSERT ASSERT_NOT AT ATCODES ATOMIC_GROUP AT_BEGINNING AT_BEGINNING_LINE AT_BEGINNING_STRING AT_BOUNDARY AT_END AT_END_LINE AT_END_STRING AT_LOCALE AT_LOC_BOUNDARY AT_LOC_NON_BOUNDARY AT_MULTILINE AT_NON_BOUNDARY AT_UNICODE AT_UNI_BOUNDARY AT_UNI_NON_BOUNDARY BIGCHARSET BRANCH CATEGORY CATEGORY_DIGIT CATEGORY_LINEBREAK CATEGORY_LOC_NOT_WORD CATEGORY_LOC_WORD CATEGORY_NOT_DIGIT CATEGORY_NOT_LINEBREAK CATEGORY_NOT_SPACE CATEGORY_NOT_WORD CATEGORY_SPACE CATEGORY_UNI_DIGIT CATEGORY_UNI_LINEBREAK CATEGORY_UNI_NOT_DIGIT CATEGORY_UNI_NOT_LINEBREAK CATEGORY_UNI_NOT_SPACE CATEGORY_UNI_NOT_WORD CATEGORY_UNI_SPACE CATEGORY_UNI_WORD CATEGORY_WORD CHARSET CHCODES CH_LOCALE CH_UNICODE FAILURE GROUPREF GROUPREF_EXISTS GROUPREF_IGNORE GROUPREF_LOC_IGNORE GROUPREF_UNI_IGNORE IN INFO IN_IGNORE IN_LOC_IGNORE IN_UNI_IGNORE JUMP LITERAL LITERAL_IGNORE LITERAL_LOC_IGNORE LITERAL_UNI_IGNORE MAGIC MARK MAXGROUPS MAXREPEAT MAX_REPEAT MAX_UNTIL MIN_REPEAT MIN_REPEAT_ONE MIN_UNTIL NEGATE NOT_LITERAL NOT_LITERAL_IGNORE NOT_LITERAL_LOC_IGNORE NOT_LITERAL_UNI_IGNORE OPCODES OP_IGNORE OP_LOCALE_IGNORE OP_UNICODE_IGNORE POSSESSIVE_REPEAT POSSESSIVE_REPEAT_ONE RANGE RANGE_UNI_IGNORE REPEAT REPEAT_ONE SRE_FLAG_ASCII SRE_FLAG_DEBUG SRE_FLAG_DOTALL SRE_FLAG_IGNORECASE SRE_FLAG_LOCALE SRE_FLAG_MULTILINE SRE_FLAG_TEMPLATE SRE_FLAG_UNICODE SRE_FLAG_VERBOSE SRE_INFO_CHARSET SRE_INFO_LITERAL SRE_INFO_PREFIX SUBPATTERN SUCCESS error",
+   "cpython": 102
+  },
+  "re._parser": {
+   "both": "ANY ANY_ALL ASCIILETTERS ASSERT ASSERT_NOT AT ATCODES ATOMIC_GROUP AT_BEGINNING AT_BEGINNING_LINE AT_BEGINNING_STRING AT_BOUNDARY AT_END AT_END_LINE AT_END_STRING AT_LOCALE AT_LOC_BOUNDARY AT_LOC_NON_BOUNDARY AT_MULTILINE AT_NON_BOUNDARY AT_UNICODE AT_UNI_BOUNDARY AT_UNI_NON_BOUNDARY BIGCHARSET BRANCH CATEGORIES CATEGORY CATEGORY_DIGIT CATEGORY_LINEBREAK CATEGORY_LOC_NOT_WORD CATEGORY_LOC_WORD CATEGORY_NOT_DIGIT CATEGORY_NOT_LINEBREAK CATEGORY_NOT_SPACE CATEGORY_NOT_WORD CATEGORY_SPACE CATEGORY_UNI_DIGIT CATEGORY_UNI_LINEBREAK CATEGORY_UNI_NOT_DIGIT CATEGORY_UNI_NOT_LINEBREAK CATEGORY_UNI_NOT_SPACE CATEGORY_UNI_NOT_WORD CATEGORY_UNI_SPACE CATEGORY_UNI_WORD CATEGORY_WORD CHARSET CHCODES CH_LOCALE CH_UNICODE DIGITS ESCAPES FAILURE FLAGS GLOBAL_FLAGS GROUPREF GROUPREF_EXISTS GROUPREF_IGNORE GROUPREF_LOC_IGNORE GROUPREF_UNI_IGNORE HEXDIGITS IN INFO IN_IGNORE IN_LOC_IGNORE IN_UNI_IGNORE JUMP LITERAL LITERAL_IGNORE LITERAL_LOC_IGNORE LITERAL_UNI_IGNORE MAGIC MARK MAXGROUPS MAXREPEAT MAXWIDTH MAX_REPEAT MAX_UNTIL MIN_REPEAT MIN_REPEAT_ONE MIN_UNTIL NEGATE NOT_LITERAL NOT_LITERAL_IGNORE NOT_LITERAL_LOC_IGNORE NOT_LITERAL_UNI_IGNORE OCTDIGITS OPCODES OP_IGNORE OP_LOCALE_IGNORE OP_UNICODE_IGNORE POSSESSIVE_REPEAT POSSESSIVE_REPEAT_ONE RANGE RANGE_UNI_IGNORE REPEAT REPEAT_CHARS REPEAT_ONE SPECIAL_CHARS SRE_FLAG_ASCII SRE_FLAG_DEBUG SRE_FLAG_DOTALL SRE_FLAG_IGNORECASE SRE_FLAG_LOCALE SRE_FLAG_MULTILINE SRE_FLAG_TEMPLATE SRE_FLAG_UNICODE SRE_FLAG_VERBOSE SRE_INFO_CHARSET SRE_INFO_LITERAL SRE_INFO_PREFIX SUBPATTERN SUCCESS State SubPattern TYPE_FLAGS Tokenizer WHITESPACE error fix_flags parse parse_template",
+   "cpython": 122
   },
   "readline": {
    "both": "add_history append_history_file clear_history get_begidx get_completer get_completer_delims get_completion_type get_current_history_length get_endidx get_history_item get_history_length get_line_buffer insert_text parse_and_bind read_history_file read_init_file redisplay remove_history_item replace_history_item set_auto_history set_completer set_completer_delims set_completion_display_matches_hook set_history_length set_pre_input_hook set_startup_hook write_history_file",
@@ -1406,6 +1762,10 @@
    "both": "ENABLE_USER_SITE PREFIXES USER_BASE USER_SITE abs_paths addpackage addsitedir addsitepackages addusersitepackages check_enableusersite enablerlcompleter execsitecustomize execusercustomize getsitepackages getuserbase getusersitepackages main makepath removeduppaths setcopyright sethelper setquit venv",
    "cpython": 23
   },
+  "smtpd": {
+   "both": "COMMASPACE DATA_SIZE_DEFAULT DEBUGSTREAM DebuggingServer Devnull NEWLINE Options PureProxy SMTPChannel SMTPServer parseargs program usage",
+   "cpython": 13
+  },
   "smtplib": {
    "both": "CRLF LMTP LMTP_PORT SMTP SMTPAuthenticationError SMTPConnectError SMTPDataError SMTPException SMTPHeloError SMTPNotSupportedError SMTPRecipientsRefused SMTPResponseException SMTPSenderRefused SMTPServerDisconnected SMTP_PORT SMTP_SSL SMTP_SSL_PORT bCRLF quoteaddr quotedata",
    "cpython": 20
@@ -1422,6 +1782,10 @@
    "both": "BaseRequestHandler BaseServer DatagramRequestHandler StreamRequestHandler TCPServer ThreadingMixIn ThreadingTCPServer ThreadingUDPServer UDPServer",
    "cpython": 18
   },
+  "spwd": {
+   "both": "getspall getspnam struct_spwd",
+   "cpython": 3
+  },
   "sqlite3": {
    "both": "Binary Blob Connection Cursor DataError DatabaseError Date DateFromTicks Error IntegrityError InterfaceError InternalError LEGACY_TRANSACTION_CONTROL NotSupportedError OperationalError PARSE_COLNAMES PARSE_DECLTYPES PrepareProtocol ProgrammingError Row SQLITE_ABORT SQLITE_ABORT_ROLLBACK SQLITE_ALTER_TABLE SQLITE_ANALYZE SQLITE_ATTACH SQLITE_AUTH SQLITE_AUTH_USER SQLITE_BUSY SQLITE_BUSY_RECOVERY SQLITE_BUSY_SNAPSHOT SQLITE_BUSY_TIMEOUT SQLITE_CANTOPEN SQLITE_CANTOPEN_CONVPATH SQLITE_CANTOPEN_DIRTYWAL SQLITE_CANTOPEN_FULLPATH SQLITE_CANTOPEN_ISDIR SQLITE_CANTOPEN_NOTEMPDIR SQLITE_CANTOPEN_SYMLINK SQLITE_CONSTRAINT SQLITE_CONSTRAINT_CHECK SQLITE_CONSTRAINT_COMMITHOOK SQLITE_CONSTRAINT_FOREIGNKEY SQLITE_CONSTRAINT_FUNCTION SQLITE_CONSTRAINT_NOTNULL SQLITE_CONSTRAINT_PINNED SQLITE_CONSTRAINT_PRIMARYKEY SQLITE_CONSTRAINT_ROWID SQLITE_CONSTRAINT_TRIGGER SQLITE_CONSTRAINT_UNIQUE SQLITE_CONSTRAINT_VTAB SQLITE_CORRUPT SQLITE_CORRUPT_INDEX SQLITE_CORRUPT_SEQUENCE SQLITE_CORRUPT_VTAB SQLITE_CREATE_INDEX SQLITE_CREATE_TABLE SQLITE_CREATE_TEMP_INDEX SQLITE_CREATE_TEMP_TABLE SQLITE_CREATE_TEMP_TRIGGER SQLITE_CREATE_TEMP_VIEW SQLITE_CREATE_TRIGGER SQLITE_CREATE_VIEW SQLITE_CREATE_VTABLE SQLITE_DBCONFIG_DEFENSIVE SQLITE_DBCONFIG_DQS_DDL SQLITE_DBCONFIG_DQS_DML SQLITE_DBCONFIG_ENABLE_FKEY SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION SQLITE_DBCONFIG_ENABLE_QPSG SQLITE_DBCONFIG_ENABLE_TRIGGER SQLITE_DBCONFIG_ENABLE_VIEW SQLITE_DBCONFIG_LEGACY_ALTER_TABLE SQLITE_DBCONFIG_LEGACY_FILE_FORMAT SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE SQLITE_DBCONFIG_RESET_DATABASE SQLITE_DBCONFIG_TRIGGER_EQP SQLITE_DBCONFIG_TRUSTED_SCHEMA SQLITE_DBCONFIG_WRITABLE_SCHEMA SQLITE_DELETE SQLITE_DENY SQLITE_DETACH SQLITE_DONE SQLITE_DROP_INDEX SQLITE_DROP_TABLE SQLITE_DROP_TEMP_INDEX SQLITE_DROP_TEMP_TABLE SQLITE_DROP_TEMP_TRIGGER SQLITE_DROP_TEMP_VIEW SQLITE_DROP_TRIGGER SQLITE_DROP_VIEW SQLITE_DROP_VTABLE SQLITE_EMPTY SQLITE_ERROR SQLITE_ERROR_MISSING_COLLSEQ SQLITE_ERROR_RETRY SQLITE_ERROR_SNAPSHOT SQLITE_FORMAT SQLITE_FULL SQLITE_FUNCTION SQLITE_IGNORE SQLITE_INSERT SQLITE_INTERNAL SQLITE_INTERRUPT SQLITE_IOERR SQLITE_IOERR_ACCESS SQLITE_IOERR_AUTH SQLITE_IOERR_BEGIN_ATOMIC SQLITE_IOERR_BLOCKED SQLITE_IOERR_CHECKRESERVEDLOCK SQLITE_IOERR_CLOSE SQLITE_IOERR_COMMIT_ATOMIC SQLITE_IOERR_CONVPATH SQLITE_IOERR_CORRUPTFS SQLITE_IOERR_DATA SQLITE_IOERR_DELETE SQLITE_IOERR_DELETE_NOENT SQLITE_IOERR_DIR_CLOSE SQLITE_IOERR_DIR_FSYNC SQLITE_IOERR_FSTAT SQLITE_IOERR_FSYNC SQLITE_IOERR_GETTEMPPATH SQLITE_IOERR_LOCK SQLITE_IOERR_MMAP SQLITE_IOERR_NOMEM SQLITE_IOERR_RDLOCK SQLITE_IOERR_READ SQLITE_IOERR_ROLLBACK_ATOMIC SQLITE_IOERR_SEEK SQLITE_IOERR_SHMLOCK SQLITE_IOERR_SHMMAP SQLITE_IOERR_SHMOPEN SQLITE_IOERR_SHMSIZE SQLITE_IOERR_SHORT_READ SQLITE_IOERR_TRUNCATE SQLITE_IOERR_UNLOCK SQLITE_IOERR_VNODE SQLITE_IOERR_WRITE SQLITE_LIMIT_ATTACHED SQLITE_LIMIT_COLUMN SQLITE_LIMIT_COMPOUND_SELECT SQLITE_LIMIT_EXPR_DEPTH SQLITE_LIMIT_FUNCTION_ARG SQLITE_LIMIT_LENGTH SQLITE_LIMIT_LIKE_PATTERN_LENGTH SQLITE_LIMIT_SQL_LENGTH SQLITE_LIMIT_TRIGGER_DEPTH SQLITE_LIMIT_VARIABLE_NUMBER SQLITE_LIMIT_VDBE_OP SQLITE_LIMIT_WORKER_THREADS SQLITE_LOCKED SQLITE_LOCKED_SHAREDCACHE SQLITE_LOCKED_VTAB SQLITE_MISMATCH SQLITE_MISUSE SQLITE_NOLFS SQLITE_NOMEM SQLITE_NOTADB SQLITE_NOTFOUND SQLITE_NOTICE SQLITE_NOTICE_RECOVER_ROLLBACK SQLITE_NOTICE_RECOVER_WAL SQLITE_OK SQLITE_OK_LOAD_PERMANENTLY SQLITE_OK_SYMLINK SQLITE_PERM SQLITE_PRAGMA SQLITE_PROTOCOL SQLITE_RANGE SQLITE_READ SQLITE_READONLY SQLITE_READONLY_CANTINIT SQLITE_READONLY_CANTLOCK SQLITE_READONLY_DBMOVED SQLITE_READONLY_DIRECTORY SQLITE_READONLY_RECOVERY SQLITE_READONLY_ROLLBACK SQLITE_RECURSIVE SQLITE_REINDEX SQLITE_ROW SQLITE_SAVEPOINT SQLITE_SCHEMA SQLITE_SELECT SQLITE_TOOBIG SQLITE_TRANSACTION SQLITE_UPDATE SQLITE_WARNING SQLITE_WARNING_AUTOINDEX Time TimeFromTicks Timestamp TimestampFromTicks Warning adapt adapters apilevel complete_statement connect converters dbapi2 enable_callback_tracebacks enable_shared_cache paramstyle register_adapter register_converter sqlite_version sqlite_version_info threadsafety version version_info",
    "cpython": 210
@@ -1433,6 +1797,18 @@
   "sqlite3.dump": {
    "both": "",
    "cpython": 0
+  },
+  "sre_compile": {
+   "both": "ANY ANY_ALL ASSERT ASSERT_NOT AT ATCODES ATOMIC_GROUP AT_BEGINNING AT_BEGINNING_LINE AT_BEGINNING_STRING AT_BOUNDARY AT_END AT_END_LINE AT_END_STRING AT_LOCALE AT_LOC_BOUNDARY AT_LOC_NON_BOUNDARY AT_MULTILINE AT_NON_BOUNDARY AT_UNICODE AT_UNI_BOUNDARY AT_UNI_NON_BOUNDARY BIGCHARSET BRANCH CATEGORY CATEGORY_DIGIT CATEGORY_LINEBREAK CATEGORY_LOC_NOT_WORD CATEGORY_LOC_WORD CATEGORY_NOT_DIGIT CATEGORY_NOT_LINEBREAK CATEGORY_NOT_SPACE CATEGORY_NOT_WORD CATEGORY_SPACE CATEGORY_UNI_DIGIT CATEGORY_UNI_LINEBREAK CATEGORY_UNI_NOT_DIGIT CATEGORY_UNI_NOT_LINEBREAK CATEGORY_UNI_NOT_SPACE CATEGORY_UNI_NOT_WORD CATEGORY_UNI_SPACE CATEGORY_UNI_WORD CATEGORY_WORD CHARSET CHCODES CH_LOCALE CH_UNICODE FAILURE GROUPREF GROUPREF_EXISTS GROUPREF_IGNORE GROUPREF_LOC_IGNORE GROUPREF_UNI_IGNORE IN INFO IN_IGNORE IN_LOC_IGNORE IN_UNI_IGNORE JUMP LITERAL LITERAL_IGNORE LITERAL_LOC_IGNORE LITERAL_UNI_IGNORE MAGIC MARK MAXCODE MAXGROUPS MAXREPEAT MAX_REPEAT MAX_UNTIL MIN_REPEAT MIN_REPEAT_ONE MIN_UNTIL NEGATE NOT_LITERAL NOT_LITERAL_IGNORE NOT_LITERAL_LOC_IGNORE NOT_LITERAL_UNI_IGNORE OPCODES OP_IGNORE OP_LOCALE_IGNORE OP_UNICODE_IGNORE POSSESSIVE_REPEAT POSSESSIVE_REPEAT_ONE RANGE RANGE_UNI_IGNORE REPEAT REPEAT_ONE SRE_FLAG_ASCII SRE_FLAG_DEBUG SRE_FLAG_DOTALL SRE_FLAG_IGNORECASE SRE_FLAG_LOCALE SRE_FLAG_MULTILINE SRE_FLAG_TEMPLATE SRE_FLAG_UNICODE SRE_FLAG_VERBOSE SRE_INFO_CHARSET SRE_INFO_LITERAL SRE_INFO_PREFIX SUBPATTERN SUCCESS compile dis error isstring",
+   "cpython": 106
+  },
+  "sre_constants": {
+   "both": "ANY ANY_ALL ASSERT ASSERT_NOT AT ATCODES ATOMIC_GROUP AT_BEGINNING AT_BEGINNING_LINE AT_BEGINNING_STRING AT_BOUNDARY AT_END AT_END_LINE AT_END_STRING AT_LOCALE AT_LOC_BOUNDARY AT_LOC_NON_BOUNDARY AT_MULTILINE AT_NON_BOUNDARY AT_UNICODE AT_UNI_BOUNDARY AT_UNI_NON_BOUNDARY BIGCHARSET BRANCH CATEGORY CATEGORY_DIGIT CATEGORY_LINEBREAK CATEGORY_LOC_NOT_WORD CATEGORY_LOC_WORD CATEGORY_NOT_DIGIT CATEGORY_NOT_LINEBREAK CATEGORY_NOT_SPACE CATEGORY_NOT_WORD CATEGORY_SPACE CATEGORY_UNI_DIGIT CATEGORY_UNI_LINEBREAK CATEGORY_UNI_NOT_DIGIT CATEGORY_UNI_NOT_LINEBREAK CATEGORY_UNI_NOT_SPACE CATEGORY_UNI_NOT_WORD CATEGORY_UNI_SPACE CATEGORY_UNI_WORD CATEGORY_WORD CHARSET CHCODES CH_LOCALE CH_UNICODE FAILURE GROUPREF GROUPREF_EXISTS GROUPREF_IGNORE GROUPREF_LOC_IGNORE GROUPREF_UNI_IGNORE IN INFO IN_IGNORE IN_LOC_IGNORE IN_UNI_IGNORE JUMP LITERAL LITERAL_IGNORE LITERAL_LOC_IGNORE LITERAL_UNI_IGNORE MAGIC MARK MAXGROUPS MAXREPEAT MAX_REPEAT MAX_UNTIL MIN_REPEAT MIN_REPEAT_ONE MIN_UNTIL NEGATE NOT_LITERAL NOT_LITERAL_IGNORE NOT_LITERAL_LOC_IGNORE NOT_LITERAL_UNI_IGNORE OPCODES OP_IGNORE OP_LOCALE_IGNORE OP_UNICODE_IGNORE POSSESSIVE_REPEAT POSSESSIVE_REPEAT_ONE RANGE RANGE_UNI_IGNORE REPEAT REPEAT_ONE SRE_FLAG_ASCII SRE_FLAG_DEBUG SRE_FLAG_DOTALL SRE_FLAG_IGNORECASE SRE_FLAG_LOCALE SRE_FLAG_MULTILINE SRE_FLAG_TEMPLATE SRE_FLAG_UNICODE SRE_FLAG_VERBOSE SRE_INFO_CHARSET SRE_INFO_LITERAL SRE_INFO_PREFIX SUBPATTERN SUCCESS error",
+   "cpython": 102
+  },
+  "sre_parse": {
+   "both": "ANY ANY_ALL ASCIILETTERS ASSERT ASSERT_NOT AT ATCODES ATOMIC_GROUP AT_BEGINNING AT_BEGINNING_LINE AT_BEGINNING_STRING AT_BOUNDARY AT_END AT_END_LINE AT_END_STRING AT_LOCALE AT_LOC_BOUNDARY AT_LOC_NON_BOUNDARY AT_MULTILINE AT_NON_BOUNDARY AT_UNICODE AT_UNI_BOUNDARY AT_UNI_NON_BOUNDARY BIGCHARSET BRANCH CATEGORIES CATEGORY CATEGORY_DIGIT CATEGORY_LINEBREAK CATEGORY_LOC_NOT_WORD CATEGORY_LOC_WORD CATEGORY_NOT_DIGIT CATEGORY_NOT_LINEBREAK CATEGORY_NOT_SPACE CATEGORY_NOT_WORD CATEGORY_SPACE CATEGORY_UNI_DIGIT CATEGORY_UNI_LINEBREAK CATEGORY_UNI_NOT_DIGIT CATEGORY_UNI_NOT_LINEBREAK CATEGORY_UNI_NOT_SPACE CATEGORY_UNI_NOT_WORD CATEGORY_UNI_SPACE CATEGORY_UNI_WORD CATEGORY_WORD CHARSET CHCODES CH_LOCALE CH_UNICODE DIGITS ESCAPES FAILURE FLAGS GLOBAL_FLAGS GROUPREF GROUPREF_EXISTS GROUPREF_IGNORE GROUPREF_LOC_IGNORE GROUPREF_UNI_IGNORE HEXDIGITS IN INFO IN_IGNORE IN_LOC_IGNORE IN_UNI_IGNORE JUMP LITERAL LITERAL_IGNORE LITERAL_LOC_IGNORE LITERAL_UNI_IGNORE MAGIC MARK MAXGROUPS MAXREPEAT MAXWIDTH MAX_REPEAT MAX_UNTIL MIN_REPEAT MIN_REPEAT_ONE MIN_UNTIL NEGATE NOT_LITERAL NOT_LITERAL_IGNORE NOT_LITERAL_LOC_IGNORE NOT_LITERAL_UNI_IGNORE OCTDIGITS OPCODES OP_IGNORE OP_LOCALE_IGNORE OP_UNICODE_IGNORE POSSESSIVE_REPEAT POSSESSIVE_REPEAT_ONE RANGE RANGE_UNI_IGNORE REPEAT REPEAT_CHARS REPEAT_ONE SPECIAL_CHARS SRE_FLAG_ASCII SRE_FLAG_DEBUG SRE_FLAG_DOTALL SRE_FLAG_IGNORECASE SRE_FLAG_LOCALE SRE_FLAG_MULTILINE SRE_FLAG_TEMPLATE SRE_FLAG_UNICODE SRE_FLAG_VERBOSE SRE_INFO_CHARSET SRE_INFO_LITERAL SRE_INFO_PREFIX SUBPATTERN SUCCESS State SubPattern TYPE_FLAGS Tokenizer WHITESPACE error fix_flags parse parse_template",
+   "cpython": 122
   },
   "ssl": {
    "both": "ALERT_DESCRIPTION_ACCESS_DENIED ALERT_DESCRIPTION_BAD_CERTIFICATE ALERT_DESCRIPTION_BAD_CERTIFICATE_HASH_VALUE ALERT_DESCRIPTION_BAD_CERTIFICATE_STATUS_RESPONSE ALERT_DESCRIPTION_BAD_RECORD_MAC ALERT_DESCRIPTION_CERTIFICATE_EXPIRED ALERT_DESCRIPTION_CERTIFICATE_REVOKED ALERT_DESCRIPTION_CERTIFICATE_UNKNOWN ALERT_DESCRIPTION_CERTIFICATE_UNOBTAINABLE ALERT_DESCRIPTION_CLOSE_NOTIFY ALERT_DESCRIPTION_DECODE_ERROR ALERT_DESCRIPTION_DECOMPRESSION_FAILURE ALERT_DESCRIPTION_DECRYPT_ERROR ALERT_DESCRIPTION_HANDSHAKE_FAILURE ALERT_DESCRIPTION_ILLEGAL_PARAMETER ALERT_DESCRIPTION_INSUFFICIENT_SECURITY ALERT_DESCRIPTION_INTERNAL_ERROR ALERT_DESCRIPTION_NO_RENEGOTIATION ALERT_DESCRIPTION_PROTOCOL_VERSION ALERT_DESCRIPTION_RECORD_OVERFLOW ALERT_DESCRIPTION_UNEXPECTED_MESSAGE ALERT_DESCRIPTION_UNKNOWN_CA ALERT_DESCRIPTION_UNKNOWN_PSK_IDENTITY ALERT_DESCRIPTION_UNRECOGNIZED_NAME ALERT_DESCRIPTION_UNSUPPORTED_CERTIFICATE ALERT_DESCRIPTION_UNSUPPORTED_EXTENSION ALERT_DESCRIPTION_USER_CANCELLED AlertDescription CERT_NONE CERT_OPTIONAL CERT_REQUIRED CHANNEL_BINDING_TYPES CertificateError DER_cert_to_PEM_cert DefaultVerifyPaths HAS_ALPN HAS_ECDH HAS_NEVER_CHECK_COMMON_NAME HAS_NPN HAS_SNI HAS_SSLv2 HAS_SSLv3 HAS_TLSv1 HAS_TLSv1_1 HAS_TLSv1_2 HAS_TLSv1_3 OPENSSL_VERSION OPENSSL_VERSION_INFO OPENSSL_VERSION_NUMBER OP_ALL OP_CIPHER_SERVER_PREFERENCE OP_ENABLE_KTLS OP_ENABLE_MIDDLEBOX_COMPAT OP_IGNORE_UNEXPECTED_EOF OP_LEGACY_SERVER_CONNECT OP_NO_COMPRESSION OP_NO_RENEGOTIATION OP_NO_SSLv2 OP_NO_SSLv3 OP_NO_TICKET OP_NO_TLSv1 OP_NO_TLSv1_1 OP_NO_TLSv1_2 OP_NO_TLSv1_3 OP_SINGLE_DH_USE OP_SINGLE_ECDH_USE Options PEM_FOOTER PEM_HEADER PEM_cert_to_DER_cert PROTOCOL_SSLv23 PROTOCOL_TLS PROTOCOL_TLS_CLIENT PROTOCOL_TLS_SERVER PROTOCOL_TLSv1 PROTOCOL_TLSv1_1 PROTOCOL_TLSv1_2 Purpose RAND_add RAND_bytes RAND_pseudo_bytes RAND_status SOCK_STREAM SOL_SOCKET SO_TYPE SSLCertVerificationError SSLContext SSLEOFError SSLError SSLErrorNumber SSLSocket SSLSyscallError SSLWantReadError SSLWantWriteError SSLZeroReturnError SSL_ERROR_EOF SSL_ERROR_INVALID_ERROR_CODE SSL_ERROR_SSL SSL_ERROR_SYSCALL SSL_ERROR_WANT_CONNECT SSL_ERROR_WANT_READ SSL_ERROR_WANT_WRITE SSL_ERROR_WANT_X509_LOOKUP SSL_ERROR_ZERO_RETURN TLSVersion VERIFY_ALLOW_PROXY_CERTS VERIFY_CRL_CHECK_CHAIN VERIFY_CRL_CHECK_LEAF VERIFY_DEFAULT VERIFY_X509_PARTIAL_CHAIN VERIFY_X509_STRICT VERIFY_X509_TRUSTED_FIRST VerifyFlags VerifyMode cert_time_to_seconds create_connection create_default_context get_default_verify_paths get_protocol_name get_server_certificate match_hostname socket socket_error wrap_socket",
@@ -1633,6 +2009,10 @@
   "wsgiref.validate": {
    "both": "ErrorWrapper InputWrapper IteratorWrapper PartialIteratorWrapper WSGIWarning WriteWrapper assert_ check_content_type check_environ check_errors check_exc_info check_headers check_input check_iterator check_status check_string_type validator",
    "cpython": 17
+  },
+  "xdrlib": {
+   "both": "ConversionError Error Packer Unpacker raise_conversion_error",
+   "cpython": 5
   },
   "xml": {
    "both": "",

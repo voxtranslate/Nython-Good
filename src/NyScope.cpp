@@ -857,35 +857,40 @@ void module_names(const node_ptr& root, std::set<std::string>& out) {
 }
 
 // The classes a module's top level defines (inside top-level blocks, if and
-// try too).
-static void module_classes(const node_ptr& st, std::vector<ClassNode*>& out) {
+// try too); with `nested`, the classes their bodies define too (round 87).
+static void module_classes(const node_ptr& st, std::vector<ClassNode*>& out, std::vector<ClassNode*>* nested = nullptr) {
     if (!st) return;
     switch (st->type()) {
-        case NodeType::CLASS: out.push_back(static_cast<ClassNode*>(st.get())); break;
+        case NodeType::CLASS: {
+            auto* cn = static_cast<ClassNode*>(st.get());
+            out.push_back(cn);
+            if (nested && cn->body) module_classes(cn->body, *nested, nested);
+            break;
+        }
         case NodeType::IF: {
             auto in = std::static_pointer_cast<IfNode>(st);
             if (in->is_expr) break;
-            module_classes(in->then_branch, out);
-            for (auto& b : in->elseif_branches) module_classes(b, out);
-            module_classes(in->else_branch, out);
+            module_classes(in->then_branch, out, nested);
+            for (auto& b : in->elseif_branches) module_classes(b, out, nested);
+            module_classes(in->else_branch, out, nested);
             break;
         }
         case NodeType::TRY: {
             auto tn = std::static_pointer_cast<TryNode>(st);
-            module_classes(tn->body, out);
-            module_classes(tn->else_clause, out);
+            module_classes(tn->body, out, nested);
+            module_classes(tn->else_clause, out, nested);
             break;
         }
         case NodeType::BLOCK: case NodeType::STATEMENTS: case NodeType::STATEMENT:
-            for (auto& s2 : st->statements()) module_classes(s2, out);
+            for (auto& s2 : st->statements()) module_classes(s2, out, nested);
             break;
         default: break;
     }
 }
 void qualify_module_classes(const node_ptr& root, const std::string& module) {
     if (!root || module.empty()) return;
-    std::vector<ClassNode*> classes;
-    for (auto& st : root->statements()) module_classes(st, classes);
+    std::vector<ClassNode*> classes, nested;
+    for (auto& st : root->statements()) module_classes(st, classes, &nested);
     std::set<std::string> own;
     for (auto* c : classes) if (c->bind_name.empty()) own.insert(c->name);
     for (auto* c : classes) {
@@ -896,6 +901,15 @@ void qualify_module_classes(const node_ptr& root, const std::string& module) {
             t.value = module + "." + b->value();
             b = std::make_shared<VariableNode>(t);
         }
+        c->bind_name = c->name;
+        c->name = module + "." + c->name;
+    }
+    // round 87: a class in a class's body is named after the module too, so
+    // its __module__ is the module's (it was "__main__"); bound under its own
+    // name in the enclosing class, its bases left as written (they resolve
+    // in that class's scope)
+    for (auto* c : nested) {
+        if (!c->bind_name.empty()) continue;
         c->bind_name = c->name;
         c->name = module + "." + c->name;
     }

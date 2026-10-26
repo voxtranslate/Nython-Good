@@ -5828,6 +5828,29 @@ both engines and under python3).
 
 ## Round 87
 
+### Part L — the standard-library modules still missing (`HANDOFF.md` §0z7)
+
+New test: `vm_audit127` (159 checks on both engines; its 143 shared ones under python3.11 - generated from its values by `tools/vm_audit127_spec.py`).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `import doctest` (and `__future__`, sre_parse, sre_compile, sre_constants, pipes, imp, xdrlib, nntplib, asyncore, asynchat, smtpd, pyexpat, pydoc_data, crypt, spwd, nis, ossaudiodev, lib2to3, turtledemo) failed | not written | CPython's modules (3.12's doctest and re internals, 3.11's for the ones later removed), the C ones written for Nython: `src/builtins/nycrypt.cpp` (crypt(3) through libcrypt at run time or Nython's own SHA-512/SHA-256/MD5-crypt, spwd, nis over libnsl), lib/_sre.ny, lib/ossaudiodev.ny over fcntl.ioctl |
+| `exec(compile("1 + 2", "<s>", "single"))` printed nothing (both engines) | a "single" code object was compiled as "exec" | it stays "single"; exec rewrites its top-level expression statements (compound statements included) into `_ny_single_display(e)`, which calls `sys.displayhook` (`include/NySingleMode.hpp`) |
+| `re._parser` / `import re._compiler` failed | re was one file | lib/re/ is a package; CPython's parser/compiler/constants/casefix loaded on first use (PEP 562 `__getattr__`) |
+| `xml.parsers.expat.errors` / `.model` were classes, `import xml.parsers.expat.errors` failed, no `pyexpat` | the parser was written as xml.parsers.expat itself | the parser is lib/pyexpat.ny with module objects `pyexpat.errors` / `pyexpat.model`; xml.parsers.expat is CPython's file over it |
+| `help('assert')`, `help('topics')` said there were no topics | no pydoc_data | `tools/gen_pydoc_topics.py` writes lib/pydoc_data from the host python3; pydoc's Helper is CPython 3.12's |
+| `mod.__doc__` raised AttributeError, `__doc__` was a NameError in a program (both engines) | modules never got the docstring | an imported module's namespace and the program's globals get it, or None (`module_docstring`; none under -OO) |
+| `sys.modules["__main__"].__doc__` was None | `_NyMainModule` set it | a property reading the program's `__doc__` |
+| `Klass.Inner.__module__` was "__main__" in an imported module (both engines) | only top-level classes were named `module.Class` | nested classes too (`qualify_module_classes`) |
+| `property().__module__`, `range(3).__module__` were "builtins" (both engines) | prelude classes stand for the builtin types | no `__module__` on their instances, as CPython (staticmethod/classmethod keep theirs) |
+| VM: `globals()` of a program listed `_NyB_dict` & co | a lazily loaded mirror chunk ran in the program's globals | its names join the base names globals() leaves out |
+| VM: `this = self.next; ...; return this` in a `.py` method returned self | `this` is Nython's self in a method | an ordinary name in Python-language source (lexer) |
+| `"{0.month}".format(date)` raised AttributeError (interpreter) | a format field's `.attr` read instance fields only | getattr's lookup (class attributes, properties) |
+| `inspect.getmodule(f) is mod` was never true | getmodule built a new module from the globals | `sys.modules[f.__module__]` when it is a module |
+| `nython -m doctest -o NOSUCH f.py` raised TypeError | argparse's suggestion compared `fuzzy_score`'s None with a number | None skipped: argparse's error, exit status 2 |
+
+New (Nython's): doctest's `+HYPOTHESIS` directive - property checking of an example over generated inputs (`# invariant:`, `# given:`, `# assume:`), counterexamples shrunk on the choice sequence as Hypothesis does and reported in doctest's failure format.
+
 ### Round 87, part M — Windows' own modules, venv, nypip (`HANDOFF.md` §0z8)
 
 New test: `vm_audit128` (91 checks; both engines, 56 under python3.11-3.13, 120 under Wine (both engines)).
