@@ -553,7 +553,8 @@ check("the layout: the interpreter, site-packages, the activation scripts",
 with open(os.path.join(ENV, BIN, "activate"), encoding="utf-8") as f:
     act = f.read()
 check("... activate names the environment and its prompt",
-      ["VIRTUAL_ENV=" + ENV in act or "VIRTUAL_ENV='" + ENV + "'" in act, "PS1='(demo) '" in act], [True, True])
+      ["VIRTUAL_ENV=" + ENV in act or "VIRTUAL_ENV='" + ENV + "'" in act,
+       any(l.strip().startswith("PS1=") and "demo" in l for l in act.split("\n"))], [True, True])
 if not WIN:
     check("... the interpreter is a link to the installation's", os.path.islink(envpy), True)
 probe = ("import sys, os, json\nprint(json.dumps([sys.prefix, sys.base_prefix, sys.exec_prefix, sys.executable,"

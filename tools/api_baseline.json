@@ -938,6 +938,10 @@
    "both": "Codec IncrementalDecoder IncrementalEncoder StreamReader StreamWriter getregentry zlib_decode zlib_encode",
    "cpython": 8
   },
+  "ensurepip": {
+   "both": "bootstrap version",
+   "cpython": 2
+  },
   "enum": {
    "both": "CONFORM CONTINUOUS EJECT Enum EnumCheck EnumMeta EnumType Flag FlagBoundary IntEnum IntFlag KEEP NAMED_FLAGS ReprEnum STRICT StrEnum UNIQUE auto bin global_enum global_enum_repr global_flag_repr global_str member nonmember property show_flag_values unique verify",
    "cpython": 32
@@ -1073,6 +1077,34 @@
   "importlib.machinery": {
    "both": "BYTECODE_SUFFIXES BuiltinImporter DEBUG_BYTECODE_SUFFIXES EXTENSION_SUFFIXES FileFinder ModuleSpec NamespaceLoader OPTIMIZED_BYTECODE_SUFFIXES PathFinder SOURCE_SUFFIXES SourceFileLoader all_suffixes",
    "cpython": 16
+  },
+  "importlib.metadata": {
+   "both": "DeprecatedNonAbstract DeprecatedTuple Distribution DistributionFinder EntryPoint EntryPoints FastPath FileHash FreezableDefaultDict Lookup MetadataPathFinder PackageMetadata PackageNotFoundError PackagePath Pair PathDistribution Prepared Sectioned SimplePath always_iterable distribution distributions entry_points files metadata method_cache packages_distributions pass_none requires unique_everseen version",
+   "cpython": 34
+  },
+  "importlib.metadata._adapters": {
+   "both": "FoldedCase Message",
+   "cpython": 2
+  },
+  "importlib.metadata._collections": {
+   "both": "FreezableDefaultDict Pair",
+   "cpython": 2
+  },
+  "importlib.metadata._functools": {
+   "both": "method_cache pass_none",
+   "cpython": 2
+  },
+  "importlib.metadata._itertools": {
+   "both": "always_iterable filterfalse unique_everseen",
+   "cpython": 3
+  },
+  "importlib.metadata._meta": {
+   "both": "Any Dict Iterator List Optional PackageMetadata Protocol SimplePath TypeVar Union overload",
+   "cpython": 11
+  },
+  "importlib.metadata._text": {
+   "both": "FoldedCase method_cache",
+   "cpython": 2
   },
   "importlib.resources": {
    "both": "Package as_file contents files is_resource open_binary open_text path read_binary read_text",
@@ -1420,7 +1452,7 @@
   },
   "stringprep": {
    "both": "b1_set b3_exceptions c22_specials c6_set c7_set c8_set c9_set in_table_a1 in_table_b1 in_table_c11 in_table_c11_c12 in_table_c12 in_table_c21 in_table_c21_c22 in_table_c22 in_table_c3 in_table_c4 in_table_c5 in_table_c6 in_table_c7 in_table_c8 in_table_c9 in_table_d1 in_table_d2 map_table_b2 map_table_b3",
-   "cpython": 27
+   "cpython": 28
   },
   "struct": {
    "both": "Struct calcsize error iter_unpack pack pack_into unpack unpack_from",
@@ -1554,6 +1586,10 @@
    "both": "NAMESPACE_DNS NAMESPACE_OID NAMESPACE_URL NAMESPACE_X500 RESERVED_FUTURE RESERVED_MICROSOFT RESERVED_NCS RFC_4122 SafeUUID UUID getnode uuid1 uuid3 uuid4 uuid5",
    "cpython": 19
   },
+  "venv": {
+   "both": "CORE_VENV_DEPS EnvBuilder create logger main",
+   "cpython": 5
+  },
   "warnings": {
    "both": "WarningMessage catch_warnings defaultaction filters filterwarnings formatwarning onceregistry resetwarnings showwarning simplefilter warn warn_explicit",
    "cpython": 12
@@ -1644,7 +1680,7 @@
   },
   "xml.parsers": {
    "both": "",
-   "cpython": 1
+   "cpython": 0
   },
   "xml.parsers.expat": {
    "both": "EXPAT_VERSION ErrorString ExpatError ParserCreate XMLParserType XML_PARAM_ENTITY_PARSING_ALWAYS XML_PARAM_ENTITY_PARSING_NEVER XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE error features native_encoding version_info",
