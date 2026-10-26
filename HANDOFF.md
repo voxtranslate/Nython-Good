@@ -663,9 +663,11 @@ cbp (80 units) and the API baseline clean; under Wine (64-bit) vm_audit124
 
 ## 0z6. Round 87, part K — the semantic gaps round 86 found, and a differential tester (vm_audit126, `tools/difftest.py`)
 
-`examples/vm_audit126.ny` (62 checks) passes on both engines and under python3
-(all of them there: the Python-language parts run as a `.py` child on the same
-engine, the rest is valid Python whose meaning agrees). Sweep: SWEEP.
+`examples/vm_audit126.ny` (63 checks) passes on both engines and under
+python3.11/3.12 (all of them there: the Python-language parts run as a `.py`
+child on the same engine, the rest is valid Python whose meaning agrees).
+Sweep against 671f58b: 480 runs, 0 not ok, no regression (vm_audit57's
+expected getattr message changed with item 12).
 
 **1. input() with replaced streams.** `input()` read the process's stdin
 whatever `sys.stdin` was. CPython's builtin_input_impl uses the objects off a
@@ -833,8 +835,11 @@ thread runs late, so the window is wide. `new_task_locked` and
 `async_loop_stop` now clear the loop thread's mark as `make_ready` does (and
 wake a polling loop). The detector is unchanged. Under Wine vm_audit104 then
 passed 40 runs of 40 (20 per engine, 102 checks each, no DeadlockError);
-vm_audit126 passes there too (58 checks per engine: the POSIX-only ones and
-the TLS server's, which needs the openssl command, are skipped).
+vm_audit126 passed there too (58 checks per engine, run before its last
+check was added: the POSIX-only ones and the TLS server's, which needs the
+openssl command, are skipped). That Windows build is of cf2c7cf plus the VM's
+yield-from fix; the later changes (sets, divmod, library class names) do not
+touch the concurrency runtime.
 
 **12. More of the same kind** - what `tools/difftest.py` (below) and probes
 written from its findings turned up, fixed on both engines:

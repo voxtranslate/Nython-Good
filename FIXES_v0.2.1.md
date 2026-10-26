@@ -5830,7 +5830,7 @@ both engines and under python3).
 
 ### Round 87, part K — the semantic gaps round 86 found, and a differential tester (`HANDOFF.md` §0z6)
 
-New test: `vm_audit126` (62 checks; both engines, all of them under python3.11/3.12). New tool: `tools/difftest.py` (differential testing against CPython with generated programs and delta debugging).
+New test: `vm_audit126` (63 checks; both engines, all of them under python3.11/3.12). New tool: `tools/difftest.py` (differential testing against CPython with generated programs and delta debugging).
 
 | Symptom | Cause | Fix |
 |---|---|---|
