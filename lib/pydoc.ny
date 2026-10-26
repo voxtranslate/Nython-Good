@@ -28,8 +28,8 @@
 # the server options print that); no MODULE REFERENCE section (getdocloc
 # gives None: the online reference documents CPython's modules, Nython's
 # lib/ differs); help() / Helper documents objects and names and lists
-# keywords and modules, but has no topics or symbols (CPython reads them
-# from pydoc_data.topics, which is not here); importfile runs a source file
+# keywords, symbols, topics (round 87: pydoc_data.topics, generated from
+# CPython's by tools/gen_pydoc_topics.py) and modules; importfile runs a source file
 # through importlib.util; -k scans module synopses, which for a lib/*.ny
 # module are a leading docstring only (most lib modules document
 # themselves in a comment block, as this one does). Locals that CPython's
@@ -1271,15 +1271,183 @@ def writedocs(dir, pkgpath='', done=None):
 
 
 class Helper:
-    """help(): documentation for objects and names (Nython: keywords and
-    modules are listed; there are no topics or symbols here)."""
+    # (Nython, round 87: CPython 3.12's Helper - its topics, keywords and
+    # symbols read from pydoc_data.topics, generated from CPython's by
+    # tools/gen_pydoc_topics.py; the intro and goodbye name Nython)
 
-    keywords = {k: '' for k in ['False', 'None', 'True', 'and', 'as', 'assert',
-                                'async', 'await', 'break', 'class', 'continue',
-                                'def', 'del', 'elif', 'else', 'except', 'finally',
-                                'for', 'from', 'global', 'if', 'import', 'in', 'is',
-                                'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise',
-                                'return', 'try', 'while', 'with', 'yield']}
+    # These dictionaries map a topic name to either an alias, or a tuple
+    # (label, seealso-items).  The "label" is the label of the corresponding
+    # section in the .rst file under Doc/ and an index into the dictionary
+    # in pydoc_data/topics.py.
+    #
+    # CAUTION: if you change one of these dictionaries, be sure to adapt the
+    #          list of needed labels in Doc/tools/extensions/pyspecific.py and
+    #          regenerate the pydoc_data/topics.py file by running
+    #              make pydoc-topics
+    #          in Doc/ and copying the output file into the Lib/ directory.
+
+    keywords = {
+        'False': '',
+        'None': '',
+        'True': '',
+        'and': 'BOOLEAN',
+        'as': 'with',
+        'assert': ('assert', ''),
+        'async': ('async', ''),
+        'await': ('await', ''),
+        'break': ('break', 'while for'),
+        'class': ('class', 'CLASSES SPECIALMETHODS'),
+        'continue': ('continue', 'while for'),
+        'def': ('function', ''),
+        'del': ('del', 'BASICMETHODS'),
+        'elif': 'if',
+        'else': ('else', 'while for'),
+        'except': 'try',
+        'finally': 'try',
+        'for': ('for', 'break continue while'),
+        'from': 'import',
+        'global': ('global', 'nonlocal NAMESPACES'),
+        'if': ('if', 'TRUTHVALUE'),
+        'import': ('import', 'MODULES'),
+        'in': ('in', 'SEQUENCEMETHODS'),
+        'is': 'COMPARISON',
+        'lambda': ('lambda', 'FUNCTIONS'),
+        'nonlocal': ('nonlocal', 'global NAMESPACES'),
+        'not': 'BOOLEAN',
+        'or': 'BOOLEAN',
+        'pass': ('pass', ''),
+        'raise': ('raise', 'EXCEPTIONS'),
+        'return': ('return', 'FUNCTIONS'),
+        'try': ('try', 'EXCEPTIONS'),
+        'while': ('while', 'break continue if TRUTHVALUE'),
+        'with': ('with', 'CONTEXTMANAGERS EXCEPTIONS yield'),
+        'yield': ('yield', ''),
+    }
+    # Either add symbols to this dictionary or to the symbols dictionary
+    # directly: Whichever is easier. They are merged later.
+    _strprefixes = [p + q for p in ('b', 'f', 'r', 'u') for q in ("'", '"')]
+    _symbols_inverse = {
+        'STRINGS' : ("'", "'''", '"', '"""', *_strprefixes),
+        'OPERATORS' : ('+', '-', '*', '**', '/', '//', '%', '<<', '>>', '&',
+                       '|', '^', '~', '<', '>', '<=', '>=', '==', '!=', '<>'),
+        'COMPARISON' : ('<', '>', '<=', '>=', '==', '!=', '<>'),
+        'UNARY' : ('-', '~'),
+        'AUGMENTEDASSIGNMENT' : ('+=', '-=', '*=', '/=', '%=', '&=', '|=',
+                                '^=', '<<=', '>>=', '**=', '//='),
+        'BITWISE' : ('<<', '>>', '&', '|', '^', '~'),
+        'COMPLEX' : ('j', 'J')
+    }
+    symbols = {
+        '%': 'OPERATORS FORMATTING',
+        '**': 'POWER',
+        ',': 'TUPLES LISTS FUNCTIONS',
+        '.': 'ATTRIBUTES FLOAT MODULES OBJECTS',
+        '...': 'ELLIPSIS',
+        ':': 'SLICINGS DICTIONARYLITERALS',
+        '@': 'def class',
+        '\\': 'STRINGS',
+        '_': 'PRIVATENAMES',
+        '__': 'PRIVATENAMES SPECIALMETHODS',
+        '`': 'BACKQUOTES',
+        '(': 'TUPLES FUNCTIONS CALLS',
+        ')': 'TUPLES FUNCTIONS CALLS',
+        '[': 'LISTS SUBSCRIPTS SLICINGS',
+        ']': 'LISTS SUBSCRIPTS SLICINGS'
+    }
+    for topic, symbols_ in _symbols_inverse.items():
+        for symbol in symbols_:
+            topics = symbols.get(symbol, topic)
+            if topic not in topics:
+                topics = topics + ' ' + topic
+            symbols[symbol] = topics
+    del topic, symbols_, symbol, topics
+
+    topics = {
+        'TYPES': ('types', 'STRINGS UNICODE NUMBERS SEQUENCES MAPPINGS '
+                  'FUNCTIONS CLASSES MODULES FILES inspect'),
+        'STRINGS': ('strings', 'str UNICODE SEQUENCES STRINGMETHODS '
+                    'FORMATTING TYPES'),
+        'STRINGMETHODS': ('string-methods', 'STRINGS FORMATTING'),
+        'FORMATTING': ('formatstrings', 'OPERATORS'),
+        'UNICODE': ('strings', 'encodings unicode SEQUENCES STRINGMETHODS '
+                    'FORMATTING TYPES'),
+        'NUMBERS': ('numbers', 'INTEGER FLOAT COMPLEX TYPES'),
+        'INTEGER': ('integers', 'int range'),
+        'FLOAT': ('floating', 'float math'),
+        'COMPLEX': ('imaginary', 'complex cmath'),
+        'SEQUENCES': ('typesseq', 'STRINGMETHODS FORMATTING range LISTS'),
+        'MAPPINGS': 'DICTIONARIES',
+        'FUNCTIONS': ('typesfunctions', 'def TYPES'),
+        'METHODS': ('typesmethods', 'class def CLASSES TYPES'),
+        'CODEOBJECTS': ('bltin-code-objects', 'compile FUNCTIONS TYPES'),
+        'TYPEOBJECTS': ('bltin-type-objects', 'types TYPES'),
+        'FRAMEOBJECTS': 'TYPES',
+        'TRACEBACKS': 'TYPES',
+        'NONE': ('bltin-null-object', ''),
+        'ELLIPSIS': ('bltin-ellipsis-object', 'SLICINGS'),
+        'SPECIALATTRIBUTES': ('specialattrs', ''),
+        'CLASSES': ('types', 'class SPECIALMETHODS PRIVATENAMES'),
+        'MODULES': ('typesmodules', 'import'),
+        'PACKAGES': 'import',
+        'EXPRESSIONS': ('operator-summary', 'lambda or and not in is BOOLEAN '
+                        'COMPARISON BITWISE SHIFTING BINARY FORMATTING POWER '
+                        'UNARY ATTRIBUTES SUBSCRIPTS SLICINGS CALLS TUPLES '
+                        'LISTS DICTIONARIES'),
+        'OPERATORS': 'EXPRESSIONS',
+        'PRECEDENCE': 'EXPRESSIONS',
+        'OBJECTS': ('objects', 'TYPES'),
+        'SPECIALMETHODS': ('specialnames', 'BASICMETHODS ATTRIBUTEMETHODS '
+                           'CALLABLEMETHODS SEQUENCEMETHODS MAPPINGMETHODS '
+                           'NUMBERMETHODS CLASSES'),
+        'BASICMETHODS': ('customization', 'hash repr str SPECIALMETHODS'),
+        'ATTRIBUTEMETHODS': ('attribute-access', 'ATTRIBUTES SPECIALMETHODS'),
+        'CALLABLEMETHODS': ('callable-types', 'CALLS SPECIALMETHODS'),
+        'SEQUENCEMETHODS': ('sequence-types', 'SEQUENCES SEQUENCEMETHODS '
+                             'SPECIALMETHODS'),
+        'MAPPINGMETHODS': ('sequence-types', 'MAPPINGS SPECIALMETHODS'),
+        'NUMBERMETHODS': ('numeric-types', 'NUMBERS AUGMENTEDASSIGNMENT '
+                          'SPECIALMETHODS'),
+        'EXECUTION': ('execmodel', 'NAMESPACES DYNAMICFEATURES EXCEPTIONS'),
+        'NAMESPACES': ('naming', 'global nonlocal ASSIGNMENT DELETION DYNAMICFEATURES'),
+        'DYNAMICFEATURES': ('dynamic-features', ''),
+        'SCOPING': 'NAMESPACES',
+        'FRAMES': 'NAMESPACES',
+        'EXCEPTIONS': ('exceptions', 'try except finally raise'),
+        'CONVERSIONS': ('conversions', ''),
+        'IDENTIFIERS': ('identifiers', 'keywords SPECIALIDENTIFIERS'),
+        'SPECIALIDENTIFIERS': ('id-classes', ''),
+        'PRIVATENAMES': ('atom-identifiers', ''),
+        'LITERALS': ('atom-literals', 'STRINGS NUMBERS TUPLELITERALS '
+                     'LISTLITERALS DICTIONARYLITERALS'),
+        'TUPLES': 'SEQUENCES',
+        'TUPLELITERALS': ('exprlists', 'TUPLES LITERALS'),
+        'LISTS': ('typesseq-mutable', 'LISTLITERALS'),
+        'LISTLITERALS': ('lists', 'LISTS LITERALS'),
+        'DICTIONARIES': ('typesmapping', 'DICTIONARYLITERALS'),
+        'DICTIONARYLITERALS': ('dict', 'DICTIONARIES LITERALS'),
+        'ATTRIBUTES': ('attribute-references', 'getattr hasattr setattr ATTRIBUTEMETHODS'),
+        'SUBSCRIPTS': ('subscriptions', 'SEQUENCEMETHODS'),
+        'SLICINGS': ('slicings', 'SEQUENCEMETHODS'),
+        'CALLS': ('calls', 'EXPRESSIONS'),
+        'POWER': ('power', 'EXPRESSIONS'),
+        'UNARY': ('unary', 'EXPRESSIONS'),
+        'BINARY': ('binary', 'EXPRESSIONS'),
+        'SHIFTING': ('shifting', 'EXPRESSIONS'),
+        'BITWISE': ('bitwise', 'EXPRESSIONS'),
+        'COMPARISON': ('comparisons', 'EXPRESSIONS BASICMETHODS'),
+        'BOOLEAN': ('booleans', 'EXPRESSIONS TRUTHVALUE'),
+        'ASSERTION': 'assert',
+        'ASSIGNMENT': ('assignment', 'AUGMENTEDASSIGNMENT'),
+        'AUGMENTEDASSIGNMENT': ('augassign', 'NUMBERMETHODS'),
+        'DELETION': 'del',
+        'RETURNING': 'return',
+        'IMPORTING': 'import',
+        'CONDITIONAL': 'if',
+        'LOOPING': ('compound', 'for while break continue'),
+        'TRUTHVALUE': ('truth', 'if while and or not BASICMETHODS'),
+        'DEBUGGING': ('debugger', 'pdb'),
+        'CONTEXTMANAGERS': ('context-managers', 'with'),
+    }
 
     def __init__(self, input=None, output=None):
         self._input = input
@@ -1294,12 +1462,16 @@ class Helper:
         return self._output or sys.stdout
 
     def __repr__(self):
-        return ('Type help() for interactive help, '
-                'or help(object) for help about object.')
+        return '<%s.%s instance>' % (self.__class__.__module__,
+                                     self.__class__.__qualname__)
 
-    def __call__(self, request=None):
-        if request is not None:
-            self.help(request)
+    _GoInteractive = object()
+    def __call__(self, request=_GoInteractive):
+        if request is not self._GoInteractive:
+            try:
+                self.help(request)
+            except ImportError as err:
+                self.output.write(f'{err}\n')
         else:
             self.intro()
             self.interact()
@@ -1315,16 +1487,17 @@ has the same effect as typing a particular string at the help> prompt.
         while True:
             try:
                 request = self.getline('help> ')
-                if not request:
-                    break
+                if not request: break
             except (KeyboardInterrupt, EOFError):
                 break
             request = request.strip()
+
+            # Make sure significant trailing quoting marks of literals don't
+            # get deleted while cleaning input
             if (len(request) > 2 and request[0] == request[-1] in ("'", '"')
                     and request[0] not in request[1:-1]):
                 request = request[1:-1]
-            if request.lower() in ('q', 'quit'):
-                break
+            if request.lower() in ('q', 'quit'): break
             if request == 'help':
                 self.intro()
             else:
@@ -1342,32 +1515,41 @@ has the same effect as typing a particular string at the help> prompt.
     def help(self, request, is_cli=False):
         if isinstance(request, str):
             request = request.strip()
-            if request == 'keywords':
-                self.listkeywords()
-            elif request in ('symbols', 'topics'):
-                self.output.write('No %s here (there is no pydoc_data).\n' % request)
-            elif request.startswith('modules'):
-                self.listmodules(request.split()[1] if len(request.split()) > 1 else '')
-            elif request in self.keywords:
-                self.output.write('%r is a keyword; there is no topic text for it here.\n'
-                                  % request)
+            if request == 'keywords': self.listkeywords()
+            elif request == 'symbols': self.listsymbols()
+            elif request == 'topics': self.listtopics()
+            elif request == 'modules': self.listmodules()
+            elif request[:8] == 'modules ':
+                self.listmodules(request.split()[1])
+            elif request in self.symbols: self.showsymbol(request)
             elif request in ['True', 'False', 'None']:
+                # special case these keywords since they are objects too
                 doc(eval(request), 'Help on %s:', is_cli=is_cli)
-            elif request:
-                doc(request, 'Help on %s:', output=self._output, is_cli=is_cli)
-        elif isinstance(request, Helper):
-            self()
-        else:
-            doc(request, 'Help on %s:', output=self._output, is_cli=is_cli)
+            elif request in self.keywords: self.showtopic(request)
+            elif request in self.topics: self.showtopic(request)
+            elif request: doc(request, 'Help on %s:', output=self._output, is_cli=is_cli)
+            else: doc(str, 'Help on %s:', output=self._output, is_cli=is_cli)
+        elif isinstance(request, Helper): self()
+        else: doc(request, 'Help on %s:', output=self._output, is_cli=is_cli)
         self.output.write('\n')
 
     def intro(self):
-        self.output.write('''Welcome to Nython's help utility (pydoc).
+        self.output.write('''\
+Welcome to Nython's help utility (pydoc), for the Python {0} language level.
+The tutorial is at https://docs.python.org/{0}/tutorial/.
 
-Enter the name of any module, keyword, or object to get help on it.
-To get a list of available modules or keywords, enter "modules" or
-"keywords". To quit this help utility, enter "q" or "quit".
-''')
+Enter the name of any module, keyword, or topic to get help on writing
+Python programs and using Python modules.  To get a list of available
+modules, keywords, symbols, or topics, enter "modules", "keywords",
+"symbols", or "topics".
+
+Each module also comes with a one-line summary of what it does; to list
+the modules whose name or summary contain a given string such as "spam",
+enter "modules spam".
+
+To quit this help utility and return to the interpreter,
+enter "q" or "quit".
+'''.format('%d.%d' % sys.version_info[:2]))
 
     def list(self, items, columns=4, width=80):
         items = list(sorted(items))
@@ -1388,6 +1570,85 @@ Here is a list of the Python keywords.  Enter any keyword to get more help.
 
 ''')
         self.list(self.keywords.keys())
+
+    def listsymbols(self):
+        self.output.write('''
+Here is a list of the punctuation symbols which Python assigns special meaning
+to. Enter any symbol to get more help.
+
+''')
+        self.list(self.symbols.keys())
+
+    def listtopics(self):
+        self.output.write('''
+Here is a list of available topics.  Enter any topic name to get more help.
+
+''')
+        self.list(self.topics.keys())
+
+    def showtopic(self, topic, more_xrefs=''):
+        try:
+            import pydoc_data.topics
+        except ImportError:
+            self.output.write('''
+Sorry, topic and keyword documentation is not available because the
+module "pydoc_data.topics" could not be found.
+''')
+            return
+        target = self.topics.get(topic, self.keywords.get(topic))
+        if not target:
+            self.output.write('no documentation found for %s\n' % repr(topic))
+            return
+        if isinstance(target, str):
+            return self.showtopic(target, more_xrefs)
+
+        label, xrefs = target
+        try:
+            doc = pydoc_data.topics.topics[label]
+        except KeyError:
+            self.output.write('no documentation found for %s\n' % repr(topic))
+            return
+        doc = doc.strip() + '\n'
+        if more_xrefs:
+            xrefs = (xrefs or '') + ' ' + more_xrefs
+        if xrefs:
+            import textwrap
+            text = 'Related help topics: ' + ', '.join(xrefs.split()) + '\n'
+            wrapped_text = textwrap.wrap(text, 72)
+            doc += '\n%s\n' % '\n'.join(wrapped_text)
+        pager(doc)
+
+    def _gettopic(self, topic, more_xrefs=''):
+        """Return unbuffered tuple of (topic, xrefs).
+
+        If an error occurs here, the exception is caught and displayed by
+        the url handler.
+
+        This function duplicates the showtopic method but returns its
+        result directly so it can be formatted for display in an html page.
+        """
+        try:
+            import pydoc_data.topics
+        except ImportError:
+            return('''
+Sorry, topic and keyword documentation is not available because the
+module "pydoc_data.topics" could not be found.
+''' , '')
+        target = self.topics.get(topic, self.keywords.get(topic))
+        if not target:
+            raise ValueError('could not find topic')
+        if isinstance(target, str):
+            return self._gettopic(target, more_xrefs)
+        label, xrefs = target
+        doc = pydoc_data.topics.topics[label]
+        if more_xrefs:
+            xrefs = (xrefs or '') + ' ' + more_xrefs
+        return doc, xrefs
+
+    def showsymbol(self, symbol):
+        target = self.symbols[symbol]
+        topic, _, xrefs = target.partition(' ')
+        self.showtopic(topic, xrefs)
 
     def listmodules(self, key=''):
         if key:
@@ -1412,6 +1673,10 @@ Please wait a moment while I gather a list of all available modules...
                 callback(None, modname, None)
             ModuleScanner().run(callback, onerror=onerror)
             self.list(modules.keys())
+            self.output.write('''
+Enter any module name to get more help.  Or, type "modules spam" to search
+for modules whose name or summary contain the string "spam".
+''')
 
 help = Helper()
 

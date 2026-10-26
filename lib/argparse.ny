@@ -83,7 +83,9 @@ def _close_match(word, options):
     var best_score = 0
     for o in options:
         var sc = fuzzy_score(word, o)
-        if sc > best_score and len(word) * 2 >= len(o) and len(o) * 2 >= len(word):
+        # (round 87: fuzzy_score gives none for no match - an invalid choice
+        # with no near option raised TypeError since round 86's strict order)
+        if sc != None and sc > best_score and len(word) * 2 >= len(o) and len(o) * 2 >= len(word):
             best_score = sc
             best = o
     return best

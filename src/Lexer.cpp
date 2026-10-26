@@ -265,10 +265,12 @@ std::vector<std::string> keyword_spellings() {
 }
 
 // round 86: the keywords that are names in Python-language source -
-// Nython's literal spellings and `elseif` (Lexer::python_names)
+// Nython's literal spellings and `elseif` (Lexer::python_names); round 87:
+// `this` too (Nython's self in a method: re/_parser.py's `this = self.next`
+// returned the Tokenizer on the VM)
 static bool is_nython_literal_word(const std::string& w) {
 	switch (w.size()) {
-		case 4: return w == "true" || w == "none" || w == "null";
+		case 4: return w == "true" || w == "none" || w == "null" || w == "this";
 		case 5: return w == "false";
 		case 6: return w == "elseif";
 		case 9: return w == "undefined";

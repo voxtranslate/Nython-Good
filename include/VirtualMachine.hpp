@@ -70,6 +70,7 @@
 #include "Parser.hpp"
 #include "Runnable.hpp"
 #include "ASTNodes.hpp"
+#include "NySingleMode.hpp"   // compile(..., "single") (round 87)
 #include "Context.hpp"
 #include "NyGC.hpp"     // rss_kb (round 75)
 
@@ -4099,6 +4100,10 @@ public:
     VMResult run(nython::node::node_ptr ast, VMMap* session=nullptr) {
         try {
             load_prelude();
+            if(!globals_.count("__doc__")){   // round 87: the program's docstring, or None, is __main__.__doc__
+                std::string doc;
+                globals_["__doc__"]=nython::node::module_docstring(ast,doc)?VMVal::make_str(doc):VMVal::make_none();
+            }
             Compiler c; auto code=c.compile(ast);
             // The module frame is pushed here rather than by exec_code() so that
             // non-daemon threads, which read module variables through it, are
@@ -6361,9 +6366,15 @@ private:
             // its names become globals, as the prelude's (load_prelude)
             bool old_exp=export_to_globals_; export_to_globals_=true;
             int old_depth=export_depth_; export_depth_=(int)call_stack_.size()+1;
+            std::unordered_set<std::string> before;
+            for(auto& kv:globals_) before.insert(kv.first);
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
             catch(...){ export_to_globals_=old_exp; export_depth_=old_depth; throw; }
             export_to_globals_=old_exp; export_depth_=old_depth;
+            // round 87: the chunk's names are the prelude's, not the program's:
+            // globals() / vars(__main__) leave them out, as the prelude's own
+            // (doctest's finder listed _NyB_dict & co as __main__'s classes)
+            for(auto& kv:globals_) if(!before.count(kv.first)) base_global_names_.insert(kv.first);
             for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;
         } catch(std::exception& e){ std::cerr<<"[VM] builtin mirror '"<<chunk<<"' failed to load: "<<e.what()<<"\n"; }
         mro_cache_.clear();
@@ -6681,7 +6692,7 @@ private:
         std::string mode=is_exec?"exec":"eval", fname="<string>";
         int crule=-1;
         std::string src=snippet_source(a[0],mode,fname,who,&crule);
-        if(mode=="exec") is_exec=true;
+        if(mode=="exec"||mode=="single") is_exec=true;
         if(!is_exec){
             size_t b=src.find_first_not_of(" \t");
             src=b==std::string::npos?std::string():src.substr(b);
@@ -6699,6 +6710,7 @@ private:
             nython::scope::RuleScope rule(crule>=0?crule==1:nython::scope::code_rule(fname,src,caller_py), top_locals);   // (the parses only)
             ast=parse_snippet(src,fname);
             if(!ast) return VMVal::make_none();
+            if(mode=="single") nython::node::single_display(ast);   // round 87: interactive code shows its values
             if(!is_exec){
                 if(!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
                 ast=parse_snippet("__ny_eval__ = (" + src + "\n)",fname);   // its value lands in a variable
@@ -6900,7 +6912,9 @@ private:
             ast=parse_snippet(src,fname);
         }
         if(mode=="eval"&&ast&&!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
-        std::vector<VMVal> ca{VMVal::make_str(src),VMVal::make_str(fname),VMVal::make_str(mode=="single"?"exec":mode),VMVal::make_bool(py)};
+        // (round 87: a "single" code object stays one - exec shows its
+        // expression statements' values, NySingleMode.hpp)
+        std::vector<VMVal> ca{VMVal::make_str(src),VMVal::make_str(fname),VMVal::make_str(mode),VMVal::make_bool(py)};
         return vm_call(load_var("_NyCode"),ca,std::nullopt,nullptr);
     }
     // round 85: the running code is Python-language source's (NyScope's
@@ -12360,7 +12374,14 @@ private:
             }
             // round 84: an instance's __module__ is its class's; __weakref__
             // None (weak references are kept aside), absent with __slots__
-            if(attr=="__module__"){ VMVal c=class_value(obj.class_name); if(c.type==VMType::CLASS&&lookup_attr(c,"__module__",out,false)) return true; }
+            if(attr=="__module__"){
+                // round 87: an instance of a builtin type has none (CPython's
+                // property(), range(3) ...); staticmethod / classmethod objects
+                // carry their function's
+                std::string cnm=nyrt::shown_class_name(obj.class_name);
+                if(nyrt::is_python_builtin_class(cnm)&&cnm!="staticmethod"&&cnm!="classmethod") return false;
+                VMVal c=class_value(obj.class_name); if(c.type==VMType::CLASS&&lookup_attr(c,"__module__",out,false)) return true;
+            }
             if(attr=="__weakref__"){ VMVal sl; if(!class_lookup(obj.class_name,"__slots__",sl)){ out=VMVal::make_none(); return true; } }
             if(attr=="__dict__"){
                 // (none for a class with __slots__ and no __dict__ - round 79)
@@ -14311,6 +14332,10 @@ private:
         else { env=std::make_shared<VMMap>(); vmgc::track_map(env); }
         (*env)["__name__"]=VMVal::make_str(name);
         (*env)["__file__"]=VMVal::make_str(filepath);
+        {   // round 87: the module's docstring, or None (NySingleMode.hpp)
+            std::string doc;
+            (*env)["__doc__"]=nython::node::module_docstring(ast,doc)?VMVal::make_str(doc):VMVal::make_none();
+        }
         {   // round 80: __package__ (relative imports, importlib) and a package's __path__
             bool pkg=nyrt::is_package_init(filepath);
             size_t dot=name.rfind('.');
