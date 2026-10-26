@@ -1428,6 +1428,15 @@ void Lexer::read_token() {
         // the loop: inside it the loop ran 0.9M more instructions at startup.)
         if (matched_kw && __builtin_expect(python_names, 0) && is_nython_literal_word(this->token.value))
             this->token.ident = TokenIdent(TokenType::Identifier, TokenKind::Identifier, TokenClass::Identifier);
+        // round 87: and `super` is a name there (`super = 1`, a parameter, a
+        // module's own `super`) - only `super(` stays the builtin's call,
+        // which the engines run with the method's class and receiver
+        if (matched_kw && __builtin_expect(python_names, 0) && this->token.type() == TokenType::Super) {
+            int c = source.current_char, k = 0;
+            while (c == ' ' || c == '\t') c = source.peek_char(k++);
+            if (c != '(')
+                this->token.ident = TokenIdent(TokenType::Identifier, TokenKind::Identifier, TokenClass::Identifier);
+        }
         // Check dynamic tokens from DynamicLangRegistry
         if (!matched_kw) {
             auto& reg = nython::DynamicLangRegistry::instance();

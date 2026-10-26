@@ -5669,7 +5669,9 @@ node_ptr Parser::starElem_(){   // round 83: starElem() records its span in ast 
 
 // [a, *b, c] -> _ny_list_cat([a], b, [c]); wrap names tuple/set around it.
 node_ptr Parser::catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap){
-    Token ft = tok; ft.value = "_ny_list_cat";
+    // (round 87: a set's pieces through _ny_set_cat - its error for a part
+    // that is not an iterable is CPython's set display's)
+    Token ft = tok; ft.value = wrap && std::string(wrap) == "set" ? "_ny_set_cat" : "_ny_list_cat";
     auto call = make_node<CallNode>(tok, make_node<VariableNode>(ft));
     std::shared_ptr<ListNode> run;
     for(auto& e : elems){

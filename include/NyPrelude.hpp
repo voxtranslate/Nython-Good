@@ -339,6 +339,32 @@ _ny_stdin = _NyStdStream(0, "<stdin>", "r")
 _ny_stdout = _NyStdStream(1, "<stdout>", "w")
 _ny_stderr = _NyStdStream(2, "<stderr>", "w")
 
+def _ny_input(fin, fout, ferr, prompt, has_prompt):
+    # input() when sys.stdin or sys.stdout is not the stream it started as
+    # (round 87; it read the process's stdin whatever sys.stdin was):
+    # CPython's builtin_input_impl off a terminal - sys.stderr flushed, the
+    # prompt written with sys.stdout.write and flushed (a missing or failing
+    # flush ignored), one line read with sys.stdin.readline(), its "\n"
+    # taken off, EOFError at the end
+    try:
+        ferr.flush()
+    except Exception:
+        pass
+    if has_prompt:
+        fout.write(str(prompt))
+    try:
+        fout.flush()
+    except Exception:
+        pass
+    var line = fin.readline()
+    if not isinstance(line, (str, bytes)) or isinstance(line, bytearray):
+        raise TypeError("object.readline() returned non-string")
+    if len(line) == 0:
+        raise EOFError("EOF when reading a line")
+    if line[-1] == ("\n" if isinstance(line, str) else 10):
+        return line[:-1]
+    return line
+
 def _ny_print(*args, **kw):
     # print(...) with file=, flush= or *args (the parser hands those here;
     # the plain forms stay the print statement)
@@ -654,13 +680,23 @@ def _ny_star_iter(it, spec):
     for item in it:
         yield _ny_star_shape(item, spec)
 
-def _ny_list_cat(*parts):
-    # [*a, b, *c] (the parser hands the pieces here)
-    var out = []
-    for p in parts:
-        for x in p:
-            out.append(x)
-    return out
+def _ny_function_str(f):
+    # CPython's _PyObject_FunctionStr (round 87): how a call's errors name
+    # the callable - "module.qualname()", "qualname()" for a builtin, else
+    # str(f) - "__main__.f() argument after * must be an iterable, not int"
+    var q = None
+    try:
+        q = f.__qualname__
+    except Exception:
+        return str(f)
+    var m = None
+    try:
+        m = f.__module__
+    except Exception:
+        m = None
+    if m is not None and m != "builtins":
+        return str(m) + "." + str(q) + "()"
+    return str(q) + "()"
 
 def _ny_dict_merge(*parts):
     # {**a, k: v, **b}
@@ -669,7 +705,7 @@ def _ny_dict_merge(*parts):
         if isinstance(p, dict):
             p = _ny_payload(p)    # a dict subclass's own items (round 77)
         if not hasattr(p, "keys"):
-            raise TypeError("'" + type(p) + "' object is not a mapping")
+            raise TypeError("'" + type(p).__name__ + "' object is not a mapping")
         for k in p.keys():
             out[k] = p[k]
     return out
@@ -1195,6 +1231,18 @@ def _ny_fn_attr(f, attr):
         if p[1] == 3 and p[2]:
             kd[p[0]] = p[3]
     return kd if len(kd) > 0 else None
+
+def _ny_class_base(cls):
+    # C.__base__ (round 87): CPython's best_base of its bases; object's None
+    import _nybases
+    return _nybases.base_of(cls)
+
+def _ny_bases_check(cls, value):
+    # C.__bases__ = value (round 87; it changed nothing): CPython's checks,
+    # lib/_nybases.ny (imported the first time); the new bases, which the
+    # engines then build the class's MRO and its subclasses' from
+    import _nybases
+    return _nybases.check(cls, value)
 
 class _NyNotImplementedType:
     # What a binary or comparison dunder returns for an operand it does not

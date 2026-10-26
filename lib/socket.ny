@@ -377,39 +377,22 @@ class socket:
     def wait_writable(self, timeout=None):
         return _net_wait(self._h, 2, timeout) != 0
 
-    # (round 85) sendmsg / recvmsg with ancillary data (SCM_RIGHTS ...):
-    # the call is made non-blocking and waited for as send/recv are (the
-    # timeout, a parked async task); POSIX only. sendmsg's address (an
-    # unconnected datagram socket's destination) is not supported.
+    # (round 85) sendmsg / recvmsg with ancillary data (SCM_RIGHTS ...);
+    # round 87: sendmsg's address (an unconnected datagram socket's
+    # destination - it was refused) and recvmsg's sender address, natively
+    # (net.cpp: _net_sendmsg / _net_recvmsg) with the socket's timeout as
+    # send / recv keep it (a parked async task); POSIX only.
     def sendmsg(self, buffers, ancdata=(), flags=0, address=None):
         _ny_sys_audit("socket.sendmsg", self, address)
-        if address is not None:
-            raise NotImplementedError("sendmsg(): a destination address is not supported here")
         var data = b"".join([bytes(_bl(b)) if not isinstance(b, str) else b.encode() for b in buffers])
         var anc = []
         for item in ancdata:
             anc.append((item[0], item[1], bytes(_bl(item[2]))))
-        var t = self.gettimeout()
-        while True:
-            try:
-                return _ny_os_call("sendmsg", self.fileno(), data, anc, flags)
-            except BlockingIOError:
-                if t == 0.0:
-                    raise
-                if not self.wait_writable(t):
-                    raise TimeoutError("timed out")
+        return _net_sendmsg(self._h, data, anc, flags, address)
 
     def recvmsg(self, bufsize, ancbufsize=0, flags=0):
-        var t = self.gettimeout()
-        while True:
-            try:
-                var r = _ny_os_call("recvmsg", self.fileno(), bufsize, ancbufsize, flags)
-                return (r[0], list(r[1]), r[2], None)
-            except BlockingIOError:
-                if t == 0.0:
-                    raise
-                if not self.wait_readable(t):
-                    raise TimeoutError("timed out")
+        var r = _net_recvmsg(self._h, bufsize, ancbufsize, flags)
+        return (r[0], list(r[1]), r[2], r[3])
 
     def __enter__(self):
         return self

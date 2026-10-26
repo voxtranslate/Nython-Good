@@ -485,13 +485,18 @@ inline std::string ny_arity_error(const std::string& fname, const std::vector<st
              + " but " + std::to_string(given) + (given == 1 ? " was" : " were") + " given";
     }
     if (!missing.empty()) {
+        // round 87: a keyword-only parameter comes marked "\x01name" - CPython
+        // reports the positional ones first, then (only if none) those
+        std::vector<std::string> pos, kwo;
+        for (auto& m : missing) (!m.empty() && m[0] == '\x01' ? kwo : pos).push_back(!m.empty() && m[0] == '\x01' ? m.substr(1) : m);
+        const std::vector<std::string>& which = pos.empty() ? kwo : pos;
         std::string names;
-        for (size_t i = 0; i < missing.size(); i++) {
-            if (i) names += missing.size() == 2 ? " and " : (i + 1 == missing.size() ? ", and " : ", ");
-            names += "'" + missing[i] + "'";
+        for (size_t i = 0; i < which.size(); i++) {
+            if (i) names += which.size() == 2 ? " and " : (i + 1 == which.size() ? ", and " : ", ");
+            names += "'" + which[i] + "'";
         }
-        return f + " missing " + std::to_string(missing.size()) + " required positional argument"
-             + (missing.size() == 1 ? "" : "s") + ": " + names;
+        return f + " missing " + std::to_string(which.size()) + (pos.empty() ? " required keyword-only argument" : " required positional argument")
+             + (which.size() == 1 ? "" : "s") + ": " + names;
     }
     return "";
 }
