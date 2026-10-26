@@ -901,6 +901,16 @@ example once, as written.
 - `sre_compile.compile(tree)` gives a Pattern whose `.pattern` is the source
   (CPython: None) - the native engine compiles the source.
 
+### Verified
+
+`tools/sweep.py --base` against 671f58b (the base built in a checkout
+with its lib/): 480 runs, 0 not ok, no regressions (vm_audit127 on both
+engines the two fixed runs); the API check against the rewritten
+baseline clean; `tools/ide_e2e.py` 463 passed, 0 failed;
+`tools/ide_memprobe.py --check` passes (0.00 KB per frame, key and
+event, -0.05 for live); ide_lint, the class check and the cbp check
+clean.
+
 ### Not done
 
 - vm_audit127 was not run under Wine. On Windows crypt runs the native
