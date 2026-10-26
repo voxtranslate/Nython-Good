@@ -615,6 +615,24 @@ Value dispatch_core(NythonExecutor& E,
         // the class's __getattribute__ and __getattr__ (round 77)
         if (name == "_ny_getattr_raw" && args.size() >= 2) return E.rawGetattr(args[0], E.getStringValue(args[1]), ctx);
         if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
+        if (name == "super") return E.superBuiltin(args, ctx);   // round 87: called by its name
+        // [*a, b, *c] / (*a,) / {*a} (the parser hands the pieces here; NyScope
+        // names the _py forms in Python-language source). Round 87: a part
+        // that is not an iterable is CPython's TypeError - "Value after * must
+        // be an iterable, not int" for a list or tuple, "'int' object is not
+        // iterable" for a set (an int iterates in Nython code only)
+        if (name.size() >= 11 && name.compare(0, 4, "_ny_") == 0 && (name.compare(4, 8, "list_cat") == 0 || name.compare(4, 7, "set_cat") == 0)) {
+            bool py = name.size() > 3 && name.compare(name.size() - 3, 3, "_py") == 0;
+            bool set = name[4] == 's';
+            std::vector<Value> out;
+            for (auto& p : args) {
+                if (!E.starIterable(p, py))
+                    E.pyRaise("TypeError", set ? "'" + E.typeNameOf(p) + "' object is not iterable"
+                                               : "Value after * must be an iterable, not " + E.typeNameOf(p));
+                for (auto& v : E.iterItems(p, ctx)) out.push_back(v);
+            }
+            return E.makeListValue(out, false);
+        }
         // a function's parameters, flags and place (inspect; round 77)
         if (name == "_ny_fn_info") return E.fnInfo(args.empty() ? NONE_VALUE : args[0]);
         if (name == "_ny_mark_builtin") return E.markBuiltinFn(args.empty() ? NONE_VALUE : args[0]);   // round 84
@@ -1063,7 +1081,29 @@ Value dispatch_core(NythonExecutor& E,
             return NONE_VALUE;
         }
         if (name == "input") {
+            // round 87: sys.stdin / sys.stdout replaced (a StringIO, an object
+            // with readline / write): the objects' methods, as CPython's
+            // input() uses them off a terminal (the prelude's _ny_input); it
+            // read the process's stdin whatever sys.stdin was. None (or a
+            // stream deleted) is CPython's "lost" RuntimeError.
+            bool sys_made = false;
+            Value fin = E.sysMember("stdin", &sys_made);
+            Value fout, ferr;
+            bool replaced = false;
+            if (sys_made) {
+                fout = E.sysMember("stdout");
+                ferr = E.sysMember("stderr");
+                if (fin.type == ValueType::UNDEFINED || fin.isNone()) E.pyRaise("RuntimeError", "input(): lost sys.stdin");
+                if (fout.type == ValueType::UNDEFINED || fout.isNone()) E.pyRaise("RuntimeError", "input(): lost sys.stdout");
+                if (ferr.type == ValueType::UNDEFINED || ferr.isNone()) E.pyRaise("RuntimeError", "input(): lost sys.stderr");
+                Value oi = E.global_ctx->getByName("_ny_stdin"), oo = E.global_ctx->getByName("_ny_stdout");
+                replaced = !(fin.type == oi.type && fin.value.p == oi.value.p) || !(fout.type == oo.type && fout.value.p == oo.value.p);
+            }
             if (nyrt::audit_on()) E.auditEvent("builtins.input", {args.empty() ? NONE_VALUE : args[0]}, ctx);   // round 84
+            if (replaced) {
+                std::vector<Value> a{fin, fout, ferr, args.empty() ? NONE_VALUE : args[0], Value(!args.empty())};
+                return E.callFunctionValue(E.global_ctx->getByName("_ny_input"), a, ctx);
+            }
             // input(prompt): one line from stdin (NyConc.cpp: read_stdin_line -
             // the GIL is released while it waits, Ctrl+C raises
             // KeyboardInterrupt); EOFError at the end of input, as in Python.

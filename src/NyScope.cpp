@@ -124,6 +124,10 @@ struct Lines {
 
 struct Collector {
     std::unique_ptr<Scope> root;
+    // round 87: `super(...)` calls in Python-language source, with their
+    // scope: one that sees a binding of the name super (a parameter, a
+    // module's own `def super`) calls that, as CPython looks the name up
+    std::vector<std::pair<CallNode*, Scope*>> super_calls;
     Lines lines;           // round 85
     bool cur_aug = false;  // round 85: the target being written is an augmented assignment's
 
@@ -393,6 +397,19 @@ struct Collector {
         }
         case NodeType::CALL: {
             auto* c = static_cast<CallNode*>(n.get());
+            // round 87: a starred display's helper in Python-language source
+            // takes no int as an iterable (its _py form, the engines' natives;
+            // the prelude's for a starred comprehension target's iterable)
+            if (s->py && c->callee && c->callee->type() == NodeType::VARIABLE) {
+                auto* v = static_cast<VariableNode*>(c->callee.get());
+                if (v->name == "_ny_list_cat" || v->name == "_ny_set_cat" || v->name == "_ny_star_iter") {
+                    // a new node: the VM compiles a name from its token
+                    Token t = v->token();
+                    t.value = v->name + "_py";
+                    c->callee = std::make_shared<VariableNode>(t);
+                }
+            }
+            if (s->py && c->callee && c->callee->type() == NodeType::SUPER) super_calls.push_back({c, s});
             walk(c->callee, s); all(c->args, s);
             break;
         }
@@ -799,6 +816,21 @@ void check(const node_ptr& root, const std::string& file, const std::string& cod
     if (!py && !file.empty()) c.lines.init(code);   // a def may opt in (not in the engines' own text)
     ps.root = c.root.get();
     c.walk(root, c.root.get());
+    // round 87: a super(...) call that sees a binding of `super` calls it
+    // (class bodies are not seen from their methods, as in Python)
+    for (auto& [call, sc] : c.super_calls) {
+        bool bound = false;
+        for (Scope* x = sc; x && !bound; x = x->parent) {
+            if (x != sc && x->kind == Kind::CLASS) continue;
+            bound = x->binds("super") || x->globals.count("super");
+        }
+        if (!bound) continue;
+        Token t = call->callee->token();
+        t.value = "super";
+        auto v = std::make_shared<VariableNode>(t);
+        v->py_src = 1;
+        call->callee = v;
+    }
     check_scope(c.root.get(), ps);
 }
 

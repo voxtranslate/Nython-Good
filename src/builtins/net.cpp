@@ -517,6 +517,7 @@ static const std::vector<std::string>& net_names() {
         "_net_bind", "_net_listen", "_net_accept", "_net_connect", "_net_connect_ex",
         "_net_send", "_net_sendall", "_net_recv", "_net_sendto", "_net_recvfrom", "_net_shutdown",
         "_net_recv_into",   // round 84: recv_into without a copy (the buffer protocol)
+        "_net_sendmsg", "_net_recvmsg",   // round 87: with a datagram's address (POSIX)
         "_net_setsockopt", "_net_getsockopt", "_net_getsockname", "_net_getpeername",
         "_net_getaddrinfo", "_net_gethostname", "_net_gethostbyname", "_net_gethostbyaddr",
         "_net_getnameinfo", "_net_inet_pton", "_net_inet_ntop", "_net_select", "_net_constants",
@@ -755,6 +756,101 @@ Value dispatch_net(NythonExecutor& E, const std::string& name, std::vector<Value
             if (!would_block(e)) raise_err(e);
             if (!await_ready(*s, nyconc::IO_READ, c)) raise_timeout();
         }
+    }
+    // round 87: sendmsg(h, data, [(level, type, data)...], flags, address)
+    // -> bytes sent, to `address` when it is not None (an unconnected
+    // datagram socket's destination: it was refused); recvmsg(h, bufsize,
+    // ancbufsize, flags) -> (data, [(level, type, data)...], msg_flags,
+    // the sender's address). The socket's timeout as send/recv keep it.
+    if (name == "_net_sendmsg" || name == "_net_recvmsg") {
+#ifdef _WIN32
+        raise("OSError", "[WinError 10045] " + name.substr(5) + "() is not supported on Windows");
+#else
+        auto s = get(handle_of(E, A.get(0, nullptr)));
+        Clock c(s->timeout);
+        if (name == "_net_sendmsg") {
+            std::string data = data_arg(E, A.get(1, "data"));
+            std::string ctl;
+            for (auto& item : E.iterItems(A.get(2, nullptr), nullptr)) {
+                auto f = E.iterItems(item, nullptr);
+                if (f.size() != 3) raise("TypeError", "sendmsg() ancillary data items must be (level, type, data) tuples");
+                std::string d = data_arg(E, f[2]);
+                size_t at = ctl.size();
+                ctl.resize(at + CMSG_SPACE(d.size()), '\0');
+                struct cmsghdr* cm = (struct cmsghdr*)&ctl[at];
+                cm->cmsg_level = (int)bigint_to_i64(f[0].value.i);
+                cm->cmsg_type = (int)bigint_to_i64(f[1].value.i);
+                cm->cmsg_len = CMSG_LEN(d.size());
+                if (!d.empty()) std::memcpy(CMSG_DATA(cm), d.data(), d.size());
+            }
+            int flags = (int)int_arg(E, A, 3, "flags", 0);
+            Value av = A.get(4, "address");
+            Addr a;
+            bool to = av.type != ValueType::NONE && av.type != ValueType::UNDEFINED;
+            if (to) a = parse_addr(E, s->family, av, false);
+            struct iovec iov;
+            iov.iov_base = data.empty() ? nullptr : &data[0];
+            iov.iov_len = data.size();
+            struct msghdr mh;
+            std::memset(&mh, 0, sizeof mh);
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = 1;
+            if (to) { mh.msg_name = &a.ss; mh.msg_namelen = a.len; }
+            if (!ctl.empty()) { mh.msg_control = &ctl[0]; mh.msg_controllen = ctl.size(); }
+            while (true) {
+                ssize_t r = ::sendmsg(s->fd, &mh, flags | MSG_NOSIGNAL);
+                if (r >= 0) return intValue((int64_t)r);
+                int e = last_err();
+                if (interrupted(e)) { run_signals(); continue; }
+                if (!would_block(e)) raise_err(e);
+                if (!await_ready(*s, nyconc::IO_WRITE, c)) raise_timeout();
+            }
+        }
+        int64_t bufsize = int_arg(E, A, 1, "bufsize", 0);
+        int64_t ancsize = int_arg(E, A, 2, "buflen", 0);
+        if (bufsize < 0 || ancsize < 0) raise("ValueError", "negative buffer size in recvmsg()");
+        int flags = (int)int_arg(E, A, 3, "flags", 0);
+        std::string buf((size_t)bufsize, '\0'), ctl((size_t)ancsize, '\0');
+        while (true) {
+            struct iovec iov;
+            iov.iov_base = bufsize ? &buf[0] : nullptr;
+            iov.iov_len = (size_t)bufsize;
+            Addr a; a.len = sizeof a.ss;
+            struct msghdr mh;
+            std::memset(&mh, 0, sizeof mh);
+            mh.msg_name = &a.ss;
+            mh.msg_namelen = a.len;
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = 1;
+            if (ancsize) { mh.msg_control = &ctl[0]; mh.msg_controllen = (size_t)ancsize; }
+            ssize_t r = ::recvmsg(s->fd, &mh, flags
+#ifdef MSG_CMSG_CLOEXEC
+                                  | MSG_CMSG_CLOEXEC
+#endif
+                                  );
+            if (r >= 0) {
+                std::string got(buf.data(), (size_t)r);
+                std::vector<Value> anc;
+                if (ancsize)
+                    for (struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+                        size_t len = cm->cmsg_len - CMSG_LEN(0);
+                        anc.push_back(E.makeListValue({intValue((int64_t)cm->cmsg_level), intValue((int64_t)cm->cmsg_type),
+                                                       E.makeBytesValue(std::string((const char*)CMSG_DATA(cm), len))}, true));
+                    }
+                int mflags = mh.msg_flags;
+#ifdef MSG_CMSG_CLOEXEC
+                mflags &= ~MSG_CMSG_CLOEXEC;   // ours (received descriptors close on exec), not the caller's
+#endif
+                // a connected stream socket reports no address (None, as CPython's)
+                return E.makeListValue({E.makeBytesValue(got), E.makeListValue(anc), intValue((int64_t)mflags),
+                                        addr_value(E, (const sockaddr*)&a.ss, mh.msg_namelen)}, true);
+            }
+            int e = last_err();
+            if (interrupted(e)) { run_signals(); continue; }
+            if (!would_block(e)) raise_err(e);
+            if (!await_ready(*s, nyconc::IO_READ, c)) raise_timeout();
+        }
+#endif
     }
     if (name == "_net_shutdown") {
         auto s = get(handle_of(E, A.get(0, nullptr)));

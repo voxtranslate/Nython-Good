@@ -370,6 +370,13 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             std::vector<Value> a0 = {args[0]};
             return E.callMethod(args[1], "__rdivmod__", a0, ctx);
         }
+        {
+            // round 87: CPython's TypeError (it said "for //"; a class with
+            // // and % but no __divmod__ is no exception)
+            NythonExecutor::Num x, y;
+            if (!NythonExecutor::asNum(args[0], x) || !NythonExecutor::asNum(args[1], y))
+                E.pyRaise("TypeError", "unsupported operand type(s) for divmod(): '" + E.typeNameOf(args[0]) + "' and '" + E.typeNameOf(args[1]) + "'");
+        }
         Value q = E.binaryOp(NythonExecutor::OP_FLOORDIV, args[0], args[1], ctx);
         Value r = E.binaryOp(NythonExecutor::OP_MOD, args[0], args[1], ctx);
         return E.makeListValue({q, r}, true);
@@ -547,11 +554,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
                     E.dictSet(dc, k, E.callMethod(args[0], "__getitem__", ka, ctx));
                 }
             } else {
-                for (auto& pairv : E.iterItems(args[0], ctx)) {
-                    std::vector<Value> kv = E.iterItems(pairv, ctx);
-                    if (kv.size() != 2) E.pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
-                    E.dictSet(dc, kv[0], kv[1]);
-                }
+                E.dictUpdatePairs(dc, args[0], ctx);   // round 87: CPython's messages
             }
         }
         // Keyword arguments in the order they were written (kw itself is

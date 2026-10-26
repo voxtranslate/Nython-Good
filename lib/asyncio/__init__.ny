@@ -3921,7 +3921,12 @@ class BaseEventLoop(AbstractEventLoop):
                 conn.setblocking(False)
                 var extra = {"peername": pair[1]}
                 if server._ssl_context is not None:
-                    _spawn_internal(self, self._accept_tls(server, conn, extra))
+                    # a task of the program's, as CPython's _accept_connection2
+                    # (round 87: an internal one was not among the tasks
+                    # asyncio.run cancels - a handshake still running when it
+                    # ended went on, and started the client_connected_cb
+                    # task after the loop was closed)
+                    self.create_task(self._accept_tls(server, conn, extra))
                 else:
                     try:
                         _SocketTransport(self, conn, server._protocol_factory(), None, extra, server)

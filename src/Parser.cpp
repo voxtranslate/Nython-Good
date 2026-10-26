@@ -5406,13 +5406,18 @@ node_ptr Parser::lambdaExpr_(){   // round 83: lambdaExpr() records its span in 
     mustBe(TokenType::Colon);
     yield_seen_.push_back(false);
     self_scope_.push_back(!params.empty() && (params[0]->value() == "self" || params[0]->value() == "this"));
+    // round 87: what the body defines is the lambda's local (`lambda: (lambda:
+    // 1)` makes "<lambda>.<locals>.<lambda>"; the inner one was "<lambda>")
+    const std::string qualname = qualOf("<lambda>");
+    qual_stack_.push_back(qualname + ".<locals>");
     node_ptr body;
     // the body is a single expression: `lambda: (yield)`, not a tuple
-    try { body = ternary(); } catch(...) { self_scope_.pop_back(); yield_seen_.pop_back(); throw; }
+    try { body = ternary(); } catch(...) { qual_stack_.pop_back(); self_scope_.pop_back(); yield_seen_.pop_back(); throw; }
+    qual_stack_.pop_back();
     self_scope_.pop_back();
     yield_seen_.pop_back();
     auto lam = make_node<LambdaNode>(tok, body);
-    static_cast<LambdaNode*>(lam.get())->qualname = qualOf("<lambda>");   // round 77
+    static_cast<LambdaNode*>(lam.get())->qualname = qualname;   // round 77
     for(auto& p : params) lam->add(p);
     static_cast<LambdaNode*>(lam.get())->defaults = std::move(param_defaults_);
     static_cast<LambdaNode*>(lam.get())->posonly = posonly;   // round 77
@@ -5669,7 +5674,9 @@ node_ptr Parser::starElem_(){   // round 83: starElem() records its span in ast 
 
 // [a, *b, c] -> _ny_list_cat([a], b, [c]); wrap names tuple/set around it.
 node_ptr Parser::catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap){
-    Token ft = tok; ft.value = "_ny_list_cat";
+    // (round 87: a set's pieces through _ny_set_cat - its error for a part
+    // that is not an iterable is CPython's set display's)
+    Token ft = tok; ft.value = wrap && std::string(wrap) == "set" ? "_ny_set_cat" : "_ny_list_cat";
     auto call = make_node<CallNode>(tok, make_node<VariableNode>(ft));
     std::shared_ptr<ListNode> run;
     for(auto& e : elems){

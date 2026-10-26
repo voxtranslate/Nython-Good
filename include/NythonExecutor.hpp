@@ -430,6 +430,10 @@ struct NythonExecutor {
     // A class statement run again makes a new class, registered as
     // "Name#n" (evalClassDecl); what is shown is Name.
     static std::string shownClassName(const std::string& n) { return nyrt::shown_class_name(n); }
+    // round 87: a class as CPython's messages name it - its __name__ (a
+    // module's class is keyed "module.Class": "'Obj' object is not callable",
+    // where it said 'pkg.mod.Obj')
+    static std::string msgClassName(const std::string& n) { return nyrt::message_class_name(nyrt::shown_class_name(n)); }
     // round 84: a function CPython implements in C, marked when the module
     // binding it had run (sealCModule): static, and "__nybuiltin__"
     static bool isNyBuiltinTag(const std::string& t) {
@@ -687,6 +691,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_exc_init","_ny_exc_str","_ny_exc_repr",        // BaseException's members as values (round 84)
             "_ny_audit_enable",                                  // sys.addaudithook (round 84)
             "_ny_gc_objects",                                    // gc.get_objects (round 85)
+            "_ny_list_cat","_ny_list_cat_py","_ny_set_cat","_ny_set_cat_py",   // starred displays (round 87: CPython's errors)
             "_ny_buf_export","_ny_buf_unexport","_ny_buf_exports","_ny_buf_addr","_ny_load_chunk",   // the buffer protocol: memoryview (round 84)
             "_ny_main_set","_ny_main_del","_ny_globals_view",   // globals() as a live view (round 81)
             "_ny_getrefcount","_ny_frame_jump",                 // sys.getrefcount, frame.f_lineno = n (round 81)
@@ -2400,7 +2405,7 @@ public:   // NythonExecutor is a struct: members default to public
             }
             if (instanceHasMethod(c, "__iter__") || instanceHasMethod(c, "__getitem__") || instanceHasMethod(c, "__next__"))
                 return nygen::contains_iter(*this, c, x, ctx);
-            pyRaise("TypeError", "argument of type '" + shownClassName(instanceClassName(c)) + "' is not iterable");
+            pyRaise("TypeError", "argument of type '" + msgClassName(instanceClassName(c)) + "' is not iterable");
         }
         if (isStringValue(c)) {
             Value px;
@@ -2425,11 +2430,34 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── BINARY OPERATORS ───────────────────────────────────────────────
+    // round 87: dict(seq) / d.update(seq) of pairs, CPython's messages naming
+    // the element (#i) that is no pair
+    void dictUpdatePairs(Container* dc, const Value& seq, Context* ctx) {
+        int64_t el = 0;
+        for (auto& pairv : iterItems(seq, ctx)) {
+            if (pairv.type == ValueType::INTEGER || pairv.type == ValueType::DOUBLE || pairv.type == ValueType::BOOLEAN || pairv.type == ValueType::NONE)
+                pyRaise("TypeError", "cannot convert dictionary update sequence element #" + std::to_string(el) + " to a sequence");
+            std::vector<Value> kv = iterItems(pairv, ctx);
+            if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element #" + std::to_string(el) + " has length " + std::to_string(kv.size()) + "; 2 is required");
+            dictSet(dc, kv[0], kv[1]);
+            el++;
+        }
+    }
+    // round 87: `x[a:b]` of a value with no slice method (the parser's
+    // x.slice(a, b)): CPython's TypeError
+    [[noreturn]] void notSubscriptable(const Value& obj, Context* ctx) {
+        if (classNodeOfValue(obj)) {
+            Value n;
+            if (getAttrValue(obj, "__name__", ctx, n) && isStringValue(n))
+                pyRaise("TypeError", "type '" + getStringValue(n) + "' is not subscriptable");
+        }
+        pyRaise("TypeError", "'" + typeNameOf(obj) + "' object is not subscriptable");
+    }
     // Arithmetic between types that have no such operator: TypeError, as in
     // Python and on the VM (binop). 1 + none used to give none here and 1
     // there; an instance added to anything concatenated its handle's text.
     [[noreturn]] void unsupportedOperands(int opc, const Value& lv, const Value& rv) {
-        pyRaise("TypeError", std::string("unsupported operand type(s) for ") + opSymbol(opc) + ": '"
+        pyRaise("TypeError", std::string("unsupported operand type(s) for ") + (opc == OP_POW ? "** or pow()" : opSymbol(opc)) + ": '"
                 + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
     }
     // round 86: `a + b` that nothing defines, in CPython's words: a str, list
@@ -2546,7 +2574,7 @@ public:   // NythonExecutor is a struct: members default to public
                     return makeStringValue(nypy::repeat_str(s, n));
                 }
                 if (Container* c = contOf(*seq)) {
-                    if (seqLen(c) >= 0) {
+                    if (seqLen(c) >= 0 && !isSetCont(c)) {   // (round 87: a set is no sequence - {1} * 2 gave [1, 1])
                         std::vector<Value> items = seqItems(c), out;
                         for (int64_t t = 0; t < n; t++) out.insert(out.end(), items.begin(), items.end());
                         return makeListValue(out, isTupleCont(c));
@@ -2588,7 +2616,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         case OP_LSHIFT: case OP_RSHIFT:
             if (nums) return numArith(opc, x, y);
-            return intValue(0);
+            unsupportedOperands(opc, lv, rv);   // round 87: CPython's TypeError (it gave 0)
         case OP_EQ: return Value(valuesEqual(lv, rv, 0));
         case OP_NE: return Value(!valuesEqual(lv, rv, 0));
         case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
@@ -2966,6 +2994,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value new_val = evalNode(an->value_node, ctx, pend);
         if (pend && raisedBy(new_val)) return NONE_VALUE;   // round 82: the value raised (evalP)
         Value result;
+        try {   // round 87: CPython's TypeError names the in-place operator (augRethrow)
         // Two numbers (round 81): binaryOp's answer without its other checks
         // (no container, bytes or object is involved), then the store.
         if (astSpecOn() && an->plain_op && opc != OP_UNKNOWN && isNumType(old_val.type) && isNumType(new_val.type)
@@ -3043,8 +3072,20 @@ public:   // NythonExecutor is a struct: members default to public
                 else result = binaryOp(opcRule(opc, an->py_src), old_val, new_val, ctx);   // round 86: the node's rule
             }
         }
+        } catch (std::string& e) { augRethrow(e, opc); }
         storeAugTarget(an, kind, obj, idx, result, ctx);
         return result;
+    }
+    // round 87: `x //= "a"` - CPython's TypeError names the in-place operator
+    // ("unsupported operand type(s) for //=: 'int' and 'str'"; "**=", not "**
+    // or pow()"); the other errors pass as they are. Called in the handler:
+    // the exception caught is rethrown, its text changed.
+    [[noreturn]] void augRethrow(std::string& e, int opc) {
+        const char* sym = opSymbol(opc);
+        const std::string pre = std::string("__exc__:TypeError:unsupported operand type(s) for ") + (opc == OP_POW ? "** or pow()" : sym) + ": ";
+        if (opc != OP_UNKNOWN && e.compare(0, pre.size(), pre) == 0)
+            e = std::string("__exc__:TypeError:unsupported operand type(s) for ") + sym + "=: " + e.substr(pre.size());
+        throw;
     }
     // The store of `t op= v`: an item, an attribute (an instance's field
     // through the target's cache - round 81) or a name.
@@ -3295,6 +3336,7 @@ public:   // NythonExecutor is a struct: members default to public
                 // function's is not).
                 if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
                     auto* cn = static_cast<ClassNode*>(class_node);
+                    if (name == "__bases__") { setClassBases(cn, obj, &val); return; }   // round 87: the MRO follows
                     // C.f = staticmethod(g) / classmethod(g) / a property
                     // (round 77): as in a class body
                     Value val2 = isInstanceValue(val) ? unwrapMethodObject(val, global_ctx) : val;
@@ -3324,6 +3366,8 @@ public:   // NythonExecutor is a struct: members default to public
         // Store on Collectable containers (namespaces, modules)
         if (Container* cont = contOf(obj)) { (*cont->container)[name] = val; return; }
         if (isPlainFunction(obj)) {
+            // round 87: what later calls use (it was only remembered)
+            if (name.size() >= 12 && (name == "__defaults__" || name == "__kwdefaults__")) setFnDefaults(obj, name, &val);
             func_attrs_[obj.value.p][name] = val;
             // f.__qualname__ = "C.f": the name its call errors give (round 77)
             if (name == "__qualname__" && isStringValue(val)) {
@@ -3331,6 +3375,13 @@ public:   // NythonExecutor is a struct: members default to public
                 if (ait != func_ast_nodes.end() && ait->second) fn_qualname_[(const Node*)ait->second] = getStringValue(val);
             }
             return;
+        }
+        // round 87: int.x = v, type(None).x = v - CPython's TypeError for a
+        // builtin type (an AttributeError naming builtin_function_or_method)
+        {
+            std::string py, legacy;
+            if (typeObjectNames(obj, py, legacy) && fnTag(func_names, obj.value.p).rfind("__class__:", 0) != 0)
+                pyRaise("TypeError", "cannot set '" + name + "' attribute of immutable type '" + py + "'");
         }
         // none.x = v, 5.x = v, "s".x = v, len.x = v: nothing can hold it
         // (AttributeError, as in Python - it was dropped silently).
@@ -3831,6 +3882,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (it != C.end() && valuesEqual(it->second, args[0], 0)) { out = intValue(k); return true; }
             }
             if (name == "indexOf") { out = intValue(-1); return true; }
+            if (tup) pyRaise("ValueError", "tuple.index(x): x not in tuple");   // round 87: CPython's
             pyRaise("ValueError", reprOf(args[0], ctx) + " is not in list");
         }
         if (name == "count") {
@@ -3958,11 +4010,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (name == "update" || name == "merge") {
             if (!args.empty()) {
                 if (Container* src = contOf(args[0]); src && seqLen(src) < 0 && !nygen::is_gen(args[0])) dictUpdate(cont, src);
-                else for (auto& pairv : iterItems(args[0], ctx)) {
-                    std::vector<Value> kv = iterItems(pairv, ctx);
-                    if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
-                    dictSet(cont, kv[0], kv[1]);
-                }
+                else dictUpdatePairs(cont, args[0], ctx);
             }
             for (auto& [k, v] : kw) dictSet(cont, makeStringValue(k), v);
             out = name == "merge" ? obj : NONE_VALUE;
@@ -4226,7 +4274,7 @@ public:   // NythonExecutor is a struct: members default to public
                 }
             }
             if (!instanceHasMethod(obj, "__getitem__"))
-                pyRaise("TypeError", "'" + shownClassName(instanceClassName(obj)) + "' object is not subscriptable");
+                pyRaise("TypeError", "'" + msgClassName(instanceClassName(obj)) + "' object is not subscriptable");
             std::vector<Value> call_args = {idx};
             return callMethod(obj, "__getitem__", call_args, ctx);
         }
@@ -4298,7 +4346,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (Container* sc = setOf(obj)) pyRaise("TypeError", "'" + std::string(isFrozenCont(sc) ? "frozenset" : "set") + "' object does not support item assignment");
         if (isInstanceVal(obj)) {
             if (!instanceHasMethod(obj, "__setitem__"))
-                throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(obj)) + "' object does not support item assignment");
+                throw std::string("__exc__:TypeError:'" + msgClassName(instanceClassName(obj)) + "' object does not support item assignment");
             std::vector<Value> call_args = {idx, val};
             Value result = callMethod(obj, "__setitem__", call_args, ctx);
             if (result.type != ValueType::NONE) return;
@@ -4464,7 +4512,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (v.type == ValueType::USERDATA && v.value.p) {
             auto fit = func_names.find(v.value.p);
             if (fit != func_names.end()) {
-                if (fit->second.rfind("__instance__:", 0) == 0) return shownClassName(fit->second.substr(13));
+                if (fit->second.rfind("__instance__:", 0) == 0) return msgClassName(fit->second.substr(13));
                 if (fit->second.rfind("__class__:", 0) == 0) return "type";
                 if (fit->second.rfind("__rtype__:", 0) == 0) return "type";
                 if (fit->second.rfind("__builtin__:", 0) == 0 || fit->second.rfind("__bmethod__:", 0) == 0) return "builtin_function_or_method";
@@ -4598,6 +4646,19 @@ public:   // NythonExecutor is a struct: members default to public
                     } catch (std::string&) {}
                     if (nyb && !qn.empty()) return "<built-in function " + qn + ">";
                     if (!qn.empty()) return "<function " + qn + " at " + idHex(v, ctx ? ctx : global_ctx) + ">";
+                } else if (Node* cnode = classNodeOfValue(v)) {
+                    // round 87: a class as CPython shows it, <class
+                    // 'module.Qualname'> - a nested class and one a function
+                    // made named by their __qualname__ (it was <class '__main__.Inner'>)
+                    Value m, q;
+                    try {
+                        if (getAttrValue(v, "__module__", ctx ? ctx : global_ctx, m) && isStringValue(m)
+                            && getAttrValue(v, "__qualname__", ctx ? ctx : global_ctx, q) && isStringValue(q)) {
+                            std::string mod = getStringValue(m), qn = getStringValue(q);
+                            (void)cnode;
+                            return "<class '" + (mod == "builtins" ? qn : mod + "." + qn) + "'>";
+                        }
+                    } catch (std::string&) {}
                 }
                 return funcDisplayName(fit->second);
             }
@@ -5062,7 +5123,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (isInstanceVal(v)) {
                 const char* d = op == "-" ? "__neg__" : op == "+" ? "__pos__" : "__invert__";
                 if (!instanceHasMethod(v, d))
-                    pyRaise("TypeError", "bad operand type for unary " + op + ": '" + shownClassName(instanceClassName(v)) + "'");
+                    pyRaise("TypeError", "bad operand type for unary " + op + ": '" + msgClassName(instanceClassName(v)) + "'");
                 std::vector<Value> no_args;
                 return callMethod(v, d, no_args, ctx);
             }
@@ -5256,6 +5317,18 @@ public:   // NythonExecutor is a struct: members default to public
         target = so;
         return true;
     }
+    // round 87: sys.<name> as it is now - UNDEFINED when sys has not been
+    // made yet (then the streams are the ones it starts with) or has no
+    // such member (input()'s "lost sys.stdin")
+    Value sysMember(const char* name, bool* made = nullptr) {
+        if (made) *made = false;
+        if (sys_ns_.type == ValueType::UNDEFINED || !sys_ns_.isCollectable() || !sys_ns_.value.gc) return UNDEFINED_VALUE;
+        auto* cont = dynamic_cast<Container*>(sys_ns_.value.gc);
+        if (!cont || !cont->container) return UNDEFINED_VALUE;
+        if (made) *made = true;
+        auto it = cont->container->find(name);
+        return it == cont->container->end() ? UNDEFINED_VALUE : it->second;
+    }
 
     void printValueRepr(Value v, Context* ctx = nullptr) { std::cout << reprOf(v, ctx); }
 
@@ -5364,7 +5437,7 @@ public:   // NythonExecutor is a struct: members default to public
         else if (isStringValue(item) || bytesOf(item) || (contOf(item) && !nygen::is_gen(item))) out = iterItems(item, ctx);
         else if (isInstanceValue(item) && !rangeOf3(item) && viewOf(item, nullptr) < 0
                  && !instanceHasMethod(item, "__iter__") && !instanceHasMethod(item, "__next__") && !instanceHasMethod(item, "__getitem__"))
-            pyRaise("TypeError", "cannot unpack non-iterable " + shownClassName(instanceClassName(item)) + " object");
+            pyRaise("TypeError", "cannot unpack non-iterable " + msgClassName(instanceClassName(item)) + " object");
         else if (isInstanceValue(item) || nygen::is_gen(item)) {
             Value it = nygen::make_iter(*this, item, ctx);
             if (nygen::is_gen(it)) {
@@ -5678,7 +5751,7 @@ public:   // NythonExecutor is a struct: members default to public
             int by_index_i = 0;
             if (!instanceHasMethod(iterator, "__next__")) {
                 if (!have_pre_iterator && instanceHasMethod(iterator, "__getitem__")) by_index = true;
-                else throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(iterator)) + "' object is not iterable");
+                else throw std::string("__exc__:TypeError:'" + msgClassName(instanceClassName(iterator)) + "' object is not iterable");
             }
             // Now call __next__ repeatedly until StopIteration
             for (bool head_first = true;; head_first = false) {
@@ -6948,7 +7021,7 @@ public:   // NythonExecutor is a struct: members default to public
                             for (size_t i = ps; i < fn->params.size(); i++) {
                                 size_t ai = i - ps;
                                 if (ai < args.size()) fc->defineByName(fn->params[i]->value(), args[ai]);
-                                else if (i < fn->defaults.size() && fn->defaults[i])
+                                else if (paramHasDefault(fn->defaults, i, nullptr, fn))   // (round 87: __defaults__ assigned)
                                     fc->defineByName(fn->params[i]->value(), paramDefault(fn, i, ctx));
                                 else fc->defineByName(fn->params[i]->value(), NONE_VALUE);
                             }
@@ -7187,6 +7260,10 @@ public:   // NythonExecutor is a struct: members default to public
             if (moduleGetattr(obj, dynamic_cast<Container*>(obj.value.gc), method_name, ctx, target))
                 return callFunctionValue(target, args, ctx, kw_in);
         }
+        // round 87: x[a:b] is x.slice(a, b) to the parser - a value with no
+        // such method is not subscriptable (CPython's TypeError; it said
+        // "'float' object has no attribute 'slice'")
+        if (method_name == "slice") notSubscriptable(obj, ctx);
         // Any other value without such a method raises too: `none.m()` and
         // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
         // spelling.
@@ -7701,6 +7778,53 @@ public:   // NythonExecutor is a struct: members default to public
         }
         return makeListValue(r, false);
     }
+    // round 87: C.__bases__ = value (it changed nothing; `val` null: del) -
+    // the prelude's _ny_bases_check (CPython's checks and messages,
+    // lib/_nybases.ny), then the class's bases rebuilt: its MRO, its
+    // subclasses' and every answer kept about classes follow at once
+    // (specInvalidate and the version classDerivesFrom's memo reads)
+    void setClassBases(ClassNode* cn, const Value& cls, const Value* val) {
+        std::vector<Value> a{cls, val ? *val : NONE_VALUE};
+        Value lst = callFunctionValue(global_ctx->getByName("_ny_bases_check"), a, global_ctx);
+        std::vector<std::string> names;
+        for (auto& b : listItems(lst)) {
+            std::string bn;
+            if (Node* bcn = classNodeOfValue(b)) bn = static_cast<ClassNode*>(bcn)->name;
+            else {
+                std::string tag = fnTag(func_names, b.value.p);
+                if (b.type == ValueType::USERDATA && tag.rfind("__builtin__:", 0) == 0) bn = tag.substr(12);
+            }
+            if (bn == "map") bn = "dict";
+            if (bn.empty()) pyRaise("TypeError", "bases must be types");
+            mirrorsFor(bn);
+            names.push_back(bn);
+        }
+        auto unlist = [&](Node* base) {
+            auto it = subclasses_.find(base);
+            if (it != subclasses_.end()) it->second.erase(std::remove(it->second.begin(), it->second.end(), (Node*)cn), it->second.end());
+        };
+        for (auto& b : cn->bases) if (Node* bn = classNodeByName(b->value())) unlist(bn);
+        if (Node* objn = classNodeByName("object")) unlist(objn);
+        std::vector<node_ptr> nb;
+        bool any = false;
+        for (auto& n : names) {
+            Token t = cn->token();
+            t.value = n;
+            nb.push_back(std::make_shared<VariableNode>(t));
+            if (Node* bn = classNodeByName(n); bn && bn != cn) { subclasses_[bn].push_back(cn); any = true; }
+        }
+        if (!any) if (Node* objn = classNodeByName("object")) subclasses_[objn].push_back(cn);
+        cn->bases = nb;
+        class_parent[(void*)cn] = names[0];
+        ++class_names_ver_;
+        mro_cache_.clear();
+        attr_hook_cache_[0].clear();
+        attr_hook_cache_[1].clear();
+        attr_hook_cache_[2].clear();
+        no_new_.clear();
+        iter_own_cache_.clear();
+        specInvalidate();
+    }
     // staticmethod / classmethod objects (the prelude's) in a class's own
     // namespace are taken apart when the class is made (round 77): the
     // function is marked static / class - what every call path here knows -
@@ -7834,7 +7958,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (fnTag(func_names, m.value.p).find("__classmethod__") == std::string::npos) a.push_back(cls);
             invokeMember(m, where, cls, a, kw, ctx);
         } else if (!kw.empty()) {
-            pyRaise("TypeError", shownClassName(static_cast<ClassNode*>(cnode)->name) + ".__init_subclass__() takes no keyword arguments");
+            pyRaise("TypeError", msgClassName(static_cast<ClassNode*>(cnode)->name) + ".__init_subclass__() takes no keyword arguments");
         }
     }
     // C[x]: __class_getitem__ (PEP 560, an implicit classmethod), and the
@@ -8341,14 +8465,54 @@ public:   // NythonExecutor is a struct: members default to public
                                                   : static_cast<LambdaNode*>(code)->names_distinct;
     }
 
+    // round 87: what `f(*x)` / `f(**x)` say of a value that is not an
+    // iterable / a mapping, as CPython's - "Value after * must be an
+    // iterable, not int" ([*x] and a call with other positional arguments),
+    // "<f> argument after * must be an iterable, not int" (a call whose only
+    // positional argument is *x: checked when the call is made, after the
+    // keywords), "<f> argument after ** must be a mapping, not int". <f> is
+    // CPython's _PyObject_FunctionStr of the callee (the prelude's
+    // _ny_function_str): `who` the callee, or `who_obj.who_name`.
+    struct CallWho { const Value* fn = nullptr; const Value* obj = nullptr; const std::string* name = nullptr; };
+    std::string calleeStr(const CallWho* who, Context* ctx) {
+        Value f = NONE_VALUE;
+        if (who && who->fn) f = *who->fn;
+        else if (who && who->obj && who->name && !getAttrValue(*who->obj, *who->name, ctx, f)) f = NONE_VALUE;
+        if (f.type == ValueType::NONE) return "function()";
+        std::vector<Value> a{f};
+        Value s = callFunctionValue(global_ctx->getByName("_ny_function_str"), a, ctx);
+        return isStringValue(s) ? getStringValue(s) : std::string("function()");
+    }
+    // *x takes it: Nython code iterates an int (round 86), Python code does not
+    bool starIterable(const Value& v, bool py) {
+        if (v.type == ValueType::INTEGER) return !py;
+        if (v.type == ValueType::NONE || v.type == ValueType::UNDEFINED || v.type == ValueType::DOUBLE || v.type == ValueType::BOOLEAN) return false;
+        if (isStringValue(v) || bytesOf(v) || nygen::is_gen(v)) return true;
+        if (isInstanceValue(v)) {
+            Value r;
+            Node* cls = classNodeOfInstance(v);
+            return !cls || findClassMember(cls, "__iter__", r) || findClassMember(cls, "__getitem__", r);
+        }
+        if (Container* c = contOf(v)) { (void)c; return true; }
+        if (!class_meta_.empty() && classNodeOfValue(v)) return true;   // a metaclass's __iter__ decides
+        return v.type != ValueType::USERDATA || isInstanceVal(v);
+    }
     void evalCallArgs(const std::vector<node_ptr>& raw_args, Context* ctx,
                       std::vector<Value>& call_args,
-                      nyrt::OrderedKw<Value>& kw_args) {
+                      nyrt::OrderedKw<Value>& kw_args, const CallWho* who = nullptr) {
+        // f(*x) alone: x is checked when the call is made (CPython's
+        // CALL_FUNCTION_EX), after the keywords are gathered
+        Value deferred;
+        bool has_deferred = false, had_dstar = false;
         for (auto& a : raw_args) {
             if (a->type() == NodeType::KEYWORD_ARG) {
                 // Named argument: name=value
                 auto* kn = static_cast<KeywordArgNode*>((a).get());
-                kw_args[kn->name] = evalNode(kn->val, ctx);
+                Value kv = evalNode(kn->val, ctx);
+                // round 87: given by a **mapping before it (CPython's error)
+                if (__builtin_expect(had_dstar, 0) && kw_args.count(kn->name))
+                    pyRaise("TypeError", calleeStr(who, ctx) + " got multiple values for keyword argument '" + kn->name + "'");
+                kw_args[kn->name] = std::move(kv);
             } else if (a->type() == NodeType::UNARY) {
                 auto* un = static_cast<UnaryNode*>((a).get());
                 if (un->op == "*") {
@@ -8356,15 +8520,27 @@ public:   // NythonExecutor is a struct: members default to public
                     // (any iterable: a string's characters, a dict's keys,
                     // an object's __iter__ - a string was passed whole)
                     Value spread_val = evalNode(un->operand, ctx);
-                    if ((spread_val.isCollectable() && spread_val.value.gc) || spread_val.type == ValueType::INTEGER
-                        || isInstanceValue(spread_val) || isStringValue(spread_val)) {
-                        for (auto& v : iterValues(spread_val, ctx)) call_args.push_back(v);
-                    } else {
-                        call_args.push_back(spread_val);
-                    }
+                    size_t npos = 0;   // (counted here: only a call with *x pays)
+                    for (auto& o : raw_args)
+                        if (o->type() != NodeType::KEYWORD_ARG && !(o->type() == NodeType::UNARY && static_cast<UnaryNode*>(o.get())->op == "**")) npos++;
+                    if (npos == 1) { deferred = spread_val; has_deferred = true; continue; }
+                    if (!starIterable(spread_val, a->py_src))
+                        pyRaise("TypeError", "Value after * must be an iterable, not " + typeNameOf(spread_val));
+                    for (auto& v : iterValues(spread_val, ctx)) call_args.push_back(v);
                 } else if (un->op == "**") {
                     // **dict spread into kw_args
                     Value spread_val = evalNode(un->operand, ctx);
+                    had_dstar = true;
+                    Value pay;
+                    if (isInstanceValue(spread_val) && !(any_payload_ && payloadOf(spread_val, pay))) {
+                        Value km;
+                        if (!getAttrValue(spread_val, "keys", ctx, km))
+                            pyRaise("TypeError", calleeStr(who, ctx) + " argument after ** must be a mapping, not " + typeNameOf(spread_val));
+                    } else if (!isInstanceValue(spread_val)) {
+                        Container* mc = contOf(spread_val);
+                        if (!mc || seqLen(mc) >= 0 || isSetCont(mc))
+                            pyRaise("TypeError", calleeStr(who, ctx) + " argument after ** must be a mapping, not " + typeNameOf(spread_val));
+                    }
                     if (isInstanceValue(spread_val)) {
                         // a dict subclass's instance: its value; another
                         // mapping through keys() and [] (round 77: it was
@@ -8379,8 +8555,14 @@ public:   // NythonExecutor is a struct: members default to public
                     if (spread_val.isCollectable() && spread_val.value.gc) {
                         auto* cont = dynamic_cast<Container*>(spread_val.value.gc);
                         if (cont && cont->container)
-                            for (auto& [k, v] : *cont->container)
-                                if (!isInternalKey(k)) kw_args[nypy::key_payload(k)] = v;
+                            for (auto& [k, v] : *cont->container) {
+                                if (isInternalKey(k)) continue;
+                                // round 87: CPython's errors (the later value won)
+                                if (nypy::key_kind(k) != nypy::K_STR) pyRaise("TypeError", "keywords must be strings");
+                                std::string kn = nypy::key_payload(k);
+                                if (kw_args.count(kn)) pyRaise("TypeError", calleeStr(who, ctx) + " got multiple values for keyword argument '" + kn + "'");
+                                kw_args[kn] = v;
+                            }
                     }
                 } else {
                     call_args.push_back(evalNode(a, ctx));
@@ -8388,6 +8570,13 @@ public:   // NythonExecutor is a struct: members default to public
             } else {
                 call_args.push_back(evalNode(a, ctx));
             }
+        }
+        if (has_deferred) {
+            const node_ptr* star = nullptr;
+            for (auto& a : raw_args) if (a->type() == NodeType::UNARY && static_cast<UnaryNode*>(a.get())->op == "*") star = &a;
+            if (!starIterable(deferred, star && (*star)->py_src))
+                pyRaise("TypeError", calleeStr(who, ctx) + " argument after * must be an iterable, not " + typeNameOf(deferred));
+            for (auto& v : iterValues(deferred, ctx)) call_args.push_back(v);
         }
     }
 
@@ -8440,6 +8629,89 @@ public:   // NythonExecutor is a struct: members default to public
             if (fn->defaults[i]) vals[i] = evalNode(fn->defaults[i], ctx);
         fn_defaults_node_[fn] = vals;
         if (fn_ptr) fn_defaults_val_[fn_ptr] = std::move(vals);
+    }
+    // round 87: f.__defaults__ / f.__kwdefaults__ assigned. For that function
+    // value (and its node, which the calls binding a method without the
+    // value use), which parameters have a default now - 1 or 0 per parameter
+    // index - and fn_defaults_val_ / fn_defaults_node_ hold the values. The
+    // binders ask only while the table is not empty (one test).
+    std::unordered_map<const void*, std::vector<char>> fn_default_mask_;
+    // (the value's own, else its node's - as paramDefault looks values up)
+    bool paramHasDefault(const std::vector<node_ptr>& defs, size_t i, const void* callee_ptr, const void* node) {
+        if (__builtin_expect(!fn_default_mask_.empty(), 0)) {
+            auto it = callee_ptr ? fn_default_mask_.find(callee_ptr) : fn_default_mask_.end();
+            if (it == fn_default_mask_.end()) it = fn_default_mask_.find(node);
+            if (it != fn_default_mask_.end()) return i < it->second.size() && it->second[i];
+        }
+        return i < defs.size() && defs[i];
+    }
+    // f.__defaults__ = t / f.__kwdefaults__ = d (None or del: none): CPython's
+    // checks, then the parameters' defaults rewritten - a tuple's values go
+    // to the last positional parameters, a dict's to the keyword-only ones
+    void setFnDefaults(const Value& f, const std::string& name, const Value* val) {
+        bool kw = name == "__kwdefaults__";
+        std::vector<Value> tup;
+        Container* kd = nullptr;
+        if (val && !val->isNone()) {
+            if (!kw) {
+                Container* c = contOf(*val);
+                if (!c || !isTupleCont(c)) pyRaise("TypeError", "__defaults__ must be set to a tuple object");
+                tup = seqItems(c);
+            } else {
+                kd = contOf(*val);
+                if (!kd || !isPlainDict(kd)) pyRaise("TypeError", "__kwdefaults__ must be set to a dict object");
+            }
+        }
+        void* p = f.value.p;
+        auto an = func_ast_nodes.find(p);
+        Node* node = an == func_ast_nodes.end() ? nullptr : (Node*)an->second;
+        auto* fn = dynamic_cast<FunctionNode*>(node);
+        auto* lam = fn ? nullptr : dynamic_cast<LambdaNode*>(node);
+        if (!fn && !lam) return;
+        const std::vector<node_ptr>& params = fn ? fn->params : lam->params;
+        const std::vector<node_ptr>& defs = fn ? fn->defaults : lam->defaults;
+        size_t n = params.size();
+        std::vector<char> mask(n, 0);
+        std::vector<Value> vals(n, UNDEFINED_VALUE);
+        auto old = fn_defaults_val_.find(p);
+        // the present state: the mask set before, else the def's own
+        for (size_t i = 0; i < n; i++) {
+            mask[i] = paramHasDefault(defs, i, p, node) ? 1 : 0;
+            if (mask[i]) vals[i] = old != fn_defaults_val_.end() && i < old->second.size() ? old->second[i] : UNDEFINED_VALUE;
+            if (mask[i] && vals[i].type == ValueType::UNDEFINED && fn) vals[i] = paramDefault(fn, i, global_ctx, p);
+        }
+        // the positional parameters and the keyword-only ones
+        std::vector<size_t> pos, kwo;
+        bool star = false;
+        for (size_t i = 0; i < n; i++) {
+            const std::string& pn = params[i]->value();
+            if (pn == "*") { star = true; continue; }
+            if (pn.size() > 1 && pn[0] == '*' && pn[1] == '*') continue;
+            if (pn.size() > 1 && pn[0] == '*') { star = true; continue; }
+            (star ? kwo : pos).push_back(i);
+        }
+        if (!kw) {
+            for (size_t i : pos) { mask[i] = 0; vals[i] = UNDEFINED_VALUE; }
+            size_t m = tup.size();
+            for (size_t j = 0; j < pos.size(); j++) {
+                // aligned to the end (CPython's co_argcount - len(defaults))
+                if (j + m < pos.size()) continue;
+                size_t k = j + m - pos.size();
+                mask[pos[j]] = 1; vals[pos[j]] = tup[k];
+            }
+        } else {
+            for (size_t i : kwo) {
+                mask[i] = 0; vals[i] = UNDEFINED_VALUE;
+                if (!kd) continue;
+                auto it = kd->container->find(nypy::key_of_str(params[i]->value()));
+                if (it != kd->container->end()) { mask[i] = 1; vals[i] = it->second; }
+            }
+        }
+        fn_default_mask_[p] = mask;
+        fn_default_mask_[node] = mask;
+        fn_defaults_val_[p] = vals;
+        if (fn) fn_defaults_node_[fn] = vals;
+        if (lam && lam->sig) fn_default_mask_[lam->sig.get()] = mask;
     }
     Value paramDefault(FunctionNode* fn, size_t i, Context* eval_ctx, void* callee_ptr = nullptr) {
         if (callee_ptr) {
@@ -8511,7 +8783,7 @@ public:   // NythonExecutor is a struct: members default to public
                 auto kw_it = posonly ? kw_args.end() : kw_args.find(pname);
                 if (posonly && !kw_args.empty() && kw_args.count(pname))
                     posonly_kw += (posonly_kw.empty() ? "" : ", ") + pname;
-                bool has_default = i < fn->defaults.size() && fn->defaults[i];
+                bool has_default = paramHasDefault(fn->defaults, i, callee_ptr, fn);   // round 87: __defaults__ assigned
                 if (!star_seen) { max_pos++; if (!has_default) min_pos++; }
                 if (!star_seen && arg_idx < call_args.size()) {
                     if (kw_it != kw_args.end() && err.empty())
@@ -8523,7 +8795,7 @@ public:   // NythonExecutor is a struct: members default to public
                     fn_ctx->defineByName(pname, paramDefault(fn, i, eval_ctx, callee_ptr));
                 } else {
                     fn_ctx->defineByName(pname, NONE_VALUE);
-                    missing.push_back(pname);
+                    missing.push_back(star_seen ? "\x01" + pname : pname);   // (round 87: keyword-only marked)
                 }
             }
         }
@@ -8607,7 +8879,7 @@ public:   // NythonExecutor is a struct: members default to public
                 has_varargs = true;
                 continue;
             }
-            bool has_default = i < lam->defaults.size() && lam->defaults[i];
+            bool has_default = paramHasDefault(lam->defaults, i, callee_ptr, lam);   // round 87: __defaults__ assigned
             max_pos++; if (!has_default) min_pos++;
             auto kw_it = kw.find(pname);
             if (ai < args.size()) fc->defineByName(pname, args[ai++]);
@@ -8615,7 +8887,7 @@ public:   // NythonExecutor is a struct: members default to public
             else if (has_default) {
                 if (made && i < made->size() && (*made)[i].type != ValueType::UNDEFINED)
                     fc->defineByName(pname, (*made)[i]);
-                else fc->defineByName(pname, evalNode(lam->defaults[i], def_ctx));
+                else fc->defineByName(pname, i < lam->defaults.size() && lam->defaults[i] ? evalNode(lam->defaults[i], def_ctx) : NONE_VALUE);
             }
             else { fc->defineByName(pname, NONE_VALUE); missing.push_back(pname); }
         }
@@ -9112,7 +9384,7 @@ public:
                                     for (size_t i = ps; i < fn->params.size(); i++) {
                                         size_t ai = i - ps;
                                         if (ai < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[ai]);
-                                        else if (i < fn->defaults.size() && fn->defaults[i])
+                                        else if (paramHasDefault(fn->defaults, i, nullptr, fn))   // (round 87)
                                             fn_ctx->defineByName(fn->params[i]->value(), paramDefault(fn, i, ctx));
                                         else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
                                     }
@@ -9131,6 +9403,11 @@ public:
 
             Value obj = evalNode(attr->object, ctx, pend);
             if (pend && raisedBy(obj)) return NONE_VALUE;   // round 82
+            // round 87: Python-language source calls no dict key's value as a
+            // method ({"f": g}.f() is CPython's AttributeError; the dict's own
+            // methods win over its keys before that)
+            if (__builtin_expect(attr->py_src, 0) && pyDictKeyRead(obj, method_name))
+                pyRaise("AttributeError", "'dict' object has no attribute '" + method_name + "'");
 
             // Evaluate arguments
             std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
@@ -9152,9 +9429,10 @@ public:
                     }
                     args.reserve(argv.n);
                     for (size_t i = 0; i < argv.n; i++) args.push_back(std::move(argv[i]));
-                } else evalCallArgs(cn->args, ctx, args, kw_args);
+                } else { CallWho who{nullptr, &obj, &method_name}; evalCallArgs(cn->args, ctx, args, kw_args, &who); }
             } else {
-                evalCallArgs(cn->args, ctx, args, kw_args);
+                CallWho who{nullptr, &obj, &method_name};   // round 87: named by */** errors
+                evalCallArgs(cn->args, ctx, args, kw_args, &who);
                 // a str's, plain dict's or list's own method (round 81)
                 if (astSpecOn() && !any_getattribute_ && !(nytrace::t_hooks & nytrace::PROFILE)) {
                     Value r;
@@ -9437,7 +9715,10 @@ public:
         std::vector<Value> args;
         nyrt::OrderedKw<Value> kw_args;
         uint64_t gen_s0 = nygen::serial_now();
-        evalCallArgs(cn->args, ctx, args, kw_args);
+        {
+            CallWho who{&callee};   // round 87: named by */** errors
+            evalCallArgs(cn->args, ctx, args, kw_args, &who);
+        }
 
         // A number, a string, bytes or None is not callable (round 78: `1("x")`,
         // `"s"()`, `none()` gave none or "NameError: 'End'", and calling bytes
@@ -9593,7 +9874,7 @@ public:
         if (callee.type == ValueType::USERDATA && callee.value.p && !string_ptrs_.count(callee.value.p) &&
             fname.find("__instance__:") == 0 && instance_to_class.count(callee.value.p)) {
             if (!instanceHasMethod(callee, "__call__"))
-                throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(callee)) + "' object is not callable");
+                throw std::string("__exc__:TypeError:'" + msgClassName(instanceClassName(callee)) + "' object is not callable");
             Value call_result = callMethod(callee, "__call__", args, ctx, &kw_args);
             if (call_result.type != ValueType::NONE) return call_result;
             // __call__ returned none — still return it (it IS the result)
@@ -10545,7 +10826,7 @@ public:
             else if (pn.size() > 1 && pn[0] == '*') { kind = 2; pn = pn.substr(1); star = true; }
             else if (star) kind = 3;
             else if (i < posonly) kind = 0;
-            bool has = i < defs.size() && defs[i] && kind != 2 && kind != 4;
+            bool has = paramHasDefault(defs, i, p, node) && kind != 2 && kind != 4;   // (round 87: __defaults__ assigned)
             Value dv = NONE_VALUE;
             if (has && p) {
                 auto dit = fn_defaults_val_.find(p);
@@ -10672,14 +10953,14 @@ public:
     // The text of the AttributeError for obj.name.
     std::string attributeErrorText(const Value& obj, const std::string& name) {
         if (isInstanceValue(obj))
-            return "'" + shownClassName(instanceClassName(obj)) + "' object has no attribute '" + name + "'";
+            return "'" + msgClassName(instanceClassName(obj)) + "' object has no attribute '" + name + "'";
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             std::string t = fnTag(func_names, obj.value.p);
             if (t.rfind("__class__:", 0) == 0) {
                 std::string cn = t.substr(10);
                 size_t tag = cn.find("__");
                 if (tag != std::string::npos && tag > 0) cn = cn.substr(0, tag);
-                return "type object '" + cn + "' has no attribute '" + name + "'";
+                return "type object '" + msgClassName(cn) + "' has no attribute '" + name + "'";   // round 87: its __name__
             }
         }
         // round 84: a module's, as CPython says it (it read "'dict' object")
@@ -10884,6 +11165,13 @@ public:
                 out = Value(); out.type = ValueType::USERDATA; out.value.p = id;
                 return true;
             }
+            // round 87: C.__base__ - the base its instances' layout comes from
+            // (CPython's best_base; lib/_nybases.ny through the prelude)
+            if (attr == "__base__" && fit != func_names.end() && fit->second.rfind("__class__:", 0) == 0) {
+                std::vector<Value> a{obj};
+                out = callFunctionValue(global_ctx->getByName("_ny_class_base"), a, ctx ? ctx : global_ctx);
+                return true;
+            }
             // C.__mro__ / C.__bases__: the classes, in C3 order / as written.
             if ((attr == "__mro__" || attr == "__bases__") && fit != func_names.end()
                 && fit->second.rfind("__class__:", 0) == 0) {
@@ -11021,9 +11309,26 @@ public:
                             out = makeStringValue("builtins");
                             return true;
                         }
+                        // round 87: a nested class, or one a function made, in
+                        // a module: the module its class statement ran in (the
+                        // module's own classes are keyed "module.Class"; it
+                        // said __main__ for the others)
+                        if (dot == std::string::npos)
+                            if (Node* cnode = classNodeOfValue(obj)) {
+                                auto cit = class_ctx_map_.find((void*)cnode);
+                                if (cit != class_ctx_map_.end() && cit->second)
+                                    if (Context* mc = moduleCtx(cit->second); mc && mc != global_ctx) {
+                                        Value mn = mc->getByName("__name__");
+                                        if (isStringValue(mn)) { out = mn; return true; }
+                                    }
+                            }
                         out = makeStringValue(dot == std::string::npos ? std::string("__main__") : nm.substr(0, dot));
                         return true;
                     }
+                    // round 87: an instance has no __name__ / __qualname__ of
+                    // its own (they are the type's; it read its class's, the
+                    // VM's AttributeError)
+                    if (t.rfind("__instance__:", 0) == 0) return false;
                     // a nested class's __qualname__ is Outer.Inner, a class in
                     // a function's f.<locals>.C (round 79: the parser's)
                     if (is_class && attr == "__qualname__") {
@@ -11220,7 +11525,7 @@ public:
                 return out;
             }
             if (!instanceHasMethod(iterator, "__next__"))
-                throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(v)) + "' object is not iterable");
+                throw std::string("__exc__:TypeError:'" + msgClassName(instanceClassName(v)) + "' object is not iterable");
             while (true) {
                 try { out.push_back(callMethod(iterator, "__next__", no_args, ctx)); }
                 catch (std::string& flow) {
@@ -14957,7 +15262,14 @@ public:
                 pyRaise("NameError", "name '" + n + "' is not defined");
             }
             for (Context* c = ctx; c; c = c->parent)
-                if (c->container && c->container->erase(n)) return NONE_VALUE;
+                if (c->container && c->container->erase(n)) {
+                    // round 87: the program's global that hid a builtin is
+                    // gone; the builtin is seen again (the main program's
+                    // scope is also the builtins', so the erase took both:
+                    // `super = 1; del super` left super unbound)
+                    if (c == global_ctx && builtin_ptrs.count(n)) c->defineByName(n, builtinValue(n));
+                    return NONE_VALUE;
+                }
             pyRaise("NameError", "name '" + n + "' is not defined");
         } else if (dn->target->type() == NodeType::SUBSCRIPT) {
             // del dict[key] or del list[idx]
@@ -15016,6 +15328,8 @@ public:
             // del obj.attr
             auto attr = static_pointer_cast<AttributeNode>(dn->target);
             Value obj = evalNode(attr->object, ctx);
+            // round 87: Python-language source deletes no dict key with `.`
+            if (__builtin_expect(attr->py_src, 0) && contOf(obj)) dictAttrStoreCheck(obj, attr->attr);
             delAttrValue(obj, attr->attr);
         }
         return NONE_VALUE;
@@ -15086,6 +15400,8 @@ public:
             if (pit != instance_properties.end() && pit->second && pit->second->container) {
                 if (pit->second->container->erase(name)) return;
             } else if (fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0) {
+                if (name == "__bases__")   // round 87: CPython's TypeError (_ny_bases_check)
+                    if (auto* bcn = dynamic_cast<ClassNode*>(classNodeOfValue(obj))) { setClassBases(bcn, obj, nullptr); return; }
                 auto cit = class_ctx_map_.find(obj.value.p);
                 auto ast_it = func_ast_nodes.find(obj.value.p);
                 if (cit == class_ctx_map_.end() && ast_it != func_ast_nodes.end()) cit = class_ctx_map_.find(ast_it->second);
@@ -15108,6 +15424,13 @@ public:
             if (seqLen(cont) < 0 && cont->container->erase(name)) return;
         }
         if (obj.type == ValueType::USERDATA && obj.value.p) {
+            // round 87: del f.__defaults__ / __kwdefaults__ - none from now on
+            if ((name == "__defaults__" || name == "__kwdefaults__") && isPlainFunction(obj)) {
+                setFnDefaults(obj, name, nullptr);
+                auto fd = func_attrs_.find(obj.value.p);
+                if (fd != func_attrs_.end()) fd->second.erase(name);
+                return;
+            }
             auto fa = func_attrs_.find(obj.value.p);
             if (fa != func_attrs_.end() && fa->second.erase(name)) return;
         }
@@ -16356,6 +16679,33 @@ public:
             }
         }
     }
+    // round 87: the builtin `super` called by its name - in Python-language
+    // source that binds the name super somewhere (NyScope makes such a
+    // super(...) an ordinary call of the name): what super() / super(C, x)
+    // make, from the calling method's class and receiver
+    Value superBuiltin(std::vector<Value>& args, Context* ctx) {
+        Node* owner = nullptr; Value self;
+        if (args.size() > 2) pyRaise("TypeError", "super() takes at most 2 arguments (" + std::to_string(args.size()) + " given)");
+        if (!args.empty()) {
+            owner = classNodeOfValue(args[0]);
+            if (!owner) pyRaise("TypeError", "super() argument 1 must be a type, not " + typeNameOf(args[0]));
+            if (args.size() < 2) pyRaise("TypeError", "super(type): unbound super objects are not supported");
+            self = args[1];
+            Node* st = isInstanceValue(self) ? classNodeOfInstance(self) : classNodeOfValue(self);
+            if (!st || (st != owner && !classDerivesFrom(static_cast<ClassNode*>(st)->name, static_cast<ClassNode*>(owner)->name)
+                        && !(!isInstanceValue(self) && isMetaclassNode(owner))))
+                pyRaise("TypeError", "super(type, obj): obj must be an instance or subtype of type");
+        } else {
+            if (owner_stack_.empty() || !owner_stack_.back()) pyRaise("RuntimeError", "super(): no arguments");
+            owner = owner_stack_.back();
+            self = ctx ? ctx->getByName("self") : UNDEFINED_VALUE;
+            if ((self.type == ValueType::UNDEFINED || self.type == ValueType::NONE) && ctx) {
+                Value fa = ctx->getByName("\x01first_arg");
+                if (fa.type != ValueType::UNDEFINED) self = fa;
+            }
+        }
+        return makeSuperProxy(owner, self, ctx);
+    }
     // The prelude's super proxy class (_NySuper): super(...) used as a
     // value (round 78; it ran the parent's constructor - the shorthand
     // super(args) from before super() existed).
@@ -16559,6 +16909,10 @@ public:
         static const std::unordered_set<std::string> takes = {
             "list","tuple","set","sorted","min","max","sum","any","all","enumerate","zip","frozenset"};   // reversed: pycore's (round 78)
         if (name == "issubclass" && args.size() >= 2) {
+            // round 87: a number or None as a class: CPython's TypeError (it read false)
+            auto scalar = [](const Value& v) { return v.type == ValueType::INTEGER || v.type == ValueType::DOUBLE || v.type == ValueType::BOOLEAN || v.type == ValueType::NONE; };
+            if (scalar(args[0])) pyRaise("TypeError", "issubclass() arg 1 must be a class");
+            if (scalar(args[1])) pyRaise("TypeError", "issubclass() arg 2 must be a class, a tuple of classes, or a union");
             auto cls_name = [&](const Value& v) -> std::string {
                 if (v.type == ValueType::USERDATA && v.value.p) {
                     std::string t = fnTag(func_names, v.value.p);
@@ -16627,7 +16981,7 @@ public:
         // absence; other errors propagate.
         if ((name == "hasattr" || name == "getattr" || name == "setattr" || name == "delattr") && args.size() >= 2) {
             if (!isStringValue(args[1]))
-                pyRaise("TypeError", name + "(): attribute name must be string, not '" + typeNameOf(args[1]) + "'");
+                pyRaise("TypeError", "attribute name must be string, not '" + typeNameOf(args[1]) + "'");   // round 87: CPython's words
             std::string an = getStringValue(args[1]);
             if (name == "setattr") {
                 if (args.size() != 3) pyRaise("TypeError", "setattr expected 3 arguments, got " + std::to_string(args.size()));
@@ -16637,6 +16991,7 @@ public:
             }
             if (name == "delattr") {
                 if (args.size() != 2) pyRaise("TypeError", "delattr expected 2 arguments, got " + std::to_string(args.size()));
+                if (contOf(args[0]) && pyCode()) dictAttrStoreCheck(args[0], an);   // round 87
                 delAttrValue(args[0], an);
                 out = NONE_VALUE; return true;
             }
@@ -16716,7 +17071,7 @@ public:
                 }
                 if (instanceHasMethod(v, "__next__")) { out = v; return true; }
                 if (!instanceHasMethod(v, "__getitem__"))
-                    throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(v)) + "' object is not iterable");
+                    throw std::string("__exc__:TypeError:'" + msgClassName(instanceClassName(v)) + "' object is not iterable");
             }
             // A lazy iterator over a list, string, dict, set or range.
             out = nygen::make_iter(*this, v, ctx);
@@ -16725,7 +17080,7 @@ public:
         if (name == "next" && !args.empty()) {
             if (isInstanceValue(args[0])) {
                 if (!instanceHasMethod(args[0], "__next__"))
-                    throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(args[0])) + "' object is not an iterator");
+                    throw std::string("__exc__:TypeError:'" + msgClassName(instanceClassName(args[0])) + "' object is not an iterator");
                 std::vector<Value> none;
                 try { out = callMethod(args[0], "__next__", none, ctx); }
                 catch (std::string& e) {
@@ -17047,6 +17402,7 @@ public:
         std::vector<Value> dead_defaults;
         auto dit = fn_defaults_val_.find(p);
         if (dit != fn_defaults_val_.end()) { dead_defaults.swap(dit->second); fn_defaults_val_.erase(dit); }
+        if (!fn_default_mask_.empty()) fn_default_mask_.erase(p);   // round 87
         Value dead_setter;
         auto sit = prop_setters_.find(p);
         if (sit != prop_setters_.end()) { dead_setter = sit->second; prop_setters_.erase(sit); }

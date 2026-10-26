@@ -1560,7 +1560,16 @@ static Task* new_task_locked(Loop* L, Engine& e, std::function<BoxPtr(Engine&)> 
     L->tasks.push_back(t);
     L->ready.push_back(t.get());
     t->in_ready = true;
+    // round 87: the loop's thread is not blocked for good any more, as
+    // make_ready says. A task put on the loop from another thread
+    // (call_soon_threadsafe's callback, run_coroutine_threadsafe) left it
+    // marked blocked_forever until it woke; a thread that blocked for good
+    // in between (an executor's worker back at its queue) then saw every
+    // thread blocked and raised a false DeadlockError - one run in two of
+    // vm_audit104's task_api under Wine, where the woken thread runs late.
+    if (L->thread) L->thread->blocked_forever = false;
     L->cv.notify_all();
+    loop_wake_poll(L);
     return t.get();
 }
 
@@ -3519,6 +3528,7 @@ static std::unordered_map<std::string, Handler>& table() {
                 // batch of callbacks), then the run ends
                 L->stop_at = L->steps + L->ready.size();
             }
+            if (L->thread) L->thread->blocked_forever = false;   // round 87: woken (new_task_locked)
             L->cv.notify_all();
             loop_wake_poll(L);
             return Ret::none();

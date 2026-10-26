@@ -6,6 +6,7 @@ this file describes it **as it actually is**, including the traps.
 Last updated: round 86, part G — **§0z** (CPython's audit events (PEP 578) raised where CPython raises them, with its names and arguments, on both engines and in the library - a table generated from CPython's docs and probes (tools/audit_events.json), the prelude-caller rule for engine audit points, events from natives behind the VM's bridge; lib/nyaudit.ny audit policies, `--audit-policy` / `--audit-log`; vm_audit121)
 Round 87, part M — **§0z8** (Windows' own modules - msvcrt, winreg, winsound, _winapi over src/builtins/nywin.cpp; virtual environments: `nython -m venv`, pyvenv.cfg found at startup (src/NySite.cpp), site-packages on the search path, site for .pth files; ensurepip; nypip, an installer (`nython -m pip`): wheels, PEP 517 sdists, --find-links, PEP 503/691 indexes over HTTPS, requirement files, PEP 440/508 by a vendored packaging, importlib.metadata; a PubGrub resolver that explains unsatisfiable requirements in pub's words; `nython.lock` for several platforms and `sync`; VM tuple ordering, bound-method members, `-m pkg`'s __package__; vm_audit128)
 Round 87, part L — **§0z7** (the standard-library modules still missing: doctest complete with byte-identical reports and Nython's +HYPOTHESIS property checking (generated inputs, Hypothesis-style shrinking), sre_parse/sre_compile/sre_constants over re._parser (re a package), pipes, imp, xdrlib, nntplib, asyncore/asynchat/smtpd, pyexpat, pydoc_data, crypt with its own SHA-crypt/MD5-crypt, spwd, nis, ossaudiodev, lib2to3, turtledemo, __future__; compile(..., "single") showing values and modules' __doc__ on both engines; vm_audit127)
+Round 87, part K — **§0z6** (the semantic gaps round 86 found, fixed on both engines: input() with replaced sys.stdin/stdout, assigned `__defaults__`/`__kwdefaults__`/`__bases__` with CPython's checks (a layout model checked against CPython), tempfile.mkstemp's descriptor, sendmsg/recvmsg addresses, the `*`/`**` messages, Python-language dict keys and `super` as a name, class names and nested-class reprs with their module, TLS handshakes cancelled by asyncio.run, the false DeadlockError under Wine (a loop thread left marked blocked); and `tools/difftest.py` - differential testing against CPython over generated programs with delta debugging - and what it found: operators of non-numbers, in-place operator messages, `1 // 'a'` read as a comment, slices of non-subscriptables, yield from send, lambda qualnames, an instance's `__name__`; vm_audit126)
 Round 86, part H — **§0z2** (nylsp: a Language Server (LSP 3.17) over the real parser - incremental sync into a piece table, diagnostics from the parser/NyScope/NyxAI, scope-aware completion, hover, signature help, definition/references across files, scope-correct rename by each file's binding rule, symbols, folding, formatting, semantic tokens with deltas, code actions, inlay hints; error recovery by indentation islands; `nython -m nylsp`; vm_audit122)
 Round 86 (main session) — **§0z5** (program text never read as a path: an f-string field naming a file read it, one naming a directory hung the parser, `f"{...}"` hung on Windows; os.read/os.write on Windows' standard descriptors in binary; nylsp's stdin on Windows; nyaudit's path patterns on Windows; the round 86 suites under Wine; vm_audit125).
 Round 86, part I — **§0z3** (HTTP/2 and HPACK beyond CPython: lib/hpack.ny (RFC 7541), lib/h2/ (RFC 9113 sans-I/O H2Connection with h2's API, hyperframe's frames, RFC 9218 priorities and scheduler, asyncio client/server with ALPN, h2.sync for http.client/urllib http2=), permessage-deflate (RFC 7692) for websocket.ny and a new websocket_asyncio.ny; HPACK admission control; two engine fixes - awaiting a coroutine's own __await__, prelude chunks loaded under threads; vm_audit123)
@@ -1171,6 +1172,312 @@ clean.
 - lib2to3: the fixers the test runs are compared with CPython's output;
   the rest run (every default fixer over the Python 2 sample) but the
   `-j` multiprocess mode was not tried.
+
+## 0z6. Round 87, part K — the semantic gaps round 86 found, and a differential tester (vm_audit126, `tools/difftest.py`)
+
+`examples/vm_audit126.ny` (63 checks) passes on both engines and under
+python3.11/3.12 (all of them there: the Python-language parts run as a `.py`
+child on the same engine, the rest is valid Python whose meaning agrees).
+Sweep against 671f58b: 480 runs, 0 not ok, no regression (vm_audit57's
+expected getattr message changed with item 12).
+
+**1. input() with replaced streams.** `input()` read the process's stdin
+whatever `sys.stdin` was. CPython's builtin_input_impl uses the objects off a
+terminal: `sys.stderr.flush()` (errors ignored), `sys.stdout.write(str(prompt))`,
+`sys.stdout.flush()` (a missing or failing flush ignored), `sys.stdin.readline()`,
+"object.readline() returned non-string" for anything but str/bytes, EOFError on
+an empty line, the trailing "\n" taken off; `sys.stdin = None` (or deleted) is
+"input(): lost sys.stdin" (stdout, stderr too). The engines' input (core.cpp,
+`VirtualMachine::vm_input`) compare sys.stdin/stdout with the streams sys
+starts with (`_ny_stdin` / `_ny_stdout`, by identity) and hand a replaced pair
+to the prelude's `_ny_input`; the console path is unchanged (and keeps
+`builtins.input/result`, which CPython raises on its terminal path only).
+`NythonExecutor::sysMember` reads sys's live namespace.
+
+**2. `f.__defaults__` / `f.__kwdefaults__` assigned** were only remembered.
+Now CPython's checks ("__defaults__ must be set to a tuple object", "...a dict
+object"; None and `del` remove them) and the values are what later calls use:
+a tuple's values go to the last positional parameters (CPython's
+`co_argcount - len(defaults)` alignment), a dict's to the keyword-only ones;
+the tuple set is the one read back (`f.__defaults__ is t`), `()` reads `()`,
+inspect.signature sees them (`_ny_fn_info` reads the same tables).
+- Interpreter: `fn_default_mask_` - per function value (and per node, for the
+  method calls that bind through the node without the value) which parameters
+  have a default now; `fn_defaults_val_` / `fn_defaults_node_` hold the
+  values. `paramHasDefault(defs, i, callee_ptr, node)` replaces the AST test in
+  every binder; it reads the table only while it is not empty (one test).
+- VM: a function value made with defaults has its own vector (`VMVal::list`,
+  shared by its copies): rewritten in place. One made without has none - and
+  its identity (`func_key`: code, closure, list) says so - so its defaults go
+  to `fn_defaults_set_` by that identity; `fn_defaults_of(fn)` is what
+  call_function and fn_info read.
+- Also: "f() missing 2 required keyword-only arguments: 'k' and 'm'" (both
+  engines said "positional"): `ny_arity_error` takes keyword-only names marked
+  "\x01" and reports CPython's way (positional ones first).
+
+**3. `C.__bases__` assigned** changed nothing. Now CPython's type_set_bases:
+`lib/_nybases.ny` (imported by the prelude's `_ny_bases_check` the first time;
+Python-language, and itself runnable under CPython) checks in CPython's order
+and words - "can only assign tuple to C.__bases__, not list", "...non-empty
+tuple...", "C.__bases__ must be tuple of classes, not 'int'", "a __bases__
+item causes an inheritance cycle", "type 'bool' is not an acceptable base
+type", "multiple bases have instance lay-out conflict", "__bases__ assignment:
+'int' deallocator differs from 'A'", "...'list' object layout differs from
+'A'", "duplicate base class A", the MRO error with the heads CPython lists,
+"cannot set/delete '__bases__' attribute of immutable type 'int'" - over a
+model of CPython's instance layouts (a class's tp_base = best_base of its
+bases, whether a type is GC-tracked = its deallocator, the type a layout comes
+from = compatible_with_tp_base walked up, the slots it adds). Checked against
+CPython: 507 assignments over 29 kinds of class (heap classes with and
+without slots, int/list/dict/str/float subclasses, exceptions with and
+without their own layout, builtins) give CPython's answer and message in every
+case. Then the engines rebuild the class: interpreter `setClassBases` (the
+base nodes, `class_parent`, `subclasses_` moved, `++class_names_ver_` for
+classDerivesFrom's memo, `mro_cache_` and the hook caches cleared,
+`specInvalidate()`); VM `set_class_bases` (`VMCode::bases`/`parent_class`,
+`subclasses_`, `mro_cache_` and the caches cleared, `vm_types_changed()`).
+Method lookups, super(), isinstance/issubclass, `except` follow the new MRO at
+once, and so do the subclasses' (their MROs are computed from the bases).
+- New: `C.__base__` (both engines, `_nybases.base_of`).
+- New: `int.x = v` / `type(None).x = v` is CPython's TypeError "cannot set
+  'x' attribute of immutable type 'int'" (it was an AttributeError naming
+  builtin_function_or_method / type).
+
+**4. tempfile.mkstemp** returned a Nython file handle. It is CPython's
+`_mkstemp_inner` now: `os.open(name, O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW
+(|O_NOINHERIT)(|O_BINARY unless text=True), 0o600)` in a loop over random
+names (FileExistsError -> next name; Windows' PermissionError for a directory
+of that name too), the audit event per name tried, `(fd, abspath)`. bytes
+components give a bytes path (mkstemp and mkdtemp; the other functions still
+refuse bytes). pydoc and cgitb (`os.close(fd)`, `os.fdopen(fd, 'w')`) work
+with it; vm_audit76's `except AttributeError: file_close(fd)` fallback is dead.
+
+**5. socket.sendmsg / recvmsg** went through `_ny_os_call` (os_posix.cpp),
+which had no address. Now natives of the socket layer (`_net_sendmsg` /
+`_net_recvmsg` in net.cpp): the address parsed as sendto's (`parse_addr`, the
+socket's family), the socket's timeout and the parked-task waits as send/recv
+keep them, recvmsg's fourth item the sender's address (None on a connected
+stream socket). POSIX only (Windows has no sendmsg in CPython either).
+
+**6. `*x` / `**x` of the wrong kind**: CPython's messages and order.
+- `[*x]`, `(*x,)`, `[a, *x]`, `f(a, *x)`: "Value after * must be an iterable,
+  not NoneType"; `{*x}`: "'NoneType' object is not iterable" (the set
+  display's own); `f(*x)` alone: "__main__.f() argument after * must be an
+  iterable, not NoneType", checked after the keywords (CPython's
+  CALL_FUNCTION_EX: `f(*None, **None)` reports the **); `f(**x)`: "...
+  argument after ** must be a mapping, not int"; `{**x}`: "'int' object is
+  not a mapping"; "keywords must be strings"; "got multiple values for
+  keyword argument 'a'" (a ** mapping and a keyword, or two mappings). The
+  callee is named as CPython's `_PyObject_FunctionStr` (the prelude's
+  `_ny_function_str`: module.qualname(), qualname() for builtins).
+- An int after `*` iterates in Nython code (round 86's ruling) and is the
+  TypeError above in Python-language source. The starred displays' helpers
+  are natives now (`_ny_list_cat`, `_ny_set_cat` and their `_py` forms, both
+  engines); NyScope renames the callee to the `_py` form in Python-language
+  scopes (a new VariableNode: the VM compiles a name from its token).
+- VM: `f(*x)` alone compiles to x itself and CALL_EX's count bit 4 (checked
+  there, after MAP_MERGE); LIST_EXTEND checks; MAP_MERGE's arg 1 marks a
+  method call (the callee for the messages is under the map being built).
+- Interpreter: `evalCallArgs(..., CallWho*)` - the callee, or the receiver and
+  the method's name, for the messages only.
+
+**7. Dict keys as attributes in Python-language source**: part J made reads,
+stores, getattr/hasattr/setattr strict; the method call (`d.f()` calling a
+function stored under "f"), `del d.k` and `delattr(d, "k")` were not. Now
+AttributeError "'dict' object has no attribute 'f'" on both engines (the
+interpreter's method-call branch on the attribute node's `py_src`, the VM's
+CALL_METHOD / DELETE_ATTR on the code's `py`; one byte test each).
+
+**8. `super` in Python-language source** is a name: the lexer leaves `super`
+an Identifier unless `(` follows (`super = 1`, `super + 1`, a parameter or
+lambda parameter or comprehension variable named super, `def take(super=3)`);
+`super(...)` stays the engines' builtin call. NyScope records each
+`super(...)` call in Python-language source; when a scope it sees binds the
+name super (a parameter, an assignment, a module's own `def super()`), the
+call becomes an ordinary call of the name (`Collector::super_calls`). So that
+such a call still works when the name is the builtin again (`del super`), the
+builtin `super` called by its name is now implemented on both engines
+(`NythonExecutor::superBuiltin`, the VM's `super_proxy_of(frame)` - what
+LOAD_SUPER makes, from the calling frame; the explicit two-argument form
+too).
+
+**9. Class names in messages**: a class of an imported module is keyed
+"pkg.mod.Obj" (round 77) and the messages used that key ("'pkg.mod.Obj'
+object is not callable"). They use the class's `__name__` now, as CPython's
+tp_name of a class statement - except a class of the installation's own
+library, which keeps "module.Class" as the C types it stands for name
+themselves ('array.array', 'decimal.Decimal'; `nyrt::message_class_name`
+looks each top-level module up once in <exe dir>/lib and ../lib):
+`msgClassName` (interpreter: typeNameOf for instances, the
+not-iterable / not-subscriptable / no attribute / not callable / unary /
+item assignment / unpack / `__init_subclass__` messages, "type object 'Obj'
+has no attribute") and `bare_class_name(shown_class_name(...))` at the VM's
+(`message_class_name(shown_class_name(...))`: vm_type_name, attr_error_text,
+unary_dunder - which used the raw key). Reprs
+were module + qualname for a module's top-level classes only: a nested class
+or one a function made said `<class '__main__.Inner'>` and `__module__`
+"__main__" wherever it was defined. Now `<class 'pkg.mod.Obj.Inner'>` and
+its module: the interpreter takes the module of the context the class
+statement ran in (`class_ctx_map_` -> `moduleCtx`), the VM records it at
+MAKE_CLASS (`VMCode::module_name`), and both reprs are `__module__` +
+`__qualname__`. Also "unsupported operand type(s) for ** or pow()"
+(CPython's words, both engines).
+
+**10. A TLS handshake when asyncio.run() ends.** The server side ran its
+handshake in an internal task (`_spawn_internal`), which asyncio.run's
+`_cancel_all_tasks` does not see: the handshake went on after run() returned,
+and started the client_connected_cb task after the loop was closed. It is a
+task of the loop now (`loop.create_task(self._accept_tls(...))`, CPython's
+`_accept_connection2`): cancelled with the others, the socket closed
+(`_tls_handshake`'s `except BaseException: sock.close()`). The client side
+(a handshake in the program's own task) was already cancelled and closed;
+vm_audit126 checks both against a server that never answers / a client that
+never sends its ClientHello, and that run() returns at once.
+
+**11. The false DeadlockError under Wine** (vm_audit104's task_api, about one
+run in two on both engines, round 85's build too). Root cause in
+src/NyConc.cpp: a task put on a loop from another thread (`new_task_locked`:
+call_soon_threadsafe's callback, run_coroutine_threadsafe, the executor's
+result) notified the loop's condition variable but left the loop thread's
+record `blocked_forever` - which only `make_ready` cleared, and the loop
+itself only once it woke. A thread that blocked for good in between (the
+executor's worker back at its queue: 'asyncio_0') ran the all-threads-blocked
+check, saw the loop thread still marked, and raised. Under Wine the woken
+thread runs late, so the window is wide. `new_task_locked` and
+`async_loop_stop` now clear the loop thread's mark as `make_ready` does (and
+wake a polling loop). The detector is unchanged. Under Wine vm_audit104 then
+passed 40 runs of 40 (20 per engine, 102 checks each, no DeadlockError);
+vm_audit126 passed there too (58 checks per engine, run before its last
+check was added: the POSIX-only ones and the TLS server's, which needs the
+openssl command, are skipped). That Windows build is of cf2c7cf plus the VM's
+yield-from fix; the later changes (sets, divmod, library class names) do not
+touch the concurrency runtime.
+
+**12. More of the same kind** - what `tools/difftest.py` (below) and probes
+written from its findings turned up, fixed on both engines:
+- `& | ^ << >>` of values that are no numbers gave 0 (`None >> 1`, `1.5 << 1`
+  on the interpreter's shift path, `[1] | 1` / `"a" ^ "b"` / `x ^= "s"` on the
+  VM): CPython's "unsupported operand type(s)" TypeError (the interpreter's
+  binaryOp shift case, the VM's binop tail - every operator now). The VM's
+  `- | & ^` of two lists were set operations, from before sets were a type
+  (the interpreter raised): a TypeError on both.
+- An augmented assignment's TypeError names the in-place operator, as
+  CPython's ("unsupported operand type(s) for //=: 'int' and 'str'", "**="
+  not "** or pow()"): the interpreter rewrites binaryOp's message in
+  evalAugAssignment (`augRethrow`, in the handler: the other errors pass
+  untouched); the VM compiles an augmented assignment's operator with arg 2
+  and `binop_aug` does the same (arg 1 keeps its older meaning). `x @= 2`
+  named no operands on the VM.
+- `1 // 'ab'`, `x // [2]`, `x // {..}`, `x // ~y` read as a `//` comment
+  (Nython's), so the line's tail vanished (a parse error further on, or a
+  statement silently cut short). The lexer's heuristic takes a quote, `[`,
+  `{` or `~` after `//` as an operand; in Python-language source `//` is
+  always floor division.
+- `x[a:b]` of a value with no slice method - `1.5[1:2]`, `None[0:1]`, an
+  instance without `__getitem__`, a class: "'float' object is not
+  subscriptable" / "type 'C' is not subscriptable" (it said "'float' object
+  has no attribute 'slice'": the parser spells a slice `x.slice(a, b)`).
+- `dict(seq)` / `d.update(seq)`: CPython's messages with the element's index
+  ("dictionary update sequence element #1 has length 3; 2 is required",
+  "cannot convert dictionary update sequence element #0 to a sequence" for a
+  number or None); `NythonExecutor::dictUpdatePairs` (both interpreter
+  sites), the VM's `dict_pair_check`.
+- "tuple.index(x): x not in tuple"; getattr/hasattr/setattr/delattr's
+  "attribute name must be string, not 'int'" (no "getattr(): " prefix, as
+  3.11-3.13; vm_audit57 expected the old text and was corrected);
+  "list.append() takes exactly one argument" on the VM; `isinstance(1, 2)`,
+  `issubclass(1, int)` read False - CPython's TypeErrors for a number or None
+  given as a class (a string still names a type in Nython code).
+- A value sent through `yield from` to an iterator without `send()` (a
+  list's, a str's, map's, an object without send) was dropped and the
+  iterator stepped; CPython raises "'list_iterator' object has no attribute
+  'send'" (NyGen.cpp's yield_from; the VM's YIELD_FROM_OP, where a list's
+  or a range's iterator is a native generator - `GenState::native` - and a
+  str's is named at the first entry as iter() names it; a generator
+  expression still takes it as next() does).
+- `[a for a, *b in [5]]` counted up to 5 (the prelude's `_ny_star_shape`
+  listed the item, Nython code iterating an int): "cannot unpack
+  non-iterable int object", as an unpacking statement already said; and in
+  Python-language source `[a for a, *b in 5]` iterated the int: "'int'
+  object is not iterable" (NyScope names `_ny_star_iter`'s `_py` form there,
+  as it does the starred displays' helpers).
+- A lambda in a lambda was named `<lambda>`: CPython's
+  `<lambda>.<locals>.<lambda>` (the parser pushes the lambda's qualname
+  while it parses the body, as for a def) - the callee in "argument after *"
+  messages too.
+- `x = {1}; x *= 2` made x the list `[1, 1]` (interpreter; `{1} * 2` too) or a
+  set holding 1 twice (VM), and on the VM `x += {"b": 2}` added the dict's
+  keys: CPython's TypeErrors (a set is no sequence to repeat or extend);
+  `(1,) ** {1}` said "for **" on the VM; `divmod(obj, 1)` said "for //" on
+  the interpreter, and both engines used `//` and `%` of a class without
+  `__divmod__` - CPython's "unsupported operand type(s) for divmod()" (the
+  VM's fallback was for timedelta, which has its own `__divmod__` now).
+- `obj.__name__` / `obj.__qualname__` of an instance read its class's on
+  the interpreter (the tag-derived special attribute); CPython and the VM
+  raise AttributeError (an instance's own field or a class attribute of
+  that name is still found first).
+
+### tools/difftest.py - differential testing, after McKeeman 1998
+
+`python3 tools/difftest.py [--count N] [--seed S] [-j 2]` generates programs
+(Csmith-style, Yang et al. 2011, scaled down to Python: a seeded grammar of
+classes with operator dunders and inheritance, closures, comprehensions,
+generators and yield from, exceptions, unpacking, slicing, formatting,
+numeric tower, augmented assignment, str/dict/set methods), runs each on
+python3, the interpreter and the VM, and compares tagged observation lines
+(every observation goes through a guard that prints the repr or the
+exception's type and text, so a difference never hides the next). Each
+disagreement group is reduced by delta debugging (ddmin over the statement
+lists at every depth, then hierarchical expression reduction) under its
+signature (engine, the kind of each side's line, the exception types), and
+written to `--out` as a runnable `finding_<hash>.py` with the three outputs
+in its header; a difference both engines make the same way is one finding
+("interp+vm"). `--run P` / `--reduce P` work on one program; `--lang ny`
+compares the interpreter with the VM on `.ny` programs. Generated programs
+are deterministic (no ids, hashes of strings, set orders, time), and
+`PYTHONHASHSEED=0` is set.
+
+On seeds 1-120 (`--count 120 --seed 1`) it gave 590 disagreeing
+observations in 120 groups before item 12's fixes and 147 in 27 groups after
+them; most of what is left is one cause (a builtin subclass's constructor
+iterating an int, under "Not done"), and the rest is listed there too
+(`int.is_integer` is new in 3.12: run it with python3.12 for that unit).
+Item 9's class names were its first finding. Run it after a change to
+operators, calls, generators or messages, and compare the group list.
+
+### Not done
+
+- A builtin subclass's constructor iterates an int in Python-language
+  source: `class L(list): ...; L(2)` gives `[0, 1]`, `class D(dict)`:
+  `D(2)` a dict-update error, `C1(2) + 1` (CPython: "'int' object is not
+  iterable"). The prelude's mirror classes (`_NyB_list` ...) are
+  Nython-language code and do the iterating; they would need the caller's
+  rule. The same for their operators: in a `.py` file `1 + S("1")` (a str
+  subclass) is "11" and `1 + L()` names 'list' (CPython: TypeErrors naming
+  'S' / 'L').
+- `abs(S("s"))` / `ord(L())` for a str/list subclass name the payload's type
+  ("bad operand type for abs(): 'str'", CPython 'S'): builtins are handed the
+  value, not the instance.
+- `super(int, 1).x`: "super() argument 1 must be a type, not ..." where
+  CPython gives "'super' object has no attribute 'x'".
+- A dict key that is an instance of a str (int ...) subclass is stored as
+  its value: `{C1("1"): 1}` shows `{'1': 1}` and its key's type is str
+  (CPython keeps the key object; a set keeps it on Nython too). Keys are
+  encoded by value so that `d["1"]` finds it; keeping the object needs a
+  side table on both engines.
+- `"s" % [1]`, `"s" % range(2)`: "not all arguments converted" - CPython
+  takes any non-tuple with `__getitem__` as a mapping there and converts
+  nothing (only a dict is a mapping to the shared formatter).
+- Comparison messages for builtin subclasses name the payload's type
+  ("'>' not supported between instances of 'C0' and 'list'", CPython 'C0'
+  and 'C0').
+- `'a'(*None)`: "a() argument after * ..." where CPython says "a argument
+  after * ..." (`_PyObject_FunctionStr` of a non-function is its str).
+- An int subclass with `__getitem__`: `max(C1(1), C1(2))` compares the
+  instances as sequences ("'<' not supported between instances of 'int' and
+  'list'"; CPython compares the ints) and `list(C1(1))` iterates the int
+  payload (CPython uses `__getitem__`); a plain class with `__getitem__` in
+  max's error names 'list'.
 
 ## 0z5. Round 86 (main session) — program text is never a path, raw standard descriptors on Windows, the round 86 suites under Wine (vm_audit125)
 

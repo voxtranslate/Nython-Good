@@ -144,7 +144,10 @@ def gettempdirb():
     return gettempdir().encode("utf-8")
 
 
-def _sanitize_params(prefix, suffix, dir):
+def _sanitize_params(prefix, suffix, dir, allow_bytes=False):
+    # [prefix, suffix, dir, output type] (round 87: bytes components make
+    # mkstemp / mkdtemp give a bytes path, as CPython's; the work is done in
+    # str, decoded with os.fsdecode)
     var kinds = []
     for x in [prefix, suffix, dir]:
         if x is not None and not isinstance(x, str):
@@ -158,8 +161,17 @@ def _sanitize_params(prefix, suffix, dir):
             kinds.append("str")
     if "bytes" in kinds and "str" in kinds:
         raise TypeError("Can't mix bytes and non-bytes in path components.")
+    var output_type = str
     if "bytes" in kinds:
-        raise TypeError("bytes paths are not supported by Nython's tempfile")
+        if not allow_bytes:
+            raise TypeError("bytes paths are not supported by Nython's tempfile")
+        output_type = bytes
+        if prefix is not None:
+            prefix = os.fsdecode(prefix)
+        if suffix is not None:
+            suffix = os.fsdecode(suffix)
+        if dir is not None:
+            dir = os.fsdecode(_fspath(dir))
     if suffix is None:
         suffix = ""
     if prefix is None:
@@ -168,22 +180,70 @@ def _sanitize_params(prefix, suffix, dir):
         dir = gettempdir()
     else:
         dir = _fspath(dir)
-    return [prefix, suffix, dir]
+    return [prefix, suffix, dir, output_type]
+
+
+# os.open's flags for mkstemp's file (CPython's _text_openflags /
+# _bin_openflags): created exclusively, never through a symbolic link, not
+# inherited by children, binary on Windows unless text=True
+_text_openflags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    _text_openflags = _text_openflags | os.O_NOFOLLOW
+if hasattr(os, "O_NOINHERIT"):
+    _text_openflags = _text_openflags | os.O_NOINHERIT
+_bin_openflags = _text_openflags
+if hasattr(os, "O_BINARY"):
+    _bin_openflags = _bin_openflags | os.O_BINARY
+
+
+def _mkstemp_inner(dir, pre, suf, flags, output_type):
+    dir = os_path_abspath(dir)
+    for seq in range(TMP_MAX):
+        var file = os_path_join(dir, pre + _random_name() + suf)
+        _ny_sys_audit("tempfile.mkstemp", file)   # round 86: CPython's event (each name tried)
+        try:
+            var fd = os.open(file, flags, 0o600)
+        except FileExistsError:
+            continue
+        except PermissionError:
+            # a directory of that name on Windows
+            if _WINDOWS and os_isdir(dir) and os.access(dir, os.W_OK):
+                continue
+            raise
+        return (fd, file if output_type is str else os.fsencode(file))
+    raise FileExistsError(17, "No usable temporary file name found")
 
 
 def mkstemp(suffix=None, prefix=None, dir=None, text=False):
     """User-callable function to create and return a unique temporary
-    file. The return value is a pair (fd, name) where fd is a Nython file
-    handle open for reading and writing (close it with file_close(fd)) and
-    name is the absolute path of the file.
+    file.  The return value is a pair (fd, name) where fd is the
+    file descriptor returned by os.open, and name is the filename.
+
+    If 'suffix' is not None, the file name will end with that suffix,
+    otherwise there will be no suffix.
+
+    If 'prefix' is not None, the file name will begin with that prefix,
+    otherwise a default prefix is used.
+
+    If 'dir' is not None, the file will be created in that directory,
+    otherwise a default directory is used.
+
+    If 'text' is specified and true, the file is opened in text
+    mode.  Else (the default) the file is opened in binary mode.
+
+    If any of 'suffix', 'prefix' and 'dir' are not None, they must be the
+    same type.  If they are bytes, the returned name will be bytes; str
+    otherwise.
 
     The file is readable and writable only by the creating user ID.
+    The file descriptor is not inherited by children of this process.
+
+    Caller is responsible for deleting the file when done with it.
     """
-    var ps = _sanitize_params(prefix, suffix, dir)
-    var path = os_mkstemp(ps[0], ps[1], ps[2])
-    _ny_sys_audit("tempfile.mkstemp", path)   # round 86: CPython's event (the file made)
-    var fd = file_open_or_raise(path, "r+" if text else "r+b")
-    return (fd, os_path_abspath(path))
+    # round 87: an OS descriptor, as CPython's (it was a Nython file handle
+    # that os.write / os.close / os.fdopen did not take)
+    var ps = _sanitize_params(prefix, suffix, dir, True)
+    return _mkstemp_inner(ps[2], ps[0], ps[1], _text_openflags if text else _bin_openflags, ps[3])
 
 
 def mkdtemp(suffix=None, prefix=None, dir=None):
@@ -193,7 +253,7 @@ def mkdtemp(suffix=None, prefix=None, dir=None):
     The directory is readable, writable, and searchable only by the
     creating user.
     """
-    var ps = _sanitize_params(prefix, suffix, dir)
+    var ps = _sanitize_params(prefix, suffix, dir, True)
     var seq = 0
     while seq < TMP_MAX:
         seq = seq + 1
@@ -202,7 +262,7 @@ def mkdtemp(suffix=None, prefix=None, dir=None):
             _ny_sys_audit("tempfile.mkdtemp", file)   # round 86: CPython's event (the directory made)
             if not _WINDOWS:
                 os_chmod(file, 0o700)
-            return os_path_abspath(file)
+            return os_path_abspath(file) if ps[3] is str else os.fsencode(os_path_abspath(file))
         if os_exists(file):
             continue
         # Not a name clash: report why the directory cannot be made.
