@@ -2041,3 +2041,13 @@ caused the Nython lexer to error. All replaced with ASCII equivalents.
   ("path") is given `PathFinder.find_distributions`.
 - `tools/gen_vm_audit128_pep440.py` regenerates the PEP 440/508 table from the
   host's `packaging`.
+
+## Round 87 (main session): the merge, errno on Windows (see `HANDOFF.md` §0z9)
+
+- On Windows errno's socket names are the Windows Sockets codes (CPython's
+  errnomodule.c rule: `errno.EADDRINUSE == 10048`), so a socket error's
+  `e.errno` compares equal to them; the redefinitions are local to the
+  table in src/builtins/nysysmods.cpp.
+- A `--base` sweep needs a base binary that finds its library: build the
+  base commit in a checkout of it (or symlink its binary from there), never
+  a copy of the binary alone.

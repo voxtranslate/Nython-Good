@@ -4,6 +4,7 @@ Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
 Last updated: round 86, part G — **§0z** (CPython's audit events (PEP 578) raised where CPython raises them, with its names and arguments, on both engines and in the library - a table generated from CPython's docs and probes (tools/audit_events.json), the prelude-caller rule for engine audit points, events from natives behind the VM's bridge; lib/nyaudit.ny audit policies, `--audit-policy` / `--audit-log`; vm_audit121)
+Round 87 (main session) — **§0z9** (the merge of parts K, L and M and its verification on Linux and under Wine; errno's socket names take the Windows Sockets codes on Windows, as CPython's, so a socket error's errno equals errno.EADDRINUSE & co there and asyncore imports; vm_audit127 run under Wine)
 Round 87, part M — **§0z8** (Windows' own modules - msvcrt, winreg, winsound, _winapi over src/builtins/nywin.cpp; virtual environments: `nython -m venv`, pyvenv.cfg found at startup (src/NySite.cpp), site-packages on the search path, site for .pth files; ensurepip; nypip, an installer (`nython -m pip`): wheels, PEP 517 sdists, --find-links, PEP 503/691 indexes over HTTPS, requirement files, PEP 440/508 by a vendored packaging, importlib.metadata; a PubGrub resolver that explains unsatisfiable requirements in pub's words; `nython.lock` for several platforms and `sync`; VM tuple ordering, bound-method members, `-m pkg`'s __package__; vm_audit128)
 Round 87, part L — **§0z7** (the standard-library modules still missing: doctest complete with byte-identical reports and Nython's +HYPOTHESIS property checking (generated inputs, Hypothesis-style shrinking), sre_parse/sre_compile/sre_constants over re._parser (re a package), pipes, imp, xdrlib, nntplib, asyncore/asynchat/smtpd, pyexpat, pydoc_data, crypt with its own SHA-crypt/MD5-crypt, spwd, nis, ossaudiodev, lib2to3, turtledemo, __future__; compile(..., "single") showing values and modules' __doc__ on both engines; vm_audit127)
 Round 87, part K — **§0z6** (the semantic gaps round 86 found, fixed on both engines: input() with replaced sys.stdin/stdout, assigned `__defaults__`/`__kwdefaults__`/`__bases__` with CPython's checks (a layout model checked against CPython), tempfile.mkstemp's descriptor, sendmsg/recvmsg addresses, the `*`/`**` messages, Python-language dict keys and `super` as a name, class names and nested-class reprs with their module, TLS handshakes cancelled by asyncio.run, the false DeadlockError under Wine (a loop thread left marked blocked); and `tools/difftest.py` - differential testing against CPython over generated programs with delta debugging - and what it found: operators of non-numbers, in-place operator messages, `1 // 'a'` read as a comment, slices of non-subscriptables, yield from send, lambda qualnames, an instance's `__name__`; vm_audit126)
@@ -662,6 +663,49 @@ Verified merged (G, H, I, the main session's fixes and J): sweep 478 runs,
 0 not ok; `tools/ide_e2e.py` 463 passed; memory probe, lint, class check,
 cbp (80 units) and the API baseline clean; under Wine (64-bit) vm_audit124
 219, vm_audit119 85 and vm_audit125 14 pass on both engines.
+
+## 0z9. Round 87 (main session) — the merge of parts K, L and M, errno on Windows, vm_audit127 under Wine
+
+The three parts were written in parallel from 671f58b and merged M, then L,
+then K; only the docs conflicted (index lines, sections, table rows, FIXES'
+round 87 table - all kept). `tools/api_baseline.json` was rewritten after
+each merge (K's: `super` a builtin on both engines). Part L's suite had
+never run on Windows; under Wine it found:
+
+- **errno's socket names on Windows** (src/builtins/nysysmods.cpp): a
+  socket's OSError carried errno 10048 (WSAEADDRINUSE) while
+  `errno.EADDRINUSE` was MinGW's 100, so `e.errno == errno.EADDRINUSE` was
+  False on Windows (True on CPython), and `errno.ESHUTDOWN`, `ETOOMANYREFS`,
+  `EHOSTDOWN`, `EUSERS`, `EDQUOT`, `ESTALE`, `EREMOTE`, `ESOCKTNOSUPPORT`,
+  `EPFNOSUPPORT` did not exist (asyncore's import failed). The table now does
+  what CPython's errnomodule.c does: the VS2010 `<errno.h>` socket names are
+  replaced by their WSAE* codes and a name the CRT lacks falls back to its
+  WSAE* code (`errno.errorcode[10035]` is "WSAEWOULDBLOCK", as CPython's,
+  since the WSA names come last). Only the table sees the redefinitions.
+  The library modules that hard-code `ECONNRESET=10054 if _win` (mailbox,
+  poplib, xmlrpc) already assumed these values.
+- vm_audit127's own assumptions: a module's `__file__` on Windows joins its
+  sys.path entry with "/" (`C:\...\ny127_x/dtsample.py`; CPython's uses
+  "\\" - not changed here), so the test strips both forms; pipes' `/bin/sh`
+  pipeline demo is POSIX-only (as CPython's test_pipes); spwd, ossaudiodev
+  and nis are checked absent on Windows; asyncore's disconnect set is
+  compared by errno names.
+
+Verification of d200133 (all three parts): `vm_audit126` 63, `vm_audit127`
+159, `vm_audit128` 91 on both engines (126/127 also under python3.11);
+sweep `--base` (the base binary inside a checkout of 671f58b, so it finds
+its library) 484 runs, 0 not ok, 0 regressions, 8 fixed (the three new
+suites and vm_audit57's getattr message, both engines); ide_e2e 463 passed;
+ide_memprobe, ide_lint, ny_classcheck, cbp (83 units), api_diff clean.
+**Wine (64-bit, both engines)**: vm_audit126/127/128, 57, 124, 68 pass
+(127: 157 checks, the POSIX-only ones skipped; 128: 120 with the msvcrt/
+winreg/winsound/_winapi checks); vm_audit104 passes 20 runs out of 20 on
+each engine (round 85's false DeadlockError is gone - part K, item 11); the
+errno-sensitive suites 46, 68, 70, 97, 104, 106, 109, 110, 118, 123 pass on
+both engines with the new errno values.
+
+Not done here: the 32-bit Windows build (no i686 MinGW in this container)
+and AArch64; module `__file__` with "\\" on Windows.
 
 ## 0z8. Round 87, part M — Windows' own modules, virtual environments, and an installer with a PubGrub resolver (vm_audit128)
 

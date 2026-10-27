@@ -5828,6 +5828,13 @@ both engines and under python3).
 
 ## Round 87
 
+### Round 87 (main session) — the merge, errno on Windows (`HANDOFF.md` §0z9)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Windows: `e.errno == errno.EADDRINUSE` False for a socket error (10048 vs 100); `errno.ESHUTDOWN` missing, `import asyncore` failed | the errno table took MinGW's `<errno.h>` values for the socket names | as CPython's errnomodule.c: the socket names take their WSAE* codes, a name the CRT lacks falls back to its WSAE* code |
+| vm_audit127 failed 15 checks under Wine | paths with "/" after a Windows directory, the POSIX-only pipes demo, spwd/ossaudiodev absent there, Linux errno numbers | the test strips both separators, runs the pipes demo on POSIX only, checks those modules absent on Windows, compares by errno names |
+
 ### Round 87, part K — the semantic gaps round 86 found, and a differential tester (`HANDOFF.md` §0z6)
 
 New test: `vm_audit126` (63 checks; both engines, all of them under python3.11/3.12). New tool: `tools/difftest.py` (differential testing against CPython with generated programs and delta debugging).
