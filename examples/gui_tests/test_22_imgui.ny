@@ -61,11 +61,18 @@ check_true("label advanced cursor", after_one > 20)
 lay.label("two", th.text)
 check_true("second label advanced again", lay.cursor_y > after_one)
 check("x returns to origin", lay.cursor_x, 10)
+# same_line puts the next item on the row of the LAST one, right after it
+# (ImGui's SameLine); it used to leave it on a new row.
+var two_cmd = lay.draw.cmds[lay.draw.count - 1]
 lay.same_line()
-var y_before = lay.cursor_y
 lay.label("three", th.text)
-check("same_line keeps the row", lay.cursor_y, y_before)
-check_true("same_line advanced x", lay.cursor_x > 10)
+var three_cmd = lay.draw.cmds[lay.draw.count - 1]
+check("same_line keeps the row", three_cmd.y, two_cmd.y)
+check_true("same_line advanced x", three_cmd.x > two_cmd.x + 10)
+lay.label("four", th.text)
+var four_cmd = lay.draw.cmds[lay.draw.count - 1]
+check("next item starts a new row", four_cmd.x, 10)
+check_true("new row is below", four_cmd.y > three_cmd.y)
 lay.indent()
 check("indent moves origin", lay.origin_x, 26)
 lay.unindent()
@@ -78,7 +85,7 @@ def frame(mx, my, down):
     ui2.io.mouse_y = my
     ui2.io.mouse_down = down
     ui2.begin_frame(10, 10, 300, 200)
-    var r = ui2.button("Run")
+    var r = ui2.button("Run", th)
     ui2.end_frame()
     return r
 
@@ -112,7 +119,7 @@ def tframe(mx, my, down):
     tw.io.mouse_y = my
     tw.io.mouse_down = down
     tw.begin_frame(0, 0, 200, 200)
-    var open = tw.tree_node("src")
+    var open = tw.tree_node("src", th)
     tw.end_frame()
     return open
 check("tree starts closed", tframe(500, 500, false), false)
@@ -136,18 +143,18 @@ var d = NyImGui()
 d.io.mouse_x = 500
 d.io.mouse_y = 500
 d.begin_frame(0, 0, 200, 200)
-d.button("A")
-d.button("B")
+d.button("A", th)
+d.button("B", th)
 check("two buttons emit four commands", d.draw.count, 4)
 check_true("first frame is a change", d.end_frame())
 d.begin_frame(0, 0, 200, 200)
-d.button("A")
-d.button("B")
+d.button("A", th)
+d.button("B", th)
 check("identical frame is skipped", d.end_frame(), false)
 check("skip counted", d.skipped_frames, 1)
 d.begin_frame(0, 0, 200, 200)
-d.button("A")
-d.button("C")
+d.button("A", th)
+d.button("C", th)
 check_true("different content redraws", d.end_frame())
 
 
@@ -165,6 +172,11 @@ class TH2:
         self.button = Color(60,60,60,255)
         self.button_hover = Color(80,80,80,255)
         self.button_active = Color(0,122,204,255)
+        # what chips() draws with (the IDE's theme has them all)
+        self.accent_soft = Color(0,122,204,64)
+        self.hover = Color(42,45,46,255)
+        self.border = Color(60,60,60,255)
+        self.text_dim = Color(150,150,150,255)
 var th2 = TH2()
 var tb = NyImGui()
 var tlabels = ["Output", "Problems", "Terminal", "Debug", "Tokens", "Workshop"]

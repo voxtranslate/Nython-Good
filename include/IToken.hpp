@@ -46,6 +46,7 @@ DECLARE_ENUM_WITH_TYPE (
 	Binary,
 	Complex,
 	String,
+	Bytes,      /// b"..." (round 77)
 
 	True,
 	False,
@@ -191,6 +192,11 @@ DECLARE_ENUM_WITH_TYPE (
 	Regex,
 	New,
 	Struct,
+	NullCoalesce,/// '??'
+	NullCoalesceAssign,/// '??='
+	OptDot,/// '?.'
+	OptBracket,/// '?[' (glued to its receiver: a?[k])
+	MatMulAssign,/// '@=' (round 77)
 	TokenTypeCount
 );
 

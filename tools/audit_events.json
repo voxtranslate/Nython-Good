@@ -1,0 +1,6044 @@
+{
+ "generated_by": "tools/gen_audit_events.py (round 86)",
+ "sources": {
+  "3.11": "https://docs.python.org/3.11/library/audit_events.html (the table of the docs' audit-event directives)",
+  "3.12": "https://docs.python.org/3.12/library/audit_events.html (the table of the docs' audit-event directives)",
+  "3.13": "https://docs.python.org/3.13/library/audit_events.html (the table of the docs' audit-event directives)"
+ },
+ "probed": [
+  "3.11",
+  "3.12",
+  "3.13"
+ ],
+ "events": {
+  "_thread.start_joinable_thread": {
+   "module": "_thread",
+   "args": [
+    "function",
+    "handle",
+    "daemon"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.13"
+   ],
+   "doc_versions": [],
+   "probe_types": {
+    "3.13": [
+     "method",
+     "int",
+     "_thread._ThreadHandle"
+    ]
+   },
+   "docs": [],
+   "nython": "absent: Nython's threading starts threads as 3.12's (_thread.start_new_thread)"
+  },
+  "_thread.start_new_thread": {
+   "module": "_thread",
+   "args": [
+    "function",
+    "args",
+    "kwargs"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.12": [
+     "method",
+     "tuple",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "_thread.html#start_new_thread"
+   ],
+   "nython": "library"
+  },
+  "_winapi.CreateFile": {
+   "module": "_winapi",
+   "args": [
+    "file_name",
+    "desired_access",
+    "share_mode",
+    "creation_disposition",
+    "flags_and_attributes"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "_winapi.CreateNamedPipe": {
+   "module": "_winapi",
+   "args": [
+    "name",
+    "open_mode",
+    "pipe_mode"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "_winapi.OpenProcess": {
+   "module": "_winapi",
+   "args": [
+    "process_id",
+    "desired_access"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "array.__new__": {
+   "module": "array",
+   "args": [
+    "typecode",
+    "initializer"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "list"
+    ],
+    "3.12": [
+     "str",
+     "list"
+    ],
+    "3.13": [
+     "str",
+     "list"
+    ]
+   },
+   "docs": [
+    "array.html#array.array"
+   ],
+   "nython": "library"
+  },
+  "builtins.breakpoint": {
+   "module": "builtins",
+   "args": [
+    "breakpointhook"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "function"
+    ],
+    "3.12": [
+     "function"
+    ],
+    "3.13": [
+     "function"
+    ]
+   },
+   "docs": [
+    "functions.html#breakpoint",
+    "../builtins/functions.html#breakpoint"
+   ],
+   "nython": "prelude"
+  },
+  "builtins.id": {
+   "module": "builtins",
+   "args": [
+    "id"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int"
+    ],
+    "3.12": [
+     "int"
+    ],
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "functions.html#id",
+    "../builtins/functions.html#id"
+   ],
+   "nython": "engine"
+  },
+  "builtins.input": {
+   "module": "builtins",
+   "args": [
+    "prompt"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "functions.html#input",
+    "../builtins/functions.html#input"
+   ],
+   "nython": "engine"
+  },
+  "builtins.input/result": {
+   "module": "builtins",
+   "args": [
+    "result"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "functions.html#input",
+    "../builtins/functions.html#input"
+   ],
+   "nython": "engine"
+  },
+  "code.__new__": {
+   "module": "code",
+   "args": [
+    "code",
+    "filename",
+    "name",
+    "argcount",
+    "posonlyargcount",
+    "kwonlyargcount",
+    "nlocals",
+    "stacksize",
+    "flags"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes",
+     "str",
+     "str",
+     "int",
+     "int",
+     "int",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "bytes",
+     "str",
+     "str",
+     "int",
+     "int",
+     "int",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "bytes",
+     "str",
+     "str",
+     "int",
+     "int",
+     "int",
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "types.html#types.CodeType"
+   ],
+   "nython": "prelude"
+  },
+  "compile": {
+   "module": "builtins",
+   "args": [
+    "source",
+    "filename"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes",
+     "str"
+    ],
+    "3.12": [
+     "bytes",
+     "str"
+    ],
+    "3.13": [
+     "bytes",
+     "str"
+    ]
+   },
+   "docs": [
+    "functions.html#compile",
+    "../builtins/functions.html#compile"
+   ],
+   "nython": "engine"
+  },
+  "cpython.PyInterpreterState_Clear": {
+   "module": "(interpreter)",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../c-api/init.html#c.PyInterpreterState_Clear"
+   ],
+   "nython": "absent: C API only (one interpreter per process)"
+  },
+  "cpython.PyInterpreterState_New": {
+   "module": "(interpreter)",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../c-api/init.html#c.PyInterpreterState_New"
+   ],
+   "nython": "absent: C API only (one interpreter per process)"
+  },
+  "cpython._PySys_ClearAuditHooks": {
+   "module": "(interpreter)",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../c-api/init.html#c.Py_FinalizeEx"
+   ],
+   "nython": "absent: only C-level hooks (PySys_AddAuditHook) hear it"
+  },
+  "cpython.run_command": {
+   "module": "(interpreter)",
+   "args": [
+    "command"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../using/cmdline.html#cmdoption-c"
+   ],
+   "nython": "engine"
+  },
+  "cpython.run_file": {
+   "module": "(interpreter)",
+   "args": [
+    "filename"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../using/cmdline.html#audit_event_cpython_run_file_0"
+   ],
+   "nython": "engine"
+  },
+  "cpython.run_interactivehook": {
+   "module": "(interpreter)",
+   "args": [
+    "hook"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "sys.html#sys.__interactivehook__"
+   ],
+   "nython": "absent: no sys.__interactivehook__"
+  },
+  "cpython.run_module": {
+   "module": "(interpreter)",
+   "args": [
+    "module-name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../using/cmdline.html#cmdoption-m"
+   ],
+   "nython": "engine"
+  },
+  "cpython.run_startup": {
+   "module": "(interpreter)",
+   "args": [
+    "filename"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../using/cmdline.html#envvar-PYTHONSTARTUP"
+   ],
+   "nython": "absent: no PYTHONSTARTUP file at Nython's prompt"
+  },
+  "cpython.run_stdin": {
+   "module": "(interpreter)",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "asyncio.html#audit_event_cpython_run_stdin_0",
+    "../using/cmdline.html#audit_event_cpython_run_stdin_1",
+    "../using/cmdline.html#audit_event_cpython_run_stdin_2",
+    "asyncio.html#audit_event_cpython_run_stdin_2",
+    "../using/cmdline.html#audit_event_cpython_run_stdin_0"
+   ],
+   "nython": "engine"
+  },
+  "ctypes.addressof": {
+   "module": "ctypes",
+   "args": [
+    "obj"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "ctypes.c_int"
+    ],
+    "3.12": [
+     "ctypes.c_int"
+    ],
+    "3.13": [
+     "ctypes.c_int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.addressof"
+   ],
+   "nython": "library"
+  },
+  "ctypes.call_function": {
+   "module": "ctypes",
+   "args": [
+    "func_pointer",
+    "arguments"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ctypes.html#foreign-functions"
+   ],
+   "nython": "absent: raised by CPython's private _ctypes.call_function only"
+  },
+  "ctypes.cdata": {
+   "module": "ctypes",
+   "args": [
+    "address"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int"
+    ],
+    "3.12": [
+     "int"
+    ],
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes._CData.from_address"
+   ],
+   "nython": "library"
+  },
+  "ctypes.cdata/buffer": {
+   "module": "ctypes",
+   "args": [
+    "pointer",
+    "size",
+    "offset"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes._CData.from_buffer",
+    "ctypes.html#ctypes._CData.from_buffer_copy"
+   ],
+   "nython": "library"
+  },
+  "ctypes.create_string_buffer": {
+   "module": "ctypes",
+   "args": [
+    "init",
+    "size"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes",
+     "int"
+    ],
+    "3.12": [
+     "bytes",
+     "int"
+    ],
+    "3.13": [
+     "bytes",
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.create_string_buffer"
+   ],
+   "nython": "library"
+  },
+  "ctypes.create_unicode_buffer": {
+   "module": "ctypes",
+   "args": [
+    "init",
+    "size"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.create_unicode_buffer"
+   ],
+   "nython": "library"
+  },
+  "ctypes.dlopen": {
+   "module": "ctypes",
+   "args": [
+    "name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "NoneType"
+    ],
+    "3.12": [
+     "NoneType"
+    ],
+    "3.13": [
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.LibraryLoader"
+   ],
+   "nython": "library"
+  },
+  "ctypes.dlsym": {
+   "module": "ctypes",
+   "args": [
+    "library",
+    "name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "ctypes.CDLL",
+     "str"
+    ],
+    "3.12": [
+     "ctypes.CDLL",
+     "str"
+    ],
+    "3.13": [
+     "ctypes.CDLL",
+     "str"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.LibraryLoader"
+   ],
+   "nython": "library"
+  },
+  "ctypes.dlsym/handle": {
+   "module": "ctypes",
+   "args": [
+    "handle",
+    "name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ctypes.html#ctypes.LibraryLoader"
+   ],
+   "nython": "absent: raised by CPython's private _ctypes.dlsym only"
+  },
+  "ctypes.get_errno": {
+   "module": "ctypes",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "ctypes.html#ctypes.get_errno"
+   ],
+   "nython": "library"
+  },
+  "ctypes.get_last_error": {
+   "module": "ctypes",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ctypes.html#ctypes.get_last_error"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "ctypes.seh_exception": {
+   "module": "ctypes",
+   "args": [
+    "code"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11"
+   ],
+   "doc_versions": [
+    "3.11"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ctypes.html#foreign-functions"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows SEH (ctypes structured exceptions) not provided"
+  },
+  "ctypes.set_errno": {
+   "module": "ctypes",
+   "args": [
+    "errno"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int"
+    ],
+    "3.12": [
+     "int"
+    ],
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.set_errno"
+   ],
+   "nython": "library"
+  },
+  "ctypes.set_exception": {
+   "module": "ctypes",
+   "args": [
+    "code"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ctypes.html#foreign-functions"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows SEH (ctypes structured exceptions) not provided"
+  },
+  "ctypes.set_last_error": {
+   "module": "ctypes",
+   "args": [
+    "error"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ctypes.html#ctypes.set_last_error"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "ctypes.string_at": {
+   "module": "ctypes",
+   "args": [
+    "ptr",
+    "size"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.string_at"
+   ],
+   "nython": "library"
+  },
+  "ctypes.wstring_at": {
+   "module": "ctypes",
+   "args": [
+    "ptr",
+    "size"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "ctypes.html#ctypes.wstring_at"
+   ],
+   "nython": "library"
+  },
+  "ensurepip.bootstrap": {
+   "module": "ensurepip",
+   "args": [
+    "root"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "NoneType"
+    ],
+    "3.13": [
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "ensurepip.html#ensurepip.bootstrap"
+   ],
+   "nython": "library"
+  },
+  "exec": {
+   "module": "builtins",
+   "args": [
+    "code_object"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "code"
+    ],
+    "3.12": [
+     "code"
+    ],
+    "3.13": [
+     "code"
+    ]
+   },
+   "docs": [
+    "functions.html#eval",
+    "functions.html#exec",
+    "../builtins/functions.html#eval",
+    "../builtins/functions.html#exec"
+   ],
+   "nython": "engine"
+  },
+  "fcntl.fcntl": {
+   "module": "fcntl",
+   "args": [
+    "fd",
+    "cmd",
+    "arg"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "NoneType"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "NoneType"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "fcntl.html#fcntl.fcntl"
+   ],
+   "nython": "library"
+  },
+  "fcntl.flock": {
+   "module": "fcntl",
+   "args": [
+    "fd",
+    "operation"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "fcntl.html#fcntl.flock"
+   ],
+   "nython": "library"
+  },
+  "fcntl.ioctl": {
+   "module": "fcntl",
+   "args": [
+    "fd",
+    "request",
+    "arg"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "bytes"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "bytes"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "bytes"
+    ]
+   },
+   "docs": [
+    "fcntl.html#fcntl.ioctl"
+   ],
+   "nython": "library"
+  },
+  "fcntl.lockf": {
+   "module": "fcntl",
+   "args": [
+    "fd",
+    "cmd",
+    "len",
+    "start",
+    "whence"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "NoneType",
+     "NoneType",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "NoneType",
+     "NoneType",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "NoneType",
+     "NoneType",
+     "int"
+    ]
+   },
+   "docs": [
+    "fcntl.html#fcntl.lockf"
+   ],
+   "nython": "library"
+  },
+  "ftplib.connect": {
+   "module": "ftplib",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "ftplib.FTP",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "ftplib.FTP",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "ftplib.FTP",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "ftplib.html#ftplib.FTP.connect"
+   ],
+   "nython": "library"
+  },
+  "ftplib.sendcmd": {
+   "module": "ftplib",
+   "args": [
+    "self",
+    "cmd"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "ftplib.html#ftplib.FTP.sendcmd",
+    "ftplib.html#ftplib.FTP.voidcmd"
+   ],
+   "nython": "library"
+  },
+  "function.__new__": {
+   "module": "function",
+   "args": [
+    "code"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "code"
+    ],
+    "3.12": [
+     "code"
+    ],
+    "3.13": [
+     "code"
+    ]
+   },
+   "docs": [
+    "types.html#types.FunctionType"
+   ],
+   "nython": "engine"
+  },
+  "gc.get_objects": {
+   "module": "gc",
+   "args": [
+    "generation"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int"
+    ],
+    "3.12": [
+     "int"
+    ],
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "gc.html#gc.get_objects"
+   ],
+   "nython": "library"
+  },
+  "gc.get_referents": {
+   "module": "gc",
+   "args": [
+    "objs"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "tuple"
+    ],
+    "3.12": [
+     "tuple"
+    ],
+    "3.13": [
+     "tuple"
+    ]
+   },
+   "docs": [
+    "gc.html#gc.get_referents"
+   ],
+   "nython": "library"
+  },
+  "gc.get_referrers": {
+   "module": "gc",
+   "args": [
+    "objs"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "tuple"
+    ],
+    "3.12": [
+     "tuple"
+    ],
+    "3.13": [
+     "tuple"
+    ]
+   },
+   "docs": [
+    "gc.html#gc.get_referrers"
+   ],
+   "nython": "library"
+  },
+  "glob.glob": {
+   "module": "glob",
+   "args": [
+    "pathname",
+    "recursive"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "bool"
+    ],
+    "3.12": [
+     "str",
+     "bool"
+    ],
+    "3.13": [
+     "str",
+     "bool"
+    ]
+   },
+   "docs": [
+    "glob.html#glob.glob",
+    "glob.html#glob.iglob"
+   ],
+   "nython": "library"
+  },
+  "glob.glob/2": {
+   "module": "glob",
+   "args": [
+    "pathname",
+    "recursive",
+    "root_dir",
+    "dir_fd"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "bool",
+     "NoneType",
+     "NoneType"
+    ],
+    "3.12": [
+     "str",
+     "bool",
+     "NoneType",
+     "NoneType"
+    ],
+    "3.13": [
+     "str",
+     "bool",
+     "NoneType",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "glob.html#glob.glob",
+    "glob.html#glob.iglob"
+   ],
+   "nython": "library"
+  },
+  "http.client.connect": {
+   "module": "http.client",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "http.client.HTTPConnection",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "http.client.HTTPConnection",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "http.client.HTTPConnection",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "http.client.html#http.client.HTTPConnection.connect"
+   ],
+   "nython": "library"
+  },
+  "http.client.send": {
+   "module": "http.client",
+   "args": [
+    "self",
+    "data"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "http.client.HTTPConnection",
+     "bytes"
+    ],
+    "3.12": [
+     "http.client.HTTPConnection",
+     "bytes"
+    ],
+    "3.13": [
+     "http.client.HTTPConnection",
+     "bytes"
+    ]
+   },
+   "docs": [
+    "http.client.html#http.client.HTTPConnection.send"
+   ],
+   "nython": "library"
+  },
+  "imaplib.open": {
+   "module": "imaplib",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "imaplib.IMAP4",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "imaplib.IMAP4",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "imaplib.IMAP4",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "imaplib.html#imaplib.IMAP4.open"
+   ],
+   "nython": "library"
+  },
+  "imaplib.send": {
+   "module": "imaplib",
+   "args": [
+    "self",
+    "data"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "imaplib.html#imaplib.IMAP4.send"
+   ],
+   "nython": "library"
+  },
+  "import": {
+   "module": "builtins",
+   "args": [
+    "module",
+    "filename",
+    "sys.path",
+    "sys.meta_path",
+    "sys.path_hooks"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "NoneType",
+     "list",
+     "list",
+     "list"
+    ],
+    "3.12": [
+     "str",
+     "NoneType",
+     "list",
+     "list",
+     "list"
+    ],
+    "3.13": [
+     "str",
+     "NoneType",
+     "list",
+     "list",
+     "list"
+    ]
+   },
+   "docs": [
+    "../reference/simple_stmts.html#import"
+   ],
+   "nython": "engine"
+  },
+  "marshal.dumps": {
+   "module": "marshal",
+   "args": [
+    "value",
+    "version"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "marshal.html#marshal.dump"
+   ],
+   "nython": "library"
+  },
+  "marshal.load": {
+   "module": "marshal",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "marshal.html#marshal.load"
+   ],
+   "nython": "library"
+  },
+  "marshal.loads": {
+   "module": "marshal",
+   "args": [
+    "bytes"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes"
+    ],
+    "3.12": [
+     "bytes"
+    ],
+    "3.13": [
+     "bytes"
+    ]
+   },
+   "docs": [
+    "marshal.html#marshal.load"
+   ],
+   "nython": "library"
+  },
+  "mmap.__new__": {
+   "module": "mmap",
+   "args": [
+    "fileno",
+    "length",
+    "access",
+    "offset"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "mmap.html#mmap.mmap"
+   ],
+   "nython": "library"
+  },
+  "msvcrt.get_osfhandle": {
+   "module": "msvcrt",
+   "args": [
+    "fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "msvcrt.html#msvcrt.get_osfhandle"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "msvcrt.locking": {
+   "module": "msvcrt",
+   "args": [
+    "fd",
+    "mode",
+    "nbytes"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "msvcrt.html#msvcrt.locking"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "msvcrt.open_osfhandle": {
+   "module": "msvcrt",
+   "args": [
+    "handle",
+    "flags"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "msvcrt.html#msvcrt.open_osfhandle"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "nntplib.connect": {
+   "module": "nntplib",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12"
+   ],
+   "probe_types": {
+    "3.11": [
+     "nntplib.NNTP",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "nntplib.NNTP",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "nntplib.html#nntplib.NNTP",
+    "nntplib.html#nntplib.NNTP_SSL"
+   ],
+   "nython": "absent: no nntplib (removed from CPython in 3.13)"
+  },
+  "nntplib.putline": {
+   "module": "nntplib",
+   "args": [
+    "self",
+    "line"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12"
+   ],
+   "probe_types": {},
+   "docs": [
+    "nntplib.html#nntplib.NNTP",
+    "nntplib.html#nntplib.NNTP_SSL"
+   ],
+   "nython": "absent: no nntplib (removed from CPython in 3.13)"
+  },
+  "object.__delattr__": {
+   "module": "builtins",
+   "args": [
+    "obj",
+    "name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "function",
+     "str"
+    ],
+    "3.12": [
+     "function",
+     "str"
+    ],
+    "3.13": [
+     "function",
+     "str"
+    ]
+   },
+   "docs": [
+    "../reference/datamodel.html#object.__delattr__"
+   ],
+   "nython": "engine"
+  },
+  "object.__getattr__": {
+   "module": "builtins",
+   "args": [
+    "obj",
+    "name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "function",
+     "str"
+    ],
+    "3.12": [
+     "function",
+     "str"
+    ],
+    "3.13": [
+     "function",
+     "str"
+    ]
+   },
+   "docs": [
+    "../reference/datamodel.html#object.__getattribute__"
+   ],
+   "nython": "engine"
+  },
+  "object.__setattr__": {
+   "module": "builtins",
+   "args": [
+    "obj",
+    "name",
+    "value"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "type",
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "type",
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "type",
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "../reference/datamodel.html#object.__setattr__"
+   ],
+   "nython": "engine"
+  },
+  "open": {
+   "module": "builtins",
+   "args": [
+    "path",
+    "mode",
+    "flags"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "functions.html#open",
+    "io.html#io.open",
+    "os.html#os.open",
+    "../builtins/functions.html#open"
+   ],
+   "nython": "prelude"
+  },
+  "os.add_dll_directory": {
+   "module": "os",
+   "args": [
+    "path"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.add_dll_directory"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows only"
+  },
+  "os.chdir": {
+   "module": "os",
+   "args": [
+    "path"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "os.html#os.chdir",
+    "os.html#os.fchdir"
+   ],
+   "nython": "prelude"
+  },
+  "os.chflags": {
+   "module": "os",
+   "args": [
+    "path",
+    "flags"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.chflags",
+    "os.html#os.lchflags"
+   ],
+   "nython": "absent: BSD/macOS only (no chflags on Linux or Windows)"
+  },
+  "os.chmod": {
+   "module": "os",
+   "args": [
+    "path",
+    "mode",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.chmod",
+    "os.html#os.fchmod",
+    "os.html#os.lchmod"
+   ],
+   "nython": "prelude"
+  },
+  "os.chown": {
+   "module": "os",
+   "args": [
+    "path",
+    "uid",
+    "gid",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.chown",
+    "os.html#os.fchown",
+    "os.html#os.lchown"
+   ],
+   "nython": "prelude"
+  },
+  "os.exec": {
+   "module": "os",
+   "args": [
+    "path",
+    "args",
+    "env"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "list",
+     "NoneType"
+    ],
+    "3.12": [
+     "str",
+     "list",
+     "NoneType"
+    ],
+    "3.13": [
+     "str",
+     "list",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "os.html#os.execl"
+   ],
+   "nython": "prelude"
+  },
+  "os.fork": {
+   "module": "os",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "os.html#os.fork"
+   ],
+   "nython": "prelude"
+  },
+  "os.forkpty": {
+   "module": "os",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "os.html#os.forkpty"
+   ],
+   "nython": "prelude"
+  },
+  "os.fwalk": {
+   "module": "os",
+   "args": [
+    "top",
+    "topdown",
+    "onerror",
+    "follow_symlinks",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "bool",
+     "NoneType",
+     "bool",
+     "NoneType"
+    ],
+    "3.12": [
+     "str",
+     "bool",
+     "NoneType",
+     "bool",
+     "NoneType"
+    ],
+    "3.13": [
+     "str",
+     "bool",
+     "NoneType",
+     "bool",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "os.html#os.fwalk"
+   ],
+   "nython": "prelude"
+  },
+  "os.getxattr": {
+   "module": "os",
+   "args": [
+    "path",
+    "attribute"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "os.html#os.getxattr"
+   ],
+   "nython": "prelude"
+  },
+  "os.kill": {
+   "module": "os",
+   "args": [
+    "pid",
+    "sig"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.kill"
+   ],
+   "nython": "prelude"
+  },
+  "os.killpg": {
+   "module": "os",
+   "args": [
+    "pgid",
+    "sig"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.killpg"
+   ],
+   "nython": "prelude"
+  },
+  "os.link": {
+   "module": "os",
+   "args": [
+    "src",
+    "dst",
+    "src_dir_fd",
+    "dst_dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.link"
+   ],
+   "nython": "prelude"
+  },
+  "os.listdir": {
+   "module": "os",
+   "args": [
+    "path"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "os.html#os.listdir"
+   ],
+   "nython": "prelude"
+  },
+  "os.listdrives": {
+   "module": "os",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.listdrives"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows only"
+  },
+  "os.listmounts": {
+   "module": "os",
+   "args": [
+    "volume"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.listmounts"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows only"
+  },
+  "os.listvolumes": {
+   "module": "os",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.listvolumes"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows only"
+  },
+  "os.listxattr": {
+   "module": "os",
+   "args": [
+    "path"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "os.html#os.listxattr"
+   ],
+   "nython": "prelude"
+  },
+  "os.lockf": {
+   "module": "os",
+   "args": [
+    "fd",
+    "cmd",
+    "len"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.lockf"
+   ],
+   "nython": "prelude"
+  },
+  "os.mkdir": {
+   "module": "os",
+   "args": [
+    "path",
+    "mode",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.makedirs",
+    "os.html#os.mkdir"
+   ],
+   "nython": "prelude"
+  },
+  "os.posix_spawn": {
+   "module": "os",
+   "args": [
+    "path",
+    "argv",
+    "env"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "list",
+     "os._Environ"
+    ],
+    "3.12": [
+     "str",
+     "list",
+     "os._Environ"
+    ],
+    "3.13": [
+     "str",
+     "list",
+     "dict"
+    ]
+   },
+   "docs": [
+    "os.html#os.posix_spawn",
+    "os.html#os.posix_spawnp"
+   ],
+   "nython": "prelude"
+  },
+  "os.putenv": {
+   "module": "os",
+   "args": [
+    "key",
+    "value"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes",
+     "bytes"
+    ],
+    "3.12": [
+     "bytes",
+     "bytes"
+    ],
+    "3.13": [
+     "bytes",
+     "bytes"
+    ]
+   },
+   "docs": [
+    "os.html#os.putenv"
+   ],
+   "nython": "prelude"
+  },
+  "os.remove": {
+   "module": "os",
+   "args": [
+    "path",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.remove",
+    "os.html#os.removedirs",
+    "os.html#os.unlink"
+   ],
+   "nython": "prelude"
+  },
+  "os.removexattr": {
+   "module": "os",
+   "args": [
+    "path",
+    "attribute"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "os.html#os.removexattr"
+   ],
+   "nython": "prelude"
+  },
+  "os.rename": {
+   "module": "os",
+   "args": [
+    "src",
+    "dst",
+    "src_dir_fd",
+    "dst_dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.rename",
+    "os.html#os.renames",
+    "os.html#os.replace"
+   ],
+   "nython": "prelude"
+  },
+  "os.rmdir": {
+   "module": "os",
+   "args": [
+    "path",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.rmdir"
+   ],
+   "nython": "prelude"
+  },
+  "os.scandir": {
+   "module": "os",
+   "args": [
+    "path"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "os.html#os.scandir"
+   ],
+   "nython": "prelude"
+  },
+  "os.setxattr": {
+   "module": "os",
+   "args": [
+    "path",
+    "attribute",
+    "value",
+    "flags"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "bytes",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "bytes",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "bytes",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.setxattr"
+   ],
+   "nython": "prelude"
+  },
+  "os.spawn": {
+   "module": "os",
+   "args": [
+    "mode",
+    "path",
+    "args",
+    "env"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.spawnl"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows only (POSIX's os.spawn* are fork + exec: os.fork, os.exec)"
+  },
+  "os.startfile": {
+   "module": "os",
+   "args": [
+    "path",
+    "operation"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.startfile"
+   ],
+   "platform": "windows",
+   "nython": "absent: Windows only"
+  },
+  "os.startfile/2": {
+   "module": "os",
+   "args": [
+    "path",
+    "operation",
+    "arguments",
+    "cwd",
+    "show_cmd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "os.html#os.startfile"
+   ],
+   "nython": "absent"
+  },
+  "os.symlink": {
+   "module": "os",
+   "args": [
+    "src",
+    "dst",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.symlink"
+   ],
+   "nython": "prelude"
+  },
+  "os.system": {
+   "module": "os",
+   "args": [
+    "command"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes"
+    ],
+    "3.12": [
+     "bytes"
+    ],
+    "3.13": [
+     "bytes"
+    ]
+   },
+   "docs": [
+    "os.html#os.system"
+   ],
+   "nython": "prelude"
+  },
+  "os.truncate": {
+   "module": "os",
+   "args": [
+    "fd",
+    "length"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.ftruncate",
+    "os.html#os.truncate"
+   ],
+   "nython": "prelude"
+  },
+  "os.unsetenv": {
+   "module": "os",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes"
+    ],
+    "3.12": [
+     "bytes"
+    ],
+    "3.13": [
+     "bytes"
+    ]
+   },
+   "docs": [
+    "os.html#os.unsetenv"
+   ],
+   "nython": "prelude"
+  },
+  "os.utime": {
+   "module": "os",
+   "args": [
+    "path",
+    "times",
+    "ns",
+    "dir_fd"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "NoneType",
+     "tuple",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "NoneType",
+     "tuple",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "NoneType",
+     "tuple",
+     "int"
+    ]
+   },
+   "docs": [
+    "os.html#os.utime"
+   ],
+   "nython": "prelude"
+  },
+  "os.walk": {
+   "module": "os",
+   "args": [
+    "top",
+    "topdown",
+    "onerror",
+    "followlinks"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "bool",
+     "NoneType",
+     "bool"
+    ],
+    "3.12": [
+     "str",
+     "bool",
+     "NoneType",
+     "bool"
+    ],
+    "3.13": [
+     "str",
+     "bool",
+     "NoneType",
+     "bool"
+    ]
+   },
+   "docs": [
+    "os.html#os.walk"
+   ],
+   "nython": "prelude"
+  },
+  "pathlib.Path.glob": {
+   "module": "pathlib",
+   "args": [
+    "self",
+    "pattern"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "pathlib.PosixPath",
+     "str"
+    ],
+    "3.12": [
+     "pathlib.PosixPath",
+     "str"
+    ],
+    "3.13": [
+     "pathlib._local.PosixPath",
+     "str"
+    ]
+   },
+   "docs": [
+    "pathlib.html#pathlib.Path.glob"
+   ],
+   "nython": "library"
+  },
+  "pathlib.Path.rglob": {
+   "module": "pathlib",
+   "args": [
+    "self",
+    "pattern"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "pathlib.PosixPath",
+     "str"
+    ],
+    "3.12": [
+     "pathlib.PosixPath",
+     "str"
+    ],
+    "3.13": [
+     "pathlib._local.PosixPath",
+     "str"
+    ]
+   },
+   "docs": [
+    "pathlib.html#pathlib.Path.rglob"
+   ],
+   "nython": "library"
+  },
+  "pathlib.Path.walk": {
+   "module": "pathlib",
+   "args": [
+    "self",
+    "on_error",
+    "follow_symlinks"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.12"
+   ],
+   "doc_versions": [],
+   "probe_types": {
+    "3.12": [
+     "pathlib.PosixPath",
+     "NoneType",
+     "bool"
+    ]
+   },
+   "docs": [],
+   "nython": "library"
+  },
+  "pdb.Pdb": {
+   "module": "pdb",
+   "args": [],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "pdb.html#pdb.Pdb"
+   ],
+   "nython": "library"
+  },
+  "pickle.find_class": {
+   "module": "pickle",
+   "args": [
+    "module",
+    "name"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "pickle.html#pickle.Unpickler.find_class"
+   ],
+   "nython": "library"
+  },
+  "poplib.connect": {
+   "module": "poplib",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "poplib.POP3",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "poplib.POP3",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "poplib.POP3",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "poplib.html#poplib.POP3",
+    "poplib.html#poplib.POP3_SSL"
+   ],
+   "nython": "library"
+  },
+  "poplib.putline": {
+   "module": "poplib",
+   "args": [
+    "self",
+    "line"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "poplib.html#poplib.POP3",
+    "poplib.html#poplib.POP3_SSL"
+   ],
+   "nython": "library"
+  },
+  "pty.spawn": {
+   "module": "pty",
+   "args": [
+    "argv"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "tuple"
+    ],
+    "3.12": [
+     "tuple"
+    ],
+    "3.13": [
+     "tuple"
+    ]
+   },
+   "docs": [
+    "pty.html#pty.spawn"
+   ],
+   "nython": "library"
+  },
+  "resource.prlimit": {
+   "module": "resource",
+   "args": [
+    "pid",
+    "resource",
+    "limits"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int",
+     "NoneType"
+    ],
+    "3.12": [
+     "int",
+     "int",
+     "NoneType"
+    ],
+    "3.13": [
+     "int",
+     "int",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "resource.html#resource.prlimit"
+   ],
+   "nython": "library"
+  },
+  "resource.setrlimit": {
+   "module": "resource",
+   "args": [
+    "resource",
+    "limits"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "tuple"
+    ],
+    "3.12": [
+     "int",
+     "tuple"
+    ],
+    "3.13": [
+     "int",
+     "tuple"
+    ]
+   },
+   "docs": [
+    "resource.html#resource.setrlimit"
+   ],
+   "nython": "library"
+  },
+  "setopencodehook": {
+   "module": "builtins",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "../c-api/file.html#c.PyFile_SetOpenCodeHook"
+   ],
+   "nython": "absent: C API only (PyFile_SetOpenCodeHook)"
+  },
+  "shutil.chown": {
+   "module": "shutil",
+   "args": [
+    "path",
+    "user",
+    "group"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int",
+     "NoneType"
+    ],
+    "3.12": [
+     "str",
+     "int",
+     "NoneType"
+    ],
+    "3.13": [
+     "str",
+     "int",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.chown"
+   ],
+   "nython": "library"
+  },
+  "shutil.copyfile": {
+   "module": "shutil",
+   "args": [
+    "src",
+    "dst"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.copy",
+    "shutil.html#shutil.copy2",
+    "shutil.html#shutil.copyfile"
+   ],
+   "nython": "library"
+  },
+  "shutil.copymode": {
+   "module": "shutil",
+   "args": [
+    "src",
+    "dst"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.copy",
+    "shutil.html#shutil.copymode"
+   ],
+   "nython": "library"
+  },
+  "shutil.copystat": {
+   "module": "shutil",
+   "args": [
+    "src",
+    "dst"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.copy2",
+    "shutil.html#shutil.copystat"
+   ],
+   "nython": "library"
+  },
+  "shutil.copytree": {
+   "module": "shutil",
+   "args": [
+    "src",
+    "dst"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.copytree"
+   ],
+   "nython": "library"
+  },
+  "shutil.make_archive": {
+   "module": "shutil",
+   "args": [
+    "base_name",
+    "format",
+    "root_dir",
+    "base_dir"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.make_archive"
+   ],
+   "nython": "library"
+  },
+  "shutil.move": {
+   "module": "shutil",
+   "args": [
+    "src",
+    "dst"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.move"
+   ],
+   "nython": "library"
+  },
+  "shutil.rmtree": {
+   "module": "shutil",
+   "args": [
+    "path",
+    "dir_fd"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "NoneType"
+    ],
+    "3.12": [
+     "str",
+     "NoneType"
+    ],
+    "3.13": [
+     "str",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.rmtree"
+   ],
+   "nython": "library"
+  },
+  "shutil.unpack_archive": {
+   "module": "shutil",
+   "args": [
+    "filename",
+    "extract_dir",
+    "format"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "shutil.html#shutil.unpack_archive"
+   ],
+   "nython": "library"
+  },
+  "signal.pthread_kill": {
+   "module": "signal",
+   "args": [
+    "thread_id",
+    "signalnum"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "signal.html#signal.pthread_kill"
+   ],
+   "nython": "library"
+  },
+  "smtplib.connect": {
+   "module": "smtplib",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "smtplib.SMTP",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "smtplib.SMTP",
+     "str",
+     "int"
+    ],
+    "3.13": [
+     "smtplib.SMTP",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "smtplib.html#smtplib.SMTP.connect"
+   ],
+   "nython": "library"
+  },
+  "smtplib.send": {
+   "module": "smtplib",
+   "args": [
+    "self",
+    "data"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "smtplib.html#smtplib.SMTP"
+   ],
+   "nython": "library"
+  },
+  "socket.__new__": {
+   "module": "socket",
+   "args": [
+    "self",
+    "family",
+    "type",
+    "protocol"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "socket.socket",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "socket.socket",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "socket.socket",
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.socket"
+   ],
+   "nython": "library"
+  },
+  "socket.bind": {
+   "module": "socket",
+   "args": [
+    "self",
+    "address"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.12": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.13": [
+     "socket.socket",
+     "tuple"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.socket.bind"
+   ],
+   "nython": "library"
+  },
+  "socket.connect": {
+   "module": "socket",
+   "args": [
+    "self",
+    "address"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.12": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.13": [
+     "socket.socket",
+     "tuple"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.socket.connect",
+    "socket.html#socket.socket.connect_ex"
+   ],
+   "nython": "library"
+  },
+  "socket.getaddrinfo": {
+   "module": "socket",
+   "args": [
+    "host",
+    "port",
+    "family",
+    "type",
+    "protocol"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int",
+     "int",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int",
+     "int",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.getaddrinfo"
+   ],
+   "nython": "library"
+  },
+  "socket.gethostbyaddr": {
+   "module": "socket",
+   "args": [
+    "ip_address"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.gethostbyaddr"
+   ],
+   "nython": "library"
+  },
+  "socket.gethostbyname": {
+   "module": "socket",
+   "args": [
+    "hostname"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.gethostbyname",
+    "socket.html#socket.gethostbyname_ex"
+   ],
+   "nython": "library"
+  },
+  "socket.gethostname": {
+   "module": "socket",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "socket.html#socket.gethostname"
+   ],
+   "nython": "library"
+  },
+  "socket.getnameinfo": {
+   "module": "socket",
+   "args": [
+    "sockaddr"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "tuple"
+    ],
+    "3.12": [
+     "tuple"
+    ],
+    "3.13": [
+     "tuple"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.getnameinfo"
+   ],
+   "nython": "library"
+  },
+  "socket.getservbyname": {
+   "module": "socket",
+   "args": [
+    "servicename",
+    "protocolname"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "str"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.getservbyname"
+   ],
+   "nython": "library"
+  },
+  "socket.getservbyport": {
+   "module": "socket",
+   "args": [
+    "port",
+    "protocolname"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "str"
+    ],
+    "3.12": [
+     "int",
+     "str"
+    ],
+    "3.13": [
+     "int",
+     "str"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.getservbyport"
+   ],
+   "nython": "library"
+  },
+  "socket.sendmsg": {
+   "module": "socket",
+   "args": [
+    "self",
+    "address"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.12": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.13": [
+     "socket.socket",
+     "tuple"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.socket.sendmsg"
+   ],
+   "nython": "library"
+  },
+  "socket.sendto": {
+   "module": "socket",
+   "args": [
+    "self",
+    "address"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.12": [
+     "socket.socket",
+     "tuple"
+    ],
+    "3.13": [
+     "socket.socket",
+     "tuple"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.socket.sendto"
+   ],
+   "nython": "library"
+  },
+  "socket.sethostname": {
+   "module": "socket",
+   "args": [
+    "name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "bytes"
+    ],
+    "3.12": [
+     "bytes"
+    ],
+    "3.13": [
+     "bytes"
+    ]
+   },
+   "docs": [
+    "socket.html#socket.sethostname"
+   ],
+   "nython": "library"
+  },
+  "sqlite3.connect": {
+   "module": "sqlite3",
+   "args": [
+    "database"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "sqlite3.html#sqlite3.connect"
+   ],
+   "nython": "library"
+  },
+  "sqlite3.connect/handle": {
+   "module": "sqlite3",
+   "args": [
+    "connection_handle"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "sqlite3.Connection"
+    ],
+    "3.12": [
+     "sqlite3.Connection"
+    ],
+    "3.13": [
+     "sqlite3.Connection"
+    ]
+   },
+   "docs": [
+    "sqlite3.html#sqlite3.connect"
+   ],
+   "nython": "library"
+  },
+  "sqlite3.enable_load_extension": {
+   "module": "sqlite3",
+   "args": [
+    "connection",
+    "enabled"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "sqlite3.Connection",
+     "bool"
+    ],
+    "3.12": [
+     "sqlite3.Connection",
+     "bool"
+    ],
+    "3.13": [
+     "sqlite3.Connection",
+     "bool"
+    ]
+   },
+   "docs": [
+    "sqlite3.html#sqlite3.Connection.enable_load_extension"
+   ],
+   "nython": "library"
+  },
+  "sqlite3.load_extension": {
+   "module": "sqlite3",
+   "args": [
+    "connection",
+    "path"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "sqlite3.Connection",
+     "str"
+    ],
+    "3.12": [
+     "sqlite3.Connection",
+     "str"
+    ],
+    "3.13": [
+     "sqlite3.Connection",
+     "str"
+    ]
+   },
+   "docs": [
+    "sqlite3.html#sqlite3.Connection.load_extension"
+   ],
+   "nython": "library"
+  },
+  "subprocess.Popen": {
+   "module": "subprocess",
+   "args": [
+    "executable",
+    "args",
+    "cwd",
+    "env"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "list",
+     "NoneType",
+     "NoneType"
+    ],
+    "3.12": [
+     "str",
+     "list",
+     "NoneType",
+     "NoneType"
+    ],
+    "3.13": [
+     "str",
+     "list",
+     "NoneType",
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "subprocess.html#subprocess.Popen"
+   ],
+   "nython": "library"
+  },
+  "sys._current_exceptions": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "sys.html#sys._current_exceptions"
+   ],
+   "nython": "prelude"
+  },
+  "sys._current_frames": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "sys.html#sys._current_frames"
+   ],
+   "nython": "prelude"
+  },
+  "sys._getframe": {
+   "module": "sys",
+   "args": [
+    "frame"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "frame"
+    ],
+    "3.12": [
+     "frame"
+    ],
+    "3.13": [
+     "frame"
+    ]
+   },
+   "docs": [
+    "sys.html#sys._getframe"
+   ],
+   "nython": "engine"
+  },
+  "sys._getframemodulename": {
+   "module": "sys",
+   "args": [
+    "depth"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.12": [
+     "int"
+    ],
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "sys.html#sys._getframemodulename"
+   ],
+   "nython": "prelude"
+  },
+  "sys.addaudithook": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "../c-api/sys.html#c.PySys_AddAuditHook",
+    "sys.html#sys.addaudithook"
+   ],
+   "nython": "prelude"
+  },
+  "sys.excepthook": {
+   "module": "sys",
+   "args": [
+    "hook",
+    "type",
+    "value",
+    "traceback"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "function",
+     "type",
+     "ZeroDivisionError",
+     "traceback"
+    ],
+    "3.12": [
+     "function",
+     "type",
+     "ZeroDivisionError",
+     "traceback"
+    ],
+    "3.13": [
+     "function",
+     "type",
+     "ZeroDivisionError",
+     "traceback"
+    ]
+   },
+   "docs": [
+    "sys.html#sys.excepthook"
+   ],
+   "nython": "prelude"
+  },
+  "sys.monitoring.register_callback": {
+   "module": "sys",
+   "args": [
+    "func"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.13"
+   ],
+   "probe_types": {
+    "3.12": [
+     "NoneType"
+    ],
+    "3.13": [
+     "NoneType"
+    ]
+   },
+   "docs": [
+    "sys.monitoring.html#sys.monitoring.register_callback"
+   ],
+   "nython": "absent: no sys.monitoring (PEP 669)"
+  },
+  "sys.set_asyncgen_hook_finalizer": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "sys.html#sys.set_asyncgen_hooks"
+   ],
+   "nython": "prelude"
+  },
+  "sys.set_asyncgen_hook_firstiter": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "sys.html#sys.set_asyncgen_hooks"
+   ],
+   "nython": "prelude"
+  },
+  "sys.set_asyncgen_hooks_finalizer": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "sys.html#sys.set_asyncgen_hooks"
+   ],
+   "nython": "absent: never raised under this name (Nython raises sys.set_asyncgen_hook_finalizer, as CPython)",
+   "note": "the documented name: CPython raises sys.set_asyncgen_hook_finalizer"
+  },
+  "sys.set_asyncgen_hooks_firstiter": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "sys.html#sys.set_asyncgen_hooks"
+   ],
+   "nython": "absent: never raised under this name (Nython raises sys.set_asyncgen_hook_firstiter, as CPython)",
+   "note": "the documented name: CPython raises sys.set_asyncgen_hook_firstiter"
+  },
+  "sys.setprofile": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "sys.html#sys.setprofile"
+   ],
+   "nython": "prelude"
+  },
+  "sys.settrace": {
+   "module": "sys",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "sys.html#sys.settrace"
+   ],
+   "nython": "prelude"
+  },
+  "sys.unraisablehook": {
+   "module": "sys",
+   "args": [
+    "hook",
+    "unraisable"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "function",
+     "UnraisableHookArgs"
+    ],
+    "3.12": [
+     "function",
+     "UnraisableHookArgs"
+    ],
+    "3.13": [
+     "function",
+     "UnraisableHookArgs"
+    ]
+   },
+   "docs": [
+    "sys.html#sys.unraisablehook"
+   ],
+   "nython": "prelude"
+  },
+  "syslog.closelog": {
+   "module": "syslog",
+   "args": [],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [],
+    "3.12": [],
+    "3.13": []
+   },
+   "docs": [
+    "syslog.html#syslog.closelog"
+   ],
+   "nython": "library"
+  },
+  "syslog.openlog": {
+   "module": "syslog",
+   "args": [
+    "ident",
+    "logoption",
+    "facility"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "int",
+     "int"
+    ],
+    "3.12": [
+     "str",
+     "int",
+     "int"
+    ],
+    "3.13": [
+     "str",
+     "int",
+     "int"
+    ]
+   },
+   "docs": [
+    "syslog.html#syslog.openlog"
+   ],
+   "nython": "library"
+  },
+  "syslog.setlogmask": {
+   "module": "syslog",
+   "args": [
+    "maskpri"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int"
+    ],
+    "3.12": [
+     "int"
+    ],
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "syslog.html#syslog.setlogmask"
+   ],
+   "nython": "library"
+  },
+  "syslog.syslog": {
+   "module": "syslog",
+   "args": [
+    "priority",
+    "message"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "int",
+     "str"
+    ],
+    "3.12": [
+     "int",
+     "str"
+    ],
+    "3.13": [
+     "int",
+     "str"
+    ]
+   },
+   "docs": [
+    "syslog.html#syslog.syslog"
+   ],
+   "nython": "library"
+  },
+  "telnetlib.Telnet.open": {
+   "module": "telnetlib",
+   "args": [
+    "self",
+    "host",
+    "port"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12"
+   ],
+   "probe_types": {
+    "3.11": [
+     "telnetlib.Telnet",
+     "str",
+     "int"
+    ],
+    "3.12": [
+     "telnetlib.Telnet",
+     "str",
+     "int"
+    ]
+   },
+   "docs": [
+    "telnetlib.html#telnetlib.Telnet.open"
+   ],
+   "nython": "library"
+  },
+  "telnetlib.Telnet.write": {
+   "module": "telnetlib",
+   "args": [
+    "self",
+    "buffer"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12"
+   ],
+   "probe_types": {},
+   "docs": [
+    "telnetlib.html#telnetlib.Telnet.write"
+   ],
+   "nython": "library"
+  },
+  "tempfile.mkdtemp": {
+   "module": "tempfile",
+   "args": [
+    "fullpath"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "tempfile.html#tempfile.TemporaryDirectory",
+    "tempfile.html#tempfile.mkdtemp"
+   ],
+   "nython": "library"
+  },
+  "tempfile.mkstemp": {
+   "module": "tempfile",
+   "args": [
+    "fullpath"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str"
+    ],
+    "3.12": [
+     "str"
+    ],
+    "3.13": [
+     "str"
+    ]
+   },
+   "docs": [
+    "tempfile.html#tempfile.NamedTemporaryFile",
+    "tempfile.html#tempfile.TemporaryFile",
+    "tempfile.html#tempfile.mkstemp"
+   ],
+   "nython": "library"
+  },
+  "time.sleep": {
+   "module": "time",
+   "args": [
+    "seconds"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.13"
+   ],
+   "probe_types": {
+    "3.13": [
+     "int"
+    ]
+   },
+   "docs": [
+    "time.html#audit_event_time_sleep_0"
+   ],
+   "nython": "engine"
+  },
+  "urllib.Request": {
+   "module": "urllib.request",
+   "args": [
+    "fullurl",
+    "data",
+    "headers",
+    "method"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {
+    "3.11": [
+     "str",
+     "NoneType",
+     "dict",
+     "str"
+    ],
+    "3.12": [
+     "str",
+     "NoneType",
+     "dict",
+     "str"
+    ],
+    "3.13": [
+     "str",
+     "NoneType",
+     "dict",
+     "str"
+    ]
+   },
+   "docs": [
+    "urllib.request.html#urllib.request.urlopen"
+   ],
+   "nython": "library"
+  },
+  "webbrowser.open": {
+   "module": "webbrowser",
+   "args": [
+    "url"
+   ],
+   "raised_from": "Python",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "webbrowser.html#webbrowser.open"
+   ],
+   "nython": "library"
+  },
+  "winreg.ConnectRegistry": {
+   "module": "winreg",
+   "args": [
+    "computer_name",
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.ConnectRegistry"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.CreateKey": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "sub_key",
+    "access"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.CreateKey",
+    "winreg.html#winreg.CreateKeyEx"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.DeleteKey": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "sub_key",
+    "access"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.DeleteKey",
+    "winreg.html#winreg.DeleteKeyEx"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.DeleteValue": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "value"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.DeleteValue"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.DisableReflectionKey": {
+   "module": "winreg",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.DisableReflectionKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.EnableReflectionKey": {
+   "module": "winreg",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.EnableReflectionKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.EnumKey": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "index"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.EnumKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.EnumValue": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "index"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.EnumValue"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.ExpandEnvironmentStrings": {
+   "module": "winreg",
+   "args": [
+    "str"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.ExpandEnvironmentStrings"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.LoadKey": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "sub_key",
+    "file_name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.LoadKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.OpenKey": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "sub_key",
+    "access"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.OpenKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.OpenKey/result": {
+   "module": "winreg",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.CreateKey",
+    "winreg.html#winreg.CreateKeyEx",
+    "winreg.html#winreg.OpenKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.PyHKEY.Detach": {
+   "module": "winreg",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.PyHKEY.Detach"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.QueryInfoKey": {
+   "module": "winreg",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.QueryInfoKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.QueryReflectionKey": {
+   "module": "winreg",
+   "args": [
+    "key"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.QueryReflectionKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.QueryValue": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "sub_key",
+    "value_name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.QueryValue",
+    "winreg.html#winreg.QueryValueEx"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.SaveKey": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "file_name"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.SaveKey"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  },
+  "winreg.SetValue": {
+   "module": "winreg",
+   "args": [
+    "key",
+    "sub_key",
+    "type",
+    "value"
+   ],
+   "raised_from": "C",
+   "versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "doc_versions": [
+    "3.11",
+    "3.12",
+    "3.13"
+   ],
+   "probe_types": {},
+   "docs": [
+    "winreg.html#winreg.SetValue",
+    "winreg.html#winreg.SetValueEx"
+   ],
+   "platform": "windows",
+   "nython": "library"
+  }
+ }
+}

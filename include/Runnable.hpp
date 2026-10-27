@@ -17,7 +17,6 @@ using exception::ReporterAware;
 
 class Runnable: public ReporterAware {
 
-    friend class gc::GarbageCollector;
 
 public:
     Runnable(Reporter* reporter): ReporterAware(reporter), stack_{}, type{RunnableType::COMPILER} {}

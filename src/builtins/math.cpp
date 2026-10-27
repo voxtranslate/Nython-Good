@@ -130,39 +130,7 @@ Value dispatch_math(NythonExecutor& E,
         }
 
     // ── from main.cpp lines 8105–8139 ──────────────────────────────────────────
-        // ===================== TIME MODULE =====================
-        if (name == "time_now" || name == "time_timestamp") {
-            auto now = std::chrono::system_clock::now();
-            auto epoch = now.time_since_epoch();
-            auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
-            return Value(static_cast<double>(millis / 1000.0));
-        }
-        if (name == "time_clock") {
-            auto now = std::chrono::high_resolution_clock::now();
-            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-            return Value(static_cast<double>(ns / 1e9));
-        }
-        if (name == "time_sleep") {
-            if (args.size() >= 1) {
-                double secs = (args[0].type == ValueType::DOUBLE) ? static_cast<double>(args[0].value.d) : (double)bigint_to_i64(args[0].value.i);
-                std::this_thread::sleep_for(std::chrono::milliseconds((int)(secs * 1000)));
-            }
-            return NONE_VALUE;
-        }
-        if (name == "time_format" || name == "time_date") {
-            std::time_t t = std::time(nullptr);
-            char buf[64];
-            std::string fmt = "%Y-%m-%d %H:%M:%S";
-            if (args.size() >= 1) fmt = getStringValue(args[0]);
-            std::strftime(buf, sizeof(buf), fmt.c_str(), std::localtime(&t));
-            return makeStringValue(std::string(buf));
-        }
-        if (name == "time_elapsed") {
-            static auto start_time = std::chrono::high_resolution_clock::now();
-            auto now = std::chrono::high_resolution_clock::now();
-            double elapsed = std::chrono::duration<double>(now - start_time).count();
-            return Value(static_cast<double>(elapsed));
-        }
+        // Time builtins: builtins/os_time.cpp (one implementation for both engines).
 
         // ===================== RANDOM MODULE =====================
     // ── from main.cpp lines 8140–8232 ──────────────────────────────────────────

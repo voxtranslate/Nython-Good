@@ -5,6 +5,7 @@
 #include "Value.hpp"
 #include <functional>
 #include <unordered_map>
+#include "NyOrderedMap.hpp"
 #include "Location.hpp"
 #include "Collectable.hpp"
 
@@ -14,12 +15,14 @@ using gc::Collectable;
 using lexer::Location;
 
 // Underlying type of every Value which has its own
-// Value container (e.g. Object, Function, Class)
-using ContainerType = std::unordered_map<std::string, Value>;
+// Value container (e.g. Object, Function, Class). Insertion-ordered, so a
+// dict iterates in the order its keys were added (as in Python).
+using ContainerType = nypy::OrderedMap<Value>;
 class Container: public Collectable {
 public:
-    Container(const Container&) = default;
-    Container& operator=(const Container&) = default;
+    // A copy owns its own map (a shared one would be freed twice).
+    Container(const Container& o);
+    Container& operator=(const Container& o);
 
 
 public:
@@ -43,6 +46,10 @@ public:
     void write(Value key, Value value);               // insert or assign to some key
     bool assign(Value key, Value value);              // assign to some key, returns false if key did not exist
     ContainerType::iterator find(const Value& value, bool* ok); // find if value is inside the container or not
+
+    // The values it holds are counted references (NyGC.hpp).
+    void gc_traverse(nython::gc::GcVisitFn visit, void* arg) override;
+    void gc_clear() override;
 
     // Access the internal container data structure via a callback function
     void access_container(std::function<void(ContainerType*)> cb);

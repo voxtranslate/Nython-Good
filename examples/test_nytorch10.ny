@@ -1,6 +1,10 @@
-import nytorch
-import "lib/nytorch/storage.ny"
-import "lib/nytorch/serving.ny"
+import "lib/nytorch.ny"
+
+# Every store in a directory of its own run: they persist, and a fixed
+# /tmp path was shared by earlier runs and by both engines running at once
+# in the sweep.
+var T = os_path_join(os_gettempdir(), "ny_nytorch10_" + str(os_getpid()) + "_" + str(random_int(0, 999999)))
+os_makedirs(T, exist_ok=true)
 
 print "=== NyTorch v3.0 Part 10 Test Suite ==="
 
@@ -27,7 +31,7 @@ tcp_close(cli_fd)
 srv.stop()
 print "SocketServer.PASS"
 
-# --- HttpServer request parsing ---
+# --- AgentHttpServer request parsing ---
 print "--- HTTP Parse Test ---"
 var raw_req = "GET /health?fmt=json HTTP/1.1\r\nHost: localhost\r\n\r\n"
 var parsed = http_parse_request(raw_req)
@@ -36,17 +40,17 @@ print "HTTP path: " + parsed["path"]
 print "HTTP query: " + parsed["query"]
 print "HTTP parse.PASS"
 
-# --- HttpServer serve one ---
-print "--- HttpServer Test ---"
-var http_srv = HttpServer(20001)
+# --- AgentHttpServer serve one ---
+print "--- AgentHttpServer Test ---"
+var http_srv = AgentHttpServer(20001)
 var hs_ok = http_srv.start()
-print "HttpServer started: " + str(hs_ok)
+print "AgentHttpServer started: " + str(hs_ok)
 
 var cl2 = tcp_connect("127.0.0.1", 20001, 2000)
 tcp_send(cl2, "GET /ping HTTP/1.0\r\nHost: localhost\r\n\r\n")
 
 var ctx = http_srv.handle_one(1000)
-print "HttpServer got request: " + str(ctx != none)
+print "AgentHttpServer got request: " + str(ctx != none)
 if ctx != none:
     var req2 = ctx["req"]
     var fd2 = ctx["fd"]
@@ -57,11 +61,11 @@ var pong = tcp_recv_all(cl2, 1000)
 print "Client got response: " + str(pong != none)
 tcp_close(cl2)
 http_srv.stop()
-print "HttpServer.PASS"
+print "AgentHttpServer.PASS"
 
 # --- AgentServer ---
 print "--- AgentServer Test ---"
-var agsrv = AgentServer("test_agent", 20002, "/tmp/ny_agsrv")
+var agsrv = AgentServer("test_agent", 20002, T + "/ny_agsrv")
 var ags_ok = agsrv.start()
 print "AgentServer started: " + str(ags_ok)
 
@@ -86,7 +90,7 @@ print "AgentServer.PASS"
 
 # --- KnowledgeGraph ---
 print "--- KnowledgeGraph Test ---"
-var kg = KnowledgeGraph("/tmp/ny_kg_test")
+var kg = KnowledgeGraph(T + "/ny_kg_test")
 kg.add_node("alice", "Person", "age=30")
 kg.add_node("bob", "Person", "age=25")
 kg.add_node("python", "Language", "type=dynamic")
@@ -124,7 +128,7 @@ print "FederatedRound.PASS"
 
 # --- FederatedLearner ---
 print "--- FederatedLearner Test ---"
-var fl = FederatedLearner("fl_agent_1", "/tmp/ny_fl", "127.0.0.1", 20010)
+var fl = FederatedLearner("fl_agent_1", T + "/ny_fl", "127.0.0.1", 20010)
 fl.setup()
 fl.init_weights([16, 32, 8])
 print "FL weights count: " + str(len(fl.local_weights))
@@ -154,7 +158,7 @@ print "NyPipeline.PASS"
 
 # --- AutoTrainer ---
 print "--- AutoTrainer Test ---"
-var trainer = AutoTrainer("test_trainer", "/tmp/ny_trainer")
+var trainer = AutoTrainer("test_trainer", T + "/ny_trainer")
 trainer.setup()
 var dummy_params = [tensor([1.0, 2.0]), tensor([3.0, 4.0])]
 trainer.record_epoch(1, 0.9, 0.8, dummy_params)
@@ -169,7 +173,7 @@ print "AutoTrainer.PASS"
 
 # --- HyperSearch ---
 print "--- HyperSearch Test ---"
-var hs = HyperSearch("test_search", "/tmp/ny_hyper")
+var hs = HyperSearch("test_search", T + "/ny_hyper")
 var lr1 = hs.suggest_lr(0.0001, 0.01)
 print "HyperSearch suggest_lr: " + str(lr1 > 0.0)
 var hidden = hs.suggest_int(32, 256)
@@ -236,7 +240,7 @@ print "NyEvent.PASS"
 print "--- NyPlugin Test ---"
 var plug = NyPlugin("LogPlugin", "1.0.0")
 plug.configure("log_level", "INFO")
-plug.configure("log_path", "/tmp/ny_plugin_test.log")
+plug.configure("log_path", T + "/ny_plugin_test.log")
 plug.add_hook("on_train_start", "log_start")
 plug.add_hook("on_epoch_end", "log_metrics")
 print "NyPlugin name: " + plug.describe()
@@ -246,7 +250,7 @@ print "NyPlugin.PASS"
 
 # --- AgentCluster ---
 print "--- AgentCluster Test ---"
-var cluster = AgentCluster("test_cluster", "/tmp/ny_cluster", 21000)
+var cluster = AgentCluster("test_cluster", T + "/ny_cluster", 21000)
 var p1_port = cluster.add_agent("worker_1", "127.0.0.1", "worker")
 var p2_port = cluster.add_agent("worker_2", "127.0.0.1", "worker")
 var p3_port = cluster.add_agent("master_1", "127.0.0.1", "master")
@@ -259,7 +263,7 @@ print "AgentCluster.PASS"
 
 # --- NyMonitor ---
 print "--- NyMonitor Test ---"
-var mon = NyMonitor("test_mon", "/tmp/ny_mon")
+var mon = NyMonitor("test_mon", T + "/ny_mon")
 mon.set_threshold("cpu", 90.0)
 mon.set_threshold("memory", 85.0)
 mon.record("cpu", 45.0)
@@ -272,8 +276,8 @@ print "NyMonitor.PASS"
 
 # --- NyConfig ---
 print "--- NyConfig Test ---"
-var cfg = NyConfig("/tmp/ny_test.cfg")
-write_file("/tmp/ny_test.cfg", "# Config\nmodel=transformer\nlr=0.001\nhidden=128\nbatch_size=32\n")
+var cfg = NyConfig(T + "/ny_test.cfg")
+write_file(T + "/ny_test.cfg", "# Config\nmodel=transformer\nlr=0.001\nhidden=128\nbatch_size=32\n")
 cfg.load()
 var model_name = cfg.get("model", "mlp")
 print "NyConfig model: " + model_name
@@ -286,7 +290,7 @@ print "NyConfig.PASS"
 
 # --- NyApp ---
 print "--- NyApp Test ---"
-var app = NyApp("my_ai_app", "/tmp/ny_app")
+var app = NyApp("my_ai_app", T + "/ny_app")
 app.load_config()
 app.schedule("train", 10, 5)
 app.schedule("eval", 50, 3)
@@ -318,3 +322,4 @@ print "NyOS.PASS"
 
 print ""
 print "=== ALL NYTORCH10 TESTS PASSED ==="
+os_rmtree(T, ignore_errors=true)

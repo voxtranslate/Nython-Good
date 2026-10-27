@@ -52,6 +52,20 @@ using namespace nython::exception;
 // ════════════════════════════════════════════════════════════════════════════════
 // dispatch_audio
 // ════════════════════════════════════════════════════════════════════════════════
+
+// Numeric value of an element whatever its type. Reading `.value.d` directly
+// (the long-double member of the value union) is only correct for DOUBLE
+// elements: an INTEGER element read that way came back as 0, so e.g.
+// tensor_scale([1, 2, 3], 2) returned [0, 0, 0].
+static inline double ny_num(const Value& v) {
+    switch (v.type) {
+        case ValueType::INTEGER: return (double)bigint_to_i64(v.value.i);
+        case ValueType::DOUBLE:  return (double)v.value.d;
+        case ValueType::BOOLEAN: return v.value.b ? 1.0 : 0.0;
+        default:                 return 0.0;
+    }
+}
+
 Value dispatch_audio(NythonExecutor& E,
                        const std::string& name,
                        std::vector<Value>& args,
@@ -145,7 +159,7 @@ Value dispatch_audio(NythonExecutor& E,
                         double coef = 0;
                         for (int n = 0; n < len; n++) {
                             auto it = mel->container->find(std::to_string(n));
-                            double v = (it != mel->container->end()) ? (double)it->second.value.d : 0;
+                            double v = (it != mel->container->end()) ? ny_num(it->second) : 0;
                             coef += v * std::cos(3.14159265 * c * (2*n+1) / (2*len));
                         }
                         result->set(std::to_string(c), Value(coef));
@@ -171,7 +185,7 @@ Value dispatch_audio(NythonExecutor& E,
                         double energy = 0;
                         for (int i = start; i < start + frame_size; i++) {
                             auto it = sig->container->find(std::to_string(i));
-                            double v = (it != sig->container->end()) ? (double)it->second.value.d : 0;
+                            double v = (it != sig->container->end()) ? ny_num(it->second) : 0;
                             energy += v * v;
                         }
                         result->set(std::to_string(idx++), Value(std::sqrt(energy / frame_size)));

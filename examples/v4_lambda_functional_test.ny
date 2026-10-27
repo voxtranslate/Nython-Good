@@ -35,12 +35,12 @@ t("counter2", c(), 2)
 t("counter3", c(), 3)
 
 print "=== MAP/FILTER/REDUCE ==="
-t("map_double", str(map(lambda x: x * 2, [1,2,3,4,5])), "[2, 4, 6, 8, 10]")
-t("map_square", str(map(lambda x: x * x, [1,2,3])), "[1, 4, 9]")
-t("map_str", str(map(lambda x: str(x) + "!", [1,2,3])), "[1!, 2!, 3!]")
+t("map_double", str(list(map(lambda x: x * 2, [1,2,3,4,5]))), "[2, 4, 6, 8, 10]")
+t("map_square", str(list(map(lambda x: x * x, [1,2,3]))), "[1, 4, 9]")
+t("map_str", str(list(map(lambda x: str(x) + "!", [1,2,3]))), "['1!', '2!', '3!']")
 
-t("filter_gt", str(filter(lambda x: x > 3, [1,2,3,4,5])), "[4, 5]")
-t("filter_even", str(filter(lambda x: x % 2 == 0, [1,2,3,4,5,6])), "[2, 4, 6]")
+t("filter_gt", str(list(filter(lambda x: x > 3, [1,2,3,4,5]))), "[4, 5]")
+t("filter_even", str(list(filter(lambda x: x % 2 == 0, [1,2,3,4,5,6]))), "[2, 4, 6]")
 
 t("reduce_sum", reduce(lambda a, b: a + b, [1,2,3,4,5]), 15)
 t("reduce_mul", reduce(lambda a, b: a * b, [1,2,3,4,5]), 120)
@@ -49,8 +49,8 @@ t("reduce_max", reduce(lambda a, b: a if a > b else b, [3,1,4,1,5,9,2,6]), 9)
 
 print "=== FUNCTIONAL PIPELINES ==="
 var nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-var result = filter(lambda x: x % 2 == 0, nums)
-result = map(lambda x: x * x, result)
+var result = list(filter(lambda x: x % 2 == 0, nums))
+result = list(map(lambda x: x * x, result))
 t("pipeline", str(result), "[4, 16, 36, 64, 100]")
 t("pipeline_sum", reduce(lambda a, b: a + b, result), 220)
 

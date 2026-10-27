@@ -6,6 +6,10 @@
 // fmt provided by Definitions.hpp
 #include "PrettyPrinter.hpp"
 #include "DynamicLang.hpp"
+#include "NyUniNames.hpp"
+#include "NyUniData.hpp"   // PEP 3131 identifiers (round 84)
+#include "NyScope.hpp"     // lexer_python (round 86)
+#include <cstdio>
 #include <sstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
@@ -29,7 +33,7 @@ std::map<TokenType,std::string> Warnings = {
 std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::End,"End"},{TokenType::NewLine,"NewLine"},{TokenType::Indent,"Indent"},{TokenType::Dedent,"Dedent"},{TokenType::Comment,"Comment"},
 	{TokenType::Identifier,"Identifier"},{TokenType::Float,"Float"},{TokenType::Integer,"Integer"},{TokenType::Hex,"Hex"},{TokenType::Oct,"Oct"},{TokenType::Binary,"Binary"},
-	{TokenType::Complex,"Complex"},{TokenType::String,"String"},{TokenType::True,"True"},{TokenType::False,"False"},{TokenType::None,"None"},{TokenType::Not,"Not"},{TokenType::And,"And"},
+	{TokenType::Complex,"Complex"},{TokenType::String,"String"},{TokenType::Bytes,"Bytes"},{TokenType::True,"True"},{TokenType::False,"False"},{TokenType::None,"None"},{TokenType::Not,"Not"},{TokenType::And,"And"},
 	{TokenType::Or,"Or"},{TokenType::Xor,"Xor"},{TokenType::Class,"Class"},{TokenType::Abstract,"Abstract"},{TokenType::Continue,"Continue"},{TokenType::If,"If"},{TokenType::Else,"Else"},{TokenType::ElseIf,"ElseIf"},{TokenType::For,"For"},{TokenType::Default,"Default"},{TokenType::Do,"Do"},{TokenType::Extends,"Extends"},{TokenType::Finally,"Finally"},{TokenType::Final,"Final"},{TokenType::Implements,"Implements"},{TokenType::Import,"Import"},
 	{TokenType::In,"In"},{TokenType::Pass,"Pass"},{TokenType::Instanceof,"Instanceof"},{TokenType::Subclassof,"Subclassof"},{TokenType::Parentof,"Parentof"},{TokenType::Interface,"Interface"},{TokenType::Package,"Package"},
 	{TokenType::NameSpace,"NameSpace"},{TokenType::Private,"Private"},{TokenType::Protected,"Protected"},{TokenType::Public,"Public"},{TokenType::Return,"Return"},{TokenType::Static,"Static"},
@@ -54,7 +58,9 @@ std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::BraceClose,"BraceClose"},{TokenType::Comma,"Comma"},{TokenType::Colon,"Colon"},{TokenType::Dot,"Dot"},{TokenType::SemiColon,"SemiColon"},
 	{TokenType::BracketOpen,"BracketOpen"},{TokenType::BracketClose,"BracketClose"},{TokenType::ParenOpen,"ParenOpen"},{TokenType::Regex,"Regex"},{TokenType::New,"New"},{TokenType::Struct,"Struct"},
 	{TokenType::ParenClose,"ParenClose"},{TokenType::At,"At"},{TokenType::RightArrow,"RightArrow"},{TokenType::LeftArrow,"LeftArrow"},{TokenType::Var,"Var"},{TokenType::Block,"Block"},
-	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"}
+	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"},
+	{TokenType::NullCoalesce,"NullCoalesce"},{TokenType::NullCoalesceAssign,"NullCoalesceAssign"},{TokenType::OptDot,"OptDot"},{TokenType::OptBracket,"OptBracket"},
+	{TokenType::MatMulAssign,"MatMulAssign"}
 };
 
 static const TokenDef KeywordTokens[] = {
@@ -156,6 +162,12 @@ static const TokenDef KeywordTokens[] = {
 	TokenDef(TokenType::Except,std::string("catch"), TokenKind::Name, TokenClass::Keyword),
 	// JS/C "null" is an alias for Nython/Python "none"
 	TokenDef(TokenType::None,std::string("null"), TokenKind::Name, TokenClass::Keyword),
+	// Python's capitalised spellings. `True` used to be an ordinary (undefined)
+	// name reading none, so a Python-style `while True:` never ran and
+	// `return True` returned a falsy value.
+	TokenDef(TokenType::True,std::string("True"), TokenKind::Name, TokenClass::Keyword),
+	TokenDef(TokenType::False,std::string("False"), TokenKind::Name, TokenClass::Keyword),
+	TokenDef(TokenType::None,std::string("None"), TokenKind::Name, TokenClass::Keyword),
 	// Lua "elseif" as alias for "elif"
 	TokenDef(TokenType::ElseIf,std::string("elseif"), TokenKind::Name, TokenClass::Keyword)
 };
@@ -246,6 +258,26 @@ inline ConstArray<TokenDef const> Keywords() {
 	return { KeywordTokens };
 }
 
+std::vector<std::string> keyword_spellings() {
+	std::vector<std::string> out;
+	for (auto& k : KeywordTokens) out.push_back(k.value);
+	return out;
+}
+
+// round 86: the keywords that are names in Python-language source -
+// Nython's literal spellings and `elseif` (Lexer::python_names); round 87:
+// `this` too (Nython's self in a method: re/_parser.py's `this = self.next`
+// returned the Tokenizer on the VM)
+static bool is_nython_literal_word(const std::string& w) {
+	switch (w.size()) {
+		case 4: return w == "true" || w == "none" || w == "null" || w == "this";
+		case 5: return w == "false";
+		case 6: return w == "elseif";
+		case 9: return w == "undefined";
+		default: return false;
+	}
+}
+
 inline bool is_ident_char(char c, bool first = false) {
 	unsigned char uc = static_cast<unsigned char>(c);
 	// Accept ASCII letters, underscore
@@ -328,28 +360,32 @@ void Lexer::unexpectedChar() {
     throw UnexpectedCharError(location, std::to_string(source.current_char));
 }
 
-Token Lexer::next() {
+// round 82: the accessors return the token in place; the empty list's
+// stand-in is a default token
+static const Token& no_token() { static const Token t; return t; }
+
+const Token& Lexer::next() {
     // Past the last token (the End token pushed by tokenize()): keep
     // returning that End token rather than a default-constructed Token,
     // whose Location{} is (1,1,"stdin"). A default-constructed token has no
     // relation to the file being parsed, so an unterminated construct at
     // EOF reported "stdin:1:1" instead of the real end-of-file position.
-    if(current>=int(tokens.size())) return tokens.empty() ? Token() : tokens.back();
+    if(current>=int(tokens.size())) return tokens.empty() ? no_token() : tokens.back();
     return tokens[current++];
 }
 
-Token Lexer::prev() {
-    if(current <= 0) return tokens.empty() ? Token() : tokens.front();
+const Token& Lexer::prev() {
+    if(current <= 0) return tokens.empty() ? no_token() : tokens.front();
     return tokens[current-1];
 }
 
-Token Lexer::curr() {
-    if(current < 0) return tokens.empty() ? Token() : tokens.front();
-    if(current>=int(tokens.size())) return tokens.empty() ? Token() : tokens.back();
+const Token& Lexer::curr_edge() {
+    if(current < 0) return tokens.empty() ? no_token() : tokens.front();
+    if(current>=int(tokens.size())) return tokens.empty() ? no_token() : tokens.back();
     return tokens[current];
 }
 
-Token Lexer::peek(int i) {
+const Token& Lexer::peek(int i) {
     if(current + i >= int(tokens.size()) || current + i < 0 ) {
         fmt::print("index out out range with value : {}\n", current + i);
         std::stringstream msg;
@@ -369,12 +405,16 @@ std::string Lexer::fileName() {
 
 void Lexer::reset_token() {
     source.location.reset(source.location.row, source.location.column);
-    TokenIdent ident(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
-    token = Token(ident, "invalid" , source.location);
+    token_start = source.location;
+    token_start_off = source.getCurrent();   // round 83: where its bytes start (make_token's end)
+    // round 82: in place (a Token was made and moved in for each token read)
+    token.ident = TokenIdent(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
+    token.value.assign("invalid");
+    token._location = source.location;
 }
 
 bool Lexer::isKeyWord(const std::string word) {
-    for(auto kw:Keywords()) {
+    for(const auto& kw:Keywords()) {   // round 82: by reference (a TokenDef - a string - was copied per keyword)
         if((kw.value.size() == word.size())&&(kw.value.c_str() == word)) {
             return true;
         }
@@ -383,7 +423,7 @@ bool Lexer::isKeyWord(const std::string word) {
 }
 
 bool Lexer::isOperator(const std::string word) {
-    for(auto op:Ops()) {
+    for(const auto& op:Ops()) {   // round 82
         if((op.value.size() == word.size())&&(op.value.c_str() == word)) {
             return true;
         }
@@ -392,7 +432,7 @@ bool Lexer::isOperator(const std::string word) {
 }
 
 bool Lexer::isSeparator(const std::string word) {
-    for(auto d:Delims()) {
+    for(const auto& d:Delims()) {   // round 82
         if((d.value.size() == word.size())&&(d.value.c_str() == word)) {
             return true;
         }
@@ -446,7 +486,35 @@ bool Lexer::is_binary(char cp) {
 
 Token& Lexer::make_token(TokenIdent ident) {
 	this->token.ident     = ident;
+	// A token is located where it starts. The column used to be reset to 1
+	// for every token, so every error said column 2. A token that spans
+	// lines - a newline - keeps the position where it ends: statement line
+	// numbers are taken from those rows.
+	// round 83: a string literal that spans lines (triple-quoted) is located
+	// where it starts, as CPython has it - a docstring's or a multi-line
+	// string statement's line is its first one (it was the last); and every
+	// token records where it ends (end_row/end_col, just past its last
+	// character), for lib/ast.ny's end positions.
 	this->token._location = source.location;
+	// the end: the token's start advanced over its bytes (source.location
+	// itself can be off after a newline was read and put back)
+	{
+	    uint32_t r = token_start.row, c = token_start.column;
+	    int cur = source.getCurrent();
+	    for (int k = token_start_off; k < cur; k++) {
+	        unsigned char ch = (unsigned char)source.peek_char(k - cur);
+	        if (ch == '\n') { r++; c = 1; }
+	        else if ((ch & 0xC0) != 0x80) c++;
+	    }
+	    this->token.end_row = r;
+	    this->token.end_col = c;
+	}
+	if (token_start.row == source.location.row)
+	    this->token._location.column = token_start.column;
+	else if (ident.id() == TokenType::String || ident.id() == TokenType::Bytes) {
+	    this->token._location.row = token_start.row;
+	    this->token._location.column = token_start.column;
+	}
 	return this->token;
 }
 
@@ -475,6 +543,7 @@ std::string Lexer::toString() {
 
 inline std::vector<Token> optimize(std::vector<Token> tk) {
 	std::vector<Token> ret;
+	ret.reserve(tk.size());   // round 82
 	int nb = (int)tk.size();
 	int paren_depth = 0;
 	int paren_indent_delta = 0;
@@ -482,11 +551,63 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
 	for(auto i = 0; i < nb; ) {
         // Guard all tk[i+1] accesses with bounds check
         while(i < nb-1 && tk[i].type()==TokenType::NewLine && tk[i+1].type()==TokenType::NewLine) i++;
-        if(i < nb-1 && tk[i].type()==TokenType::String && tk[i+1].type()==TokenType::String) {
-            Token token = tk[i];
-            while(i < nb-1 && tk[i].type()==TokenType::String && tk[i+1].type()==TokenType::String) {
-                token.value.append(tk[i+1].value);
-                i++;
+        // Adjacent string literals are one string, as in Python: 'a' 'b'
+        // == 'ab', and inside brackets across lines too. The joined token
+        // used to be built and dropped, so 'a' 'b' 'c' read as 'c' and a
+        // literal continued on the next line inside parentheses was a
+        // syntax error. Line breaks skipped inside brackets keep their
+        // indentation bookkeeping (paren_indent_delta).
+        // round 79: f-strings join the run too ("a" f"{x}", f"{x}" f"{y}",
+        // Python's implicit concatenation): an f-string is the token `f`
+        // then its text, so a run holding one becomes one f-string, the
+        // braces of its plain pieces doubled so that they stay literal.
+        auto f_at = [&](int k) {
+            return k + 1 < nb && tk[k].type()==TokenType::Identifier && tk[k].value=="f"
+                && tk[k+1].type()==TokenType::String;
+        };
+        if(tk[i].type()==TokenType::String || f_at(i)) {
+            int first_str = f_at(i) ? i + 1 : i;
+            int f_tok = f_at(i) ? i : -1;
+            Token token = tk[first_str];
+            std::vector<std::pair<bool, std::string>> parts{{f_tok >= 0, tk[first_str].value}};
+            int j = first_str + 1, last = first_str, d = 0, d_last = 0;
+            while(j < nb) {
+                TokenType t = tk[j].type();
+                if(paren_depth > 0 && (t==TokenType::NewLine || t==TokenType::Indent || t==TokenType::Dedent)) {
+                    if(t==TokenType::Indent) d++;
+                    else if(t==TokenType::Dedent) d--;
+                    j++;
+                    continue;
+                }
+                if(t==TokenType::String) { parts.push_back({false, tk[j].value}); last = j; d_last = d; j++; continue; }
+                if(f_at(j)) {
+                    parts.push_back({true, tk[j+1].value});
+                    if(f_tok < 0) f_tok = j;
+                    last = j + 1; d_last = d; j += 2;
+                    continue;
+                }
+                break;
+            }
+            if(last > first_str) {
+                paren_indent_delta += d_last;
+                token.value.clear();
+                for(auto& pc : parts) {
+                    if(f_tok < 0 || pc.first) { token.value += pc.second; continue; }
+                    for(char c : pc.second) { token.value += c; if(c=='{' || c=='}') token.value += c; }
+                }
+                // round 83: the joined literal ends where its last piece
+                // does, and an f-string's `f` token stands where the run
+                // starts (`"a" f"{x}"` is one literal from the "a")
+                token.end_row = tk[last].end_row;
+                token.end_col = tk[last].end_col;
+                if(f_tok >= 0) {
+                    int run0 = f_at(i) ? i : first_str;
+                    tk[f_tok]._location = tk[run0]._location;
+                }
+                if(f_tok >= 0) ret.push_back(std::move(tk[f_tok]));
+                ret.push_back(std::move(token));
+                i = last + 1;
+                continue;
             }
         }
         if(i >= nb) break;
@@ -502,7 +623,7 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
         }
         // After closing last paren, consume extra Dedent tokens to rebalance
         if(paren_depth == 0 && paren_indent_delta > 0 && tk[i].type()==TokenType::NewLine) {
-            ret.push_back(tk[i++]);
+            ret.push_back(std::move(tk[i++]));
             while(i < nb && paren_indent_delta > 0 && tk[i].type()==TokenType::Dedent) {
                 paren_indent_delta--;
                 i++;
@@ -514,20 +635,62 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
             paren_indent_delta--;
             i++; continue;
         }
-        // Guard tk[i+1] access before using it
-        if(i < nb-1 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine) {
-            ret.push_back(tk[i]);
+        // Guard tk[i+1] access before using it. A trailing comma at the end
+        // of a line joins the next one only when that is indented under it:
+        // `y = 3,` / `return 1,` / `i, = x` end their statement, as in
+        // Python (round 77: the next line became part of the tuple).
+        if(i < nb-2 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine
+           && tk[i+2].type()==TokenType::Indent) {
+            ret.push_back(std::move(tk[i]));
             i += 2;
         } else {
-            ret.push_back(tk[i++]);
+            ret.push_back(std::move(tk[i++]));
         }
     }
 	return ret;
 }
 
-std::vector<Token> Lexer::tokenize() {
+// round 80: whether `${...}` in an ordinary quoted string literal means
+// what Python means (the text) rather than Nython's interpolation: a .py
+// file, or a file whose leading comment block says `# nython: module` (the
+// standard library's Python modules) or `# nython: python`. Backtick
+// template strings interpolate everywhere; raw strings, bytes and f-strings
+// never do.
+static bool python_string_mode(const std::string& file, const std::string& code) {
+    if (file.size() > 3 && file.compare(file.size() - 3, 3, ".py") == 0) return true;
+    size_t i = 0;
+    while (i < code.size()) {
+        size_t e = code.find('\n', i);
+        if (e == std::string::npos) e = code.size();
+        size_t b = code.find_first_not_of(" \t\r", i);
+        if (b == std::string::npos || b >= e) { i = e + 1; continue; }   // a blank line
+        if (code[b] != '#') break;                                       // the code starts
+        size_t p = code.find("nython:", b);
+        if (p != std::string::npos && p < e) {
+            size_t w = code.find_first_not_of(" \t", p + 7);
+            if (w != std::string::npos && w < e) {
+                size_t we = w;
+                while (we < e && (std::isalnum((unsigned char)code[we]) || code[we] == '_' || code[we] == '-')) we++;
+                std::string word = code.substr(w, we - w);
+                if (word == "module" || word == "python") return true;
+            }
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
+const std::vector<Token>& Lexer::tokenize() {   // round 82: the tokens in place (each call copied them)
     reset();
     if(source.line_number()<0) source.read();
+    python_strings = force_python_strings || python_string_mode(source.fileName(), source.sourceCode());   // round 83: forced by lib/ast.ny's parse
+    // round 86 (the source is copied out only for a file that may be one:
+    // not for the engines' own text, "stdin")
+    python_names = force_python_names;
+    if (!python_names) {
+        std::string fn = source.fileName();
+        python_names = nython::scope::lexer_python(fn, fn == "stdin" ? std::string() : source.sourceCode());
+    }
     while (!source.isAtEnd()) { /// this->token.type() != TokenType::End
         this->read_token();
     }
@@ -543,7 +706,7 @@ std::vector<Token> Lexer::tokenize() {
     this->token.value = "End";
     make_token(TokenType::End, TokenKind::End, TokenClass::Eof);
     tokens.push_back(this->token);
-    tokens = optimize(tokens);
+    tokens = optimize(std::move(tokens));   // round 82: moved, not copied (twice)
     return tokens;
 }
 
@@ -551,6 +714,17 @@ void Lexer::read_token() {
     reset_token();
     source.reset_frame();
     bool potential_keyword = true;
+    // round 79: the ++ / -- at the current character sits between an operand
+    // and another operand glued to it (x--y): Python's binary and unary sign
+    auto glued_unary = [this]() {
+        char n = this->source.peek_char(1);
+        bool operand_next = std::isalnum((unsigned char)n) || n == '_' || n == '(' || n == '['
+                            || n == '"' || n == '\'' || (unsigned char)n >= 0x80;
+        if (!operand_next || tokens.empty()) return false;
+        TokenType pt = tokens.back().type();
+        return pt == TokenType::Identifier || pt == TokenType::Integer || pt == TokenType::Float
+            || pt == TokenType::ParenClose || pt == TokenType::BracketClose || pt == TokenType::String;
+    };
     switch(source.read_char()) {
         case '0':
         case '1':
@@ -653,8 +827,34 @@ void Lexer::read_token() {
           break;
         }
         case '?': {
-            this->token.value = "?";
-            make_token(TokenType::QuestionMark,TokenKind::QuestionMark,TokenClass::Delimiter);
+            // `??` / `??=` null-coalescing, `?.` / `?[` optional chaining,
+            // else the `?` of the C-style ternary `c ? a : b`. Two spellings
+            // stay the ternary's: `c ? .5 : 1` (a digit after `?.`) and
+            // `c ? [1] : [2]` - `?[` is optional indexing only when the `?`
+            // is glued to its receiver (`a?[k]`); `a?.[k]` always is.
+            char n1 = source.peek_char(), n2 = source.peek_char(1);
+            char before = source.peek_char(-2);
+            bool glued = before != '\0' && !std::isspace((unsigned char)before);
+            if (n1 == '?' && n2 == '=') {
+                source.read_char(); source.read_char();
+                this->token.value = "?\?=";
+                make_token(TokenType::NullCoalesceAssign,TokenKind::QuestionMark,TokenClass::Assignment);
+            } else if (n1 == '?') {
+                source.read_char();
+                this->token.value = "??";
+                make_token(TokenType::NullCoalesce,TokenKind::QuestionMark,TokenClass::Operator);
+            } else if (n1 == '.' && !std::isdigit((unsigned char)n2) && n2 != '.') {
+                source.read_char();
+                this->token.value = "?.";
+                make_token(TokenType::OptDot,TokenKind::QuestionMark,TokenClass::Delimiter);
+            } else if (n1 == '[' && glued) {
+                // the `[` stays for the parser: OptBracket then BracketOpen
+                this->token.value = "?[";
+                make_token(TokenType::OptBracket,TokenKind::QuestionMark,TokenClass::Delimiter);
+            } else {
+                this->token.value = "?";
+                make_token(TokenType::QuestionMark,TokenKind::QuestionMark,TokenClass::Delimiter);
+            }
           break;
         }
         case ':': {
@@ -679,6 +879,11 @@ void Lexer::read_token() {
                 source.read_char();
                 this->consume_string(source.current_char);
                 this->token.type(TokenType::Identifier);
+              } else if (this->source.peek_char() == '=') {
+                // `a @= b` (round 77: it read as a decorator `@` and `=`)
+                this->source.read_char();
+                this->token.value = "@=";
+                make_token(TokenType::MatMulAssign,TokenKind::At,TokenClass::Assignment);
               } else {
                 this->token.value = "@";
                 make_token(TokenType::At,TokenKind::At,TokenClass::Delimiter);
@@ -941,6 +1146,15 @@ void Lexer::read_token() {
         }
         /// + -  *
         case '+': {
+            // round 79: x++y / x--y are Python's x + (+y) / x - (-y): after
+            // an operand, a ++ or -- glued to another operand is two
+            // operators, not Nython's postfix increment / decrement
+            // (_pydecimal's `a--n//a>>1` read as a decrement)
+            if (this->source.peek_char() == '+' && glued_unary()) {
+                this->token.value = "+";
+                make_token(TokenType::Add,TokenKind::Plus,TokenClass::Operator);
+                break;
+            }
             switch (this->source.peek_char()) {
                 case '+': {
                   this->token.value = "++";
@@ -963,6 +1177,11 @@ void Lexer::read_token() {
             break;
         }
         case '-': {
+            if (this->source.peek_char() == '-' && glued_unary()) {   // round 79: see '+'
+                this->token.value = "-";
+                make_token(TokenType::Sub,TokenKind::Minus,TokenClass::Operator);
+                break;
+            }
             switch (this->source.peek_char()) {
                 case '-': {
                   this->token.value = "--";
@@ -1036,15 +1255,22 @@ void Lexer::read_token() {
                         break;
                     }
                     // Disambiguate: // as floor div vs // as comment
-                    bool is_floordiv = false;
+                    // (round 87: Python-language source has no // comments,
+                    // and an operand that starts with a quote, a bracket, a
+                    // brace or ~ makes it floor division - `1 // 'a'`, `x //
+                    // [2]` read as a comment)
+                    bool is_floordiv = python_names;
+                    auto operand_start = [](char c) {
+                        return c == '\'' || c == '"' || c == '[' || c == '{' || c == '~';
+                    };
                     if (c2 == ' ' || c2 == '\t') {
                         char c3 = source.peek_char(1);
                         if ((c3 >= '0' && c3 <= '9') || c3 == '(' || c3 == '-'
-                            || (c3 >= 'a' && c3 <= 'z') || (c3 >= 'A' && c3 <= 'Z') || c3 == '_')
+                            || (c3 >= 'a' && c3 <= 'z') || (c3 >= 'A' && c3 <= 'Z') || c3 == '_' || operand_start(c3))
                             is_floordiv = true;
                     } else if ((c2 >= '0' && c2 <= '9') || c2 == '(' || c2 == '-'
                                || (c2 >= 'a' && c2 <= 'z') || (c2 >= 'A' && c2 <= 'Z')
-                               || c2 == '_' || c2 == '$') {
+                               || c2 == '_' || c2 == '$' || operand_start(c2)) {
                         is_floordiv = true;
                     }
                     if (is_floordiv) {
@@ -1198,12 +1424,27 @@ void Lexer::read_token() {
     // Change the type of keyword tokens
     if (this->token.type() == TokenType::Identifier && potential_keyword) {
         bool matched_kw = false;
-        for(auto kw : Keywords()) {
+        for(const auto& kw : Keywords()) {   // round 82: by reference (a string copied per keyword per identifier: 8% of the startup)
             if(this->token.value == kw.value) {
                 this->token.ident = kw.ident;
                 matched_kw = true;
                 break;
             }
+        }
+        // round 86: in Python-language source Nython's literal spellings and
+        // `elseif` are ordinary names (`true = 3`, `def f(elseif=1)`), as they
+        // are to CPython; True / False / None stay the literals. (Tested after
+        // the loop: inside it the loop ran 0.9M more instructions at startup.)
+        if (matched_kw && __builtin_expect(python_names, 0) && is_nython_literal_word(this->token.value))
+            this->token.ident = TokenIdent(TokenType::Identifier, TokenKind::Identifier, TokenClass::Identifier);
+        // round 87: and `super` is a name there (`super = 1`, a parameter, a
+        // module's own `super`) - only `super(` stays the builtin's call,
+        // which the engines run with the method's class and receiver
+        if (matched_kw && __builtin_expect(python_names, 0) && this->token.type() == TokenType::Super) {
+            int c = source.current_char, k = 0;
+            while (c == ' ' || c == '\t') c = source.peek_char(k++);
+            if (c != '(')
+                this->token.ident = TokenIdent(TokenType::Identifier, TokenKind::Identifier, TokenClass::Identifier);
         }
         // Check dynamic tokens from DynamicLangRegistry
         if (!matched_kw) {
@@ -1267,7 +1508,9 @@ void Lexer::consume_numeric() {
                 break;
             }
 			case 'j': case 'J':{
-                this->consume_cplx();
+                // 0j: the decimal path reads imaginary literals (consume_cplx
+                // lost the character after them: print(0j) was a syntax error)
+                this->consume_decimal();
                 break;
             }
 			case '.': case 'e': case 'E':{
@@ -1348,6 +1591,51 @@ inline bool isComplex(char cp) {
     return cp == 'j' or cp == 'J';
 }
 
+// The decimal digits of a suffixed number literal as the lexer spelled it
+// ("2.5e+3", "1500e-3", "1e3e+3": mantissa, then the exponents written and
+// implied by the suffix) when its value is a whole number; "" otherwise.
+static std::string scaled_suffix_integer(const std::string& lit) {
+    std::string mant;
+    long exp10 = 0;
+    size_t i = 0;
+    while (i < lit.size() && lit[i] != 'e' && lit[i] != 'E') mant += lit[i++];
+    while (i < lit.size()) {
+        i++;                                   // the 'e'
+        size_t start = i;
+        if (i < lit.size() && (lit[i] == '+' || lit[i] == '-')) i++;
+        while (i < lit.size() && std::isdigit((unsigned char)lit[i])) i++;
+        if (i == start) return std::string();
+        try { exp10 += std::stol(lit.substr(start, i - start)); } catch (...) { return std::string(); }
+    }
+    std::string digits;
+    long frac = 0;
+    bool point = false;
+    for (char c : mant) {
+        if (c == '.') { point = true; continue; }
+        if (!std::isdigit((unsigned char)c)) return std::string();
+        digits += c;
+        if (point) frac++;
+    }
+    if (digits.empty()) return std::string();
+    long shift = exp10 - frac;                 // value = digits * 10^shift
+    if (shift < 0) {
+        // Whole only if the digits dropped are all zeros.
+        long drop = -shift;
+        if (drop > (long)digits.size()) {
+            for (char c : digits) if (c != '0') return std::string();
+            return "0";
+        }
+        for (size_t k = digits.size() - (size_t)drop; k < digits.size(); k++)
+            if (digits[k] != '0') return std::string();
+        digits.resize(digits.size() - (size_t)drop);
+    } else {
+        if (shift > 4000) return std::string();
+        digits.append((size_t)shift, '0');
+    }
+    size_t nz = digits.find_first_not_of('0');
+    return nz == std::string::npos ? std::string("0") : digits.substr(nz);
+}
+
 void Lexer::consume_decimal() {
     char cp;
     char numchar;
@@ -1421,14 +1709,33 @@ void Lexer::consume_decimal() {
     }
     source.put_char();
     if (cp == '.' && !point_passed) {
-        cp = source.peek_char();
-        if(std::isspace(cp)) {
+        // the '.' was put back: peek_char() is it, peek_char(1) what follows
+        cp = source.peek_char(1);
+        // `5.` is a float before a space and before what ends an operand
+        // (`[5., 0.]`, `f(1.)`; round 77) - `1.+(2, 3)` stays a member call
+        if(std::isspace(cp) || cp == ',' || cp == ')' || cp == ']' || cp == '}' || cp == ':' || cp == ';'
+           || cp == '#' || cp == '\0') {
         	source.read_char();
         	decoder << '.';
         	point_passed = true;
         }
     }
     this->token.value = decoder.str();
+    // A unit suffix (1k, 2.5M, 3m, 10u ...) scales the number by a power of
+    // ten. The literal is an exact integer when the scaled value is whole
+    // (1k == 1000, 2.5k == 2500, 2000m == 2) and a float only when it is
+    // fractional (1m == 0.001, 1500m == 1.5); arithmetic then follows the
+    // operation (1k / 3 is a float, 1k // 3 and 1k * 2 are ints). It used
+    // to be a float always. Worked out on the digits, not in binary
+    // floating point, so 1.1k is exactly 1100.
+    if ( units_passed && !complx_passed ) {
+        std::string whole = scaled_suffix_integer(this->token.value);
+        if (!whole.empty()) {
+            this->token.value = whole;
+            make_token(TokenType::Integer,TokenKind::Number,TokenClass::Literal);
+            return;
+        }
+    }
     //Check if we parsed a complex
     if ( complx_passed ) {
         source.read_char();
@@ -1446,6 +1753,8 @@ void Lexer::consume_hex() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0x");
+    // `0x_ff`, `0xff_ff`: an underscore between digits (round 77)
+    if (source.current_char == '_' && Lexer::is_hex(source.peek_char())) source.read_char();
     // There has to be at least one hex character
     if (!Lexer::is_hex(source.current_char)) {
         this->unexpectedChar();
@@ -1454,6 +1763,8 @@ void Lexer::consume_hex() {
     while (true) {
         if (Lexer::is_hex(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_hex(source.peek_char())) {
             cp = source.read_char();
         } else if (cp == '.') {
             if (point_passed) {
@@ -1479,6 +1790,7 @@ void Lexer::consume_octal() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0o");
+    if (source.current_char == '_' && Lexer::is_octal(source.peek_char())) source.read_char();   // 0o_17 (round 77)
     // There has to be at least one hex character
     if (!Lexer::is_octal(source.current_char)) {
         this->unexpectedChar();
@@ -1487,6 +1799,8 @@ void Lexer::consume_octal() {
     while (true) {
         if (Lexer::is_octal(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_octal(source.peek_char())) {
             cp = source.read_char();
         }else if (cp == '.') {
             if (point_passed) {
@@ -1512,6 +1826,7 @@ void Lexer::consume_binary() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0b");
+    if (source.current_char == '_' && Lexer::is_binary(source.peek_char())) source.read_char();   // 0b_1010 (round 77)
     // There has to be at least one hex character
     if (!Lexer::is_binary(source.current_char)) {
         this->unexpectedChar();
@@ -1520,6 +1835,8 @@ void Lexer::consume_binary() {
     while (true) {
         if (Lexer::is_binary(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_binary(source.peek_char())) {
             cp = source.read_char();
         }else if (cp == '.') {
             if (point_passed) {
@@ -1605,6 +1922,11 @@ bool Lexer::handle_indentation() {
 		else break;
 	}
 	source.put_char();
+	// round 79: a comment-only line does not change the indentation, as in
+	// Python's tokenizer - a comment indented deeper than the code around it
+	// (a continued trailing comment) or less (one at column 0 inside a
+	// function) was an Indent/Dedent and a syntax error
+	if(c == '#') return false;
 	if(col > indent) {
 		///Adjust the current indentation level.
 		indent = col;
@@ -1653,8 +1975,201 @@ void Lexer::consume_ident() {
         source.appendToFrame(source.current_char);
     }
     source.put_char();
-    this->token.value = source.get_current_frame();
+    std::string ident = source.get_current_frame();
+    // r"..." / r'...': a raw string - backslashes are kept as written.
+    if ((ident == "r" || ident == "R") && (source.peek_char() == '"' || source.peek_char() == '\'')) {
+        char q = source.read_char();
+        consume_raw_string(q);
+        return;
+    }
+    // b"..." / rb"..." (any case, either order): a bytes literal (round 77).
+    if (source.peek_char() == '"' || source.peek_char() == '\'') {
+        std::string lo;
+        for (char c : ident) lo += (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+        if (lo == "b" || lo == "rb" || lo == "br") {
+            char q = source.read_char();
+            consume_bytes(q, lo != "b");
+            return;
+        }
+        // u"..." is a plain string; F"..." an f-string (the parser reads
+        // `f` + a string); rf"..." / fR"..." an f-string over a raw string:
+        // the `f` token, then the raw text (round 77)
+        if (lo == "u") {
+            char q = source.read_char();
+            consume_string(q);
+            return;
+        }
+        if (lo == "f") { ident = "f"; fstring_next_ = true; }   // round 84: PEP 701
+        if (lo == "rf" || lo == "fr") {
+            this->token.value = "f";
+            make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
+            tokens.push_back(this->token);
+            char q = source.read_char();
+            consume_raw_string(q);
+            return;
+        }
+    }
+    // round 84: PEP 3131 - an identifier with non-ASCII characters is
+    // XID_Start XID_Continue* and is NFKC-normalized (`ﬁ = 1` binds `fi`,
+    // `ℌ` is `H`), as CPython's tokenizer and parser do. In a Python-mode
+    // file (.py, `# nython: python` / `module`) any other character is
+    // CPython's SyntaxError ("invalid character '€' (U+20AC)"); Nython
+    // source keeps its other identifiers (emoji ...) as they are written.
+    bool ascii_ident = true;
+    for (char ch : ident) if ((unsigned char)ch >= 0x80) { ascii_ident = false; break; }
+    if (!ascii_ident) {
+        bool valid = true;
+        uint32_t bad = 0;
+        size_t k = 0;
+        bool first = true;
+        while (k < ident.size()) {
+            unsigned char b0 = (unsigned char)ident[k];
+            size_t len = b0 < 0x80 ? 1 : (b0 & 0xE0) == 0xC0 ? 2 : (b0 & 0xF0) == 0xE0 ? 3 : 4;
+            if (k + len > ident.size()) len = 1;
+            uint32_t cp = len == 1 ? b0 : len == 2 ? (b0 & 0x1Fu) : len == 3 ? (b0 & 0x0Fu) : (b0 & 0x07u);
+            for (size_t j = 1; j < len; j++) cp = (cp << 6) | ((unsigned char)ident[k + j] & 0x3Fu);
+            k += len;
+            bool ok = cp == '_' || cp == '$' || (first ? nyucd::is_xid_start(cp) : nyucd::is_xid_continue(cp));
+            if (!ok) { valid = false; bad = cp; break; }
+            first = false;
+        }
+        if (valid) ident = nyucd::normalize_utf8(nyucd::NFKC, ident);
+        else if (python_strings) {
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "%04X", (unsigned)bad);
+            std::string ch;
+            if (bad < 0x80) ch += (char)bad;
+            else if (bad < 0x800) { ch += (char)(0xC0 | (bad >> 6)); ch += (char)(0x80 | (bad & 0x3F)); }
+            else if (bad < 0x10000) { ch += (char)(0xE0 | (bad >> 12)); ch += (char)(0x80 | ((bad >> 6) & 0x3F)); ch += (char)(0x80 | (bad & 0x3F)); }
+            else { ch += (char)(0xF0 | (bad >> 18)); ch += (char)(0x80 | ((bad >> 12) & 0x3F)); ch += (char)(0x80 | ((bad >> 6) & 0x3F)); ch += (char)(0x80 | (bad & 0x3F)); }
+            this->token.value = nyucd::is_printable(bad) ? "invalid character '" + ch + "' (U+" + hex + ")"
+                                                         : std::string("invalid non-printable character U+") + hex;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+    }
+    this->token.value = ident;
     make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
+}
+
+// The body of a raw string literal, its opening quote just read (a single
+// quote, or the first of three). Nothing is an escape; a backslash only keeps
+// the quote after it from ending the string, as in Python.
+void Lexer::consume_raw_string(char q) {
+    std::string out;
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        if (source.peek_char() == q) { source.read_char(); n = 3; }
+        else { this->token.value = ""; make_token(TokenType::String,TokenKind::String,TokenClass::Default); return; }   // round 80: raw, no ${
+    }
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) {
+            this->token.value = out;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+        if (c == '\\') {
+            out += c;
+            char d = source.read_char();
+            if (d == '\0' || d == (char)-1) continue;
+            out += d;
+            continue;
+        }
+        if (c == q) {
+            if (n == 1) break;
+            if (source.peek_char() == q) {
+                source.read_char();
+                if (source.peek_char() == q) { source.read_char(); break; }
+                out += q; out += q; continue;
+            }
+        }
+        if (c == '\n' && n == 1) {
+            this->token.value = out;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+        out += c;
+    }
+    this->token.value = out;
+    make_token(TokenType::String,TokenKind::String,TokenClass::Default);   // round 80: a raw string never interpolates ${...}
+}
+
+// The body of a bytes literal, its opening quote just read. Python's rules:
+// only ASCII characters may be written in it, \xhh and \ooo give any byte,
+// \u is not an escape, an unknown escape keeps its backslash; a raw one
+// (rb"...") keeps every backslash.
+void Lexer::consume_bytes(char q, bool raw) {
+    std::string out;
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        if (source.peek_char() == q) { source.read_char(); n = 3; }
+        else { this->token.value = ""; make_token(TokenType::Bytes,TokenKind::String,TokenClass::Literal); return; }
+    }
+    auto fail = [&](const char* why) {
+        this->token.value = why;
+        errors++;
+        make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+        add_info_item(LexerInfoLevel::Error,token);
+    };
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { fail("unterminated bytes literal"); return; }
+        if ((unsigned char)c >= 0x80) { fail("bytes can only contain ASCII literal characters"); return; }
+        if (c == '\n' && n == 1) { fail("unterminated bytes literal"); return; }
+        if (c == q) {
+            if (n == 1) break;
+            if (source.peek_char() == q) {
+                source.read_char();
+                if (source.peek_char() == q) { source.read_char(); break; }
+                out += q; out += q; continue;
+            }
+            out += q; continue;
+        }
+        if (c != '\\') { if (c != '\r') out += c; continue; }
+        char d = source.read_char();
+        if (d == '\0' || d == (char)-1) { fail("unterminated bytes literal"); return; }
+        if (raw) { out += '\\'; out += d; continue; }
+        switch (d) {
+            case '\n': break;                       // line continuation
+            case '\\': out += '\\'; break;
+            case '\'': out += '\''; break;
+            case '"': out += '"'; break;
+            case 'a': out += '\a'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            case 'v': out += '\v'; break;
+            case 'x': {
+                char h1 = source.read_char();
+                char h2 = source.read_char();
+                if (!is_hex(h1) || !is_hex(h2)) { fail("invalid \\x escape in bytes literal"); return; }
+                out += (char)((hex2num(h1) << 4) | hex2num(h2));
+                break;
+            }
+            default:
+                if (d >= '0' && d <= '7') {
+                    int v = d - '0';
+                    for (int k = 0; k < 2 && source.peek_char() >= '0' && source.peek_char() <= '7'; k++)
+                        v = v * 8 + (source.read_char() - '0');
+                    out += (char)(v & 0xFF);
+                } else {
+                    out += '\\'; out += d;            // unknown: kept as written
+                }
+        }
+    }
+    this->token.value = out;
+    make_token(TokenType::Bytes,TokenKind::String,TokenClass::Literal);
 }
 
 void Lexer::consume_regex(char first) {
@@ -1685,9 +2200,95 @@ void Lexer::consume_regex(char first) {
 	}
 }
 
+// round 84: PEP 701 - a replacement field of an f-string, its `{` just read:
+// copied as written up to its closing `}` (the parser parses it), with the
+// strings inside it read whole whatever their quotes, brackets counted, a
+// format spec's own fields followed, comments dropped.
+void Lexer::read_fstring_field(std::stringstream& out, char first) {
+    out << '{';
+    int depth = 0;
+    bool spec = false;
+    std::string prev;   // the identifier characters just before a quote: a string prefix
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { source.put_char(); return; }   // unterminated: the caller reports it
+        if (spec) {
+            if (c == '{') { read_fstring_field(out, first); continue; }
+            if (c == '}') { out << '}'; return; }
+            if (c == first) { source.put_char(); return; }
+            out << c;
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            std::string lo;
+            for (char p : prev) lo += (char)((p >= 'A' && p <= 'Z') ? p + 32 : p);
+            bool nested_f = !lo.empty() && lo.size() <= 2 && lo.find('f') != std::string::npos
+                            && lo.find_first_not_of("rf") == std::string::npos;   // f, rf, fr
+            out << c;
+            read_nested_string(out, c, nested_f);
+            prev.clear();
+            continue;
+        }
+        if (is_ident_part(c)) prev += c; else prev.clear();
+        if (c == '#') {   // a comment, to the end of its line
+            while (source.peek_char() != '\n' && source.peek_char() != '\0' && source.peek_char() != (char)-1) source.read_char();
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']') { if (depth > 0) depth--; }
+        else if (c == '}') {
+            if (depth == 0) { out << '}'; return; }
+            depth--;
+        } else if (c == ':' && depth == 0) spec = true;
+        out << c;
+    }
+}
+
+// The rest of a string literal inside a replacement field, its opening quote
+// already copied: copied as written, escapes and all (a nested f-string's
+// fields followed in turn).
+void Lexer::read_nested_string(std::stringstream& out, char q, bool fstr) {
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        out << q;
+        if (source.peek_char() != q) return;   // ''
+        source.read_char();
+        out << q;
+        n = 3;
+    }
+    int ends = 0;
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { source.put_char(); return; }
+        if (c == '\\') {
+            out << c;
+            char d = source.read_char();
+            if (d == '\0' || d == (char)-1) { source.put_char(); return; }
+            out << d;
+            ends = 0;
+            continue;
+        }
+        if (fstr && c == '{') {
+            if (source.peek_char() == '{') { source.read_char(); out << "{{"; ends = 0; continue; }
+            read_fstring_field(out, q);
+            ends = 0;
+            continue;
+        }
+        if (c == '\n' && n == 1) { source.put_char(); return; }   // unterminated: the parser reports it
+        out << c;
+        if (c == q) {
+            if (++ends == n) return;
+        } else ends = 0;
+    }
+}
+
 void Lexer::consume_string(char first) {
     std::stringstream strbuff;
     char cur = first;
+    // round 84: PEP 701 - an f-string's fields are read whole
+    const bool fstr = fstring_next_;
+    fstring_next_ = false;
 	int quote_count     = 0;
 	int end_quote_count = 0;
 	while(cur == first && quote_count < 3) {
@@ -1710,6 +2311,18 @@ void Lexer::consume_string(char first) {
                     source.location.column
                 );
                 return;
+			}
+			// A quote that did not end a triple-quoted string is part of it
+			// ("""say "hi" """ kept no quotes, so exec'd source and docstrings
+			// lost them) - round 77.
+			if(quote_count == 3 && cur != first && end_quote_count > 0)
+				for(int q = 0; q < end_quote_count; q++) strbuff << first;
+			// round 84: PEP 701 - a replacement field, copied whole ({{ is a brace)
+			if(fstr && cur == '{') {
+				end_quote_count = 0;
+				if(source.peek_char() == '{') { source.read_char(); strbuff << "{{"; continue; }
+				read_fstring_field(strbuff, first);
+				continue;
 			}
 			if(cur != '\\' && cur != '\x0c' && cur != '\r') {
 				// For triple-quoted strings (quote_count==3), preserve literal newlines
@@ -1817,12 +2430,54 @@ void Lexer::consume_string(char first) {
                             }
                             break;
                         }
+						case 'N': {
+                            // \N{EM DASH}: the character of that name, as in
+                            // Python (round 77; NyUniNames.hpp). An unknown
+                            // name is a SyntaxError, as there.
+                            if(source.peek_char() != '{') { strbuff << '\\' << c; break; }
+                            source.read_char();
+                            std::string nm;
+                            char nc;
+                            while((nc = source.peek_char()) != '}' && nc != '\0' && nc != '\n' && nc != first && nm.size() < 128) {
+                                source.read_char();
+                                nm += nc;
+                            }
+                            uint32_t codepoint = 0;
+                            if(nc == '}' && ::nyuni::lookup(nm, codepoint)) {
+                                source.read_char();
+                                if(codepoint < 0x80) {
+                                    strbuff << (char)codepoint;
+                                } else if(codepoint < 0x800) {
+                                    strbuff << (char)(0xC0|(codepoint>>6));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                } else if(codepoint < 0x10000) {
+                                    strbuff << (char)(0xE0|(codepoint>>12));
+                                    strbuff << (char)(0x80|((codepoint>>6)&0x3F));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                } else {
+                                    strbuff << (char)(0xF0|(codepoint>>18));
+                                    strbuff << (char)(0x80|((codepoint>>12)&0x3F));
+                                    strbuff << (char)(0x80|((codepoint>>6)&0x3F));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                }
+                            } else {
+                                throw nython::exception::SyntaxError(
+                                    Location(source.location.row, source.location.column, source.fileName()),
+                                    nc == '}' ? "(unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name"
+                                              : "(unicode error) 'unicodeescape' codec can't decode bytes: malformed \\N character escape");
+                            }
+                            break;
+                        }
 						case 'x': case 'X': {
-                            // \xHH hex escape (exactly 2 hex digits)
+                            // \xHH: the code point U+00HH, as in Python ("\xe9"
+                            // is "é"; it used to be the raw byte 0xE9, which is
+                            // not UTF-8 - b"\xe9" is the byte).
                             char h1 = source.read_char();
                             char h2 = source.read_char();
                             if(is_hex(h1) && is_hex(h2)) {
-                                strbuff << (char)((hex2num(h1)<<4)|hex2num(h2));
+                                uint32_t cp = (uint32_t)((hex2num(h1)<<4)|hex2num(h2));
+                                if(cp < 0x80) strbuff << (char)cp;
+                                else { strbuff << (char)(0xC0|(cp>>6)); strbuff << (char)(0x80|(cp&0x3F)); }
                             } else {
                                 strbuff << '\\' << c;
                                 if(!is_hex(h1)) source.put_char();
@@ -1834,8 +2489,25 @@ void Lexer::consume_string(char first) {
                             this->unexpectedChar();
                             break;
                         }
+						case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                            // \ooo: up to three octal digits, a code point
+                            uint32_t cp = (uint32_t)(c - '0');
+                            for(int k = 0; k < 2; k++) {
+                                char o = source.peek_char();
+                                if(o < '0' || o > '7') break;
+                                source.read_char();
+                                cp = cp * 8 + (uint32_t)(o - '0');
+                            }
+                            if(cp < 0x80) strbuff << (char)cp;
+                            else { strbuff << (char)(0xC0|(cp>>6)); strbuff << (char)(0x80|(cp&0x3F)); }
+                            break;
+                        }
+						case '\n':
+                            // a backslash at the end of a line continues it
+                            break;
 						default:
-						    strbuff << char(cur);
+						    // an unknown escape keeps its backslash, as in Python
+						    strbuff << '\\' << c;
 						break;
 					}
 				}
@@ -1843,7 +2515,9 @@ void Lexer::consume_string(char first) {
 		}
 	}
     this->token.value = strbuff.str();
-    make_token(TokenType::String,TokenKind::String,TokenClass::Literal);
+    // round 80: in a Python-mode file a quoted string's ${...} is its text
+    // (backtick template strings still interpolate)
+    make_token(TokenType::String,TokenKind::String,(python_strings && first != '`') ? TokenClass::Default : TokenClass::Literal);
 }
 
 void Lexer::consume_right_shift() {

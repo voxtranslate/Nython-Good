@@ -1,5 +1,5 @@
 import io
-import "examples/lib/io.ny"
+import "examples/lib/fileio.ny"
 
 # TextFile API
 var tf = TextFile("/tmp/ny_tf.txt")

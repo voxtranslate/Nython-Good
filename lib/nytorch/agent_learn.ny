@@ -26,6 +26,8 @@
 # The same keyword list ide_editor.ny's SyntaxHighlighter ships with —
 # duplicated rather than imported (nytorch has no business depending on GUI
 # code), but sourced from the same real language, not reinvented.
+import "lib/nytorch/core.ny"
+
 def _ny_keywords():
     return ["def", "class", "if", "elif", "else", "while", "for", "in",
             "return", "import", "var", "const", "let", "not", "and", "or",
@@ -278,3 +280,294 @@ class CodingAgent:
     def perplexity_on(self, text):
         var idxs = self._categorize(text)
         return self.model.evaluate(idxs)
+
+
+
+# ── the completion ranker (round 82) ─────────────────────────────────────────
+# The model above, put to work: lib/aiagent.ny's NyxAgent and the IDE re-rank
+# the editor's completion list with it, trained on the user's own workspace.
+#
+# CodeTokenModel is an online n-gram model of code tokens - Hindle, Barr, Su,
+# Gabel & Devanbu, "On the Naturalness of Software" (ICSE 2012), showed code
+# is repetitive enough that n-gram models predict the next token well - with
+# Witten-Bell interpolation of trigram, bigram and unigram estimates, and a
+# cache of the most recent identifiers (Tu, Su & Devanbu, "On the Localness
+# of Software", FSE 2014: what was just written is likely again). Every
+# observed token updates the counts at once (it learns as code is read or
+# typed). CompletionRanker combines it with the category MLP above
+# (TokenLanguageModel: what kind of token follows this kind, trained by
+# gradient steps on the same text) and re-orders candidates: a candidate
+# that starts with what was typed stays ahead of a fuzzy match, and within
+# those the model decides. completion_mrr() measures it as the mean
+# reciprocal rank of the token the user went on to type, before and after
+# training (vm_audit105).
+
+var _NY_TOKEN_RE = none
+
+def code_tokens(text):
+    """[[text, category], ...] of a source text: strings and numbers whole,
+    comments dropped (the categories above: keyword, identifier, number,
+    string, operator, punct)."""
+    import re
+    global _NY_TOKEN_RE
+    if _NY_TOKEN_RE == none:
+        _NY_TOKEN_RE = re.compile(r'"""[\s\S]*?"""|' + r"'''[\s\S]*?'''|" + r'"(?:[^"\\\n]|\\.)*"|' + r"'(?:[^'\\\n]|\\.)*'|" + r"#[^\n]*|[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]+)?|==|!=|<=|>=|\*\*|//|->|\+=|-=|\*=|/=|[-+*/%=<>!&|^~@]|[()\[\]{}:,.;]")
+    var out = []
+    for t in _NY_TOKEN_RE.findall(text):
+        var c = t[0:1]
+        if c == "#":
+            continue
+        if c == "\"" or c == "'":
+            out.append([t, "string"])
+        elif c >= "0" and c <= "9":
+            out.append([t, "number"])
+        elif _is_id_char(c):
+            if _in_keywords(t):
+                out.append([t, "keyword"])
+            else:
+                out.append([t, "identifier"])
+        elif _is_op_char(c):
+            out.append([t, "operator"])
+        else:
+            out.append([t, "punct"])
+    return out
+
+
+def _code_token_key(tc):
+    if tc[1] == "string":
+        return "<str>"
+    if tc[1] == "number":
+        return "<num>"
+    return tc[0]
+
+
+class CodeTokenModel:
+    def __init__(self, cache_size=400):
+        self.uni = {}
+        self.bi = {}          # prev -> {tok: count}
+        self.bi_n = {}        # prev -> how many tokens followed it
+        self.tri = {}         # prev2 + " " + prev -> {tok: count}
+        self.tri_n = {}
+        self.total = 0
+        self.cache = []       # the most recent identifiers
+        self.cache_counts = {}
+        self.cache_size = cache_size
+        self.lam_cache = 0.15
+
+    def _bump(self, table, totals, key, tok):
+        var d = table.get(key)
+        if d == none:
+            d = {}
+            table[key] = d
+        d[tok] = d.get(tok, 0) + 1
+        totals[key] = totals.get(key, 0) + 1
+
+    def observe_tokens(self, toks):
+        var p2 = "<s>"
+        var p1 = "<s>"
+        for tc in toks:
+            var t = _code_token_key(tc)
+            self.uni[t] = self.uni.get(t, 0) + 1
+            self.total = self.total + 1
+            self._bump(self.bi, self.bi_n, p1, t)
+            self._bump(self.tri, self.tri_n, p2 + " " + p1, t)
+            if tc[1] == "identifier":
+                self.remember(t)
+            p2 = p1
+            p1 = t
+        return len(toks)
+
+    def remember(self, t):
+        self.cache.append(t)
+        self.cache_counts[t] = self.cache_counts.get(t, 0) + 1
+        if len(self.cache) > self.cache_size:
+            var old = self.cache.pop(0)
+            var n = self.cache_counts[old] - 1
+            if n <= 0:
+                del self.cache_counts[old]
+            else:
+                self.cache_counts[old] = n
+
+    # Witten-Bell: (c(h, w) + T(h) P_lower(w)) / (c(h) + T(h))
+    def _wb(self, d, n, tok, lower):
+        if d == none:
+            return lower
+        var types = len(d)
+        return (d.get(tok, 0) + types * lower) / (n + types)
+
+    def prob(self, tok, p2, p1):
+        var v = len(self.uni) + 1
+        var p_uni = (self.uni.get(tok, 0) + 1.0) / (self.total + v)
+        var p_bi = self._wb(self.bi.get(p1), self.bi_n.get(p1, 0), tok, p_uni)
+        var h = p2 + " " + p1
+        var p = self._wb(self.tri.get(h), self.tri_n.get(h, 0), tok, p_bi)
+        if len(self.cache) > 0:
+            var pc = self.cache_counts.get(tok, 0) / len(self.cache)
+            p = (1.0 - self.lam_cache) * p + self.lam_cache * pc
+        return p
+
+
+class CompletionRanker:
+    # The category MLP has 36 transitions to learn: a sample of each file's
+    # pairs (max_category_pairs) and a total budget (max_category_steps) keep
+    # its gradient steps - the slow part - from growing with the workspace.
+    def __init__(self, hidden=8, seed=11, category_model=true, max_category_pairs=24, max_category_steps=240):
+        self.ngram = CodeTokenModel()
+        self.cat = none
+        if category_model:
+            self.cat = TokenLanguageModel(hidden, seed)
+        self.max_category_pairs = max_category_pairs
+        self.max_category_steps = max_category_steps
+        self.files = 0
+        self.tokens = 0
+        self.cat_steps = 0
+        self.gamma = 0.5
+        self._cat_probs = none
+
+    def trained(self):
+        return self.files > 0
+
+    def observe_source(self, text):
+        """Learns from one source text: every token updates the n-gram
+        counts; a sample of its category pairs takes gradient steps."""
+        var toks = code_tokens(text)
+        self.ngram.observe_tokens(toks)
+        self.files = self.files + 1
+        self.tokens = self.tokens + len(toks)
+        if self.cat != none and len(toks) > 1 and self.cat_steps < self.max_category_steps:
+            var n = len(toks) - 1
+            var step = 1
+            if n > self.max_category_pairs:
+                step = int(n / self.max_category_pairs)
+            var i = 0
+            while i < n and self.cat_steps < self.max_category_steps:
+                self.cat.observe_pair(KIND_INDEX[toks[i][1]], KIND_INDEX[toks[i + 1][1]])
+                self.cat_steps = self.cat_steps + 1
+                i = i + step
+            self._cat_probs = none
+        return len(toks)
+
+    # P(category of the next token | category of the previous one), from the
+    # MLP, kept as a 6x6 table until it is trained again
+    def category_prob(self, prev_cat, cat):
+        if self.cat == none:
+            return 1.0
+        if self._cat_probs == none:
+            import math
+            var table = []
+            var a = 0
+            while a < KIND_COUNT:
+                var logits = self.cat.model.forward(self.cat._onehot(a))
+                var mx = logits.data[0]
+                var j = 1
+                while j < KIND_COUNT:
+                    if logits.data[j] > mx:
+                        mx = logits.data[j]
+                    j = j + 1
+                var row = []
+                var z = 0.0
+                j = 0
+                while j < KIND_COUNT:
+                    var e = math.exp(logits.data[j] - mx)
+                    row.append(e)
+                    z = z + e
+                    j = j + 1
+                j = 0
+                while j < KIND_COUNT:
+                    row[j] = row[j] / z
+                    j = j + 1
+                table.append(row)
+                a = a + 1
+            self._cat_probs = table
+        return self._cat_probs[KIND_INDEX.get(prev_cat, 1)][KIND_INDEX.get(cat, 1)]
+
+    def context(self, text_before):
+        """[prev2, prev1, category of prev1] from the text before the word."""
+        var toks = code_tokens(text_before)
+        var n = len(toks)
+        var p2 = "<s>"
+        var p1 = "<s>"
+        var c1 = "punct"
+        if n >= 1:
+            p1 = _code_token_key(toks[n - 1])
+            c1 = toks[n - 1][1]
+        if n >= 2:
+            p2 = _code_token_key(toks[n - 2])
+        return [p2, p1, c1]
+
+    def score(self, cand, ctx):
+        import math
+        var p = self.ngram.prob(cand, ctx[0], ctx[1])
+        var cat = "identifier"
+        if _in_keywords(cand):
+            cat = "keyword"
+        return math.log(p) + self.gamma * math.log(max(self.category_prob(ctx[2], cat), 0.000001))
+
+    def rerank(self, names, kinds, ctx, typed=""):
+        """The candidates re-ordered: those starting with `typed` (matching
+        case first) ahead of fuzzy matches, the model's order within each
+        group, the original order breaking ties. [names, kinds]."""
+        if not self.trained() or len(names) < 2:
+            return [names, kinds]
+        var low = typed.lower()
+        var keyed = []
+        var i = 0
+        while i < len(names):
+            var nm = names[i]
+            var grp = 2
+            if typed != "" and nm.startswith(typed):
+                grp = 0
+            elif typed != "" and nm.lower().startswith(low):
+                grp = 1
+            keyed.append([grp, -self.score(nm, ctx), i])
+            i = i + 1
+        keyed = sorted(keyed)
+        var on = []
+        var ok = []
+        for k in keyed:
+            on.append(names[k[2]])
+            ok.append(kinds[k[2]])
+        return [on, ok]
+
+
+def completion_mrr(ranker, text, base_names, base_kinds, prefix_len=1, min_len=3, use_model=true, limit=60):
+    """The mean reciprocal rank of each identifier of `text` in the
+    completion list the IDE shows after its first prefix_len characters are
+    typed (ac_index_rank over the base names and the text's own words),
+    re-ranked by the model or not. [mrr, positions]."""
+    var ix = ac_index_new()
+    ac_index_set_base(ix, base_names, base_kinds)
+    ac_index_scan(ix, string_split(text, "\n"), min_len)
+    var toks = code_tokens(text)
+    var total = 0.0
+    var n = 0
+    var p2 = "<s>"
+    var p1 = "<s>"
+    var c1 = "punct"
+    var i = 0
+    while i < len(toks):
+        var t = toks[i][0]
+        var c = toks[i][1]
+        if (c == "identifier" or c == "keyword") and len(t) >= min_len:
+            var typed = t[0:prefix_len]
+            var res = ac_index_rank(ix, typed, limit, typed)
+            var names = res[0]
+            if use_model:
+                names = ranker.rerank(names, res[1], [p2, p1, c1], typed)[0]
+            var k = 0
+            var rank = 0
+            while k < len(names):
+                if names[k] == t:
+                    rank = k + 1
+                    break
+                k = k + 1
+            if rank > 0:
+                total = total + 1.0 / rank
+            n = n + 1
+        p2 = p1
+        p1 = _code_token_key(toks[i])
+        c1 = c
+        i = i + 1
+    if n == 0:
+        return [0.0, 0]
+    return [total / n, n]

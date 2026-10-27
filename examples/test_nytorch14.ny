@@ -1,7 +1,4 @@
-import nytorch
-import "lib/nytorch/activations.ny"
-import "lib/nytorch/reinforcement.ny"
-import "lib/nytorch/convnets.ny"
+import "lib/nytorch.ny"
 
 print "=== NYTORCH14 TEST SUITE ==="
 print ""
@@ -22,6 +19,14 @@ def assert_eq(name, a, b):
         passed = passed + 1
     else:
         print "  FAIL: " + name + " (got " + str(a) + " expected " + str(b) + ")"
+        failed = failed + 1
+
+def assert_near(name, a, b, tol):
+    if abs(a - b) <= tol:
+        print "  PASS: " + name
+        passed = passed + 1
+    else:
+        print "  FAIL: " + name + " (|" + str(a) + " - " + str(b) + "| > " + str(tol) + ")"
         failed = failed + 1
 
 # ── 231: ConvBlock ─────────────────────────────────────────────────────────
@@ -129,7 +134,8 @@ assert_eq("WaveNetBlock name", wnb.get_name(), "WaveNetBlock")
 assert_eq("WaveNetBlock dilation", wnb.get_dilation(), 1)
 var wnb_result = wnb.forward(tensor_randn([32]), 0.0)
 assert_eq("WaveNetBlock result has [res, skip]", len(wnb_result), 2)
-assert_true("WaveNetBlock skip is float", type(wnb_result[1]) == "float" or type(wnb_result[1]) == "int")
+assert_eq("WaveNetBlock residual keeps (channels, length)", wnb_result[0].shape, [8, 4])
+assert_eq("WaveNetBlock skip is a (channels, length) tensor", wnb_result[1].shape, [8, 4])
 
 # ── 241: WaveNet ───────────────────────────────────────────────────────────
 print "--- WaveNet ---"
@@ -155,8 +161,19 @@ var token_ids = ctc.greedy_decode(frames)
 assert_true("CTC greedy decode runs", len(token_ids) >= 0)
 var ctc_text = ctc.decode_to_string([1, 2, 3, 7, 4, 5])
 assert_true("CTC decode to string", len(ctc_text) > 0)
-var ctc_loss_val = ctc.compute_loss(100, 20)
-assert_true("CTC loss > 0", ctc_loss_val > 0.0)
+# uniform per-frame distribution over 8 labels, 3 frames, target "a" (id 1):
+# the 6 alignments (1__, _1_, __1, 11_, _11, 111) give -log(6 / 8^3)
+var uni = []
+for i in range(0, 3):
+    uni.append([0.0 - log(8.0)] * 8)
+var ctc_loss_val = ctc.compute_loss(uni, [1])
+assert_near("CTC loss = -log(6 / 512)", ctc_loss_val, log(512.0 / 6.0), 0.000000001)
+var ctc_bad = false
+try:
+    ctc.compute_loss(100, 20)
+except e:
+    ctc_bad = true
+assert_true("CTC compute_loss rejects the old (lengths) form", ctc_bad)
 
 # ── 243: ASRPipeline ───────────────────────────────────────────────────────
 print "--- ASRPipeline ---"
@@ -340,7 +357,8 @@ assert_eq("TB global step", flush_info["step"], 10)
 
 # ── 256: CheckpointManager ────────────────────────────────────────────────
 print "--- CheckpointManager ---"
-var ckpt = CheckpointManager("./checkpoints", 3, "val_loss", "min")
+os_exec("rm -rf /tmp/nytorch14_ckpt")
+var ckpt = CheckpointManager("/tmp/nytorch14_ckpt", 3, "val_loss", "min")
 assert_eq("Ckpt name", ckpt.get_name(), "CheckpointManager")
 var r1 = ckpt.save("model_state_v1", 1.5, 100)
 var r2 = ckpt.save("model_state_v2", 1.2, 200)
@@ -352,15 +370,30 @@ assert_true("Ckpt r4 not best (loss went up)", not r4["is_best"])
 assert_true("Ckpt keeps max_to_keep", len(ckpt.list_checkpoints()) <= 3)
 var best = ckpt.load_best()
 assert_true("Ckpt best path non-empty", len(best["path"]) > 0)
+assert_eq("Ckpt best state read back from disk", best["state"], "model_state_v3")
+assert_true("Ckpt best file exists", file_exists(best["path"]))
+assert_true("Ckpt oldest file deleted", not file_exists(r1["path"]))
+var ck_net = Linear(2, 2)
+var r5 = ckpt.save(ck_net, 0.5, 500)
+var ck_net2 = Linear(2, 2)
+ck_net2.load_state_dict(ckpt.load_best()["state"])
+assert_true("Ckpt module weights round-trip", ck_net2.weight.allclose(ck_net.weight))
 
 # ── 257: LearningRateFinder ────────────────────────────────────────────────
 print "--- LearningRateFinder ---"
-var lr_finder = LearningRateFinder("resnet", "adam", 1e-7, 10.0, 100)
+torch.manual_seed(1)
+var lrf_model = Sequential(Linear(2, 8), ReLU(), Linear(8, 1))
+var lrf_opt = SGD(lrf_model.parameters(), 0.001)
+var lrf_data = [[Tensor([[0.0, 1.0], [1.0, 0.0], [1.0, 1.0], [0.5, 0.5]]), Tensor([[1.0], [1.0], [2.0], [1.0]])]]
+var lrf_w0 = lrf_model.state_dict()["layers.0.weight"].clone()
+var lr_finder = LearningRateFinder(lrf_model, lrf_opt, 1e-4, 10.0, 100)
 assert_eq("LRFinder name", lr_finder.get_name(), "LearningRateFinder")
-var lr_result = lr_finder.run([])
+var lr_result = lr_finder.run(lrf_data)
 assert_true("LRFinder best_lr > 0", lr_result["best_lr"] > 0.0)
 assert_true("LRFinder min_loss >= 0", lr_result["min_loss"] >= 0.0)
-assert_eq("LRFinder n_steps", lr_result["n_steps"], 100)
+assert_true("LRFinder stops at divergence or after n_steps", lr_result["n_steps"] > 10 and lr_result["n_steps"] <= 100)
+assert_true("LRFinder suggestion lies in the range", lr_result["best_lr"] >= 1e-4 and lr_result["best_lr"] <= 10.0)
+assert_true("LRFinder restores the weights", lrf_model.state_dict()["layers.0.weight"].allclose(lrf_w0))
 var summary = lr_finder.plot_summary()
 assert_true("LRFinder summary non-empty", len(summary) > 10)
 
@@ -413,6 +446,94 @@ for trial in range(0, 15):
 var best_params = bayes_opt.best()
 assert_eq("BayesOpt n_observations", best_params["n_observations"], 15)
 assert_true("BayesOpt best_value >= 0", best_params["value"] >= 0.0)
+
+# ── Values and invariants ──────────────────────────────────────────────────
+print "--- invariants ---"
+torch.manual_seed(14)
+# YOLO decode: one 1x1 cell, anchor 0 predicts class 3 with t = 0
+var yh = YOLOHead(4, 2, 1, 3, 32)
+nt_fill_(yh.conv.weight.data, 0.0)
+var yb = nt_full([18], -10.0)
+yb[0] = 0.0
+yb[1] = 0.0
+yb[2] = 0.0
+yb[3] = 0.0
+yb[4] = 10.0
+yb[8] = 10.0
+nt_copy_(yh.conv.bias.data, yb)
+var ydet = yh.forward([0.1, 0.2, 0.3])
+assert_eq("YOLO: one detection", len(ydet), 1)
+assert_eq("YOLO: class 3", ydet[0]["class"], 3)
+assert_true("YOLO box = ((0.5 + cx) * stride, ..., anchor size)", abs(ydet[0]["box"][0] - 16.0) < 0.000000001 and abs(ydet[0]["box"][2] - 116.0) < 0.000000001 and abs(ydet[0]["box"][3] - 90.0) < 0.000000001)
+assert_near("YOLO confidence = sigmoid(obj) * sigmoid(cls)", ydet[0]["conf"], sigmoid(10.0) * sigmoid(10.0), 0.000000001)
+assert_eq("NMS drops the overlapping lower-score box", yolo.nms([[0.5, 0.5, 0.4, 0.4], [0.52, 0.5, 0.4, 0.4], [3.0, 3.0, 0.4, 0.4]], [0.8, 0.9, 0.7]), [1, 2])
+
+# ARIMA recovers an AR(1) coefficient and continues a trend
+var ar = [0.0]
+var arn = nt_normal(400, 0.0, 1.0)
+for i in range(1, 400):
+    ar.append(0.7 * ar[i - 1] + arn[i])
+var arm = ARIMAModel(1, 0, 0)
+arm.fit(ar)
+assert_near("ARIMA(1,0,0) finds phi = 0.7", arm.ar_coefs[0], 0.7, 0.1)
+var trend = []
+for i in range(0, 60):
+    trend.append(3.0 + 2.0 * float(i))
+var arm2 = ARIMAModel(1, 1, 0)
+arm2.fit(trend)
+var tf = arm2.forecast(3)
+assert_near("ARIMA(1,1,0) continues a linear trend", tf[2], 3.0 + 2.0 * 62.0, 0.001)
+var arm3 = ARIMAModel(1, 0, 1)
+arm3.fit(ar)
+assert_true("ARIMA(1,0,1) fits (finite AIC, sigma2 ~ 1)", arm3.sigma2 > 0.7 and arm3.sigma2 < 1.3)
+
+# Bayesian optimisation finds the minimum of a 1-d quadratic
+var bo = HyperparameterBayesOpt({"x": [0.0, 1.0]}, 4, "ei")
+for i in range(0, 14):
+    var px = bo.suggest()
+    bo.observe(px, (px["x"] - 0.3) * (px["x"] - 0.3))
+assert_true("BayesOpt: best x within 0.05 of 0.3", abs(bo.best()["params"]["x"] - 0.3) < 0.05)
+
+# a 1 kHz tone peaks in the mel band that contains 1 kHz
+var sr = 16000
+var tone = []
+for i in range(0, 4096):
+    tone.append(sin(2.0 * 3.141592653589793 * 1000.0 * float(i) / float(sr)))
+var ms = MelSpectrogram(sr, 512, 256, 40, 0.0, 8000.0)
+var melp = ms.compute(tone)
+var mid = melp.select(0, melp.size()[0] // 2)
+var peak = mid.argmax().item()
+var mel_of = lambda f: 2595.0 * log(1.0 + f / 700.0) / log(10.0)
+var want = (mel_of(1000.0) / mel_of(8000.0)) * 41.0 - 1.0
+assert_true("mel peak at the 1 kHz band", abs(float(peak) - want) <= 1.0)
+var mf = mfcc_ext.extract(tone)
+assert_eq("MFCC shape is (n_mfcc, n_frames)", mf.shape[0], 13)
+
+# causal convolutions: the future cannot change the past
+var tcn2 = TCNLayer(1, 2, 3, 2, 0.0)
+var sig_a = [0.5, -0.2, 0.3, 0.9, -0.4, 0.1, 0.7, 0.2]
+var sig_b = [0.5, -0.2, 0.3, 0.9, 5.0, 5.0, 5.0, 5.0]
+var ta = tcn2.forward(sig_a, false)
+var tb = tcn2.forward(sig_b, false)
+assert_true("TCN: outputs up to t=3 ignore later inputs", ta.slice(1, 0, 4).allclose(tb.slice(1, 0, 4)))
+assert_true("TCN: later outputs do change", not ta.slice(1, 4, 8).allclose(tb.slice(1, 4, 8)))
+var wn2 = WaveNet(4, 2, 1, 8)
+var la = wn2.logits(sig_a)
+var lb = wn2.logits(sig_b)
+assert_true("WaveNet is causal", la.slice(1, 0, 4).allclose(lb.slice(1, 0, 4)))
+
+# the speech recogniser learns one utterance through the CTC loss
+torch.manual_seed(7)
+var asr2 = ASRPipeline(8000, 13, ["_", "a", "b"], 16)
+var utt = []
+for i in range(0, 1536):
+    utt.append(sin(0.05 * float(i)) * sin(0.0021 * float(i)))
+var asr_first = asr2.train_step(utt, "ab", 0.05)
+var asr_last = asr_first
+for i in range(0, 60):
+    asr_last = asr2.train_step(utt, "ab", 0.05)
+assert_true("ASR: CTC loss falls 10x", asr_last < asr_first / 10.0)
+assert_eq("ASR: transcribes the trained utterance", asr2.transcribe(utt)["text"], "ab")
 
 # ── Summary ──────────────────────────────────────────────────────────────
 print ""

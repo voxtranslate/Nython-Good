@@ -31,7 +31,7 @@ check("type int",    type(1), "int")
 check("type list",   type([1]), "list")
 
 print "=== numeric result types ==="
-check("pow is float", pow(2, 10), 1024.0)
+check("pow of ints is an int", pow(2, 10), 1024)   # as in Python (round 74)
 check("abs",          abs(0 - 5), 5)
 check("round",        round(2.567, 2), 2.57)
 

@@ -1,0 +1,405 @@
+#ifdef _SC_2_CHAR_TERM
+    {"SC_2_CHAR_TERM", _SC_2_CHAR_TERM},
+#endif
+#ifdef _SC_2_C_BIND
+    {"SC_2_C_BIND", _SC_2_C_BIND},
+#endif
+#ifdef _SC_2_C_DEV
+    {"SC_2_C_DEV", _SC_2_C_DEV},
+#endif
+#ifdef _SC_2_C_VERSION
+    {"SC_2_C_VERSION", _SC_2_C_VERSION},
+#endif
+#ifdef _SC_2_FORT_DEV
+    {"SC_2_FORT_DEV", _SC_2_FORT_DEV},
+#endif
+#ifdef _SC_2_FORT_RUN
+    {"SC_2_FORT_RUN", _SC_2_FORT_RUN},
+#endif
+#ifdef _SC_2_LOCALEDEF
+    {"SC_2_LOCALEDEF", _SC_2_LOCALEDEF},
+#endif
+#ifdef _SC_2_SW_DEV
+    {"SC_2_SW_DEV", _SC_2_SW_DEV},
+#endif
+#ifdef _SC_2_UPE
+    {"SC_2_UPE", _SC_2_UPE},
+#endif
+#ifdef _SC_2_VERSION
+    {"SC_2_VERSION", _SC_2_VERSION},
+#endif
+#ifdef _SC_AIO_LISTIO_MAX
+    {"SC_AIO_LISTIO_MAX", _SC_AIO_LISTIO_MAX},
+#endif
+#ifdef _SC_AIO_MAX
+    {"SC_AIO_MAX", _SC_AIO_MAX},
+#endif
+#ifdef _SC_AIO_PRIO_DELTA_MAX
+    {"SC_AIO_PRIO_DELTA_MAX", _SC_AIO_PRIO_DELTA_MAX},
+#endif
+#ifdef _SC_ARG_MAX
+    {"SC_ARG_MAX", _SC_ARG_MAX},
+#endif
+#ifdef _SC_ASYNCHRONOUS_IO
+    {"SC_ASYNCHRONOUS_IO", _SC_ASYNCHRONOUS_IO},
+#endif
+#ifdef _SC_ATEXIT_MAX
+    {"SC_ATEXIT_MAX", _SC_ATEXIT_MAX},
+#endif
+#ifdef _SC_AVPHYS_PAGES
+    {"SC_AVPHYS_PAGES", _SC_AVPHYS_PAGES},
+#endif
+#ifdef _SC_BC_BASE_MAX
+    {"SC_BC_BASE_MAX", _SC_BC_BASE_MAX},
+#endif
+#ifdef _SC_BC_DIM_MAX
+    {"SC_BC_DIM_MAX", _SC_BC_DIM_MAX},
+#endif
+#ifdef _SC_BC_SCALE_MAX
+    {"SC_BC_SCALE_MAX", _SC_BC_SCALE_MAX},
+#endif
+#ifdef _SC_BC_STRING_MAX
+    {"SC_BC_STRING_MAX", _SC_BC_STRING_MAX},
+#endif
+#ifdef _SC_CHARCLASS_NAME_MAX
+    {"SC_CHARCLASS_NAME_MAX", _SC_CHARCLASS_NAME_MAX},
+#endif
+#ifdef _SC_CHAR_BIT
+    {"SC_CHAR_BIT", _SC_CHAR_BIT},
+#endif
+#ifdef _SC_CHAR_MAX
+    {"SC_CHAR_MAX", _SC_CHAR_MAX},
+#endif
+#ifdef _SC_CHAR_MIN
+    {"SC_CHAR_MIN", _SC_CHAR_MIN},
+#endif
+#ifdef _SC_CHILD_MAX
+    {"SC_CHILD_MAX", _SC_CHILD_MAX},
+#endif
+#ifdef _SC_CLK_TCK
+    {"SC_CLK_TCK", _SC_CLK_TCK},
+#endif
+#ifdef _SC_COLL_WEIGHTS_MAX
+    {"SC_COLL_WEIGHTS_MAX", _SC_COLL_WEIGHTS_MAX},
+#endif
+#ifdef _SC_DELAYTIMER_MAX
+    {"SC_DELAYTIMER_MAX", _SC_DELAYTIMER_MAX},
+#endif
+#ifdef _SC_EQUIV_CLASS_MAX
+    {"SC_EQUIV_CLASS_MAX", _SC_EQUIV_CLASS_MAX},
+#endif
+#ifdef _SC_EXPR_NEST_MAX
+    {"SC_EXPR_NEST_MAX", _SC_EXPR_NEST_MAX},
+#endif
+#ifdef _SC_FSYNC
+    {"SC_FSYNC", _SC_FSYNC},
+#endif
+#ifdef _SC_GETGR_R_SIZE_MAX
+    {"SC_GETGR_R_SIZE_MAX", _SC_GETGR_R_SIZE_MAX},
+#endif
+#ifdef _SC_GETPW_R_SIZE_MAX
+    {"SC_GETPW_R_SIZE_MAX", _SC_GETPW_R_SIZE_MAX},
+#endif
+#ifdef _SC_INT_MAX
+    {"SC_INT_MAX", _SC_INT_MAX},
+#endif
+#ifdef _SC_INT_MIN
+    {"SC_INT_MIN", _SC_INT_MIN},
+#endif
+#ifdef _SC_IOV_MAX
+    {"SC_IOV_MAX", _SC_IOV_MAX},
+#endif
+#ifdef _SC_JOB_CONTROL
+    {"SC_JOB_CONTROL", _SC_JOB_CONTROL},
+#endif
+#ifdef _SC_LINE_MAX
+    {"SC_LINE_MAX", _SC_LINE_MAX},
+#endif
+#ifdef _SC_LOGIN_NAME_MAX
+    {"SC_LOGIN_NAME_MAX", _SC_LOGIN_NAME_MAX},
+#endif
+#ifdef _SC_LONG_BIT
+    {"SC_LONG_BIT", _SC_LONG_BIT},
+#endif
+#ifdef _SC_MAPPED_FILES
+    {"SC_MAPPED_FILES", _SC_MAPPED_FILES},
+#endif
+#ifdef _SC_MB_LEN_MAX
+    {"SC_MB_LEN_MAX", _SC_MB_LEN_MAX},
+#endif
+#ifdef _SC_MEMLOCK
+    {"SC_MEMLOCK", _SC_MEMLOCK},
+#endif
+#ifdef _SC_MEMLOCK_RANGE
+    {"SC_MEMLOCK_RANGE", _SC_MEMLOCK_RANGE},
+#endif
+#ifdef _SC_MEMORY_PROTECTION
+    {"SC_MEMORY_PROTECTION", _SC_MEMORY_PROTECTION},
+#endif
+#ifdef _SC_MESSAGE_PASSING
+    {"SC_MESSAGE_PASSING", _SC_MESSAGE_PASSING},
+#endif
+#ifdef _SC_MINSIGSTKSZ
+    {"SC_MINSIGSTKSZ", _SC_MINSIGSTKSZ},
+#endif
+#ifdef _SC_MQ_OPEN_MAX
+    {"SC_MQ_OPEN_MAX", _SC_MQ_OPEN_MAX},
+#endif
+#ifdef _SC_MQ_PRIO_MAX
+    {"SC_MQ_PRIO_MAX", _SC_MQ_PRIO_MAX},
+#endif
+#ifdef _SC_NGROUPS_MAX
+    {"SC_NGROUPS_MAX", _SC_NGROUPS_MAX},
+#endif
+#ifdef _SC_NL_ARGMAX
+    {"SC_NL_ARGMAX", _SC_NL_ARGMAX},
+#endif
+#ifdef _SC_NL_LANGMAX
+    {"SC_NL_LANGMAX", _SC_NL_LANGMAX},
+#endif
+#ifdef _SC_NL_MSGMAX
+    {"SC_NL_MSGMAX", _SC_NL_MSGMAX},
+#endif
+#ifdef _SC_NL_NMAX
+    {"SC_NL_NMAX", _SC_NL_NMAX},
+#endif
+#ifdef _SC_NL_SETMAX
+    {"SC_NL_SETMAX", _SC_NL_SETMAX},
+#endif
+#ifdef _SC_NL_TEXTMAX
+    {"SC_NL_TEXTMAX", _SC_NL_TEXTMAX},
+#endif
+#ifdef _SC_NPROCESSORS_CONF
+    {"SC_NPROCESSORS_CONF", _SC_NPROCESSORS_CONF},
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+    {"SC_NPROCESSORS_ONLN", _SC_NPROCESSORS_ONLN},
+#endif
+#ifdef _SC_NZERO
+    {"SC_NZERO", _SC_NZERO},
+#endif
+#ifdef _SC_OPEN_MAX
+    {"SC_OPEN_MAX", _SC_OPEN_MAX},
+#endif
+#ifdef _SC_PAGESIZE
+    {"SC_PAGESIZE", _SC_PAGESIZE},
+#endif
+#ifdef _SC_PAGE_SIZE
+    {"SC_PAGE_SIZE", _SC_PAGE_SIZE},
+#endif
+#ifdef _SC_PASS_MAX
+    {"SC_PASS_MAX", _SC_PASS_MAX},
+#endif
+#ifdef _SC_PHYS_PAGES
+    {"SC_PHYS_PAGES", _SC_PHYS_PAGES},
+#endif
+#ifdef _SC_PII
+    {"SC_PII", _SC_PII},
+#endif
+#ifdef _SC_PII_INTERNET
+    {"SC_PII_INTERNET", _SC_PII_INTERNET},
+#endif
+#ifdef _SC_PII_INTERNET_DGRAM
+    {"SC_PII_INTERNET_DGRAM", _SC_PII_INTERNET_DGRAM},
+#endif
+#ifdef _SC_PII_INTERNET_STREAM
+    {"SC_PII_INTERNET_STREAM", _SC_PII_INTERNET_STREAM},
+#endif
+#ifdef _SC_PII_OSI
+    {"SC_PII_OSI", _SC_PII_OSI},
+#endif
+#ifdef _SC_PII_OSI_CLTS
+    {"SC_PII_OSI_CLTS", _SC_PII_OSI_CLTS},
+#endif
+#ifdef _SC_PII_OSI_COTS
+    {"SC_PII_OSI_COTS", _SC_PII_OSI_COTS},
+#endif
+#ifdef _SC_PII_OSI_M
+    {"SC_PII_OSI_M", _SC_PII_OSI_M},
+#endif
+#ifdef _SC_PII_SOCKET
+    {"SC_PII_SOCKET", _SC_PII_SOCKET},
+#endif
+#ifdef _SC_PII_XTI
+    {"SC_PII_XTI", _SC_PII_XTI},
+#endif
+#ifdef _SC_POLL
+    {"SC_POLL", _SC_POLL},
+#endif
+#ifdef _SC_PRIORITIZED_IO
+    {"SC_PRIORITIZED_IO", _SC_PRIORITIZED_IO},
+#endif
+#ifdef _SC_PRIORITY_SCHEDULING
+    {"SC_PRIORITY_SCHEDULING", _SC_PRIORITY_SCHEDULING},
+#endif
+#ifdef _SC_REALTIME_SIGNALS
+    {"SC_REALTIME_SIGNALS", _SC_REALTIME_SIGNALS},
+#endif
+#ifdef _SC_RE_DUP_MAX
+    {"SC_RE_DUP_MAX", _SC_RE_DUP_MAX},
+#endif
+#ifdef _SC_RTSIG_MAX
+    {"SC_RTSIG_MAX", _SC_RTSIG_MAX},
+#endif
+#ifdef _SC_SAVED_IDS
+    {"SC_SAVED_IDS", _SC_SAVED_IDS},
+#endif
+#ifdef _SC_SCHAR_MAX
+    {"SC_SCHAR_MAX", _SC_SCHAR_MAX},
+#endif
+#ifdef _SC_SCHAR_MIN
+    {"SC_SCHAR_MIN", _SC_SCHAR_MIN},
+#endif
+#ifdef _SC_SELECT
+    {"SC_SELECT", _SC_SELECT},
+#endif
+#ifdef _SC_SEMAPHORES
+    {"SC_SEMAPHORES", _SC_SEMAPHORES},
+#endif
+#ifdef _SC_SEM_NSEMS_MAX
+    {"SC_SEM_NSEMS_MAX", _SC_SEM_NSEMS_MAX},
+#endif
+#ifdef _SC_SEM_VALUE_MAX
+    {"SC_SEM_VALUE_MAX", _SC_SEM_VALUE_MAX},
+#endif
+#ifdef _SC_SHARED_MEMORY_OBJECTS
+    {"SC_SHARED_MEMORY_OBJECTS", _SC_SHARED_MEMORY_OBJECTS},
+#endif
+#ifdef _SC_SHRT_MAX
+    {"SC_SHRT_MAX", _SC_SHRT_MAX},
+#endif
+#ifdef _SC_SHRT_MIN
+    {"SC_SHRT_MIN", _SC_SHRT_MIN},
+#endif
+#ifdef _SC_SIGQUEUE_MAX
+    {"SC_SIGQUEUE_MAX", _SC_SIGQUEUE_MAX},
+#endif
+#ifdef _SC_SSIZE_MAX
+    {"SC_SSIZE_MAX", _SC_SSIZE_MAX},
+#endif
+#ifdef _SC_STREAM_MAX
+    {"SC_STREAM_MAX", _SC_STREAM_MAX},
+#endif
+#ifdef _SC_SYNCHRONIZED_IO
+    {"SC_SYNCHRONIZED_IO", _SC_SYNCHRONIZED_IO},
+#endif
+#ifdef _SC_THREADS
+    {"SC_THREADS", _SC_THREADS},
+#endif
+#ifdef _SC_THREAD_ATTR_STACKADDR
+    {"SC_THREAD_ATTR_STACKADDR", _SC_THREAD_ATTR_STACKADDR},
+#endif
+#ifdef _SC_THREAD_ATTR_STACKSIZE
+    {"SC_THREAD_ATTR_STACKSIZE", _SC_THREAD_ATTR_STACKSIZE},
+#endif
+#ifdef _SC_THREAD_DESTRUCTOR_ITERATIONS
+    {"SC_THREAD_DESTRUCTOR_ITERATIONS", _SC_THREAD_DESTRUCTOR_ITERATIONS},
+#endif
+#ifdef _SC_THREAD_KEYS_MAX
+    {"SC_THREAD_KEYS_MAX", _SC_THREAD_KEYS_MAX},
+#endif
+#ifdef _SC_THREAD_PRIORITY_SCHEDULING
+    {"SC_THREAD_PRIORITY_SCHEDULING", _SC_THREAD_PRIORITY_SCHEDULING},
+#endif
+#ifdef _SC_THREAD_PRIO_INHERIT
+    {"SC_THREAD_PRIO_INHERIT", _SC_THREAD_PRIO_INHERIT},
+#endif
+#ifdef _SC_THREAD_PRIO_PROTECT
+    {"SC_THREAD_PRIO_PROTECT", _SC_THREAD_PRIO_PROTECT},
+#endif
+#ifdef _SC_THREAD_PROCESS_SHARED
+    {"SC_THREAD_PROCESS_SHARED", _SC_THREAD_PROCESS_SHARED},
+#endif
+#ifdef _SC_THREAD_SAFE_FUNCTIONS
+    {"SC_THREAD_SAFE_FUNCTIONS", _SC_THREAD_SAFE_FUNCTIONS},
+#endif
+#ifdef _SC_THREAD_STACK_MIN
+    {"SC_THREAD_STACK_MIN", _SC_THREAD_STACK_MIN},
+#endif
+#ifdef _SC_THREAD_THREADS_MAX
+    {"SC_THREAD_THREADS_MAX", _SC_THREAD_THREADS_MAX},
+#endif
+#ifdef _SC_TIMERS
+    {"SC_TIMERS", _SC_TIMERS},
+#endif
+#ifdef _SC_TIMER_MAX
+    {"SC_TIMER_MAX", _SC_TIMER_MAX},
+#endif
+#ifdef _SC_TTY_NAME_MAX
+    {"SC_TTY_NAME_MAX", _SC_TTY_NAME_MAX},
+#endif
+#ifdef _SC_TZNAME_MAX
+    {"SC_TZNAME_MAX", _SC_TZNAME_MAX},
+#endif
+#ifdef _SC_T_IOV_MAX
+    {"SC_T_IOV_MAX", _SC_T_IOV_MAX},
+#endif
+#ifdef _SC_UCHAR_MAX
+    {"SC_UCHAR_MAX", _SC_UCHAR_MAX},
+#endif
+#ifdef _SC_UINT_MAX
+    {"SC_UINT_MAX", _SC_UINT_MAX},
+#endif
+#ifdef _SC_UIO_MAXIOV
+    {"SC_UIO_MAXIOV", _SC_UIO_MAXIOV},
+#endif
+#ifdef _SC_ULONG_MAX
+    {"SC_ULONG_MAX", _SC_ULONG_MAX},
+#endif
+#ifdef _SC_USHRT_MAX
+    {"SC_USHRT_MAX", _SC_USHRT_MAX},
+#endif
+#ifdef _SC_VERSION
+    {"SC_VERSION", _SC_VERSION},
+#endif
+#ifdef _SC_WORD_BIT
+    {"SC_WORD_BIT", _SC_WORD_BIT},
+#endif
+#ifdef _SC_XBS5_ILP32_OFF32
+    {"SC_XBS5_ILP32_OFF32", _SC_XBS5_ILP32_OFF32},
+#endif
+#ifdef _SC_XBS5_ILP32_OFFBIG
+    {"SC_XBS5_ILP32_OFFBIG", _SC_XBS5_ILP32_OFFBIG},
+#endif
+#ifdef _SC_XBS5_LP64_OFF64
+    {"SC_XBS5_LP64_OFF64", _SC_XBS5_LP64_OFF64},
+#endif
+#ifdef _SC_XBS5_LPBIG_OFFBIG
+    {"SC_XBS5_LPBIG_OFFBIG", _SC_XBS5_LPBIG_OFFBIG},
+#endif
+#ifdef _SC_XOPEN_CRYPT
+    {"SC_XOPEN_CRYPT", _SC_XOPEN_CRYPT},
+#endif
+#ifdef _SC_XOPEN_ENH_I18N
+    {"SC_XOPEN_ENH_I18N", _SC_XOPEN_ENH_I18N},
+#endif
+#ifdef _SC_XOPEN_LEGACY
+    {"SC_XOPEN_LEGACY", _SC_XOPEN_LEGACY},
+#endif
+#ifdef _SC_XOPEN_REALTIME
+    {"SC_XOPEN_REALTIME", _SC_XOPEN_REALTIME},
+#endif
+#ifdef _SC_XOPEN_REALTIME_THREADS
+    {"SC_XOPEN_REALTIME_THREADS", _SC_XOPEN_REALTIME_THREADS},
+#endif
+#ifdef _SC_XOPEN_SHM
+    {"SC_XOPEN_SHM", _SC_XOPEN_SHM},
+#endif
+#ifdef _SC_XOPEN_UNIX
+    {"SC_XOPEN_UNIX", _SC_XOPEN_UNIX},
+#endif
+#ifdef _SC_XOPEN_VERSION
+    {"SC_XOPEN_VERSION", _SC_XOPEN_VERSION},
+#endif
+#ifdef _SC_XOPEN_XCU_VERSION
+    {"SC_XOPEN_XCU_VERSION", _SC_XOPEN_XCU_VERSION},
+#endif
+#ifdef _SC_XOPEN_XPG2
+    {"SC_XOPEN_XPG2", _SC_XOPEN_XPG2},
+#endif
+#ifdef _SC_XOPEN_XPG3
+    {"SC_XOPEN_XPG3", _SC_XOPEN_XPG3},
+#endif
+#ifdef _SC_XOPEN_XPG4
+    {"SC_XOPEN_XPG4", _SC_XOPEN_XPG4},
+#endif

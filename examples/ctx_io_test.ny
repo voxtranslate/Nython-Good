@@ -1,5 +1,5 @@
 import io
-import "examples/lib/io.ny"
+import "examples/lib/fileio.ny"
 
 # File with context manager (with statement)
 with File("/tmp/ny_ctx.txt", "w") as f:

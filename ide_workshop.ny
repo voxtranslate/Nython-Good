@@ -81,6 +81,17 @@ class LangWorkshopPanel:
         self.selected_rule = -1
         self.selected_op = -1
 
+    # The IDE lays this panel out with set_pos/set_size. Neither existed, so
+    # both calls silently returned none (a missing method is not an error in
+    # Nython) and the panel was always drawn at its 100x100 constructor rect.
+    def set_pos(self, x, y):
+        self.x = x
+        self.y = y
+
+    def set_size(self, w, h):
+        self.w = w
+        self.h = h
+
     def show(self):
         self.visible = true
         self._refresh_registry()

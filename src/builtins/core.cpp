@@ -14,6 +14,7 @@
 
 // Platform compatibility (must come first)
 #include "platform_compat.hpp"
+#include "NyUniNames.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -325,84 +326,17 @@ Value dispatch_core(NythonExecutor& E,
         // =====================================================================
     // ── from main.cpp lines 4561–4723 ──────────────────────────────────────────
         // ===================== MAP / FILTER / REDUCE =====================
-        if (name == "map") {
-            if (args.size() >= 2 && args[0].type == ValueType::USERDATA) {
-                Value fn_val = args[0];
-                if (args.size() == 2 && args[1].isCollectable()) {
-                    auto* cont = dynamic_cast<Container*>(args[1].value.gc);
-                    if (cont && cont->container) {
-                        auto li = cont->container->find("__len__");
-                        int len = (li != cont->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                        Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end()) {
-                                std::vector<Value> ca = {it->second};
-                                result->set(std::to_string(i), callFunctionValue(fn_val, ca, ctx));
-                            }
-                        }
-                        result->set("__len__", Value(len));
-                        return Value((Collectable*)result);
-                    }
-                }
-                if (args.size() >= 3) {
-                    int min_len = 999999;
-                    std::vector<Container*> iters;
-                    for (size_t a = 1; a < args.size(); a++) {
-                        if (args[a].isCollectable()) {
-                            auto* c = dynamic_cast<Container*>(args[a].value.gc);
-                            iters.push_back(c);
-                            if (c && c->container) {
-                                auto li = c->container->find("__len__");
-                                int l = (li != c->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                                if (l < min_len) min_len = l;
-                            }
-                        }
-                    }
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    for (int i = 0; i < min_len; i++) {
-                        std::vector<Value> ca;
-                        for (auto* c : iters) {
-                            if (c && c->container) {
-                                auto it = c->container->find(std::to_string(i));
-                                if (it != c->container->end()) ca.push_back(it->second);
-                            }
-                        }
-                        result->set(std::to_string(i), callFunctionValue(fn_val, ca, ctx));
-                    }
-                    result->set("__len__", Value(min_len));
-                    return Value((Collectable*)result);
-                }
-            }
-            return NONE_VALUE;
-        }
-        if (name == "filter") {
-            // filter(fn, list) -> [x for x in list if fn(x)]
-            if (args.size() >= 2 && args[0].type == ValueType::USERDATA && args[1].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[1].value.gc);
-                if (cont && cont->container) {
-                    auto len_it = cont->container->find("__len__");
-                    int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int out_idx = 0;
-                    for (int i = 0; i < len; i++) {
-                        auto it = cont->container->find(std::to_string(i));
-                        if (it != cont->container->end()) {
-                            std::vector<Value> ca = {it->second};
-                            Value rv = callFunctionValue(args[0], ca, ctx);
-                            if (rv.isTrue()) {
-                                result->set(std::to_string(out_idx++), it->second);
-                            }
-                        }
-                    }
-                    result->set("__len__", Value(out_idx));
-                    return Value((Collectable*)result);
-                }
-            }
-            return NONE_VALUE;
-        }
         if (name == "reduce") {
             // reduce(fn, list[, initial])
+            // any other iterable - a lazy map/filter/zip, a range, a dict
+            // view, a generator - is read first (round 78: map() and filter()
+            // are lazy now, and reduce(f, map(...)) gave none)
+            if (args.size() >= 2 && args[0].type == ValueType::USERDATA) {
+                Container* lc = E.contOf(args[1]);
+                bool seq = lc && NythonExecutor::seqLen(lc) >= 0 && !nygen::is_gen(args[1]);
+                if (!seq && (lc || E.isInstanceValue(args[1]) || E.isStringValue(args[1])))
+                    args[1] = E.makeListValue(E.iterItems(args[1], ctx));
+            }
             if (args.size() >= 2 && args[0].type == ValueType::USERDATA && args[1].isCollectable()) {
                 auto* cont = dynamic_cast<Container*>(args[1].value.gc);
                 if (cont && cont->container) {
@@ -429,113 +363,6 @@ Value dispatch_core(NythonExecutor& E,
                 }
             }
             return NONE_VALUE;
-        }
-        if (name == "list" || name == "tuple") {
-            if (args.empty()) return NONE_VALUE;
-            // If it's a generator object, collect remaining values from __idx__
-            if (args[0].isCollectable() && args[0].value.gc) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container && cont->container->count("__gen__")) {
-                    auto idx_it = cont->container->find("__idx__");
-                    auto len_it = cont->container->find("__len__");
-                    int start = (idx_it != cont->container->end()) ? (int)bigint_to_i64(idx_it->second.value.i) : 0;
-                    int len   = (len_it != cont->container->end()) ? (int)bigint_to_i64(len_it->second.value.i) : 0;
-                    auto* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int out = 0;
-                    for (int i = start; i < len; i++) {
-                        auto it = cont->container->find(std::to_string(i));
-                        if (it != cont->container->end()) result->set(std::to_string(out++), it->second);
-                    }
-                    result->set("__len__", Value(out));
-                    return Value((Collectable*)result);
-                }
-            }
-            return args[0];
-        }
-        if (name == "set") {
-            // Deduplicate: build a new list containing only unique values
-            if (args.empty() || !args[0].isCollectable()) return args.empty() ? NONE_VALUE : args[0];
-            auto* src = dynamic_cast<Container*>(args[0].value.gc);
-            if (!src || !src->container) return args[0];
-            auto li = src->container->find("__len__");
-            int len = (li != src->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-            auto* result = new Object((Runnable*)runner, "list", Type::LIST);
-            std::vector<std::string> seen_strs;
-            int out_idx = 0;
-            for (int i = 0; i < len; i++) {
-                auto it = src->container->find(std::to_string(i));
-                if (it == src->container->end()) continue;
-                const Value& v = it->second;
-                // Compute a string key for deduplication
-                std::string key;
-                if (v.type == ValueType::INTEGER) key = "i:" + std::to_string(bigint_to_i64(v.value.i));
-                else if (v.type == ValueType::DOUBLE) key = "d:" + std::to_string(v.value.d);
-                else if (v.type == ValueType::BOOLEAN) key = std::string("b:") + (v.value.b ? "1" : "0");
-                else if (v.type == ValueType::NONE) key = "none";
-                else key = "s:" + getStringValue(const_cast<Value&>(v));
-                bool dup = false;
-                for (auto& s : seen_strs) if (s == key) { dup = true; break; }
-                if (!dup) {
-                    seen_strs.push_back(key);
-                    result->set(std::to_string(out_idx++), v);
-                }
-            }
-            result->set("__len__", Value(out_idx));
-            result->set("__set__", Value(1));  // tag as set type
-            return Value((Collectable*)result);
-        }
-        if (name == "divmod") {
-            if (args.size() >= 2 && args[0].type == ValueType::INTEGER && args[1].type == ValueType::INTEGER) {
-                int64_t a = bigint_to_i64(args[0].value.i);
-                int64_t b = bigint_to_i64(args[1].value.i);
-                if (b == 0) throw std::string("division by zero");
-                Object* result = new Object((Runnable*)runner, "tuple", Type::LIST);
-                result->set("0", Value(static_cast<int>(a / b)));
-                result->set("1", Value(static_cast<int>(a % b)));
-                result->set("__len__", Value(2));
-                return Value((Collectable*)result);
-            }
-            return NONE_VALUE;
-        }
-        if (name == "all") {
-            if (args.size() >= 1 && args[0].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto li = cont->container->find("__len__");
-                    int len = (li != cont->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                    for (int i = 0; i < len; i++) {
-                        auto it = cont->container->find(std::to_string(i));
-                        if (it != cont->container->end() && !isTruthy(it->second)) return Value(false);
-                    }
-                    return Value(true);
-                }
-            }
-            return Value(true);
-        }
-        if (name == "any") {
-            if (args.size() >= 1 && args[0].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto li = cont->container->find("__len__");
-                    int len = (li != cont->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                    for (int i = 0; i < len; i++) {
-                        auto it = cont->container->find(std::to_string(i));
-                        if (it != cont->container->end() && isTruthy(it->second)) return Value(true);
-                    }
-                    return Value(false);
-                }
-            }
-            return Value(false);
-        }
-        if (name == "round") {
-            if (args.empty()) return NONE_VALUE;
-            double val = args[0].type == ValueType::DOUBLE ? static_cast<double>(args[0].value.d) : static_cast<double>(bigint_to_i64(args[0].value.i));
-            if (args.size() >= 2) {
-                int digits = static_cast<int>(bigint_to_i64(args[1].value.i));
-                double factor = std::pow(10.0, digits);
-                return Value(std::round(val * factor) / factor);
-            }
-            return Value(static_cast<int>(std::round(val)));
         }
 
 
@@ -619,6 +446,21 @@ Value dispatch_core(NythonExecutor& E,
             return NONE_VALUE;
         }
 
+        if ((name == "keys" || name == "values" || name == "items") && args.size() >= 1) {
+            // A dict: its typed keys in insertion order, as d.keys() etc.
+            if (Container* dc = E.contOf(args[0]); dc && NythonExecutor::seqLen(dc) < 0) {
+                std::vector<Value> none;
+                static const nyrt::OrderedKw<Value> nokw;
+                Value r;
+                if (E.dictMethod(dc, args[0], name, none, nokw, ctx, r)) {
+                    // Nython's keys(d) / values(d) / items(d) stay lists:
+                    // d.keys() is a live view since round 78
+                    std::vector<Value> items;
+                    if (E.rangeOrViewItems(r, items)) return E.makeListValue(items);
+                    return r;
+                }
+            }
+        }
         if (name == "keys") {
             if (args.size() >= 1) {
                 Container* cont = nullptr;
@@ -629,7 +471,12 @@ Value dispatch_core(NythonExecutor& E,
                 // segfaulted: items("abc"), keys("abc") and values("abc") all
                 // crashed the process.
                 if (!cont && args[0].type == ValueType::USERDATA && !isStringValue(args[0]))
-                    cont = dynamic_cast<Container*>(static_cast<Collectable*>(args[0].value.p));
+                {
+                    // An instance's fields (value.p is its identity, not a
+                    // Collectable: casting it read a bogus vtable).
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) cont = pit->second;
+                }
                 if (cont && cont->container) {
                     auto* list = new Object(static_cast<Runnable*>(runner), "list", Type::LIST);
                     int idx = 0;
@@ -653,7 +500,12 @@ Value dispatch_core(NythonExecutor& E,
                 // segfaulted: items("abc"), keys("abc") and values("abc") all
                 // crashed the process.
                 if (!cont && args[0].type == ValueType::USERDATA && !isStringValue(args[0]))
-                    cont = dynamic_cast<Container*>(static_cast<Collectable*>(args[0].value.p));
+                {
+                    // An instance's fields (value.p is its identity, not a
+                    // Collectable: casting it read a bogus vtable).
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) cont = pit->second;
+                }
                 if (cont && cont->container) {
                     auto* list = new Object(static_cast<Runnable*>(runner), "list", Type::LIST);
                     int idx = 0;
@@ -677,7 +529,12 @@ Value dispatch_core(NythonExecutor& E,
                 // segfaulted: items("abc"), keys("abc") and values("abc") all
                 // crashed the process.
                 if (!cont && args[0].type == ValueType::USERDATA && !isStringValue(args[0]))
-                    cont = dynamic_cast<Container*>(static_cast<Collectable*>(args[0].value.p));
+                {
+                    // An instance's fields (value.p is its identity, not a
+                    // Collectable: casting it read a bogus vtable).
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) cont = pit->second;
+                }
                 if (cont && cont->container) {
                     auto* list = new Object(static_cast<Runnable*>(runner), "list", Type::LIST);
                     int idx = 0;
@@ -715,7 +572,363 @@ Value dispatch_core(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
-        if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "dir" || name == "vars" || name == "globals" || name == "locals" || name == "iter" || name == "help" || name == "format" || name == "slice" || name == "divmod" || name == "complex") {
+        // object.__new__(cls): an instance of cls without running __init__
+        // (round 77).
+        if (name == "_ny_object_new") {
+            Node* cn = args.empty() ? nullptr : E.classNodeOfValue(args[0]);
+            if (!cn) E.pyRaise("TypeError", "object.__new__(X): X is not a type object");
+            std::string cname = static_cast<nython::node::ClassNode*>(cn)->name;
+            Value inst = E.newInstance(cname, args[0].value.p);
+            if (E.isExceptionClass(cname)) { std::vector<Value> none; E.setExceptionArgs(inst, none); }
+            return inst;
+        }
+        // _ny_method_new(f, obj): f bound to obj (classmethod.__get__,
+        // types.MethodType) - round 77
+        if (name == "_ny_method_new") {
+            if (args.size() != 2) E.pyRaise("TypeError", "method expected 2 arguments, got " + std::to_string(args.size()));
+            return E.methodNew(args[0], args[1], ctx);
+        }
+        // classes deriving from builtin types (round 77): an instance's
+        // value (anything else is its own), and T.__new__(cls, ...)
+        if (name == "_ny_payload") {
+            if (args.empty()) return NONE_VALUE;
+            Value p;
+            if (E.payloadOf(args[0], p)) return p;
+            if (E.isInstanceValue(args[0])) E.checkHasPayload(args[0]);
+            return args[0];
+        }
+        if (name == "_ny_payload_new" && args.size() >= 3) return E.newPayloadInstance(args[0], args[1], args[2]);
+        // obj.__dict__[k] = v / del obj.__dict__[k] (the view's): a field
+        // stored or removed directly (round 77)
+        if (name == "_ny_setfield" && args.size() >= 3) { E.setField(args[0], args[1], args[2]); return NONE_VALUE; }
+        if (name == "_ny_delfield" && args.size() >= 2) { E.delField(args[0], args[1]); return NONE_VALUE; }
+        // __slots__ and __class__ assignment (round 79; the prelude's "slots"
+        // chunk): a slot's value, a class's slot flags, an instance's class
+        if (name == "_ny_getfield" && args.size() >= 2) return E.getField(args[0], args[1]);
+        if (name == "_ny_mark_slots" && args.size() >= 2) {
+            E.markSlots(args[0], args[1].type == ValueType::INTEGER ? (int)bigint_to_i64(args[1].value.i) : 0);
+            return NONE_VALUE;
+        }
+        if (name == "_ny_slot_flags") return Value((int)(args.empty() ? 0 : E.slotFlags(args[0])));
+        if (name == "_ny_switch_class" && args.size() >= 2) { E.switchClass(args[0], args[1]); return NONE_VALUE; }
+        // object.__getattribute__(obj, name): the attribute lookup without
+        // the class's __getattribute__ and __getattr__ (round 77)
+        if (name == "_ny_getattr_raw" && args.size() >= 2) return E.rawGetattr(args[0], E.getStringValue(args[1]), ctx);
+        if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
+        if (name == "super") return E.superBuiltin(args, ctx);   // round 87: called by its name
+        // [*a, b, *c] / (*a,) / {*a} (the parser hands the pieces here; NyScope
+        // names the _py forms in Python-language source). Round 87: a part
+        // that is not an iterable is CPython's TypeError - "Value after * must
+        // be an iterable, not int" for a list or tuple, "'int' object is not
+        // iterable" for a set (an int iterates in Nython code only)
+        if (name.size() >= 11 && name.compare(0, 4, "_ny_") == 0 && (name.compare(4, 8, "list_cat") == 0 || name.compare(4, 7, "set_cat") == 0)) {
+            bool py = name.size() > 3 && name.compare(name.size() - 3, 3, "_py") == 0;
+            bool set = name[4] == 's';
+            std::vector<Value> out;
+            for (auto& p : args) {
+                if (!E.starIterable(p, py))
+                    E.pyRaise("TypeError", set ? "'" + E.typeNameOf(p) + "' object is not iterable"
+                                               : "Value after * must be an iterable, not " + E.typeNameOf(p));
+                for (auto& v : E.iterItems(p, ctx)) out.push_back(v);
+            }
+            return E.makeListValue(out, false);
+        }
+        // a function's parameters, flags and place (inspect; round 77)
+        if (name == "_ny_fn_info") return E.fnInfo(args.empty() ? NONE_VALUE : args[0]);
+        if (name == "_ny_mark_builtin") return E.markBuiltinFn(args.empty() ? NONE_VALUE : args[0]);   // round 84
+        if (name == "_ny_vm_code") return E.vmCodeInfo(args);   // round 83: lib/dis.ny
+        if (name == "_ny_fn_globals") return E.fnGlobals(args.empty() ? NONE_VALUE : args[0]);
+        // the lexer's keyword spellings (lib/keyword.ny's nykwlist; the VM
+        // reaches this through the builtin bridge)
+        if (name == "_ny_keywords") {
+            std::vector<Value> ks;
+            for (auto& k : nython::lexer::keyword_spellings()) ks.push_back(E.makeStringValue(k));
+            return E.makeListValue(ks);
+        }
+        // Unicode character names (lib/unicodedata.ny, src/NyUniNames.cpp;
+        // round 77): the character of a name or none, the name of a
+        // character or "" - through the bridge on the VM
+        if (name == "_ny_unicode_lookup") {
+            uint32_t cp = 0;
+            if (args.empty() || !E.isStringValue(args[0]) || !::nyuni::lookup(E.getStringValue(args[0]), cp)) return NONE_VALUE;
+            std::string out;
+            nypy::u8_encode(cp, out);
+            return E.makeStringValue(out);
+        }
+        if (name == "_ny_unicode_name") {
+            if (args.empty() || !E.isStringValue(args[0])) return E.makeStringValue("");
+            std::string s = E.getStringValue(args[0]);
+            size_t i = 0;
+            if (s.empty()) return E.makeStringValue("");
+            uint32_t cp = nypy::u8_decode(s, i);
+            return E.makeStringValue(::nyuni::name(cp));
+        }
+        // type.__new__ / type.__call__ read from the builtin (round 83): the
+        // prelude's _ny_type_m_new / _ny_type_m_call pass the positional
+        // arguments, then the keywords as a dict
+        if (name == "_ny_type_new" || name == "_ny_type_call") {
+            nyrt::OrderedKw<Value> kw;
+            std::vector<Value> a = args;
+            if (!a.empty()) {
+                if (Container* c = E.contOf(a.back()))
+                    for (auto& kv : *c->container)
+                        if (!NythonExecutor::isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+                a.pop_back();
+            }
+            if (name == "_ny_type_new") return E.typeNew(a, kw, ctx);
+            if (a.empty()) E.pyRaise("TypeError", "descriptor '__call__' of 'type' object needs an argument");
+            Value cls = a[0];
+            std::vector<Value> rest(a.begin() + 1, a.end());
+            E.type_call_skip_ = true;
+            return E.instantiateClass(cls, rest, kw, ctx);
+        }
+        if (name == "_ny_setattr_raw" && args.size() >= 3) {
+            NythonExecutor::RawAttr raw;
+            E.setAttr(args[0], E.getStringValue(args[1]), args[2]);
+            return NONE_VALUE;
+        }
+        if (name == "_ny_delattr_raw" && args.size() >= 2) {
+            NythonExecutor::RawAttr raw;
+            E.delAttrValue(args[0], E.getStringValue(args[1]));
+            return NONE_VALUE;
+        }
+        if (name == "eval" || name == "exec") return E.evalExecBuiltin(name == "exec", args, ctx);
+        if (name == "compile") return E.compileBuiltin(args, ctx);
+        // round 81: globals() is the module's live namespace (a view), and
+        // so is locals() at a module's top level, as in CPython
+        if (name == "locals") {
+            if (!ctx || ctx == E.global_ctx || ctx->inModule || !ctx->parent) return E.globalsView(ctx);
+            return E.reflectLocals(ctx);
+        }
+        if (name == "globals") return E.globalsView(ctx);
+        // the program's globals stored and deleted by name: globals()'s
+        // view and sys.modules["__main__"] (round 81)
+        if (name == "_ny_main_set") {
+            if (args.size() < 2 || !E.isStringValue(args[0])) E.pyRaise("TypeError", "_ny_main_set(name, value)");
+            E.global_ctx->defineByName(E.getStringValue(args[0]), args[1]);
+            return NONE_VALUE;
+        }
+        if (name == "_ny_main_del") {
+            if (args.empty() || !E.isStringValue(args[0])) E.pyRaise("TypeError", "_ny_main_del(name)");
+            return Value(E.global_ctx->container && E.global_ctx->container->erase(E.getStringValue(args[0])) > 0);
+        }
+        if (name == "_ny_globals_view") {
+            // the program's globals() view (from anywhere)
+            return E.globalsView(nullptr);
+        }
+        if (name == "_ny_frame_jump") return E.frameJump(args);   // frame.f_lineno = n (round 81)
+        // The buffer protocol (round 84; the prelude's memoryview): a bytes /
+        // bytearray value's storage as [address, length, readonly, owner] -
+        // the owner the object a view keeps alive (the value itself here) -
+        // counting an export of a bytearray (its size is then fixed:
+        // BufferError); None for anything else. _ny_buf_unexport gives an
+        // export back, _ny_buf_exports counts them; _ny_buf_addr is a
+        // bytearray's storage address now (no export: valid until it is
+        // resized - lib/array.ny reads and writes its items there).
+        if (name == "_ny_buf_export" || name == "_ny_buf_unexport" || name == "_ny_buf_exports" || name == "_ny_buf_addr") {
+            Value v = args.empty() ? NONE_VALUE : E.unwrapPayload(args[0]);
+            nyheap::Bytes* bo = E.bytesOf(v);
+            if (name == "_ny_buf_addr") return bo && bo->mut ? intValue((int64_t)(intptr_t)bo->s.data()) : NONE_VALUE;
+            if (!bo) return name == "_ny_buf_export" ? NONE_VALUE : intValue(0);
+            if (name == "_ny_buf_exports") return intValue(bo->exports);
+            if (name == "_ny_buf_unexport") { if (bo->exports > 0) bo->exports--; return intValue(bo->exports); }
+            if (bo->mut) bo->exports++;
+            return E.makeListValue({intValue((int64_t)(intptr_t)bo->s.data()), intValue((int64_t)bo->s.size()), Value(!bo->mut), v});
+        }
+        if (name == "_ny_gc_objects") {
+            // (round 85) gc.get_objects(generation): the collector's tracked
+            // objects a program can see - containers (lists, dicts, sets,
+            // tuples, modules, generators), instances, functions, bound
+            // methods; not the engine's scopes or its builtins' members
+            int gen = -1;
+            if (!args.empty() && args[0].type == ValueType::INTEGER) gen = (int)bigint_to_i64(args[0].value.i);
+            struct Acc { std::vector<Value> out; };
+            Acc acc;
+            nygc::each_tracked(gen, [](Collectable* c, void* p) {
+                auto* a = static_cast<Acc*>(p);
+                uint16_t f = c->gc_flags;
+                if (f & nygc::F_KINST) { auto* in = static_cast<nyheap::Inst*>(c); a->out.push_back(nyheap::userValue(in, (void*)&in->tag)); return; }
+                if (f & nygc::F_KFUNC) { auto* fn = static_cast<nyheap::Func*>(c); a->out.push_back(nyheap::userValue(fn, (void*)&fn->id)); return; }
+                if (auto* b = dynamic_cast<nyheap::Bound*>(c)) { a->out.push_back(nyheap::userValue(b, (void*)&b->tag)); return; }
+                if ((f & nygc::F_KCONT) && !dynamic_cast<Context*>(c)) a->out.push_back(Value(c));
+            }, &acc);
+            return E.makeListValue(acc.out);
+        }
+        if (name == "_ny_load_chunk") {
+            // (round 84) a prelude chunk loaded on first need - "buffer":
+            // memoryview's members and the buffer helpers (NyPreludeBuffer.cpp)
+            if (!args.empty() && E.isStringValue(args[0])) E.ensureMirror(E.getStringValue(args[0]));
+            return NONE_VALUE;
+        }
+        if (name == "_ny_getrefcount") {
+            // sys.getrefcount(x) (round 81): the object's count (exact
+            // reference counting, NyGC) without the references this call
+            // holds itself, plus one for the argument - as CPython counts;
+            // what is not a counted object (int, float, bool, None) is
+            // immortal there: 2**32 - 1, as 3.12 reports it
+            if (args.size() != 1) E.pyRaise("TypeError", "sys.getrefcount() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+            Collectable* o = args[0].value.o;
+            if (!o) return Value(bigint((long long)4294967295LL));
+            static const long long kCallRefs = getenv("NY_RC_RAW") ? 0 : 1;   // the argument vector's copy
+            long long rc = (long long)o->gc_rc - kCallRefs + 1;
+            return Value(bigint(rc < 1 ? 1LL : rc));
+        }
+        // The __main__ module's globals, from anywhere (a library module's
+        // globals() is its own): unittest.main() finds the program's
+        // TestCase classes here, as Python's reads sys.modules["__main__"].
+        if (name == "_ny_main_globals") return E.reflectGlobals(nullptr);
+        // sys.modules and importlib (round 80; the VM has its own)
+        if (name == "_ny_modules") return E.sysModulesValue();
+        if (name == "_ny_module_new") return E.moduleNew(args.empty() ? std::string() : E.getStringValue(args[0]));
+        if (name == "_ny_module_exec") {
+            if (args.size() < 3) E.pyRaise("TypeError", "_ny_module_exec(module, path, name)");
+            return E.moduleExec(args[0], E.getStringValue(args[1]), E.getStringValue(args[2]));
+        }
+        if (name == "_ny_find_module") return E.findModule(args.empty() ? std::string() : E.getStringValue(args[0]));
+        // sys's facts (round 80): plain values both engines read (the VM
+        // through the builtin bridge)
+        if (name == "_ny_sys_info") {
+            std::string k = args.empty() ? std::string() : E.getStringValue(args[0]);
+            if (k == "flags") {
+                auto& f = nyrt::cli_flags();
+                std::vector<Value> v;
+                for (int x : {f.debug, f.inspect, f.interactive, f.optimize, f.dont_write_bytecode, f.no_user_site,
+                              f.no_site, f.ignore_environment, f.verbose, f.bytes_warning, f.quiet,
+                              f.hash_randomization, f.isolated, f.dev_mode, f.utf8_mode, f.warn_default_encoding,
+                              f.safe_path, f.int_max_str_digits})
+                    v.push_back(Value(x));
+                return E.makeListValue(v);
+            }
+            if (k == "path") {
+                // CPython's sys.path: the script's directory ("" for -c and
+                // the prompt), NYTHONPATH, the standard library
+                std::vector<std::string> p;
+                const std::string& sp = nyrt::script_path();
+                size_t cut = sp.find_last_of("/\\");
+                p.push_back(cut == std::string::npos ? std::string() : sp.substr(0, cut));
+                for (auto d : nyrt::library_dirs()) {
+                    while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+                    p.push_back(d);
+                }
+                return E.nyos_list_of(p);
+            }
+            if (k == "orig_argv") return E.nyos_list_of(nyrt::orig_argv());
+            if (k == "switch_interval") {
+                // sys.getswitchinterval / setswitchinterval: the GIL's
+                // hand-over interval (NyConc.cpp)
+                if (args.size() > 1) {
+                    double s = args[1].type == ValueType::DOUBLE ? args[1].value.d
+                             : args[1].type == ValueType::INTEGER ? (double)bigint_to_i64(args[1].value.i) : 0.0;
+                    nyconc::set_switch_interval(s);
+                    return NONE_VALUE;
+                }
+                return Value(nyconc::switch_interval());
+            }
+            // (round 85) sys.get/set_int_max_str_digits (checked by the
+            // prelude), sys.getallocatedblocks, sys.thread_info's version
+            if (k == "int_max_str_digits") {
+                if (args.size() > 1) {
+                    nyrt::int_max_str_digits() = (int)std::min<int64_t>(bigint_to_i64(args[1].value.i), INT32_MAX);
+                    return NONE_VALUE;
+                }
+                return Value((int)nyrt::int_max_str_digits());
+            }
+            if (k == "allocated_blocks") {
+                auto st = nygc::stats();
+                return intValue((int64_t)(st.tracked + st.live_strings));
+            }
+            if (k == "libc_version") {
+#if defined(__GLIBC__)
+                return E.makeStringValue(std::string("NPTL ") + std::to_string(__GLIBC__) + "." + std::to_string(__GLIBC_MINOR__));
+#else
+                return NONE_VALUE;
+#endif
+            }
+            if (k == "venv") {
+                // (round 87) [the virtual environment's directory or None,
+                // include-system-site-packages, sys._base_executable]
+                auto& st = nyrt::site_state();
+                const std::string& be = nyrt::base_executable().empty() ? nyrt::executable_path() : nyrt::base_executable();
+                return E.makeListValue({st.venv.empty() ? NONE_VALUE : E.makeStringValue(st.venv),
+                                        Value(st.system_site), E.makeStringValue(be)});
+            }
+            if (k == "prefix") {
+                // the directory holding the standard library's lib/
+                auto dirs = nyrt::stdlib_dirs();
+                std::string d = dirs.empty() ? std::string() : dirs.back();
+                while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+                size_t cut = d.find_last_of("/\\");
+                return E.makeStringValue(cut == std::string::npos ? std::string() : d.substr(0, cut));
+            }
+            return NONE_VALUE;
+        }
+        if (name == "_ny_recursion_limit") {
+            // sys.getrecursionlimit() / setrecursionlimit(n): one limit both
+            // engines check (NyRuntime.hpp)
+            if (args.empty() || args[0].type == ValueType::NONE) return Value((int)nyrt::recursion_limit());
+            if (args[0].type != ValueType::INTEGER) E.pyRaise("TypeError", "'" + E.typeNameOf(args[0]) + "' object cannot be interpreted as an integer");
+            int64_t n = bigint_to_i64(args[0].value.i);
+            if (n < 1) E.pyRaise("ValueError", "recursion limit must be greater or equal than 1");
+            nyrt::recursion_limit() = n > 1000000 ? 1000000 : (int)n;
+            return NONE_VALUE;
+        }
+        // The exception an except clause is handling now, here or in a
+        // caller (sys.exc_info()[1]); none outside every except clause.
+        if (name == "_ny_exc_current") {
+            if (E.handling_exc_.empty() || E.handling_obj_.empty()) return NONE_VALUE;
+            const Value& held = E.handling_obj_.back().second;
+            if (held.type != ValueType::NONE) return held;
+            return E.exceptionObject(E.handling_exc_.back());
+        }
+        // round 84: BaseException's own __init__/__str__/__repr__ as values
+        // (the prelude's _NyExcExtra): the instance's args and fields set
+        // from (args, kwargs) as a constructor sets them, and the text the
+        // engine makes for str()/repr() whatever a subclass overrides.
+        if (name == "_ny_exc_init") {
+            if (args.size() < 1 || !E.isInstanceValue(args[0])) return NONE_VALUE;
+            std::vector<Value> items = args.size() > 1 ? E.listItems(args[1]) : std::vector<Value>{};
+            E.setExceptionArgs(args[0], items);
+            if (args.size() > 2) {
+                nyrt::OrderedKw<Value> kw;
+                if (Container* kc = E.contOf(args[2]))
+                    for (auto& kv : *kc->container) if (!E.isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+                E.setExceptionKw(args[0], kw);
+            }
+            return NONE_VALUE;
+        }
+        if (name == "_ny_audit_enable") { nyrt::audit_on() = true; return NONE_VALUE; }   // round 84
+        if (name == "_ny_exc_str") {
+            if (args.empty() || !E.isInstanceValue(args[0])) return E.makeStringValue("");
+            return E.makeStringValue(E.exceptionMessage(args[0]));
+        }
+        if (name == "_ny_exc_repr") {
+            if (args.empty() || !E.isInstanceValue(args[0])) return E.makeStringValue("");
+            return E.makeStringValue(E.exceptionRepr(args[0], ctx));
+        }
+        // The running frames, innermost first: (filename, lineno, function,
+        // module) - sys._getframe, traceback.extract_stack, warnings (round 77).
+        if (name == "_ny_stack") return E.pyStackValue();
+        // Frame objects (round 78; NythonExecutor::frameObject)
+        if (name == "_ny_frame_get") return E.frameGet(args);
+        if (name == "_ny_frame_sync") return args.empty() ? Value(false) : E.frameSync(args[0]);
+        if (name == "_ny_frame_back") return args.empty() ? NONE_VALUE : E.frameBack(args[0]);
+        if (name == "_ny_frame_globals") return E.frameGlobals(args);
+        if (name == "_ny_builtins_dict") return E.builtinsDict();
+        // sys.settrace / sys.setprofile and f_locals write-through (round 79)
+        if (name == "_ny_settrace" || name == "sys.settrace") {
+            if (nyrt::audit_on() && !E.preludeCaller(ctx)) E.auditEvent("sys.settrace", {}, ctx);   // round 86
+            return E.pySetHook(args, true);
+        }
+        if (name == "_ny_setprofile" || name == "sys.setprofile") {
+            if (nyrt::audit_on() && !E.preludeCaller(ctx)) E.auditEvent("sys.setprofile", {}, ctx);   // round 86
+            return E.pySetHook(args, false);
+        }
+        if (name == "_ny_gettrace" || name == "sys.gettrace") return E.pyGetHook(true);
+        if (name == "_ny_getprofile" || name == "sys.getprofile") return E.pyGetHook(false);
+        if (name == "_ny_frame_local_set") return E.frameLocalSet(args);
+        if (name == "vars") return E.reflectVars(args, ctx);
+        if (name == "dir") return E.reflectDir(args, ctx);
+        if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "iter" || name == "help" || name == "slice" || name == "complex") {
             return NONE_VALUE; // placeholder
         }
         // id(x) / hash(x) — registered as recognised builtin names (see
@@ -724,7 +937,14 @@ Value dispatch_core(NythonExecutor& E,
         // module and returned UNDEFINED, which reads as 0. The method form
         // obj.id()/obj.hash() (objectProtocol) already worked; this gives
         // the global function the same behaviour instead of nothing.
-        if (name == "id") {
+        // (round 86) builtins.id with the identity, as CPython's id() - not
+        // for the engine's own (a repr's address: _ny_id) nor the prelude's
+        if (name == "id" && nyrt::audit_on() && !E.preludeCaller(ctx)) {
+            Value r = dispatch_core(E, "_ny_id", args, ctx);
+            E.auditEvent("builtins.id", {r}, ctx);
+            return r;
+        }
+        if (name == "id" || name == "_ny_id") {
             if (args.empty()) return Value(bigint((long long)0));
             Value& v = args[0];
             // Heap-allocated values (class instances, containers): identity
@@ -815,9 +1035,17 @@ Value dispatch_core(NythonExecutor& E,
             return args.size() ? args[0] : Value(0);
         }
         if (name == "read_file") {
+            // "" for a missing file (legacy contract); a directory is an
+            // IsADirectoryError rather than the raw C++ stream failure.
             if (args.size() >= 1) {
                 std::string fname = getStringValue(args[0]);
-                std::ifstream f(fname);
+                struct stat dst;
+                if (stat(fname.c_str(), &dst) == 0 && S_ISDIR(dst.st_mode))
+                    throw std::string("__exc__:IsADirectoryError:[Errno 21] Is a directory: '" + fname + "'");
+                // Binary: the bytes as they are. Text mode translated line
+                // endings on Windows, so a file never round-tripped there (a
+                // CRLF document saved back came out with \r\r\n).
+                std::ifstream f(fname, std::ios::binary);
                 if (f.is_open()) {
                     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                     return makeStringValue(content);
@@ -829,7 +1057,7 @@ Value dispatch_core(NythonExecutor& E,
             if (args.size() >= 2) {
                 std::string fname = getStringValue(args[0]);
                 std::string content = getStringValue(args[1]);
-                std::ofstream f(fname);
+                std::ofstream f(fname, std::ios::binary | std::ios::trunc);   // byte-exact, as read_file
                 if (f.is_open()) { f << content; return Value(true); }
             }
             return Value(false);
@@ -838,49 +1066,6 @@ Value dispatch_core(NythonExecutor& E,
             if (args.size() >= 1) {
                 struct stat buf;
                 return Value(stat(getStringValue(args[0]).c_str(), &buf) == 0);
-            }
-            return Value(false);
-        }
-        if (name == "dict") {
-            if (args.empty()) { auto* m = new Object((Runnable*)runner, "map", Type::MAP); return Value((Collectable*)m); }
-            if (args[0].isCollectable()) {
-                auto* src = dynamic_cast<Container*>(args[0].value.gc);
-                if (src && src->container) {
-                    auto li = src->container->find("__len__");
-                    int len = (li != src->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                    auto* m = new Object((Runnable*)runner, "map", Type::MAP);
-                    for (int i = 0; i < len; i++) {
-                        auto it = src->container->find(std::to_string(i));
-                        if (it != src->container->end() && it->second.isCollectable()) {
-                            auto* pair = dynamic_cast<Container*>(it->second.value.gc);
-                            if (pair && pair->container) {
-                                auto k = pair->container->find("0");
-                                auto v = pair->container->find("1");
-                                if (k != pair->container->end() && v != pair->container->end())
-                                    (*m->container)[getStringValue(k->second)] = v->second;
-                            }
-                        }
-                    }
-                    return Value((Collectable*)m);
-                }
-            }
-            return NONE_VALUE;
-        }
-        if (name == "bool") {
-            if (args.size() >= 1) {
-                if (args[0].type == ValueType::USERDATA && args[0].value.p) return Value(!getStringValue(args[0]).empty());
-                if (args[0].type == ValueType::COLLECTABLE && args[0].value.gc) {
-                    auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                    if (cont && cont->container) {
-                        auto len_it = cont->container->find("__len__");
-                        if (len_it != cont->container->end()) return Value(bigint_to_i64(len_it->second.value.i) > 0);
-                    }
-                }
-                if (args[0].type == ValueType::NONE) return Value(false);
-                if (args[0].type == ValueType::INTEGER) return Value(bigint_to_i64(args[0].value.i) != 0);
-                if (args[0].type == ValueType::DOUBLE) return Value(args[0].value.d != 0.0);
-                if (args[0].type == ValueType::BOOLEAN) return args[0];
-                return Value(true);
             }
             return Value(false);
         }
@@ -895,96 +1080,47 @@ Value dispatch_core(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
-        if (name == "abs") {
-            if (args.size() >= 1) {
-                if (args[0].type == ValueType::INTEGER) {
-                    int64_t v = bigint_to_i64(args[0].value.i);
-                    return Value((int)(v < 0 ? -v : v));
-                }
-                if (args[0].type == ValueType::DOUBLE) return Value(std::abs(args[0].value.d));
-            }
-            return Value(0);
-        }
-        if (name == "min" || name == "max") {
-            if (args.size() == 1 && args[0].isCollectable()) {
-                // Single iterable arg: find min/max element
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto len_it = cont->container->find("__len__");
-                    int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                    if (len == 0) return NONE_VALUE;
-                    Value best = cont->container->at("0");
-                    for (int i = 1; i < len; i++) {
-                        Value v = cont->container->at(std::to_string(i));
-                        double vd = (v.type == ValueType::DOUBLE) ? v.value.d : (double)bigint_to_i64(v.value.i);
-                        double bd = (best.type == ValueType::DOUBLE) ? best.value.d : (double)bigint_to_i64(best.value.i);
-                        // Also handle string comparison
-                        if (v.type == ValueType::USERDATA && best.type == ValueType::USERDATA) {
-                            std::string sv = getStringValue(v), sb = getStringValue(best);
-                            if (name == "min" ? sv < sb : sv > sb) best = v;
-                        } else if (name == "min" ? vd < bd : vd > bd) best = v;
-                    }
-                    return best;
-                }
-            }
-            if (args.size() >= 2) {
-                auto toDouble = [](const Value& v) -> double {
-                    if (v.type == ValueType::DOUBLE) return v.value.d;
-                    if (v.type == ValueType::INTEGER) return (double)bigint_to_i64(v.value.i);
-                    return 0.0;
-                };
-                bool bothInt = args[0].type == ValueType::INTEGER && args[1].type == ValueType::INTEGER;
-                if (bothInt) {
-                    int64_t a = bigint_to_i64(args[0].value.i), b = bigint_to_i64(args[1].value.i);
-                    return Value((int)(name == "min" ? std::min(a, b) : std::max(a, b)));
-                }
-                double a = toDouble(args[0]), b = toDouble(args[1]);
-                return Value(name == "min" ? std::min(a, b) : std::max(a, b));
-            }
-            return args.empty() ? Value(0) : args[0];
-        }
         if (name == "input") {
-            if (!args.empty()) printValue(args[0]);
+            // round 87: sys.stdin / sys.stdout replaced (a StringIO, an object
+            // with readline / write): the objects' methods, as CPython's
+            // input() uses them off a terminal (the prelude's _ny_input); it
+            // read the process's stdin whatever sys.stdin was. None (or a
+            // stream deleted) is CPython's "lost" RuntimeError.
+            bool sys_made = false;
+            Value fin = E.sysMember("stdin", &sys_made);
+            Value fout, ferr;
+            bool replaced = false;
+            if (sys_made) {
+                fout = E.sysMember("stdout");
+                ferr = E.sysMember("stderr");
+                if (fin.type == ValueType::UNDEFINED || fin.isNone()) E.pyRaise("RuntimeError", "input(): lost sys.stdin");
+                if (fout.type == ValueType::UNDEFINED || fout.isNone()) E.pyRaise("RuntimeError", "input(): lost sys.stdout");
+                if (ferr.type == ValueType::UNDEFINED || ferr.isNone()) E.pyRaise("RuntimeError", "input(): lost sys.stderr");
+                Value oi = E.global_ctx->getByName("_ny_stdin"), oo = E.global_ctx->getByName("_ny_stdout");
+                replaced = !(fin.type == oi.type && fin.value.p == oi.value.p) || !(fout.type == oo.type && fout.value.p == oo.value.p);
+            }
+            if (nyrt::audit_on()) E.auditEvent("builtins.input", {args.empty() ? NONE_VALUE : args[0]}, ctx);   // round 84
+            if (replaced) {
+                std::vector<Value> a{fin, fout, ferr, args.empty() ? NONE_VALUE : args[0], Value(!args.empty())};
+                return E.callFunctionValue(E.global_ctx->getByName("_ny_input"), a, ctx);
+            }
+            // input(prompt): one line from stdin (NyConc.cpp: read_stdin_line -
+            // the GIL is released while it waits, Ctrl+C raises
+            // KeyboardInterrupt); EOFError at the end of input, as in Python.
+            if (!args.empty()) std::cout << E.strOf(args[0]) << std::flush;
             std::string line;
-            std::getline(std::cin, line);
-            return makeStringValue(line);
-        }
-        if (name == "hex") {
-            if (args.size() >= 1 && args[0].type == ValueType::INTEGER) {
-                std::stringstream ss; ss << "0x" << std::hex << bigint_to_i64(args[0].value.i);
-                return makeStringValue(ss.str());
+            bool ok;
+            try { ok = nyconc::read_stdin_line(line); }
+            catch (nyconc::NyError& err) {
+                if (!err.raw.empty()) throw std::string(err.raw);
+                throw std::string("__exc__:" + err.type + ":" + err.msg);
             }
-            return NONE_VALUE;
-        }
-        if (name == "oct") {
-            if (args.size() >= 1 && args[0].type == ValueType::INTEGER) {
-                std::stringstream ss; ss << "0o" << std::oct << bigint_to_i64(args[0].value.i);
-                return makeStringValue(ss.str());
-            }
-            return NONE_VALUE;
-        }
-        if (name == "bin") {
-            if (args.size() >= 1 && args[0].type == ValueType::INTEGER) {
-                int64_t n = bigint_to_i64(args[0].value.i);
-                std::string s = "0b";
-                if (n == 0) s += "0";
-                else { std::string bits; while(n>0){ bits = (char)('0'+(n&1)) + bits; n>>=1; } s+=bits; }
-                return makeStringValue(s);
-            }
-            return NONE_VALUE;
-        }
-        if (name == "chr") {
-            if (args.size() >= 1 && args[0].type == ValueType::INTEGER) {
-                return makeStringValue(std::string(1, (char)bigint_to_i64(args[0].value.i)));
-            }
-            return NONE_VALUE;
-        }
-        if (name == "ord") {
-            if (args.size() >= 1 && args[0].type == ValueType::USERDATA && args[0].value.p) {
-                std::string s = getStringValue(args[0]);
-                if (!s.empty()) return Value((int)s[0]);
-            }
-            return Value(0);
+            if (!ok) E.pyRaise("EOFError", "EOF when reading a line");
+            Value res = E.makeStringValue(line);
+            // (round 86) the line read, as CPython's input() reports it when it
+            // read the terminal (its readline path; not a pipe or a file)
+            if (nyrt::audit_on() && isatty(0) && isatty(1)) E.auditEvent("builtins.input/result", {res}, ctx);
+            return res;
         }
 
     return UNDEFINED_VALUE;  // not handled by this module

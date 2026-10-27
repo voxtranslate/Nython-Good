@@ -1,0 +1,1036 @@
+// Generated from CPython 3.11/3.12's socket module (round 85): the integer
+// constants Nython's lacked, each where this platform's headers define it.
+// CAN_BCM_*: the enum of <linux/can/bcm.h>; IPPORT_*: CPython's fallbacks.
+#ifdef AF_ALG
+    C("AF_ALG", AF_ALG);
+#endif
+#ifdef AF_APPLETALK
+    C("AF_APPLETALK", AF_APPLETALK);
+#endif
+#ifdef AF_ASH
+    C("AF_ASH", AF_ASH);
+#endif
+#ifdef AF_ATMPVC
+    C("AF_ATMPVC", AF_ATMPVC);
+#endif
+#ifdef AF_ATMSVC
+    C("AF_ATMSVC", AF_ATMSVC);
+#endif
+#ifdef AF_AX25
+    C("AF_AX25", AF_AX25);
+#endif
+#ifdef AF_BLUETOOTH
+    C("AF_BLUETOOTH", AF_BLUETOOTH);
+#endif
+#ifdef AF_BRIDGE
+    C("AF_BRIDGE", AF_BRIDGE);
+#endif
+#ifdef AF_CAN
+    C("AF_CAN", AF_CAN);
+#endif
+#ifdef AF_DECnet
+    C("AF_DECnet", AF_DECnet);
+#endif
+#ifdef AF_ECONET
+    C("AF_ECONET", AF_ECONET);
+#endif
+#ifdef AF_IPX
+    C("AF_IPX", AF_IPX);
+#endif
+#ifdef AF_IRDA
+    C("AF_IRDA", AF_IRDA);
+#endif
+#ifdef AF_KEY
+    C("AF_KEY", AF_KEY);
+#endif
+#ifdef AF_LLC
+    C("AF_LLC", AF_LLC);
+#endif
+#ifdef AF_NETBEUI
+    C("AF_NETBEUI", AF_NETBEUI);
+#endif
+#ifdef AF_NETLINK
+    C("AF_NETLINK", AF_NETLINK);
+#endif
+#ifdef AF_NETROM
+    C("AF_NETROM", AF_NETROM);
+#endif
+#ifdef AF_PACKET
+    C("AF_PACKET", AF_PACKET);
+#endif
+#ifdef AF_PPPOX
+    C("AF_PPPOX", AF_PPPOX);
+#endif
+#ifdef AF_QIPCRTR
+    C("AF_QIPCRTR", AF_QIPCRTR);
+#endif
+#ifdef AF_RDS
+    C("AF_RDS", AF_RDS);
+#endif
+#ifdef AF_ROSE
+    C("AF_ROSE", AF_ROSE);
+#endif
+#ifdef AF_ROUTE
+    C("AF_ROUTE", AF_ROUTE);
+#endif
+#ifdef AF_SECURITY
+    C("AF_SECURITY", AF_SECURITY);
+#endif
+#ifdef AF_SNA
+    C("AF_SNA", AF_SNA);
+#endif
+#ifdef AF_TIPC
+    C("AF_TIPC", AF_TIPC);
+#endif
+#ifdef AF_VSOCK
+    C("AF_VSOCK", AF_VSOCK);
+#endif
+#ifdef AF_WANPIPE
+    C("AF_WANPIPE", AF_WANPIPE);
+#endif
+#ifdef AF_X25
+    C("AF_X25", AF_X25);
+#endif
+#ifdef AI_ADDRCONFIG
+    C("AI_ADDRCONFIG", AI_ADDRCONFIG);
+#endif
+#ifdef AI_ALL
+    C("AI_ALL", AI_ALL);
+#endif
+#ifdef AI_NUMERICSERV
+    C("AI_NUMERICSERV", AI_NUMERICSERV);
+#endif
+#ifdef AI_V4MAPPED
+    C("AI_V4MAPPED", AI_V4MAPPED);
+#endif
+#ifdef ALG_OP_DECRYPT
+    C("ALG_OP_DECRYPT", ALG_OP_DECRYPT);
+#endif
+#ifdef ALG_OP_ENCRYPT
+    C("ALG_OP_ENCRYPT", ALG_OP_ENCRYPT);
+#endif
+#ifdef ALG_OP_SIGN
+    C("ALG_OP_SIGN", ALG_OP_SIGN);
+#endif
+#ifdef ALG_OP_VERIFY
+    C("ALG_OP_VERIFY", ALG_OP_VERIFY);
+#endif
+#ifdef ALG_SET_AEAD_ASSOCLEN
+    C("ALG_SET_AEAD_ASSOCLEN", ALG_SET_AEAD_ASSOCLEN);
+#endif
+#ifdef ALG_SET_AEAD_AUTHSIZE
+    C("ALG_SET_AEAD_AUTHSIZE", ALG_SET_AEAD_AUTHSIZE);
+#endif
+#ifdef ALG_SET_IV
+    C("ALG_SET_IV", ALG_SET_IV);
+#endif
+#ifdef ALG_SET_KEY
+    C("ALG_SET_KEY", ALG_SET_KEY);
+#endif
+#ifdef ALG_SET_OP
+    C("ALG_SET_OP", ALG_SET_OP);
+#endif
+#ifdef ALG_SET_PUBKEY
+    C("ALG_SET_PUBKEY", ALG_SET_PUBKEY);
+#endif
+#ifdef BTPROTO_HCI
+    C("BTPROTO_HCI", BTPROTO_HCI);
+#endif
+#ifdef BTPROTO_L2CAP
+    C("BTPROTO_L2CAP", BTPROTO_L2CAP);
+#endif
+#ifdef BTPROTO_RFCOMM
+    C("BTPROTO_RFCOMM", BTPROTO_RFCOMM);
+#endif
+#ifdef BTPROTO_SCO
+    C("BTPROTO_SCO", BTPROTO_SCO);
+#endif
+#ifdef CAN_BCM
+    C("CAN_BCM", CAN_BCM);
+#endif
+#ifdef CAN_FD_FRAME
+    C("CAN_BCM_CAN_FD_FRAME", CAN_FD_FRAME);
+#endif
+#ifdef RX_ANNOUNCE_RESUME
+    C("CAN_BCM_RX_ANNOUNCE_RESUME", RX_ANNOUNCE_RESUME);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_RX_CHANGED", RX_CHANGED);
+#endif
+#ifdef RX_CHECK_DLC
+    C("CAN_BCM_RX_CHECK_DLC", RX_CHECK_DLC);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_RX_DELETE", RX_DELETE);
+#endif
+#ifdef RX_FILTER_ID
+    C("CAN_BCM_RX_FILTER_ID", RX_FILTER_ID);
+#endif
+#ifdef RX_NO_AUTOTIMER
+    C("CAN_BCM_RX_NO_AUTOTIMER", RX_NO_AUTOTIMER);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_RX_READ", RX_READ);
+#endif
+#ifdef RX_RTR_FRAME
+    C("CAN_BCM_RX_RTR_FRAME", RX_RTR_FRAME);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_RX_SETUP", RX_SETUP);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_RX_STATUS", RX_STATUS);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_RX_TIMEOUT", RX_TIMEOUT);
+#endif
+#ifdef SETTIMER
+    C("CAN_BCM_SETTIMER", SETTIMER);
+#endif
+#ifdef STARTTIMER
+    C("CAN_BCM_STARTTIMER", STARTTIMER);
+#endif
+#ifdef TX_ANNOUNCE
+    C("CAN_BCM_TX_ANNOUNCE", TX_ANNOUNCE);
+#endif
+#ifdef TX_COUNTEVT
+    C("CAN_BCM_TX_COUNTEVT", TX_COUNTEVT);
+#endif
+#ifdef TX_CP_CAN_ID
+    C("CAN_BCM_TX_CP_CAN_ID", TX_CP_CAN_ID);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_TX_DELETE", TX_DELETE);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_TX_EXPIRED", TX_EXPIRED);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_TX_READ", TX_READ);
+#endif
+#ifdef TX_RESET_MULTI_IDX
+    C("CAN_BCM_TX_RESET_MULTI_IDX", TX_RESET_MULTI_IDX);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_TX_SEND", TX_SEND);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_TX_SETUP", TX_SETUP);
+#endif
+#if NY_HAVE_CAN_BCM
+    C("CAN_BCM_TX_STATUS", TX_STATUS);
+#endif
+#ifdef CAN_EFF_FLAG
+    C("CAN_EFF_FLAG", CAN_EFF_FLAG);
+#endif
+#ifdef CAN_EFF_MASK
+    C("CAN_EFF_MASK", CAN_EFF_MASK);
+#endif
+#ifdef CAN_ERR_FLAG
+    C("CAN_ERR_FLAG", CAN_ERR_FLAG);
+#endif
+#ifdef CAN_ERR_MASK
+    C("CAN_ERR_MASK", CAN_ERR_MASK);
+#endif
+#ifdef CAN_ISOTP
+    C("CAN_ISOTP", CAN_ISOTP);
+#endif
+#ifdef CAN_J1939
+    C("CAN_J1939", CAN_J1939);
+#endif
+#ifdef CAN_RAW
+    C("CAN_RAW", CAN_RAW);
+#endif
+#ifdef CAN_RAW_FD_FRAMES
+    C("CAN_RAW_FD_FRAMES", CAN_RAW_FD_FRAMES);
+#endif
+#ifdef CAN_RAW_FILTER
+    C("CAN_RAW_FILTER", CAN_RAW_FILTER);
+#endif
+#ifdef CAN_RAW_JOIN_FILTERS
+    C("CAN_RAW_JOIN_FILTERS", CAN_RAW_JOIN_FILTERS);
+#endif
+#ifdef CAN_RAW_LOOPBACK
+    C("CAN_RAW_LOOPBACK", CAN_RAW_LOOPBACK);
+#endif
+#ifdef CAN_RAW_RECV_OWN_MSGS
+    C("CAN_RAW_RECV_OWN_MSGS", CAN_RAW_RECV_OWN_MSGS);
+#endif
+#ifdef CAN_RTR_FLAG
+    C("CAN_RTR_FLAG", CAN_RTR_FLAG);
+#endif
+#ifdef CAN_SFF_MASK
+    C("CAN_SFF_MASK", CAN_SFF_MASK);
+#endif
+#ifdef EAGAIN
+    C("EAGAIN", EAGAIN);
+#endif
+#ifdef EAI_ADDRFAMILY
+    C("EAI_ADDRFAMILY", EAI_ADDRFAMILY);
+#endif
+#ifdef EAI_AGAIN
+    C("EAI_AGAIN", EAI_AGAIN);
+#endif
+#ifdef EAI_BADFLAGS
+    C("EAI_BADFLAGS", EAI_BADFLAGS);
+#endif
+#ifdef EAI_FAIL
+    C("EAI_FAIL", EAI_FAIL);
+#endif
+#ifdef EAI_FAMILY
+    C("EAI_FAMILY", EAI_FAMILY);
+#endif
+#ifdef EAI_MEMORY
+    C("EAI_MEMORY", EAI_MEMORY);
+#endif
+#ifdef EAI_NODATA
+    C("EAI_NODATA", EAI_NODATA);
+#endif
+#ifdef EAI_NONAME
+    C("EAI_NONAME", EAI_NONAME);
+#endif
+#ifdef EAI_OVERFLOW
+    C("EAI_OVERFLOW", EAI_OVERFLOW);
+#endif
+#ifdef EAI_SERVICE
+    C("EAI_SERVICE", EAI_SERVICE);
+#endif
+#ifdef EAI_SOCKTYPE
+    C("EAI_SOCKTYPE", EAI_SOCKTYPE);
+#endif
+#ifdef EAI_SYSTEM
+    C("EAI_SYSTEM", EAI_SYSTEM);
+#endif
+#ifdef EBADF
+    C("EBADF", EBADF);
+#endif
+#ifdef ETHERTYPE_ARP
+    C("ETHERTYPE_ARP", ETHERTYPE_ARP);
+#endif
+#ifdef ETHERTYPE_IP
+    C("ETHERTYPE_IP", ETHERTYPE_IP);
+#endif
+#ifdef ETHERTYPE_IPV6
+    C("ETHERTYPE_IPV6", ETHERTYPE_IPV6);
+#endif
+#ifdef ETHERTYPE_VLAN
+    C("ETHERTYPE_VLAN", ETHERTYPE_VLAN);
+#endif
+#ifdef ETH_P_ALL
+    C("ETH_P_ALL", ETH_P_ALL);
+#endif
+#ifdef EWOULDBLOCK
+    C("EWOULDBLOCK", EWOULDBLOCK);
+#endif
+#ifdef HCI_DATA_DIR
+    C("HCI_DATA_DIR", HCI_DATA_DIR);
+#endif
+#ifdef HCI_FILTER
+    C("HCI_FILTER", HCI_FILTER);
+#endif
+#ifdef HCI_TIME_STAMP
+    C("HCI_TIME_STAMP", HCI_TIME_STAMP);
+#endif
+#ifdef INADDR_ALLHOSTS_GROUP
+    C("INADDR_ALLHOSTS_GROUP", INADDR_ALLHOSTS_GROUP);
+#endif
+#ifdef INADDR_MAX_LOCAL_GROUP
+    C("INADDR_MAX_LOCAL_GROUP", INADDR_MAX_LOCAL_GROUP);
+#endif
+#ifdef INADDR_NONE
+    C("INADDR_NONE", INADDR_NONE);
+#endif
+#ifdef INADDR_UNSPEC_GROUP
+    C("INADDR_UNSPEC_GROUP", INADDR_UNSPEC_GROUP);
+#endif
+#ifdef IOCTL_VM_SOCKETS_GET_LOCAL_CID
+    C("IOCTL_VM_SOCKETS_GET_LOCAL_CID", IOCTL_VM_SOCKETS_GET_LOCAL_CID);
+#endif
+    C("IPPORT_RESERVED", 1024);
+    C("IPPORT_USERRESERVED", 5000);
+#ifdef IPPROTO_AH
+    C("IPPROTO_AH", IPPROTO_AH);
+#endif
+#ifdef IPPROTO_DSTOPTS
+    C("IPPROTO_DSTOPTS", IPPROTO_DSTOPTS);
+#endif
+#ifdef IPPROTO_EGP
+    C("IPPROTO_EGP", IPPROTO_EGP);
+#endif
+#ifdef IPPROTO_ESP
+    C("IPPROTO_ESP", IPPROTO_ESP);
+#endif
+#ifdef IPPROTO_FRAGMENT
+    C("IPPROTO_FRAGMENT", IPPROTO_FRAGMENT);
+#endif
+#ifdef IPPROTO_GRE
+    C("IPPROTO_GRE", IPPROTO_GRE);
+#endif
+#ifdef IPPROTO_HOPOPTS
+    C("IPPROTO_HOPOPTS", IPPROTO_HOPOPTS);
+#endif
+#ifdef IPPROTO_ICMP
+    C("IPPROTO_ICMP", IPPROTO_ICMP);
+#endif
+#ifdef IPPROTO_ICMPV6
+    C("IPPROTO_ICMPV6", IPPROTO_ICMPV6);
+#endif
+#ifdef IPPROTO_IDP
+    C("IPPROTO_IDP", IPPROTO_IDP);
+#endif
+#ifdef IPPROTO_IGMP
+    C("IPPROTO_IGMP", IPPROTO_IGMP);
+#endif
+#ifdef IPPROTO_IPIP
+    C("IPPROTO_IPIP", IPPROTO_IPIP);
+#endif
+#ifdef IPPROTO_MPTCP
+    C("IPPROTO_MPTCP", IPPROTO_MPTCP);
+#endif
+#ifdef IPPROTO_NONE
+    C("IPPROTO_NONE", IPPROTO_NONE);
+#endif
+#ifdef IPPROTO_PIM
+    C("IPPROTO_PIM", IPPROTO_PIM);
+#endif
+#ifdef IPPROTO_PUP
+    C("IPPROTO_PUP", IPPROTO_PUP);
+#endif
+#ifdef IPPROTO_RAW
+    C("IPPROTO_RAW", IPPROTO_RAW);
+#endif
+#ifdef IPPROTO_ROUTING
+    C("IPPROTO_ROUTING", IPPROTO_ROUTING);
+#endif
+#ifdef IPPROTO_RSVP
+    C("IPPROTO_RSVP", IPPROTO_RSVP);
+#endif
+#ifdef IPPROTO_SCTP
+    C("IPPROTO_SCTP", IPPROTO_SCTP);
+#endif
+#ifdef IPPROTO_TP
+    C("IPPROTO_TP", IPPROTO_TP);
+#endif
+#ifdef IPPROTO_UDPLITE
+    C("IPPROTO_UDPLITE", IPPROTO_UDPLITE);
+#endif
+#ifdef IPV6_CHECKSUM
+    C("IPV6_CHECKSUM", IPV6_CHECKSUM);
+#endif
+#ifdef IPV6_DONTFRAG
+    C("IPV6_DONTFRAG", IPV6_DONTFRAG);
+#endif
+#ifdef IPV6_DSTOPTS
+    C("IPV6_DSTOPTS", IPV6_DSTOPTS);
+#endif
+#ifdef IPV6_HOPLIMIT
+    C("IPV6_HOPLIMIT", IPV6_HOPLIMIT);
+#endif
+#ifdef IPV6_HOPOPTS
+    C("IPV6_HOPOPTS", IPV6_HOPOPTS);
+#endif
+#ifdef IPV6_MULTICAST_IF
+    C("IPV6_MULTICAST_IF", IPV6_MULTICAST_IF);
+#endif
+#ifdef IPV6_NEXTHOP
+    C("IPV6_NEXTHOP", IPV6_NEXTHOP);
+#endif
+#ifdef IPV6_PATHMTU
+    C("IPV6_PATHMTU", IPV6_PATHMTU);
+#endif
+#ifdef IPV6_PKTINFO
+    C("IPV6_PKTINFO", IPV6_PKTINFO);
+#endif
+#ifdef IPV6_RECVDSTOPTS
+    C("IPV6_RECVDSTOPTS", IPV6_RECVDSTOPTS);
+#endif
+#ifdef IPV6_RECVHOPLIMIT
+    C("IPV6_RECVHOPLIMIT", IPV6_RECVHOPLIMIT);
+#endif
+#ifdef IPV6_RECVHOPOPTS
+    C("IPV6_RECVHOPOPTS", IPV6_RECVHOPOPTS);
+#endif
+#ifdef IPV6_RECVPATHMTU
+    C("IPV6_RECVPATHMTU", IPV6_RECVPATHMTU);
+#endif
+#ifdef IPV6_RECVPKTINFO
+    C("IPV6_RECVPKTINFO", IPV6_RECVPKTINFO);
+#endif
+#ifdef IPV6_RECVRTHDR
+    C("IPV6_RECVRTHDR", IPV6_RECVRTHDR);
+#endif
+#ifdef IPV6_RECVTCLASS
+    C("IPV6_RECVTCLASS", IPV6_RECVTCLASS);
+#endif
+#ifdef IPV6_RTHDR
+    C("IPV6_RTHDR", IPV6_RTHDR);
+#endif
+#ifdef IPV6_RTHDRDSTOPTS
+    C("IPV6_RTHDRDSTOPTS", IPV6_RTHDRDSTOPTS);
+#endif
+#ifdef IPV6_RTHDR_TYPE_0
+    C("IPV6_RTHDR_TYPE_0", IPV6_RTHDR_TYPE_0);
+#endif
+#ifdef IPV6_TCLASS
+    C("IPV6_TCLASS", IPV6_TCLASS);
+#endif
+#ifdef IPV6_UNICAST_HOPS
+    C("IPV6_UNICAST_HOPS", IPV6_UNICAST_HOPS);
+#endif
+#ifdef IP_ADD_SOURCE_MEMBERSHIP
+    C("IP_ADD_SOURCE_MEMBERSHIP", IP_ADD_SOURCE_MEMBERSHIP);
+#endif
+#ifdef IP_BIND_ADDRESS_NO_PORT
+    C("IP_BIND_ADDRESS_NO_PORT", IP_BIND_ADDRESS_NO_PORT);
+#endif
+#ifdef IP_BLOCK_SOURCE
+    C("IP_BLOCK_SOURCE", IP_BLOCK_SOURCE);
+#endif
+#ifdef IP_DEFAULT_MULTICAST_LOOP
+    C("IP_DEFAULT_MULTICAST_LOOP", IP_DEFAULT_MULTICAST_LOOP);
+#endif
+#ifdef IP_DEFAULT_MULTICAST_TTL
+    C("IP_DEFAULT_MULTICAST_TTL", IP_DEFAULT_MULTICAST_TTL);
+#endif
+#ifdef IP_DROP_SOURCE_MEMBERSHIP
+    C("IP_DROP_SOURCE_MEMBERSHIP", IP_DROP_SOURCE_MEMBERSHIP);
+#endif
+#ifdef IP_HDRINCL
+    C("IP_HDRINCL", IP_HDRINCL);
+#endif
+#ifdef IP_MAX_MEMBERSHIPS
+    C("IP_MAX_MEMBERSHIPS", IP_MAX_MEMBERSHIPS);
+#endif
+#ifdef IP_OPTIONS
+    C("IP_OPTIONS", IP_OPTIONS);
+#endif
+#ifdef IP_PKTINFO
+    C("IP_PKTINFO", IP_PKTINFO);
+#endif
+#ifdef IP_RECVOPTS
+    C("IP_RECVOPTS", IP_RECVOPTS);
+#endif
+#ifdef IP_RECVRETOPTS
+    C("IP_RECVRETOPTS", IP_RECVRETOPTS);
+#endif
+#ifdef IP_RECVTOS
+    C("IP_RECVTOS", IP_RECVTOS);
+#endif
+#ifdef IP_RETOPTS
+    C("IP_RETOPTS", IP_RETOPTS);
+#endif
+#ifdef IP_TOS
+    C("IP_TOS", IP_TOS);
+#endif
+#ifdef IP_TRANSPARENT
+    C("IP_TRANSPARENT", IP_TRANSPARENT);
+#endif
+#ifdef IP_UNBLOCK_SOURCE
+    C("IP_UNBLOCK_SOURCE", IP_UNBLOCK_SOURCE);
+#endif
+#ifdef J1939_EE_INFO_NONE
+    C("J1939_EE_INFO_NONE", J1939_EE_INFO_NONE);
+#endif
+#ifdef J1939_EE_INFO_TX_ABORT
+    C("J1939_EE_INFO_TX_ABORT", J1939_EE_INFO_TX_ABORT);
+#endif
+#ifdef J1939_FILTER_MAX
+    C("J1939_FILTER_MAX", J1939_FILTER_MAX);
+#endif
+#ifdef J1939_IDLE_ADDR
+    C("J1939_IDLE_ADDR", J1939_IDLE_ADDR);
+#endif
+#ifdef J1939_MAX_UNICAST_ADDR
+    C("J1939_MAX_UNICAST_ADDR", J1939_MAX_UNICAST_ADDR);
+#endif
+#ifdef J1939_NLA_BYTES_ACKED
+    C("J1939_NLA_BYTES_ACKED", J1939_NLA_BYTES_ACKED);
+#endif
+#ifdef J1939_NLA_PAD
+    C("J1939_NLA_PAD", J1939_NLA_PAD);
+#endif
+#ifdef J1939_NO_ADDR
+    C("J1939_NO_ADDR", J1939_NO_ADDR);
+#endif
+#ifdef J1939_NO_NAME
+    C("J1939_NO_NAME", J1939_NO_NAME);
+#endif
+#ifdef J1939_NO_PGN
+    C("J1939_NO_PGN", J1939_NO_PGN);
+#endif
+#ifdef J1939_PGN_ADDRESS_CLAIMED
+    C("J1939_PGN_ADDRESS_CLAIMED", J1939_PGN_ADDRESS_CLAIMED);
+#endif
+#ifdef J1939_PGN_ADDRESS_COMMANDED
+    C("J1939_PGN_ADDRESS_COMMANDED", J1939_PGN_ADDRESS_COMMANDED);
+#endif
+#ifdef J1939_PGN_MAX
+    C("J1939_PGN_MAX", J1939_PGN_MAX);
+#endif
+#ifdef J1939_PGN_PDU1_MAX
+    C("J1939_PGN_PDU1_MAX", J1939_PGN_PDU1_MAX);
+#endif
+#ifdef J1939_PGN_REQUEST
+    C("J1939_PGN_REQUEST", J1939_PGN_REQUEST);
+#endif
+#ifdef MSG_CMSG_CLOEXEC
+    C("MSG_CMSG_CLOEXEC", MSG_CMSG_CLOEXEC);
+#endif
+#ifdef MSG_CONFIRM
+    C("MSG_CONFIRM", MSG_CONFIRM);
+#endif
+#ifdef MSG_CTRUNC
+    C("MSG_CTRUNC", MSG_CTRUNC);
+#endif
+#ifdef MSG_DONTROUTE
+    C("MSG_DONTROUTE", MSG_DONTROUTE);
+#endif
+#ifdef MSG_EOR
+    C("MSG_EOR", MSG_EOR);
+#endif
+#ifdef MSG_ERRQUEUE
+    C("MSG_ERRQUEUE", MSG_ERRQUEUE);
+#endif
+#ifdef MSG_FASTOPEN
+    C("MSG_FASTOPEN", MSG_FASTOPEN);
+#endif
+#ifdef MSG_MORE
+    C("MSG_MORE", MSG_MORE);
+#endif
+#ifdef MSG_NOSIGNAL
+    C("MSG_NOSIGNAL", MSG_NOSIGNAL);
+#endif
+#ifdef MSG_TRUNC
+    C("MSG_TRUNC", MSG_TRUNC);
+#endif
+#ifdef NETLINK_CRYPTO
+    C("NETLINK_CRYPTO", NETLINK_CRYPTO);
+#endif
+#ifdef NETLINK_DNRTMSG
+    C("NETLINK_DNRTMSG", NETLINK_DNRTMSG);
+#endif
+#ifdef NETLINK_FIREWALL
+    C("NETLINK_FIREWALL", NETLINK_FIREWALL);
+#endif
+#ifdef NETLINK_IP6_FW
+    C("NETLINK_IP6_FW", NETLINK_IP6_FW);
+#endif
+#ifdef NETLINK_NFLOG
+    C("NETLINK_NFLOG", NETLINK_NFLOG);
+#endif
+#ifdef NETLINK_ROUTE
+    C("NETLINK_ROUTE", NETLINK_ROUTE);
+#endif
+#ifdef NETLINK_USERSOCK
+    C("NETLINK_USERSOCK", NETLINK_USERSOCK);
+#endif
+#ifdef NETLINK_XFRM
+    C("NETLINK_XFRM", NETLINK_XFRM);
+#endif
+#ifdef NI_DGRAM
+    C("NI_DGRAM", NI_DGRAM);
+#endif
+#ifdef NI_MAXHOST
+    C("NI_MAXHOST", NI_MAXHOST);
+#endif
+#ifdef NI_MAXSERV
+    C("NI_MAXSERV", NI_MAXSERV);
+#endif
+#ifdef NI_NOFQDN
+    C("NI_NOFQDN", NI_NOFQDN);
+#endif
+#ifdef PACKET_BROADCAST
+    C("PACKET_BROADCAST", PACKET_BROADCAST);
+#endif
+#ifdef PACKET_FASTROUTE
+    C("PACKET_FASTROUTE", PACKET_FASTROUTE);
+#endif
+#ifdef PACKET_HOST
+    C("PACKET_HOST", PACKET_HOST);
+#endif
+#ifdef PACKET_LOOPBACK
+    C("PACKET_LOOPBACK", PACKET_LOOPBACK);
+#endif
+#ifdef PACKET_MULTICAST
+    C("PACKET_MULTICAST", PACKET_MULTICAST);
+#endif
+#ifdef PACKET_OTHERHOST
+    C("PACKET_OTHERHOST", PACKET_OTHERHOST);
+#endif
+#ifdef PACKET_OUTGOING
+    C("PACKET_OUTGOING", PACKET_OUTGOING);
+#endif
+#ifdef PF_CAN
+    C("PF_CAN", PF_CAN);
+#endif
+#ifdef PF_PACKET
+    C("PF_PACKET", PF_PACKET);
+#endif
+#ifdef PF_RDS
+    C("PF_RDS", PF_RDS);
+#endif
+#ifdef SCM_CREDENTIALS
+    C("SCM_CREDENTIALS", SCM_CREDENTIALS);
+#endif
+#ifdef SCM_J1939_DEST_ADDR
+    C("SCM_J1939_DEST_ADDR", SCM_J1939_DEST_ADDR);
+#endif
+#ifdef SCM_J1939_DEST_NAME
+    C("SCM_J1939_DEST_NAME", SCM_J1939_DEST_NAME);
+#endif
+#ifdef SCM_J1939_ERRQUEUE
+    C("SCM_J1939_ERRQUEUE", SCM_J1939_ERRQUEUE);
+#endif
+#ifdef SCM_J1939_PRIO
+    C("SCM_J1939_PRIO", SCM_J1939_PRIO);
+#endif
+#ifdef SCM_RIGHTS
+    C("SCM_RIGHTS", SCM_RIGHTS);
+#endif
+#ifdef SOCK_CLOEXEC
+    C("SOCK_CLOEXEC", SOCK_CLOEXEC);
+#endif
+#ifdef SOCK_NONBLOCK
+    C("SOCK_NONBLOCK", SOCK_NONBLOCK);
+#endif
+#ifdef SOCK_RDM
+    C("SOCK_RDM", SOCK_RDM);
+#endif
+#ifdef SOCK_SEQPACKET
+    C("SOCK_SEQPACKET", SOCK_SEQPACKET);
+#endif
+#ifdef SOL_ALG
+    C("SOL_ALG", SOL_ALG);
+#endif
+#ifdef SOL_CAN_BASE
+    C("SOL_CAN_BASE", SOL_CAN_BASE);
+#endif
+#ifdef SOL_CAN_RAW
+    C("SOL_CAN_RAW", SOL_CAN_RAW);
+#endif
+#ifdef SOL_HCI
+    C("SOL_HCI", SOL_HCI);
+#endif
+#ifdef SOL_IP
+    C("SOL_IP", SOL_IP);
+#endif
+#ifdef SOL_RDS
+    C("SOL_RDS", SOL_RDS);
+#endif
+#ifdef SOL_TCP
+    C("SOL_TCP", SOL_TCP);
+#endif
+#ifdef SOL_TIPC
+    C("SOL_TIPC", SOL_TIPC);
+#endif
+#ifdef SOL_UDP
+    C("SOL_UDP", SOL_UDP);
+#endif
+#ifdef SO_ACCEPTCONN
+    C("SO_ACCEPTCONN", SO_ACCEPTCONN);
+#endif
+#ifdef SO_BINDTODEVICE
+    C("SO_BINDTODEVICE", SO_BINDTODEVICE);
+#endif
+#ifdef SO_DEBUG
+    C("SO_DEBUG", SO_DEBUG);
+#endif
+#ifdef SO_DOMAIN
+    C("SO_DOMAIN", SO_DOMAIN);
+#endif
+#ifdef SO_DONTROUTE
+    C("SO_DONTROUTE", SO_DONTROUTE);
+#endif
+#ifdef SO_INCOMING_CPU
+    C("SO_INCOMING_CPU", SO_INCOMING_CPU);
+#endif
+#ifdef SO_J1939_ERRQUEUE
+    C("SO_J1939_ERRQUEUE", SO_J1939_ERRQUEUE);
+#endif
+#ifdef SO_J1939_FILTER
+    C("SO_J1939_FILTER", SO_J1939_FILTER);
+#endif
+#ifdef SO_J1939_PROMISC
+    C("SO_J1939_PROMISC", SO_J1939_PROMISC);
+#endif
+#ifdef SO_J1939_SEND_PRIO
+    C("SO_J1939_SEND_PRIO", SO_J1939_SEND_PRIO);
+#endif
+#ifdef SO_MARK
+    C("SO_MARK", SO_MARK);
+#endif
+#ifdef SO_OOBINLINE
+    C("SO_OOBINLINE", SO_OOBINLINE);
+#endif
+#ifdef SO_PASSCRED
+    C("SO_PASSCRED", SO_PASSCRED);
+#endif
+#ifdef SO_PASSSEC
+    C("SO_PASSSEC", SO_PASSSEC);
+#endif
+#ifdef SO_PEERCRED
+    C("SO_PEERCRED", SO_PEERCRED);
+#endif
+#ifdef SO_PEERSEC
+    C("SO_PEERSEC", SO_PEERSEC);
+#endif
+#ifdef SO_PRIORITY
+    C("SO_PRIORITY", SO_PRIORITY);
+#endif
+#ifdef SO_PROTOCOL
+    C("SO_PROTOCOL", SO_PROTOCOL);
+#endif
+#ifdef SO_RCVLOWAT
+    C("SO_RCVLOWAT", SO_RCVLOWAT);
+#endif
+#ifdef SO_RCVTIMEO
+    C("SO_RCVTIMEO", SO_RCVTIMEO);
+#endif
+#ifdef SO_SNDLOWAT
+    C("SO_SNDLOWAT", SO_SNDLOWAT);
+#endif
+#ifdef SO_SNDTIMEO
+    C("SO_SNDTIMEO", SO_SNDTIMEO);
+#endif
+#ifdef SO_VM_SOCKETS_BUFFER_MAX_SIZE
+    C("SO_VM_SOCKETS_BUFFER_MAX_SIZE", SO_VM_SOCKETS_BUFFER_MAX_SIZE);
+#endif
+#ifdef SO_VM_SOCKETS_BUFFER_MIN_SIZE
+    C("SO_VM_SOCKETS_BUFFER_MIN_SIZE", SO_VM_SOCKETS_BUFFER_MIN_SIZE);
+#endif
+#ifdef SO_VM_SOCKETS_BUFFER_SIZE
+    C("SO_VM_SOCKETS_BUFFER_SIZE", SO_VM_SOCKETS_BUFFER_SIZE);
+#endif
+#ifdef TCP_CC_INFO
+    C("TCP_CC_INFO", TCP_CC_INFO);
+#endif
+#ifdef TCP_CONGESTION
+    C("TCP_CONGESTION", TCP_CONGESTION);
+#endif
+#ifdef TCP_CORK
+    C("TCP_CORK", TCP_CORK);
+#endif
+#ifdef TCP_DEFER_ACCEPT
+    C("TCP_DEFER_ACCEPT", TCP_DEFER_ACCEPT);
+#endif
+#ifdef TCP_FASTOPEN
+    C("TCP_FASTOPEN", TCP_FASTOPEN);
+#endif
+#ifdef TCP_FASTOPEN_CONNECT
+    C("TCP_FASTOPEN_CONNECT", TCP_FASTOPEN_CONNECT);
+#endif
+#ifdef TCP_FASTOPEN_KEY
+    C("TCP_FASTOPEN_KEY", TCP_FASTOPEN_KEY);
+#endif
+#ifdef TCP_FASTOPEN_NO_COOKIE
+    C("TCP_FASTOPEN_NO_COOKIE", TCP_FASTOPEN_NO_COOKIE);
+#endif
+#ifdef TCP_INFO
+    C("TCP_INFO", TCP_INFO);
+#endif
+#ifdef TCP_INQ
+    C("TCP_INQ", TCP_INQ);
+#endif
+#ifdef TCP_LINGER2
+    C("TCP_LINGER2", TCP_LINGER2);
+#endif
+#ifdef TCP_MAXSEG
+    C("TCP_MAXSEG", TCP_MAXSEG);
+#endif
+#ifdef TCP_MD5SIG
+    C("TCP_MD5SIG", TCP_MD5SIG);
+#endif
+#ifdef TCP_MD5SIG_EXT
+    C("TCP_MD5SIG_EXT", TCP_MD5SIG_EXT);
+#endif
+#ifdef TCP_NOTSENT_LOWAT
+    C("TCP_NOTSENT_LOWAT", TCP_NOTSENT_LOWAT);
+#endif
+#ifdef TCP_QUEUE_SEQ
+    C("TCP_QUEUE_SEQ", TCP_QUEUE_SEQ);
+#endif
+#ifdef TCP_QUICKACK
+    C("TCP_QUICKACK", TCP_QUICKACK);
+#endif
+#ifdef TCP_REPAIR
+    C("TCP_REPAIR", TCP_REPAIR);
+#endif
+#ifdef TCP_REPAIR_OPTIONS
+    C("TCP_REPAIR_OPTIONS", TCP_REPAIR_OPTIONS);
+#endif
+#ifdef TCP_REPAIR_QUEUE
+    C("TCP_REPAIR_QUEUE", TCP_REPAIR_QUEUE);
+#endif
+#ifdef TCP_REPAIR_WINDOW
+    C("TCP_REPAIR_WINDOW", TCP_REPAIR_WINDOW);
+#endif
+#ifdef TCP_SAVED_SYN
+    C("TCP_SAVED_SYN", TCP_SAVED_SYN);
+#endif
+#ifdef TCP_SAVE_SYN
+    C("TCP_SAVE_SYN", TCP_SAVE_SYN);
+#endif
+#ifdef TCP_SYNCNT
+    C("TCP_SYNCNT", TCP_SYNCNT);
+#endif
+#ifdef TCP_THIN_DUPACK
+    C("TCP_THIN_DUPACK", TCP_THIN_DUPACK);
+#endif
+#ifdef TCP_THIN_LINEAR_TIMEOUTS
+    C("TCP_THIN_LINEAR_TIMEOUTS", TCP_THIN_LINEAR_TIMEOUTS);
+#endif
+#ifdef TCP_TIMESTAMP
+    C("TCP_TIMESTAMP", TCP_TIMESTAMP);
+#endif
+#ifdef TCP_TX_DELAY
+    C("TCP_TX_DELAY", TCP_TX_DELAY);
+#endif
+#ifdef TCP_ULP
+    C("TCP_ULP", TCP_ULP);
+#endif
+#ifdef TCP_USER_TIMEOUT
+    C("TCP_USER_TIMEOUT", TCP_USER_TIMEOUT);
+#endif
+#ifdef TCP_WINDOW_CLAMP
+    C("TCP_WINDOW_CLAMP", TCP_WINDOW_CLAMP);
+#endif
+#ifdef TCP_ZEROCOPY_RECEIVE
+    C("TCP_ZEROCOPY_RECEIVE", TCP_ZEROCOPY_RECEIVE);
+#endif
+#ifdef TIPC_ADDR_ID
+    C("TIPC_ADDR_ID", TIPC_ADDR_ID);
+#endif
+#ifdef TIPC_ADDR_NAME
+    C("TIPC_ADDR_NAME", TIPC_ADDR_NAME);
+#endif
+#ifdef TIPC_ADDR_NAMESEQ
+    C("TIPC_ADDR_NAMESEQ", TIPC_ADDR_NAMESEQ);
+#endif
+#ifdef TIPC_CFG_SRV
+    C("TIPC_CFG_SRV", TIPC_CFG_SRV);
+#endif
+#ifdef TIPC_CLUSTER_SCOPE
+    C("TIPC_CLUSTER_SCOPE", TIPC_CLUSTER_SCOPE);
+#endif
+#ifdef TIPC_CONN_TIMEOUT
+    C("TIPC_CONN_TIMEOUT", TIPC_CONN_TIMEOUT);
+#endif
+#ifdef TIPC_CRITICAL_IMPORTANCE
+    C("TIPC_CRITICAL_IMPORTANCE", TIPC_CRITICAL_IMPORTANCE);
+#endif
+#ifdef TIPC_DEST_DROPPABLE
+    C("TIPC_DEST_DROPPABLE", TIPC_DEST_DROPPABLE);
+#endif
+#ifdef TIPC_HIGH_IMPORTANCE
+    C("TIPC_HIGH_IMPORTANCE", TIPC_HIGH_IMPORTANCE);
+#endif
+#ifdef TIPC_IMPORTANCE
+    C("TIPC_IMPORTANCE", TIPC_IMPORTANCE);
+#endif
+#ifdef TIPC_LOW_IMPORTANCE
+    C("TIPC_LOW_IMPORTANCE", TIPC_LOW_IMPORTANCE);
+#endif
+#ifdef TIPC_MEDIUM_IMPORTANCE
+    C("TIPC_MEDIUM_IMPORTANCE", TIPC_MEDIUM_IMPORTANCE);
+#endif
+#ifdef TIPC_NODE_SCOPE
+    C("TIPC_NODE_SCOPE", TIPC_NODE_SCOPE);
+#endif
+#ifdef TIPC_PUBLISHED
+    C("TIPC_PUBLISHED", TIPC_PUBLISHED);
+#endif
+#ifdef TIPC_SRC_DROPPABLE
+    C("TIPC_SRC_DROPPABLE", TIPC_SRC_DROPPABLE);
+#endif
+#ifdef TIPC_SUBSCR_TIMEOUT
+    C("TIPC_SUBSCR_TIMEOUT", TIPC_SUBSCR_TIMEOUT);
+#endif
+#ifdef TIPC_SUB_CANCEL
+    C("TIPC_SUB_CANCEL", TIPC_SUB_CANCEL);
+#endif
+#ifdef TIPC_SUB_PORTS
+    C("TIPC_SUB_PORTS", TIPC_SUB_PORTS);
+#endif
+#ifdef TIPC_SUB_SERVICE
+    C("TIPC_SUB_SERVICE", TIPC_SUB_SERVICE);
+#endif
+#ifdef TIPC_TOP_SRV
+    C("TIPC_TOP_SRV", TIPC_TOP_SRV);
+#endif
+#ifdef TIPC_WAIT_FOREVER
+    C("TIPC_WAIT_FOREVER", TIPC_WAIT_FOREVER);
+#endif
+#ifdef TIPC_WITHDRAWN
+    C("TIPC_WITHDRAWN", TIPC_WITHDRAWN);
+#endif
+#ifdef TIPC_ZONE_SCOPE
+    C("TIPC_ZONE_SCOPE", TIPC_ZONE_SCOPE);
+#endif
+#ifdef UDPLITE_RECV_CSCOV
+    C("UDPLITE_RECV_CSCOV", UDPLITE_RECV_CSCOV);
+#endif
+#ifdef UDPLITE_SEND_CSCOV
+    C("UDPLITE_SEND_CSCOV", UDPLITE_SEND_CSCOV);
+#endif
+#ifdef VMADDR_CID_ANY
+    C("VMADDR_CID_ANY", VMADDR_CID_ANY);
+#endif
+#ifdef VMADDR_CID_HOST
+    C("VMADDR_CID_HOST", VMADDR_CID_HOST);
+#endif
+#ifdef VMADDR_PORT_ANY
+    C("VMADDR_PORT_ANY", VMADDR_PORT_ANY);
+#endif
+#ifdef VM_SOCKETS_INVALID_VERSION
+    C("VM_SOCKETS_INVALID_VERSION", VM_SOCKETS_INVALID_VERSION);
+#endif
+// The ones the Linux headers give as enum members (no macro to test), and
+// UDP-Lite's, which glibc's <netinet/udp.h> lacks: CPython's values, where
+// the header (the family) exists.
+#if defined(__linux__) && __has_include(<linux/if_alg.h>)
+#  ifndef ALG_OP_SIGN
+    C("ALG_OP_SIGN", 2);
+#  endif
+#  ifndef ALG_OP_VERIFY
+    C("ALG_OP_VERIFY", 3);
+#  endif
+#  ifndef ALG_SET_PUBKEY
+    C("ALG_SET_PUBKEY", 6);
+#  endif
+#endif
+#if defined(__linux__) && __has_include(<linux/can/raw.h>)
+    C("CAN_RAW_FILTER", CAN_RAW_FILTER); C("CAN_RAW_LOOPBACK", CAN_RAW_LOOPBACK);
+    C("CAN_RAW_RECV_OWN_MSGS", CAN_RAW_RECV_OWN_MSGS); C("CAN_RAW_FD_FRAMES", CAN_RAW_FD_FRAMES);
+    C("CAN_RAW_JOIN_FILTERS", CAN_RAW_JOIN_FILTERS);
+#endif
+#if defined(__linux__) && __has_include(<linux/can/j1939.h>)
+    C("SO_J1939_FILTER", SO_J1939_FILTER); C("SO_J1939_PROMISC", SO_J1939_PROMISC);
+    C("SO_J1939_SEND_PRIO", SO_J1939_SEND_PRIO); C("SO_J1939_ERRQUEUE", SO_J1939_ERRQUEUE);
+    C("SCM_J1939_DEST_ADDR", SCM_J1939_DEST_ADDR); C("SCM_J1939_DEST_NAME", SCM_J1939_DEST_NAME);
+    C("SCM_J1939_PRIO", SCM_J1939_PRIO); C("SCM_J1939_ERRQUEUE", SCM_J1939_ERRQUEUE);
+    C("J1939_NLA_PAD", J1939_NLA_PAD); C("J1939_NLA_BYTES_ACKED", J1939_NLA_BYTES_ACKED);
+    C("J1939_EE_INFO_NONE", J1939_EE_INFO_NONE); C("J1939_EE_INFO_TX_ABORT", J1939_EE_INFO_TX_ABORT);
+#endif
+#if defined(__linux__) && __has_include(<linux/tipc.h>)
+#  ifndef TIPC_CLUSTER_SCOPE
+    C("TIPC_CLUSTER_SCOPE", 2);
+#  endif
+#  ifndef TIPC_NODE_SCOPE
+    C("TIPC_NODE_SCOPE", 3);
+#  endif
+#endif
+#if defined(__linux__)
+#  ifndef UDPLITE_SEND_CSCOV
+    C("UDPLITE_SEND_CSCOV", 10);
+#  endif
+#  ifndef UDPLITE_RECV_CSCOV
+    C("UDPLITE_RECV_CSCOV", 11);
+#  endif
+#endif
+// Bluetooth's (<bluetooth/bluetooth.h>, not installed with glibc): the Linux
+// kernel's ABI values, as CPython defines them, where the platform has
+// AF_BLUETOOTH
+#if defined(__linux__) && defined(AF_BLUETOOTH)
+    C("BTPROTO_L2CAP", 0); C("BTPROTO_HCI", 1); C("BTPROTO_SCO", 2); C("BTPROTO_RFCOMM", 3);
+    C("SOL_HCI", 0); C("HCI_DATA_DIR", 1); C("HCI_FILTER", 2); C("HCI_TIME_STAMP", 3);
+#endif

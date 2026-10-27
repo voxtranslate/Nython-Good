@@ -142,14 +142,20 @@ struct Token extends IToken {
     Location _location;
     TokenIdent ident  = {TokenType::End, TokenKind::End, TokenClass::Eof};
     std::string value = "End";
+    // round 83: where the token ends - the row and (1-based character)
+    // column just past its last character (lib/ast.ny's end positions);
+    // 0 when unknown (a token the parser made).
+    uint32_t end_row = 0, end_col = 0;
 
     Token() : _location{} {
     }
 
-    Token(const Token& other) : _location(other._location), ident(other.ident), value(other.value) {
+    Token(const Token& other) : _location(other._location), ident(other.ident), value(other.value),
+                                end_row(other.end_row), end_col(other.end_col) {
     }
 
-    Token(Token&& other) noexcept : _location(std::move(other._location)), ident(std::move(other.ident)), value(std::move(other.value)) {
+    Token(Token&& other) noexcept : _location(std::move(other._location)), ident(std::move(other.ident)), value(std::move(other.value)),
+                                    end_row(other.end_row), end_col(other.end_col) {
     }
 
     Token(TokenIdent t) : _location{}, ident(t) {
@@ -184,6 +190,8 @@ struct Token extends IToken {
             ident     = token.ident;
             _location = token._location;
             value     = token.value;
+            end_row   = token.end_row;   // round 83
+            end_col   = token.end_col;
         }
         return *this;
     }
@@ -193,6 +201,8 @@ struct Token extends IToken {
             ident     = std::move(token.ident);
             _location = std::move(token._location);
             value     = std::move(token.value);
+            end_row   = token.end_row;   // round 83
+            end_col   = token.end_col;
         }
         return *this;
     }

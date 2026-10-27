@@ -61,8 +61,8 @@ var data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 var evens_sq = sum(map(lambda x: x * x, filter(lambda x: x % 2 == 0, data)))
 t("pipeline", evens_sq, 220)
 var names = ["alice", "bob"]
-var uppers = map(lambda s: s.upper(), names)
-t("map_str", str(uppers), "[ALICE, BOB]")
+var uppers = list(map(lambda s: s.upper(), names))
+t("map_str", str(uppers), "['ALICE', 'BOB']")
 
 print "=== WITH __enter__/__exit__ ==="
 class Ctx:
@@ -71,7 +71,7 @@ class Ctx:
     def __enter__(self):
         self.state = "entered"
         return self
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.state = "exited"
 var ctx = Ctx()
 with ctx as c:
@@ -93,11 +93,11 @@ class A:
         self.a = v
 class B(A):
     def init(self, v, w):
-        super(v)
+        super().init(v)
         self.b = w
 class C(B):
     def init(self, v, w, x):
-        super(v, w)
+        super().init(v, w)
         self.c = x
 var obj = C(1, 2, 3)
 t("inherit_a", obj.a, 1)

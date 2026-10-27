@@ -34,13 +34,13 @@ class Base:
 
 class Child1(Base):
     def init(self, v):
-        super(v)
+        super().init(v)
 class Child2 extends Base:
     def init(self, v):
-        super(v)
+        super().init(v)
 class Child3 inherits Base:
     def init(self, v):
-        super(v)
+        super().init(v)
 
 t("parens", Child1(10).get(), 10)
 t("extends", Child2(20).get(), 20)
@@ -52,15 +52,15 @@ class L1:
         self.a = "L1"
 class L2(L1):
     def init(self):
-        super()
+        super().init()
         self.b = "L2"
 class L3(L2):
     def init(self):
-        super()
+        super().init()
         self.c = "L3"
 class L4(L3):
     def init(self):
-        super()
+        super().init()
         self.d = "L4"
 var deep = L4()
 t("chain_a", deep.a, "L1")
@@ -163,7 +163,7 @@ var unique = Set(words)
 t("set_len", len(unique), 3)
 
 var d = {"name": "Nython", "ver": "0.3"}
-t("keys", str(sorted(d.keys())), "[name, ver]")
+t("keys", str(sorted(d.keys())), "['name', 'ver']")
 t("values", len(d.values()), 2)
 t("items", len(d.items()), 2)
 
@@ -231,18 +231,18 @@ t("sum", sum([1,2,3,4,5]), 15)
 t("len_str", len("hello"), 5)
 t("len_list", len([1,2,3]), 3)
 t("sorted", str(sorted([3,1,4,1,5])), "[1, 1, 3, 4, 5]")
-t("reversed", str(reversed([1,2,3])), "[3, 2, 1]")
-t("type_int", type(42), "int")
-t("type_str", type("hi"), "string")
-t("type_list", type([1,2,3]), "list")
+t("reversed", str(list(reversed([1,2,3]))), "[3, 2, 1]")
+t("type_int", type(42) == "int", true)
+t("type_str", type("hi") == "string", true)
+t("type_list", type([1,2,3]) == "list", true)
 t("isinstance", isinstance(42, "int"), true)
 t("chr_ord", chr(65), "A")
 t("ord_chr", ord("A"), 65)
 
 print "=== ENUMERATE / ZIP ==="
-var en = enumerate(["a", "b", "c"])
+var en = list(enumerate(["a", "b", "c"]))
 t("enum_len", len(en), 3)
-var zp = zip([1,2,3], ["a","b","c"])
+var zp = list(zip([1,2,3], ["a","b","c"]))
 t("zip_len", len(zp), 3)
 
 print "=== SWAP & MULTI-ASSIGN ==="

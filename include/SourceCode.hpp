@@ -43,12 +43,12 @@ class SourceCode extends IReader {
 		    if(current_char=='\n') {
                 location.row++;
                 location.column = 1;
-		    }else {
-		        if(current_char == '\t'){
-                    location.column += TabSize;
-                }else{
-                    location.column++;
-                }
+		    }else if((static_cast<unsigned char>(current_char) & 0xC0) != 0x80) {
+		        // One column per character, a tab included: the column is a
+		        // position in the line's text (what the caret under an error
+		        // and the IDE's diagnostics index), not a visual width. UTF-8
+		        // continuation bytes belong to the character before them.
+                location.column++;
             }
 		    return current_char;
 		}
@@ -67,10 +67,9 @@ class SourceCode extends IReader {
                 location.column = 1;
             }
             else {
-                if(this->location.column) {
-                    if(current_char == '\t') this->location.column -= TabSize;
-                    else this->location.column--;
-                }
+                if(this->location.column > 1
+                   && (static_cast<unsigned char>(current_char) & 0xC0) != 0x80)
+                    this->location.column--;
             }
             return current_char;
         }
@@ -102,6 +101,9 @@ class SourceCode extends IReader {
 
         // Format a location in the source
         std::string format(Location location);
+
+        // Program text (not a file) named `name` in messages ("<string>").
+        static SourceCode from_text(const std::string& text, const std::string& name);
 
         // Create a shared pointer to a source
         static source_ptr create(std::string source);

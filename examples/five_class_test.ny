@@ -6,7 +6,7 @@ class A:
 
 class B(A):
     def init(self, v, w):
-        super(v)
+        super().init(v)
         self.w = w
     def get_both(self):
         return str(self.v) + "," + str(self.w)

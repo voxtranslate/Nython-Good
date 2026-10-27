@@ -1,12 +1,15 @@
 # Writing Nython that the runtime can afford
 
-The interpreter does not reclaim containers (see FIXES round 22 onward). Every
-list a program builds and discards stays resident for the life of the process.
-That makes a few ordinary-looking patterns extremely expensive, and the cost
-shows up as resident memory rather than as a slow function, so it is easy to
-miss until a large input arrives.
+**Round 75:** both engines now reclaim garbage - reference counting frees an
+object when its last reference goes, and a cycle collector frees groups that
+only refer to each other (`GC_NOTES.md`). The memory figures below were
+measured before that, when every list a program discarded stayed resident
+for the life of the process; discarded snapshots and concatenated lists are
+now freed. The advice still holds for *time*: `x = x + [y]` copies the whole
+list on every iteration (quadratic), and a snapshot per edit still costs its
+size while it is alive.
 
-Numbers below are measured, not estimated.
+Numbers below are measured, not estimated (before round 75).
 
 ## 1. Never grow a list with `x = x + [y]`
 
